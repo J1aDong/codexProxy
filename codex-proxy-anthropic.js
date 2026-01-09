@@ -30,8 +30,14 @@ const TEMPLATE = JSON.parse(fs.readFileSync(TEMPLATE_PATH, "utf8"));
 function transformTools(anthropicTools) {
   if (!anthropicTools || anthropicTools.length === 0) return [];
   
+  const hasSkillTool = anthropicTools.some(tool => {
+    const name = tool?.name || tool?.function?.name || "";
+    return typeof name === "string" && name.toLowerCase() === "skill";
+  });
+
   console.log("📨 Tools received:", {
     count: anthropicTools.length,
+    hasSkillTool,
     firstTool: JSON.stringify(anthropicTools[0])?.substring(0, 200)
   });
   
@@ -118,6 +124,28 @@ function resolveImageUrl(block) {
   return "";
 }
 
+function summarizeDocumentBlock(block) {
+  if (!block || typeof block !== "object") return "[document omitted]";
+
+  const source = block.source && typeof block.source === "object" ? block.source : {};
+  const parts = [];
+  const sourceType = typeof source.type === "string" ? source.type : "";
+  const mediaType = typeof source.media_type === "string"
+    ? source.media_type
+    : (typeof source.mime_type === "string" ? source.mime_type : "");
+  const name = typeof block.name === "string" ? block.name : "";
+  const base64Len = typeof source.data === "string" ? source.data.length : 0;
+
+  if (name) parts.push(`name=${name}`);
+  if (sourceType) parts.push(`source=${sourceType}`);
+  if (mediaType) parts.push(`media=${mediaType}`);
+  if (base64Len) parts.push(`base64_len=${base64Len}`);
+
+  return parts.length > 0
+    ? `[document omitted: ${parts.join(" ")}]`
+    : "[document omitted]";
+}
+
 // 提取 tool_result 的内容文本
 function extractToolResultContent(content) {
   if (typeof content === "string") return content;
@@ -128,6 +156,7 @@ function extractToolResultContent(content) {
     return content.map(block => {
       if (typeof block === "string") return block;
       if (block.type === "text" && block.text) return block.text;
+      if (block.type === "document") return summarizeDocumentBlock(block);
       if (block.type === "image") return "[image]";
       return JSON.stringify(block);
     }).join("\n");
@@ -136,6 +165,7 @@ function extractToolResultContent(content) {
   // 对象格式
   if (typeof content === "object") {
     if (content.type === "text" && content.text) return content.text;
+    if (content.type === "document") return summarizeDocumentBlock(content);
     return JSON.stringify(content);
   }
 
@@ -212,6 +242,15 @@ function transformMessages(messages) {
         currentMessage.content.push({
           type: textType,
           text: block.text || ""
+        });
+        continue;
+      }
+      
+      if (block.type === "document") {
+        ensureMessage();
+        currentMessage.content.push({
+          type: textType,
+          text: summarizeDocumentBlock(block)
         });
         continue;
       }
