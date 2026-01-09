@@ -194,8 +194,13 @@ function transformMessages(messages) {
     
     for (const block of blocks) {
       if (!block) continue;
-      
+
+      // 调试日志：打印 block 摘要
       if (typeof block === "string") {
+        console.log("📦 Block:", {
+          type: "string",
+          length: block.length
+        });
         ensureMessage();
         currentMessage.content.push({
           type: textType,
@@ -203,7 +208,15 @@ function transformMessages(messages) {
         });
         continue;
       }
-      
+
+      console.log("📦 Block:", {
+        type: block.type,
+        hasSource: !!block.source,
+        sourceType: block.source?.type,
+        hasImageUrl: !!block.image_url,
+        keys: Object.keys(block)
+      });
+
       if (block.type === "text") {
         ensureMessage();
         currentMessage.content.push({
@@ -212,15 +225,31 @@ function transformMessages(messages) {
         });
         continue;
       }
-      
+
       if (block.type === "image" || block.type === "image_url" || block.type === "input_image") {
+        const source = block.source;
         const imageUrl = resolveImageUrl(block);
+        const isDataUrl = typeof imageUrl === "string" && imageUrl.startsWith("data:");
+
+        console.log("🖼️ Image block:", {
+          type: block.type,
+          sourceType: source?.type,
+          mediaType: source?.media_type,
+          hasData: typeof source?.data === "string",
+          isDataUrl
+        });
+
         if (imageUrl && role === "user") {
+          // OpenAI Responses API 格式：input_image 作为 message content 的一部分
           ensureMessage();
           currentMessage.content.push({
             type: "input_image",
-            image_url: imageUrl
+            image_url: imageUrl,
+            detail: "auto"
           });
+          if (isDataUrl) {
+            console.log("📤 Using input_image format with data URL");
+          }
         } else {
           ensureMessage();
           currentMessage.content.push({
