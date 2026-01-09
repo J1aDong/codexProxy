@@ -93,6 +93,65 @@ function transformTools(anthropicTools) {
 }
 
 // Anthropic 消息转换为 Codex 输入格式（支持 content blocks 与 tool_result）
+// 解析图片 URL，支持多种格式
+function resolveImageUrl(block) {
+  if (!block || typeof block !== "object") return "";
+
+  // OpenAI 格式: image_url 字符串或对象
+  if (typeof block.image_url === "string") return block.image_url;
+  if (block.image_url && typeof block.image_url === "object") {
+    return block.image_url.url || block.image_url.uri || "";
+  }
+
+  // Anthropic 格式: source 对象
+  const source = block.source;
+  if (source && typeof source === "object") {
+    // URL 类型
+    if (source.type === "url" && source.url) return source.url;
+    // 直接 URL/URI 字段
+    if (typeof source.url === "string") return source.url;
+    if (typeof source.uri === "string") return source.uri;
+    // Base64 类型
+    if (source.type === "base64" && typeof source.data === "string") {
+      if (source.data.startsWith("data:")) return source.data;
+      const mediaType = source.media_type || "image/png";
+      return `data:${mediaType};base64,${source.data}`;
+    }
+    // 兼容：data 字段直接存在
+    if (typeof source.data === "string") {
+      if (source.data.startsWith("data:")) return source.data;
+      const mediaType = source.media_type || "image/png";
+      return `data:${mediaType};base64,${source.data}`;
+    }
+  }
+
+  return "";
+}
+
+// 提取 tool_result 的内容文本
+function extractToolResultContent(content) {
+  if (typeof content === "string") return content;
+  if (!content) return "";
+
+  // 数组格式：提取所有文本
+  if (Array.isArray(content)) {
+    return content.map(block => {
+      if (typeof block === "string") return block;
+      if (block.type === "text" && block.text) return block.text;
+      if (block.type === "image") return "[image]";
+      return JSON.stringify(block);
+    }).join("\n");
+  }
+
+  // 对象格式
+  if (typeof content === "object") {
+    if (content.type === "text" && content.text) return content.text;
+    return JSON.stringify(content);
+  }
+
+  return String(content);
+}
+
 function transformMessages(messages) {
   const input = [];
   
@@ -154,33 +213,44 @@ function transformMessages(messages) {
         continue;
       }
       
-      if (block.type === "image") {
-        ensureMessage();
-        currentMessage.content.push({
-          type: "input_image",
-          image_url: block.source?.data || block.source?.url || block.source?.uri || ""
-        });
+      if (block.type === "image" || block.type === "image_url" || block.type === "input_image") {
+        const imageUrl = resolveImageUrl(block);
+        if (imageUrl && role === "user") {
+          ensureMessage();
+          currentMessage.content.push({
+            type: "input_image",
+            image_url: imageUrl
+          });
+        } else {
+          ensureMessage();
+          currentMessage.content.push({
+            type: textType,
+            text: imageUrl || JSON.stringify(block)
+          });
+        }
         continue;
       }
       
       if (block.type === "tool_result") {
         currentMessage = null;
-        const resultText = typeof block.content === "string"
-          ? block.content
-          : JSON.stringify(block.content || "");
+        const resultText = extractToolResultContent(block.content);
         input.push({
-          type: "function_call_result",
-          id: block.tool_use_id || block.id || `tool_${Date.now()}`,
-          content: [{
-            type: "output_text",
-            text: resultText
-          }]
+          type: "function_call_output",
+          call_id: block.tool_use_id || block.id || `tool_${Date.now()}`,
+          output: resultText
         });
         continue;
       }
-      
+
       if (block.type === "tool_use") {
-        // tool_use 由模型产生，输入侧可忽略
+        // assistant 消息中的 tool_use 转换为 Codex function_call
+        currentMessage = null;
+        input.push({
+          type: "function_call",
+          call_id: block.id || `call_${Date.now()}`,
+          name: block.name || "unknown",
+          arguments: typeof block.input === "string" ? block.input : JSON.stringify(block.input || {})
+        });
         continue;
       }
       
