@@ -2,6 +2,8 @@
 
 本项目提供 OpenAI Chat Completions 格式与 Codex Responses API 格式之间的转换，使 OpenCode 能够使用 aicodemirror 的 Codex API。
 
+目前仅支持 aicodemirror。
+
 ## 功能特性
 
 ✅ **完整功能支持**
@@ -11,71 +13,38 @@
 - 推理强度配置（reasoning_effort）
 - 工具结果反馈循环
 
-## 目录结构
-
-```
-codexProxy/
-├── codex-proxy-openai-compatible.js  # OpenAI Chat Completions 风格适配器
-├── codex-proxy-anthropic.js         # Anthropic Messages API 风格适配器
-├── codex-proxy-test.py              # 测试套件
-├── codex-request.json               # Codex 请求模板（包含完整的工具定义）
-└── README.md                        # 本文档
-```
-
-> **注意**：`codex-request.json` 包含 Codex CLI 的完整工具定义和 instructions，是代理正常运行所必需的。
-
 ## 快速开始
 
-### 选择适配器风格
-
-#### 方式一：OpenAI Chat Completions 风格（默认）
-
-```bash
-cd /Users/mr.j/myRoom/code/ai/codexProxy
-node codex-proxy-openai-compatible.js
-```
-
-OpenCode 配置：
-```json
-{
-  "provider": {
-    "localproxyCodex": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "本地中转Codex",
-      "options": {
-        "baseURL": "http://localhost:8889/v1",
-        "apiKey": "sk-ant-api03-你的API密钥"
-      }
-    }
-  }
-}
-```
-
-#### 方式二：Anthropic Messages API 风格
+### 1. 启动 Anthropic 适配器
 
 ```bash
 cd /Users/mr.j/myRoom/code/ai/codexProxy
 node codex-proxy-anthropic.js
 ```
 
-OpenCode 配置：
+### 2. 配置 Claude Code 环境
+
+Claude Code 配置文件路径：`/Users/mr.j/.claude/settings.json`
+
 ```json
 {
-  "provider": {
-    "localproxyCodexAnthropic": {
-      "npm": "@ai-sdk/anthropic",
-      "name": "本地中转Codex-Anthropic",
-      "options": {
-        "baseURL": "http://localhost:8889/messages",
-        "apiKey": "sk-ant-api03-你的API密钥"
-      }
-    }
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8889",
+    "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-你的API密钥"
+  },
+  "forceLoginMethod": "claudeai",
+  "permissions": {
+    "allow": [],
+    "deny": []
   }
 }
 ```
 
 代理服务器默认监听 `http://localhost:8889`
 
+## 完整用例
+
+OpenCode 配置：
 ```json
 {
   "provider": {
