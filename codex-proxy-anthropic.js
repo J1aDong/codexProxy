@@ -574,8 +574,29 @@ const server = http.createServer((req, res) => {
         
         // 必须使用客户端传入的 API key
         // 支持两种认证方式：Authorization header 或 x-api-key header
-        const authHeader = req.headers.authorization || "";
-        const apiKeyHeader = req.headers["x-api-key"] || "";
+        const rawAuthHeader = Array.isArray(req.headers.authorization)
+          ? req.headers.authorization[0]
+          : req.headers.authorization;
+        const rawApiKeyHeader = Array.isArray(req.headers["x-api-key"])
+          ? req.headers["x-api-key"][0]
+          : req.headers["x-api-key"];
+        const rawAltApiKeyHeader = Array.isArray(req.headers["api-key"])
+          ? req.headers["api-key"][0]
+          : req.headers["api-key"];
+
+        let authHeader = typeof rawAuthHeader === "string" ? rawAuthHeader : "";
+        let apiKeyHeader = typeof rawApiKeyHeader === "string" ? rawApiKeyHeader : "";
+        if (!apiKeyHeader && typeof rawAltApiKeyHeader === "string") {
+          apiKeyHeader = rawAltApiKeyHeader;
+        }
+
+        if (!authHeader && apiKeyHeader) {
+          authHeader = `Bearer ${apiKeyHeader}`;
+        }
+        if (!apiKeyHeader && authHeader) {
+          const match = authHeader.match(/^Bearer\\s+(.+)$/i);
+          apiKeyHeader = match ? match[1] : authHeader;
+        }
 
         if (!authHeader && !apiKeyHeader) {
           res.writeHead(401, {"Content-Type": "application/json"});
