@@ -15,28 +15,66 @@
 
 ```
 codexProxy/
-├── codex-proxy.js        # 代理服务器主程序
-├── codex-proxy-test.py   # 测试套件
-├── codex-request.json    # Codex 请求模板（包含完整的工具定义）
-└── README.md             # 本文档
+├── codex-proxy-openai-compatible.js  # OpenAI Chat Completions 风格适配器
+├── codex-proxy-anthropic.js         # Anthropic Messages API 风格适配器
+├── codex-proxy-test.py              # 测试套件
+├── codex-request.json               # Codex 请求模板（包含完整的工具定义）
+└── README.md                        # 本文档
 ```
 
 > **注意**：`codex-request.json` 包含 Codex CLI 的完整工具定义和 instructions，是代理正常运行所必需的。
 
 ## 快速开始
 
-### 1. 启动代理服务器
+### 选择适配器风格
+
+#### 方式一：OpenAI Chat Completions 风格（默认）
 
 ```bash
 cd /Users/mr.j/myRoom/code/ai/codexProxy
-node codex-proxy.js
+node codex-proxy-openai-compatible.js
+```
+
+OpenCode 配置：
+```json
+{
+  "provider": {
+    "localproxyCodex": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "本地中转Codex",
+      "options": {
+        "baseURL": "http://localhost:8889/v1",
+        "apiKey": "sk-ant-api03-你的API密钥"
+      }
+    }
+  }
+}
+```
+
+#### 方式二：Anthropic Messages API 风格
+
+```bash
+cd /Users/mr.j/myRoom/code/ai/codexProxy
+node codex-proxy-anthropic.js
+```
+
+OpenCode 配置：
+```json
+{
+  "provider": {
+    "localproxyCodexAnthropic": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "本地中转Codex-Anthropic",
+      "options": {
+        "baseURL": "http://localhost:8889/messages",
+        "apiKey": "sk-ant-api03-你的API密钥"
+      }
+    }
+  }
+}
 ```
 
 代理服务器默认监听 `http://localhost:8889`
-
-### 2. 配置 OpenCode
-
-编辑 OpenCode 配置文件 `~/.config/opencode/opencode.json`，添加 Codex provider：
 
 ```json
 {
@@ -89,29 +127,64 @@ Summary: 8/8 tests passed
 ================================================================================
 ```
 
-## API 参数映射
+## API 格式对比
 
-### OpenAI → Codex
+### OpenAI Chat Completions → Codex
 
 | OpenAI 参数 | Codex 参数 | 说明 |
 |------------|-----------|------|
-| `model` | `model` | 模型名称 |
 | `messages` | `input` | 消息内容 |
-| `messages[i].content` | `input[i].content[].text` | 消息文本 |
+| `system` | `instructions` | 系统提示 |
 | `tools` | `tools` | 工具定义 |
-| `tool_choice` | `tool_choice` | 工具选择策略 |
-| `stream` | `stream` | 是否流式输出 |
-| `reasoning_effort` | `reasoning.effort` | 推理强度 |
 
-### reasoning_effort 映射
+响应格式：
+```json
+{"id":"chatcmpl-xxx","object":"chat.completion.chunk",...}
+```
 
-| OpenAI 值 | Codex 值 |
-|-----------|----------|
-| `xlow` | `low` |
-| `low` | `low` |
-| `medium` | `medium` |
-| `high` | `high` |
-| `xhigh` | `high` |
+### Anthropic Messages → Codex
+
+| Anthropic 参数 | Codex 参数 | 说明 |
+|---------------|-----------|------|
+| `messages` | `input` | 消息内容 |
+| `system` | `instructions` | 系统提示 |
+| `tools` | `tools` | 工具定义 |
+
+响应格式：
+```json
+{"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+```
+
+### Anthropic 响应示例
+
+```json
+{
+  "type": "content_block_delta",
+  "delta": { "type": "text_delta", "text": "Hello!" },
+  "index": 0
+}
+```
+
+工具调用：
+```json
+{
+  "type": "content_block_start",
+  "content_block": {
+    "type": "tool_use",
+    "id": "tool_123",
+    "name": "shell_command",
+    "input": {}
+  }
+}
+```
+
+消息结束：
+```json
+{
+  "type": "message_delta",
+  "delta": { "stop_reason": "end_turn" }
+}
+```
 
 ## 支持的工具
 

@@ -176,7 +176,12 @@ class CodexToCompletionsTransform extends Transform {
             model: "gpt-5.2-codex",
             choices: [{
               index: 0,
-              delta: { content: data.delta },
+              delta: {
+                content: [{
+                  type: "text",
+                  text: data.delta
+                }]
+              },
               finish_reason: null
             }]
           }) + "\n\n");
