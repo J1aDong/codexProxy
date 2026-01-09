@@ -22,16 +22,6 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const PORT = 8889;
 
-// 加载配置文件
-const CONFIG_PATH = path.resolve(__dirname, "config.json");
-let CONFIG = { apiKey: "" };
-try {
-  CONFIG = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-  console.log("✅ API key loaded from config.json");
-} catch (e) {
-  console.log("⚠️  No config.json found, will use Authorization header from client");
-}
-
 // 加载模板文件
 const TEMPLATE_PATH = path.resolve(__dirname, "codex-request.json");
 const TEMPLATE = JSON.parse(fs.readFileSync(TEMPLATE_PATH, "utf8"));
@@ -305,12 +295,30 @@ function transformRequest(anthropicBody) {
   
   const sessionId = randomUUID();
   
-  // 转换消息
-  const input = transformMessages(messages);
+  // 转换对话消息
+  const chatMessages = transformMessages(messages);
   
-  // 获取 instructions（Codex API 要求必须包含完整的系统提示）
-  // 总是使用模板中的 instructions，忽略用户自定义的 system
-  // 因为 Codex 对 instructions 有严格验证
+  // 构建 Codex 要求的 input 数组结构
+  // 1. 必须以 TEMPLATE.input[0] 开头 (包含 # AGENTS.md 签名)，否则后端校验失败
+  const finalInput = [TEMPLATE.input[0]];
+  
+  // 2. 如果有用户提供的 system prompt (Claude Skills)，将其作为上下文注入
+  if (anthropicBody.system) {
+    console.log("📝 Injecting Claude system context (" + anthropicBody.system.length + " chars)");
+    finalInput.push({
+      type: "message",
+      role: "user",
+      content: [{
+        type: "input_text",
+        text: `<system_context>\n${anthropicBody.system}\n</system_context>`
+      }]
+    });
+  }
+  
+  // 3. 追加实际对话历史
+  finalInput.push(...chatMessages);
+  
+  // 获取 instructions (必须与模板完全一致)
   const instructions = TEMPLATE.instructions;
   
   // 转换工具
@@ -327,7 +335,7 @@ function transformRequest(anthropicBody) {
     body: {
       model: codexModel,
       instructions,
-      input: input.length > 0 ? input : TEMPLATE.input,
+      input: finalInput,
       tools: transformedTools.length > 0 ? transformedTools : TEMPLATE.tools,
       tool_choice: "auto",
       parallel_tool_calls: true,
@@ -564,11 +572,17 @@ const server = http.createServer((req, res) => {
         // 获取 Claude Code 需要的 header
         const anthropicVersion = req.headers["x-anthropic-version"] || req.headers["anthropic-version"] || "2023-06-01";
         
-        // 优先使用配置文件中的 API key，否则使用客户端传入的
+        // 必须使用客户端传入的 API key
         // 支持两种认证方式：Authorization header 或 x-api-key header
-        const authHeader = req.headers.authorization || `Bearer ${CONFIG.apiKey}`;
-        const apiKeyHeader = req.headers["x-api-key"] || CONFIG.apiKey;
-        
+        const authHeader = req.headers.authorization || "";
+        const apiKeyHeader = req.headers["x-api-key"] || "";
+
+        if (!authHeader && !apiKeyHeader) {
+          res.writeHead(401, {"Content-Type": "application/json"});
+          res.end(JSON.stringify({ error: { type: "unauthorized", message: "Missing API key" } }));
+          return;
+        }
+
         const options = {
           hostname: "api.aicodemirror.com",
           path: "/api/codex/backend-api/codex/responses",
@@ -576,8 +590,8 @@ const server = http.createServer((req, res) => {
           headers: {
             "Content-Type": "application/json",
             "Content-Length": Buffer.byteLength(postData),
-            "Authorization": authHeader,
-            "x-api-key": apiKeyHeader,
+            ...(authHeader ? { "Authorization": authHeader } : {}),
+            ...(apiKeyHeader ? { "x-api-key": apiKeyHeader } : {}),
             "User-Agent": "Anthropic-Node/0.3.4",
             "x-anthropic-version": anthropicVersion,
             "originator": "codex_cli_rs",
