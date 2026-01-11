@@ -106,6 +106,7 @@
 <script lang="ts" setup>
 import { reactive, ref, onMounted, computed, watch } from 'vue'
 import { Document } from '@element-plus/icons-vue'
+import { ElMessageBox } from 'element-plus'
 
 const isRunning = ref(false)
 const showLogs = ref(false)
@@ -244,6 +245,26 @@ onMounted(async () => {
   window.ipcRenderer.on('proxy-log', (_event, message) => {
     logs.value.push(message)
     if (logs.value.length > 2000) logs.value.shift()
+  })
+
+  window.ipcRenderer.on('port-in-use', (_event, port) => {
+    ElMessageBox.confirm(
+      lang.value === 'zh' 
+        ? `端口 ${port} 已被占用。是否终止该端口上的服务并启动代理？`
+        : `Port ${port} is in use. Do you want to terminate the service on this port and start the proxy?`,
+      lang.value === 'zh' ? '端口冲突' : 'Port Conflict',
+      {
+        confirmButtonText: lang.value === 'zh' ? '终止并启动' : 'Kill & Start',
+        cancelButtonText: lang.value === 'zh' ? '取消' : 'Cancel',
+        type: 'warning',
+      }
+    )
+      .then(() => {
+        window.ipcRenderer.send('start-proxy', { ...form, force: true })
+      })
+      .catch(() => {
+        isRunning.value = false
+      })
   })
 })
 </script>

@@ -1,6 +1,8 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import path from 'path'
-import { spawn, ChildProcess } from 'child_process'
+import { spawn, exec, ChildProcess } from 'child_process'
+import net from 'net'
+import fs from 'fs'
 
 process.env.DIST = path.join(__dirname, '../dist')
 process.env.PUBLIC = app.isPackaged ? process.env.DIST : path.join(process.env.DIST, '../public')
@@ -26,6 +28,35 @@ function createWindow() {
   } else {
     win.loadFile(path.join(process.env.DIST || '', 'index.html'))
   }
+}
+
+// Port Utilities
+const checkPort = (port: number): Promise<boolean> => {
+  return new Promise((resolve) => {
+    const server = net.createServer()
+    server.once('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        resolve(true)
+      } else {
+        resolve(false)
+      }
+    })
+    server.once('listening', () => {
+      server.close()
+      resolve(false)
+    })
+    server.listen(port)
+  })
+}
+
+const killProcessOnPort = (port: number): Promise<void> => {
+  return new Promise((resolve) => {
+    const command = process.platform === 'win32'
+      ? `for /f "tokens=5" %a in ('netstat -aon ^| findstr :${port}') do taskkill /f /pid %a`
+      : `lsof -i :${port} -t | xargs kill -9`
+
+    exec(command, () => resolve())
+  })
 }
 
 app.on('window-all-closed', () => {
@@ -57,8 +88,6 @@ ipcMain.on('stop-proxy', () => {
   stopProxy()
 })
 
-import fs from 'fs'
-
 const CONFIG_PATH = path.join(app.getPath('userData'), 'proxy-config.json')
 
 // ... (existing code) ...
@@ -83,17 +112,31 @@ ipcMain.on('save-config', (_event, config) => {
   }
 })
 
-ipcMain.on('start-proxy', (_event, config) => {
+ipcMain.on('start-proxy', async (_event, config) => {
   // Save config on start
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
   } catch (e) { /* ignore */ }
   
+  const { port, targetUrl, apiKey, force } = config
+
+  // Check port if not forced
+  if (!force) {
+    const isInUse = await checkPort(Number(port))
+    if (isInUse) {
+      win?.webContents.send('port-in-use', port)
+      return
+    }
+  } else {
+    // Kill existing process
+    win?.webContents.send('proxy-log', `[System] Stopping process on port ${port}...`)
+    await killProcessOnPort(Number(port))
+    // Small delay to ensure port release
+    await new Promise(r => setTimeout(r, 1000))
+  }
+  
   if (proxyProcess) return
 
-
-  const { port, targetUrl, apiKey } = config
-  
   // Resolve path to codex-proxy-anthropic.js
   let scriptPath: string
   if (app.isPackaged) {
