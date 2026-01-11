@@ -34,6 +34,16 @@
       "dist",
       "dist-electron"
     ],
+    "extraResources": [
+      {
+        "from": "../codex-proxy-anthropic.js",
+        "to": "codex-proxy-anthropic.js"
+      },
+      {
+        "from": "../codex-request.json",
+        "to": "codex-request.json"
+      }
+    ],
     "mac": {
       "artifactName": "${productName}_${version}_${os}_${arch}.${ext}"
     },

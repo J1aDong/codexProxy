@@ -95,11 +95,15 @@ ipcMain.on('start-proxy', (_event, config) => {
   const { port, targetUrl, apiKey } = config
   
   // Resolve path to codex-proxy-anthropic.js
-  // In dev: project_root/fronted/electron/main.ts -> project_root/codex-proxy-anthropic.js
-  // We assume main.ts is executed from fronted/
-  
-  // TODO: Fix path for production build
-  const scriptPath = path.resolve(__dirname, '../../codex-proxy-anthropic.js')
+  let scriptPath: string
+  if (app.isPackaged) {
+    // In production, extraResources puts files in resources/
+    scriptPath = path.join(process.resourcesPath, 'codex-proxy-anthropic.js')
+  } else {
+    // In dev: project_root/fronted/electron/main.ts -> project_root/codex-proxy-anthropic.js
+    // main.ts is compiled to dist-electron/main.js, so we go up two levels
+    scriptPath = path.resolve(__dirname, '../../codex-proxy-anthropic.js')
+  }
   
   const env = { 
     ...process.env,
