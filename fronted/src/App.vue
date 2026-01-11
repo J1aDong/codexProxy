@@ -5,10 +5,15 @@
       <div class="header-section">
         <div class="status-badge" :class="{ running: isRunning }">
           <div class="status-dot"></div>
-          <span class="status-text">{{ isRunning ? 'Running' : 'Stopped' }}</span>
+          <span class="status-text">{{ isRunning ? t.statusRunning : t.statusStopped }}</span>
         </div>
-        <h1 class="app-title">Codex Proxy</h1>
+        <h1 class="app-title">{{ t.title }}</h1>
         <div class="header-actions">
+           <!-- Language Switch -->
+           <el-button circle text @click="toggleLang" class="lang-btn">
+             {{ lang === 'zh' ? 'En' : '中' }}
+           </el-button>
+           <!-- Logs Toggle -->
            <el-button circle text @click="showLogs = true">
              <el-icon><Document /></el-icon>
            </el-button>
@@ -20,37 +25,37 @@
         <el-form :model="form" label-position="top" class="apple-form">
           <el-row :gutter="20">
             <el-col :span="8">
-              <el-form-item label="Port">
+              <el-form-item :label="t.port">
                 <el-input v-model.number="form.port" placeholder="8889" />
               </el-form-item>
             </el-col>
             <el-col :span="16">
-              <el-form-item label="Target URL">
+              <el-form-item :label="t.targetUrl">
                 <el-input v-model="form.targetUrl" placeholder="https://..." />
               </el-form-item>
             </el-col>
           </el-row>
           
-          <el-form-item label="Codex API Key">
+          <el-form-item :label="t.apiKey">
             <el-input 
               v-model="form.apiKey" 
               type="password" 
-              placeholder="Optional - Overrides client key" 
+              :placeholder="t.apiKeyPlaceholder" 
               show-password 
             />
             <div class="form-tip">
-              If configured here, you can use any random string as the API key in Claude Code.
+              {{ t.apiKeyTip }}
             </div>
           </el-form-item>
 
           <div class="form-actions">
-            <el-button @click="resetDefaults">Restore Defaults</el-button>
+            <el-button @click="resetDefaults">{{ t.restoreDefaults }}</el-button>
             <el-button 
               :type="isRunning ? 'danger' : 'primary'"
               @click="toggleProxy"
               class="primary-btn"
             >
-              {{ isRunning ? 'Stop Proxy' : 'Start Proxy' }}
+              {{ isRunning ? t.stopProxy : t.startProxy }}
             </el-button>
           </div>
         </el-form>
@@ -58,14 +63,19 @@
 
       <!-- Guide Section -->
       <div class="guide-section">
-        <h3>Configuration Guide</h3>
+        <h3>{{ t.guideTitle }}</h3>
         <p class="guide-desc">
-          Add the following to your Claude Code settings file:<br>
+          {{ t.guideDesc }}<br>
           <code class="path">~/.claude/settings.json</code>
         </p>
         
         <div class="code-block-wrapper">
           <pre class="code-block">{{ configExample }}</pre>
+          <div class="copy-action">
+            <el-button size="small" link type="info" @click="copyConfig">
+              {{ copied ? t.copied : t.copy }}
+            </el-button>
+          </div>
         </div>
       </div>
     </div>
@@ -73,7 +83,7 @@
     <!-- Logs Drawer -->
     <el-drawer 
       v-model="showLogs" 
-      title="System Logs" 
+      :title="t.logsTitle" 
       direction="rtl" 
       size="400px"
     >
@@ -82,10 +92,11 @@
           <span class="log-time">{{ new Date().toLocaleTimeString() }}</span>
           <span class="log-content">{{ log }}</span>
         </div>
+        <div v-if="logs.length === 0" class="empty-logs">{{ t.noLogs }}</div>
       </div>
       <template #footer>
         <div style="flex: auto">
-          <el-button @click="clearLogs">Clear</el-button>
+          <el-button @click="clearLogs">{{ t.clearLogs }}</el-button>
         </div>
       </template>
     </el-drawer>
@@ -100,6 +111,58 @@ const isRunning = ref(false)
 const showLogs = ref(false)
 const logs = ref<string[]>([])
 const logsContainer = ref<HTMLElement | null>(null)
+const copied = ref(false)
+
+// Language Support
+const lang = ref<'zh' | 'en'>('zh')
+const toggleLang = () => {
+  lang.value = lang.value === 'zh' ? 'en' : 'zh'
+}
+
+const translations = {
+  zh: {
+    statusRunning: '代理运行中',
+    statusStopped: '代理已停止',
+    title: 'Codex 代理',
+    port: '端口',
+    targetUrl: '目标地址',
+    apiKey: 'Codex API 密钥',
+    apiKeyPlaceholder: '选填 - 将覆盖客户端提供的密钥',
+    apiKeyTip: '如果在此处配置，您可以在 Claude Code 中使用任意随机字符串作为 API 密钥。',
+    restoreDefaults: '恢复默认',
+    startProxy: '启动代理',
+    stopProxy: '停止代理',
+    guideTitle: '配置指南',
+    guideDesc: '请将以下内容添加到您的 Claude Code 配置文件：',
+    logsTitle: '系统日志',
+    clearLogs: '清除日志',
+    copy: '复制',
+    copied: '已复制',
+    noLogs: '暂无日志...',
+  },
+  en: {
+    statusRunning: 'Proxy Running',
+    statusStopped: 'Proxy Stopped',
+    title: 'Codex Proxy',
+    port: 'Port',
+    targetUrl: 'Target URL',
+    apiKey: 'Codex API Key',
+    apiKeyPlaceholder: 'Optional - Overrides client key',
+    apiKeyTip: 'If configured here, you can use any random string as the API key in Claude Code.',
+    restoreDefaults: 'Restore Defaults',
+    startProxy: 'Start Proxy',
+    stopProxy: 'Stop Proxy',
+    guideTitle: 'Configuration Guide',
+    guideDesc: 'Add the following to your Claude Code settings file:',
+    logsTitle: 'System Logs',
+    clearLogs: 'Clear Logs',
+    copy: 'Copy',
+    copied: 'Copied',
+    noLogs: 'No logs yet...',
+  }
+}
+
+const t = computed(() => translations[lang.value])
 
 const DEFAULT_CONFIG = {
   port: 8889,
@@ -123,7 +186,6 @@ const resetDefaults = () => {
   form.port = DEFAULT_CONFIG.port
   form.targetUrl = DEFAULT_CONFIG.targetUrl
   form.apiKey = DEFAULT_CONFIG.apiKey
-  // If running, user might want to restart, but we just reset form for now.
 }
 
 const toggleProxy = () => {
@@ -136,6 +198,18 @@ const toggleProxy = () => {
 
 const clearLogs = () => {
   logs.value = []
+}
+
+const copyConfig = async () => {
+  try {
+    await navigator.clipboard.writeText(configExample.value)
+    copied.value = true
+    setTimeout(() => {
+      copied.value = false
+    }, 2000)
+  } catch (err) {
+    console.error('Failed to copy', err)
+  }
 }
 
 // Auto scroll logs
@@ -232,6 +306,11 @@ body {
   margin-right: 6px;
 }
 
+.lang-btn {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
 /* Card Styling */
 .config-card {
   border: none !important;
@@ -312,6 +391,12 @@ body {
   line-height: 1.5;
 }
 
+.copy-action {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+}
+
 /* Logs */
 .logs-container {
   height: 100%;
@@ -335,6 +420,12 @@ body {
 .log-content {
   color: var(--text-primary);
   word-break: break-all;
+}
+
+.empty-logs {
+  text-align: center;
+  color: var(--text-secondary);
+  margin-top: 40px;
 }
 
 /* Element Plus overrides */
