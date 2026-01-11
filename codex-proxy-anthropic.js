@@ -833,17 +833,17 @@ const server = http.createServer((req, res) => {
           apiKeyHeader = rawAltApiKeyHeader;
         }
 
-        if (!authHeader && apiKeyHeader) {
-          authHeader = `Bearer ${apiKeyHeader}`;
-        }
-        if (!apiKeyHeader && authHeader) {
-          const match = authHeader.match(/^Bearer\\s+(.+)$/i);
-          apiKeyHeader = match ? match[1] : authHeader;
-        }
-
-        if (!authHeader && !apiKeyHeader && process.env.CODEX_API_KEY) {
+        // 优先使用环境变量配置的 Key (强制覆盖)
+        if (process.env.CODEX_API_KEY) {
           apiKeyHeader = process.env.CODEX_API_KEY;
           authHeader = `Bearer ${apiKeyHeader}`;
+        } else if (!authHeader && apiKeyHeader) {
+          authHeader = `Bearer ${apiKeyHeader}`;
+        }
+        
+        if (!apiKeyHeader && authHeader) {
+          const match = authHeader.match(/^Bearer\s+(.+)$/i);
+          apiKeyHeader = match ? match[1] : authHeader;
         }
 
         if (!authHeader && !apiKeyHeader) {
