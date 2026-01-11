@@ -174,10 +174,14 @@ const form = reactive({ ...DEFAULT_CONFIG })
 
 const configExample = computed(() => {
   return `{
-  "provider": "@ai-sdk/anthropic",
-  "apiKey": "${form.apiKey ? '************' : 'sk-any-string-is-fine'}",
-  "anthropic": {
-    "baseURL": "http://localhost:${form.port}/messages"
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:${form.port}",
+    "ANTHROPIC_AUTH_TOKEN": "${form.apiKey ? '************' : 'sk-ant-api03-any-string-is-fine'}"
+  },
+  "forceLoginMethod": "claudeai",
+  "permissions": {
+    "allow": [],
+    "deny": []
   }
 }`
 })
