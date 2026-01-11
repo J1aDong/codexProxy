@@ -173,10 +173,14 @@ const DEFAULT_CONFIG = {
 const form = reactive({ ...DEFAULT_CONFIG })
 
 const configExample = computed(() => {
+  const tokenPlaceholder = lang.value === 'zh' 
+    ? "替换为真实的key或者假如在proxy页面中配置了则任意字符串" 
+    : "Replace with real key (or any string if configured in proxy page)";
+    
   return `{
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:${form.port}",
-    "ANTHROPIC_AUTH_TOKEN": "${form.apiKey ? '************' : 'sk-ant-api03-any-string-is-fine'}"
+    "ANTHROPIC_AUTH_TOKEN": "${tokenPlaceholder}"
   },
   "forceLoginMethod": "claudeai",
   "permissions": {
