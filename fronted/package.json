@@ -4,6 +4,10 @@
   "version": "0.0.1",
   "main": "dist-electron/main.js",
   "description": "Desktop configuration UI for Codex Proxy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USER/YOUR_REPO.git"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build && electron-builder",
@@ -26,6 +30,9 @@
   },
   "build": {
     "appId": "com.codex.proxy",
+    "publish": [
+      "github"
+    ],
     "productName": "Codex Proxy",
     "directories": {
       "output": "release/${version}"
