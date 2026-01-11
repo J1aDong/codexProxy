@@ -323,6 +323,26 @@ function transformMessages(messages) {
   return input;
 }
 
+// 从消息中提取 cwd（工作目录）
+// Claude Code 可能在消息中包含路径信息
+function extractCwdFromMessages(messages) {
+  // 尝试从第一条用户消息中提取路径
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      const content = Array.isArray(msg.content)
+        ? msg.content.map(c => c.text || "").join(" ")
+        : (typeof msg.content === "string" ? msg.content : "");
+
+      // 匹配常见的路径模式
+      const pathMatch = content.match(/(?:^|\s)(\/[^\s]+)/);
+      if (pathMatch && pathMatch[1].length > 1) {
+        return pathMatch[1];
+      }
+    }
+  }
+  return null;
+}
+
 // 主转换函数
 function transformRequest(anthropicBody) {
   const { 
@@ -341,15 +361,36 @@ function transformRequest(anthropicBody) {
   // 1. 必须以 TEMPLATE.input[0] 开头 (包含 # AGENTS.md 签名)，否则后端校验失败
   const finalInput = [TEMPLATE.input[0]];
   
-  // 2. 如果有用户提供的 system prompt (Claude Skills)，将其作为上下文注入
+  // 2. 如果有用户提供的 system prompt (Claude Code)，转换为 Codex 原生格式
   if (anthropicBody.system) {
-    console.log("📝 Injecting Claude system context (" + anthropicBody.system.length + " chars)");
+    // 从请求中提取 cwd（如果有），否则使用默认值
+    const cwd = extractCwdFromMessages(messages) || process.cwd();
+
+    console.log("📝 Injecting AGENTS.md context (" + anthropicBody.system.length + " chars)");
+
+    // 2.1 AGENTS.md 格式：# AGENTS.md instructions for {cwd} + <INSTRUCTIONS>
     finalInput.push({
       type: "message",
       role: "user",
       content: [{
         type: "input_text",
-        text: `<system_context>\n${anthropicBody.system}\n</system_context>`
+        text: `# AGENTS.md instructions for ${cwd}\n\n<INSTRUCTIONS>\n${anthropicBody.system}\n</INSTRUCTIONS>`
+      }]
+    });
+
+    // 2.2 environment_context：独立的 user message
+    finalInput.push({
+      type: "message",
+      role: "user",
+      content: [{
+        type: "input_text",
+        text: `<environment_context>
+  <cwd>${cwd}</cwd>
+  <approval_policy>on-request</approval_policy>
+  <sandbox_mode>workspace-write</sandbox_mode>
+  <network_access>restricted</network_access>
+  <shell>${process.env.SHELL || 'bash'}</shell>
+</environment_context>`
       }]
     });
   }
