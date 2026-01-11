@@ -1,0 +1,15 @@
+
+🚀 Codex Proxy (Anthropic Style)
+📡 Listening: http://localhost:8889/messages
+🎯 Target: https://api.aicodemirror.com/api/codex/backend-api/codex/responses
+
+✨ Features:
+   - Anthropic Messages API ↔ Codex Responses API
+   - Tool/Function calls ✅
+   - Streaming ✅
+
+📝 OpenCode 配置示例:
+   provider: @ai-sdk/anthropic
+   baseURL: http://localhost:8889
+
+

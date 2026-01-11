@@ -26,134 +26,22 @@ const PORT = 8889;
 const TEMPLATE_PATH = path.resolve(__dirname, "codex-request.json");
 const TEMPLATE = JSON.parse(fs.readFileSync(TEMPLATE_PATH, "utf8"));
 
-// ============================================================
-// Skill 转换模块 - Claude Code Skill → Codex CLI Skill
-// ============================================================
-
-const SKILL_SEARCH_PATHS = [
-  path.join(process.env.HOME || "", ".claude", "skills"),
-  path.join(process.env.HOME || "", ".codex", "skills"),
-];
-
-function findSkillPath(skillName, cwd) {
-  if (!skillName) return null;
-  
-  const parts = skillName.split(":");
-  const namespace = parts.length > 1 ? parts[0] : null;
-  const name = parts.length > 1 ? parts.slice(1).join(":") : skillName;
-  
-  const searchPaths = [...SKILL_SEARCH_PATHS];
-  if (cwd) {
-    searchPaths.push(path.join(cwd, ".claude", "skills"));
-    searchPaths.push(path.join(cwd, ".codex", "skills"));
-  }
-  
-  for (const basePath of searchPaths) {
-    const candidates = namespace
-      ? [
-          path.join(basePath, namespace, name, "SKILL.md"),
-          path.join(basePath, `${namespace}-${name}`, "SKILL.md"),
-        ]
-      : [
-          path.join(basePath, name, "SKILL.md"),
-        ];
-    
-    for (const candidate of candidates) {
-      try {
-        if (fs.existsSync(candidate)) return candidate;
-      } catch (e) {}
-    }
-  }
-  return null;
-}
-
-function extractSkillFromToolResult(content) {
-  if (!content) return null;
-  
-  const blocks = Array.isArray(content) ? content : [content];
-  const allTexts = blocks
-    .map(block => typeof block === "string" ? block : (block.text || ""))
-    .filter(Boolean);
-  const fullText = allTexts.join("\n");
-  
-  const nameMatch = fullText.match(/<command-name>([^<]+)<\/command-name>/);
-  const skillName = nameMatch ? nameMatch[1].replace(/^\//, "") : null;
-  
-  const pathMatch = fullText.match(/Base Path:\s*([^\n]+)/);
-  const basePath = pathMatch ? pathMatch[1].trim() : null;
-  
-  let skillContent = null;
-  if (fullText.includes("Base Path:")) {
-    const idx = fullText.indexOf("\n", fullText.indexOf("Base Path:"));
-    if (idx !== -1) skillContent = fullText.substring(idx + 1).trim();
-  } else {
-    const contentWithoutMeta = fullText
-      .replace(/<command-name>[^<]*<\/command-name>/g, "")
-      .replace(/<[^>]+>/g, "")
-      .trim();
-    if (contentWithoutMeta) skillContent = contentWithoutMeta;
-  }
-  
-  return (skillName && skillContent) ? { skillName, skillContent, basePath } : null;
-}
-
-function convertToCodexSkillFormat(skillName, skillContent, skillPath) {
-  let fullContent = skillContent;
-  
-  if (skillPath) {
-    try {
-      const fileContent = fs.readFileSync(skillPath, "utf-8");
-      if (fileContent.trim()) fullContent = fileContent;
-    } catch (e) {
-      console.warn("⚠️ Failed to read skill file:", skillPath, e.message);
-    }
-  }
-  
-  return `<skill>
-<name>${skillName}</name>
-<path>${skillPath || "unknown"}</path>
-${fullContent}
-</skill>`;
-}
-
-function isSkillToolUse(block) {
-  return block?.type === "tool_use" && 
-         typeof block.name === "string" && 
-         block.name.toLowerCase() === "skill";
-}
-
-function isSkillToolResult(block, skillToolIds) {
-  if (!block || block.type !== "tool_result") return false;
-  
-  const toolUseId = block.tool_use_id || block.id;
-  if (skillToolIds?.has(toolUseId)) return true;
-  
-  const content = block.content;
-  if (!content) return false;
-  
-  const text = typeof content === "string" 
-    ? content 
-    : (Array.isArray(content) ? content.map(b => b.text || "").join("\n") : "");
-  
-  return text.includes("<command-name>") || text.includes("Base Path:");
-}
-
 // Anthropic 工具转换为 Codex 工具
 function transformTools(anthropicTools) {
   if (!anthropicTools || anthropicTools.length === 0) return [];
   
-  const filteredTools = anthropicTools.filter(tool => {
+  const hasSkillTool = anthropicTools.some(tool => {
     const name = tool?.name || tool?.function?.name || "";
-    return typeof name !== "string" || name.toLowerCase() !== "skill";
+    return typeof name === "string" && name.toLowerCase() === "skill";
   });
 
   console.log("📨 Tools received:", {
     count: anthropicTools.length,
-    filteredCount: filteredTools.length,
-    skillToolFiltered: anthropicTools.length !== filteredTools.length
+    hasSkillTool,
+    firstTool: JSON.stringify(anthropicTools[0])?.substring(0, 200)
   });
   
-  return filteredTools.map(tool => {
+  return anthropicTools.map(tool => {
     console.log("📨 Tool type:", tool.type, "Tool keys:", Object.keys(tool));
     
     // Claude Code 格式: { name, description, input_schema }
@@ -284,21 +172,8 @@ function extractToolResultContent(content) {
   return String(content);
 }
 
-function transformMessages(messages, cwd) {
+function transformMessages(messages) {
   const input = [];
-  const extractedSkills = [];
-  const skillToolIds = new Set();
-  
-  for (const msg of messages) {
-    const content = msg?.content;
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        if (isSkillToolUse(block)) {
-          skillToolIds.add(block.id);
-        }
-      }
-    }
-  }
   
   for (const msg of messages) {
     if (!msg || !msg.role) continue;
@@ -416,22 +291,6 @@ function transformMessages(messages, cwd) {
       
       if (block.type === "tool_result") {
         currentMessage = null;
-        
-        if (isSkillToolResult(block, skillToolIds)) {
-          const skillInfo = extractSkillFromToolResult(block.content);
-          if (skillInfo) {
-            const skillPath = findSkillPath(skillInfo.skillName, cwd);
-            const codexSkill = convertToCodexSkillFormat(
-              skillInfo.skillName,
-              skillInfo.skillContent,
-              skillPath
-            );
-            extractedSkills.push(codexSkill);
-            console.log("🎯 Skill extracted:", skillInfo.skillName);
-            continue;
-          }
-        }
-        
         const resultText = extractToolResultContent(block.content);
         input.push({
           type: "function_call_output",
@@ -442,13 +301,8 @@ function transformMessages(messages, cwd) {
       }
 
       if (block.type === "tool_use") {
+        // assistant 消息中的 tool_use 转换为 Codex function_call
         currentMessage = null;
-        
-        if (isSkillToolUse(block)) {
-          console.log("🔧 Skipping Skill tool_use:", block.id);
-          continue;
-        }
-        
         input.push({
           type: "function_call",
           call_id: block.id || `call_${Date.now()}`,
@@ -466,7 +320,7 @@ function transformMessages(messages, cwd) {
     }
   }
   
-  return { input, skills: extractedSkills };
+  return input;
 }
 
 // 从消息中提取 cwd（工作目录）
@@ -500,11 +354,8 @@ function transformRequest(anthropicBody) {
   
   const sessionId = randomUUID();
   
-  // 从请求中提取 cwd（如果有），否则使用默认值
-  const cwd = extractCwdFromMessages(messages) || process.cwd();
-  
-  // 转换对话消息（同时提取 Skills）
-  const { input: chatMessages, skills: extractedSkills } = transformMessages(messages, cwd);
+  // 转换对话消息
+  const chatMessages = transformMessages(messages);
   
   // 构建 Codex 要求的 input 数组结构
   // 1. 必须以 TEMPLATE.input[0] 开头 (包含 # AGENTS.md 签名)，否则后端校验失败
@@ -512,6 +363,9 @@ function transformRequest(anthropicBody) {
   
   // 2. 如果有用户提供的 system prompt (Claude Code)，转换为 Codex 原生格式
   if (anthropicBody.system) {
+    // 从请求中提取 cwd（如果有），否则使用默认值
+    const cwd = extractCwdFromMessages(messages) || process.cwd();
+
     console.log("📝 Injecting AGENTS.md context (" + anthropicBody.system.length + " chars)");
 
     // 2.1 AGENTS.md 格式：# AGENTS.md instructions for {cwd} + <INSTRUCTIONS>
@@ -541,22 +395,7 @@ function transformRequest(anthropicBody) {
     });
   }
   
-  // 3. 注入提取的 Skills（Codex 格式）
-  if (extractedSkills.length > 0) {
-    console.log("🎯 Injecting", extractedSkills.length, "skill(s) into request");
-    for (const skill of extractedSkills) {
-      finalInput.push({
-        type: "message",
-        role: "user",
-        content: [{
-          type: "input_text",
-          text: skill
-        }]
-      });
-    }
-  }
-  
-  // 4. 追加实际对话历史
+  // 3. 追加实际对话历史
   finalInput.push(...chatMessages);
   
   // 获取 instructions (必须与模板完全一致)
