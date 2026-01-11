@@ -20,7 +20,9 @@ const path = require("path");
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
-const PORT = 8889;
+const PORT = parseInt(process.env.PORT || "8889", 10);
+const DEFAULT_TARGET = "https://api.aicodemirror.com/api/codex/backend-api/codex/responses";
+const targetUrl = new URL(process.env.CODEX_PROXY_TARGET || DEFAULT_TARGET);
 
 // 加载模板文件
 const TEMPLATE_PATH = path.resolve(__dirname, "codex-request.json");
@@ -839,6 +841,11 @@ const server = http.createServer((req, res) => {
           apiKeyHeader = match ? match[1] : authHeader;
         }
 
+        if (!authHeader && !apiKeyHeader && process.env.CODEX_API_KEY) {
+          apiKeyHeader = process.env.CODEX_API_KEY;
+          authHeader = `Bearer ${apiKeyHeader}`;
+        }
+
         if (!authHeader && !apiKeyHeader) {
           res.writeHead(401, {"Content-Type": "application/json"});
           res.end(JSON.stringify({ error: { type: "unauthorized", message: "Missing API key" } }));
@@ -846,8 +853,10 @@ const server = http.createServer((req, res) => {
         }
 
         const options = {
-          hostname: "api.aicodemirror.com",
-          path: "/api/codex/backend-api/codex/responses",
+          hostname: targetUrl.hostname,
+          path: targetUrl.pathname + targetUrl.search,
+          protocol: targetUrl.protocol,
+          port: targetUrl.port || (targetUrl.protocol === "https:" ? 443 : 80),
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -909,7 +918,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`\n🚀 Codex Proxy (Anthropic Style)`);
   console.log(`📡 Listening: http://localhost:${PORT}/messages`);
-  console.log(`🎯 Target: https://api.aicodemirror.com/api/codex/backend-api/codex/responses`);
+  console.log(`🎯 Target: ${targetUrl.toString()}`);
   console.log(`\n✨ Features:`);
   console.log(`   - Anthropic Messages API ↔ Codex Responses API`);
   console.log(`   - Tool/Function calls ✅`);
