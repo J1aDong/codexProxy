@@ -30,9 +30,16 @@ jobs:
           cd fronted
           npm install
 
-      - name: Build and Publish Electron App
+      - name: Build Electron App
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd fronted
           npm run build -- --publish always
+
+      # macOS: 移除隔离属性，防止"已损坏"提示
+      - name: Remove quarantine attribute (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          find fronted/release -name "*.app" -exec xattr -cr {} \; 2>/dev/null || true
+          find fronted/release -name "*.dmg" -exec xattr -cr {} \; 2>/dev/null || true

@@ -1,6 +1,6 @@
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, utilityProcess, UtilityProcess } from 'electron'
 import path from 'path'
-import { spawn, exec, ChildProcess } from 'child_process'
+import { exec } from 'child_process'
 import net from 'net'
 import fs from 'fs'
 
@@ -8,7 +8,7 @@ process.env.DIST = path.join(__dirname, '../dist')
 process.env.PUBLIC = app.isPackaged ? process.env.DIST : path.join(process.env.DIST, '../public')
 
 let win: BrowserWindow | null
-let proxyProcess: ChildProcess | null = null
+let proxyProcess: UtilityProcess | null = null
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 
@@ -113,14 +113,12 @@ ipcMain.on('save-config', (_event, config) => {
 })
 
 ipcMain.on('start-proxy', async (_event, config) => {
-  // Save config on start
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
   } catch (e) { /* ignore */ }
   
   const { port, targetUrl, apiKey, force } = config
 
-  // Check port if not forced
   if (!force) {
     const isInUse = await checkPort(Number(port))
     if (isInUse) {
@@ -128,31 +126,18 @@ ipcMain.on('start-proxy', async (_event, config) => {
       return
     }
   } else {
-    // Kill existing process
     win?.webContents.send('proxy-log', `[System] Stopping process on port ${port}...`)
     await killProcessOnPort(Number(port))
-    // Small delay to ensure port release
     await new Promise(r => setTimeout(r, 1000))
   }
   
   if (proxyProcess) return
 
-  // Resolve path to codex-proxy-anthropic.js
   let scriptPath: string
   if (app.isPackaged) {
-    // In production, extraResources puts files in resources/
     scriptPath = path.join(process.resourcesPath, 'codex-proxy-anthropic.js')
   } else {
-    // In dev: project_root/fronted/electron/main.ts -> project_root/codex-proxy-anthropic.js
-    // main.ts is compiled to dist-electron/main.js, so we go up two levels
     scriptPath = path.resolve(__dirname, '../../codex-proxy-anthropic.js')
-  }
-  
-  const env = { 
-    ...process.env,
-    PORT: port.toString(),
-    CODEX_PROXY_TARGET: targetUrl,
-    CODEX_API_KEY: apiKey
   }
 
   win?.webContents.send('proxy-log', `[System] Starting proxy on port ${port}...`)
@@ -160,7 +145,14 @@ ipcMain.on('start-proxy', async (_event, config) => {
   win?.webContents.send('proxy-log', `[System] Script: ${scriptPath}`)
 
   try {
-    proxyProcess = spawn('node', [scriptPath], { env })
+    proxyProcess = utilityProcess.fork(scriptPath, [], {
+      env: {
+        ...process.env,
+        PORT: port.toString(),
+        CODEX_PROXY_TARGET: targetUrl,
+        CODEX_API_KEY: apiKey
+      }
+    })
 
     proxyProcess.stdout?.on('data', (data) => {
       win?.webContents.send('proxy-log', data.toString().trim())
@@ -170,7 +162,7 @@ ipcMain.on('start-proxy', async (_event, config) => {
       win?.webContents.send('proxy-log', `[Error] ${data.toString().trim()}`)
     })
 
-    proxyProcess.on('close', (code) => {
+    proxyProcess.on('exit', (code) => {
       win?.webContents.send('proxy-log', `[System] Process exited with code ${code}`)
       proxyProcess = null
       win?.webContents.send('proxy-status', 'stopped')

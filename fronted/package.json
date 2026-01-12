@@ -1,7 +1,7 @@
 {
   "name": "codex-proxy-desktop",
   "private": true,
-  "version": "0.0.3",
+  "version": "0.0.4",
   "main": "dist-electron/main.js",
   "description": "Desktop configuration UI for Codex Proxy",
   "repository": {
