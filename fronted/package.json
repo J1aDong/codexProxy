@@ -33,13 +33,21 @@
     "publish": [
       "github"
     ],
+    "compression": "maximum",
+    "electronLanguages": [
+      "zh",
+      "en",
+      "zh-CN",
+      "en-US"
+    ],
     "productName": "Codex Proxy",
     "directories": {
       "output": "release/${version}"
     },
     "files": [
       "dist",
-      "dist-electron"
+      "dist-electron",
+      "!node_modules"
     ],
     "extraResources": [
       {
