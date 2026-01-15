@@ -1,0 +1,1201 @@
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{json, Value};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::broadcast;
+use uuid::Uuid;
+
+/// Codex 请求模板中的 instructions
+const CODEX_INSTRUCTIONS: &str = include_str!("instructions.txt");
+
+/// 日志目录
+const LOG_DIR: &str = "logs";
+
+/// 全局调试日志开关
+static DEBUG_LOG_ENABLED: AtomicBool = AtomicBool::new(cfg!(debug_assertions));
+
+/// 设置调试日志开关
+pub fn set_debug_log(enabled: bool) {
+    DEBUG_LOG_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+/// 获取调试日志开关状态
+pub fn is_debug_log_enabled() -> bool {
+    DEBUG_LOG_ENABLED.load(Ordering::SeqCst)
+}
+
+/// 截断字符串用于日志显示
+fn truncate_for_log(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}... (len={})", &s[..max_len], s.len())
+    }
+}
+
+/// 会话日志记录器
+pub struct SessionLogger {
+    session_id: String,
+    log_path: PathBuf,
+}
+
+impl SessionLogger {
+    /// 创建新的会话日志记录器
+    pub fn new(session_id: &str, log_dir: Option<&str>) -> Self {
+        let dir = log_dir.unwrap_or(LOG_DIR);
+        let _ = fs::create_dir_all(dir);
+
+        let log_path = PathBuf::from(dir).join(format!("{}.log", session_id));
+
+        Self {
+            session_id: session_id.to_string(),
+            log_path,
+        }
+    }
+
+    /// 写入日志（仅在 debug 模式下）
+    pub fn log(&self, message: &str) {
+        if !is_debug_log_enabled() {
+            return;
+        }
+
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let line = format!("[{}] {}\n", timestamp, message);
+
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    /// 获取日志文件路径
+    pub fn log_path(&self) -> &PathBuf {
+        &self.log_path
+    }
+
+    /// 获取 session ID
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+/// Anthropic 请求体
+#[derive(Debug, Deserialize)]
+pub struct AnthropicRequest {
+    pub model: Option<String>,
+    pub messages: Vec<Message>,
+    pub system: Option<SystemContent>,
+    pub tools: Option<Vec<Value>>,
+    #[serde(default = "default_stream")]
+    pub stream: bool,
+}
+
+fn default_stream() -> bool {
+    true
+}
+
+/// system 字段可以是字符串或数组
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum SystemContent {
+    Text(String),
+    Blocks(Vec<SystemBlock>),
+}
+
+impl SystemContent {
+    pub fn to_string(&self) -> String {
+        match self {
+            SystemContent::Text(s) => s.clone(),
+            SystemContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    SystemBlock::Text { text } => Some(text.clone()),
+                    SystemBlock::PlainString(s) => Some(s.clone()),
+                    SystemBlock::Other(v) => {
+                        // 尝试提取 text 字段，或者将整个值转为字符串
+                        v.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| Some(serde_json::to_string(v).unwrap_or_default()))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum SystemBlock {
+    PlainString(String),
+    Text { text: String },
+    Other(Value),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Message {
+    pub role: String,
+    #[serde(default, deserialize_with = "deserialize_message_content")]
+    pub content: Option<MessageContent>,
+}
+
+/// 消息内容 - 支持多种格式
+#[derive(Debug, Serialize, Clone)]
+pub enum MessageContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+/// 自定义反序列化：支持字符串、单个对象、数组（纯字符串/纯对象/混合）
+fn deserialize_message_content<'de, D>(deserializer: D) -> Result<Option<MessageContent>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<Value> = Option::deserialize(deserializer)?;
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        // 单个字符串
+        Value::String(s) => Ok(Some(MessageContent::Text(s))),
+
+        // 单个对象 - 转为单元素数组
+        Value::Object(obj) => {
+            let block = parse_content_block(Value::Object(obj));
+            Ok(Some(MessageContent::Blocks(vec![block])))
+        }
+
+        // 数组 - 可能是字符串数组、对象数组或混合数组
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                return Ok(Some(MessageContent::Blocks(vec![])));
+            }
+
+            // 将所有元素转换为 ContentBlock
+            let blocks: Vec<ContentBlock> = arr
+                .into_iter()
+                .map(|item| match item {
+                    // 字符串元素转为 Text block
+                    Value::String(s) => ContentBlock::Text { text: s },
+                    // 对象元素解析为 ContentBlock
+                    other => parse_content_block(other),
+                })
+                .collect();
+
+            Ok(Some(MessageContent::Blocks(blocks)))
+        }
+
+        // null
+        Value::Null => Ok(None),
+
+        // 其他类型转为字符串
+        other => Ok(Some(MessageContent::Text(other.to_string()))),
+    }
+}
+
+/// 解析单个 ContentBlock
+fn parse_content_block(value: Value) -> ContentBlock {
+    parse_content_block_from_value(value)
+}
+
+#[derive(Debug, Clone)]
+pub enum ContentBlock {
+    Text { text: String },
+    Image { source: Option<ImageSource> },
+    ImageUrl { image_url: ImageUrlValue },
+    InputImage {
+        image_url: Option<ImageUrlValue>,
+        url: Option<String>,
+        detail: Option<String>,
+    },
+    ToolUse {
+        id: Option<String>,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: Option<String>,
+        id: Option<String>,
+        content: Option<Value>,
+    },
+    Document { source: Option<Value>, name: Option<String> },
+    /// 用于存储无法解析的原始值
+    OtherValue(Value),
+}
+
+impl Serialize for ContentBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            ContentBlock::Text { text } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "text")?;
+                map.serialize_entry("text", text)?;
+                map.end()
+            }
+            ContentBlock::OtherValue(v) => v.serialize(serializer),
+            _ => {
+                // 其他类型简单序列化为 JSON
+                let value = json!({"type": "unknown"});
+                value.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Ok(parse_content_block_from_value(value))
+    }
+}
+
+/// 从 Value 解析 ContentBlock
+fn parse_content_block_from_value(value: Value) -> ContentBlock {
+    let obj = match &value {
+        Value::Object(obj) => obj,
+        _ => return ContentBlock::OtherValue(value),
+    };
+
+    let block_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    match block_type {
+        "text" => {
+            let text = obj.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            ContentBlock::Text { text }
+        }
+        "image" => {
+            let source = obj.get("source").and_then(|s| serde_json::from_value(s.clone()).ok());
+            ContentBlock::Image { source }
+        }
+        "image_url" => {
+            let image_url = obj.get("image_url")
+                .and_then(|u| serde_json::from_value(u.clone()).ok())
+                .unwrap_or(ImageUrlValue::Str(String::new()));
+            ContentBlock::ImageUrl { image_url }
+        }
+        "input_image" => {
+            let image_url = obj.get("image_url").and_then(|u| serde_json::from_value(u.clone()).ok());
+            let url = obj.get("url").and_then(|u| u.as_str()).map(|s| s.to_string());
+            let detail = obj.get("detail").and_then(|d| d.as_str()).map(|s| s.to_string());
+            ContentBlock::InputImage { image_url, url, detail }
+        }
+        "tool_use" => {
+            let id = obj.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
+            let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            // input 为 null 或缺失时归一化为 {}
+            let input = obj.get("input")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .unwrap_or(json!({}));
+            ContentBlock::ToolUse { id, name, input }
+        }
+        "tool_result" => {
+            let tool_use_id = obj.get("tool_use_id").and_then(|i| i.as_str()).map(|s| s.to_string());
+            let id = obj.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
+            let content = obj.get("content").cloned();
+            ContentBlock::ToolResult { tool_use_id, id, content }
+        }
+        "document" => {
+            let source = obj.get("source").cloned();
+            let name = obj.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+            ContentBlock::Document { source, name }
+        }
+        "" => {
+            // 没有 type 字段，检查是否有 text 字段
+            if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                return ContentBlock::Text { text: text.to_string() };
+            }
+            ContentBlock::OtherValue(value)
+        }
+        _ => ContentBlock::OtherValue(value),
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: Option<String>,
+    pub media_type: Option<String>,
+    #[serde(alias = "mime_type")]
+    pub mime_type: Option<String>,
+    pub data: Option<String>,
+    pub url: Option<String>,
+    pub uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum ImageUrlValue {
+    Str(String),
+    ObjUrl { url: String },
+    ObjUri { uri: String },
+}
+
+/// 请求转换器
+pub struct TransformRequest;
+
+impl TransformRequest {
+    pub fn transform(
+        anthropic_body: &AnthropicRequest,
+        log_tx: Option<&broadcast::Sender<String>>,
+        log_dir: Option<&str>,
+    ) -> (Value, String, Option<SessionLogger>) {
+        let session_id = Uuid::new_v4().to_string();
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "/".to_string());
+
+        // 创建会话日志记录器
+        let logger = if is_debug_log_enabled() {
+            Some(SessionLogger::new(&session_id, log_dir))
+        } else {
+            None
+        };
+
+        // 辅助函数：同时写入 broadcast 和文件
+        let log = |msg: &str| {
+            if is_debug_log_enabled() {
+                if let Some(tx) = log_tx {
+                    let _ = tx.send(msg.to_string());
+                }
+                if let Some(ref l) = logger {
+                    l.log(msg);
+                }
+            }
+        };
+
+        log(&format!("📋 [Transform] Session: {}", &session_id[..8]));
+        if let Some(ref l) = logger {
+            log(&format!("📋 [Transform] Log file: {:?}", l.log_path()));
+        }
+
+        // 模型转换
+        let original_model = anthropic_body.model.as_deref().unwrap_or("unknown");
+        let codex_model = anthropic_body
+            .model
+            .as_ref()
+            .map(|m| {
+                if m.to_lowercase().contains("claude")
+                    || m.to_lowercase().contains("sonnet")
+                    || m.to_lowercase().contains("opus")
+                    || m.to_lowercase().contains("haiku")
+                {
+                    "gpt-5.2-codex".to_string()
+                } else {
+                    m.clone()
+                }
+            })
+            .unwrap_or_else(|| "gpt-5.2-codex".to_string());
+
+        log(&format!("📋 [Transform] Model: {} → {}", original_model, codex_model));
+
+        // 转换消息
+        let chat_messages = Self::transform_messages(&anthropic_body.messages, log_tx, logger.as_ref());
+
+        // 构建 input 数组
+        let mut final_input: Vec<Value> = vec![Self::build_template_input()];
+
+        // 注入 system prompt
+        if let Some(system) = &anthropic_body.system {
+            let system_text = system.to_string();
+            log(&format!("📋 [Transform] System prompt: {} chars", system_text.len()));
+
+            final_input.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>", cwd, system_text)
+                }]
+            }));
+
+            final_input.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!(r#"<environment_context>
+  <cwd>{}</cwd>
+  <approval_policy>on-request</approval_policy>
+  <sandbox_mode>workspace-write</sandbox_mode>
+  <network_access>restricted</network_access>
+  <shell>{}</shell>
+</environment_context>"#, cwd, std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string()))
+                }]
+            }));
+        }
+
+        // 追加对话历史
+        final_input.extend(chat_messages);
+
+        // 转换工具
+        let transformed_tools = Self::transform_tools(anthropic_body.tools.as_ref(), log_tx, logger.as_ref());
+
+        log(&format!(
+            "📋 [Transform] Final: {} input items, {} tools",
+            final_input.len(),
+            transformed_tools.len()
+        ));
+
+        let body = json!({
+            "model": codex_model,
+            "instructions": CODEX_INSTRUCTIONS,
+            "input": final_input,
+            "tools": transformed_tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": { "summary": "auto" },
+            "store": false,
+            "stream": anthropic_body.stream,
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": session_id
+        });
+
+        (body, session_id.clone(), logger)
+    }
+
+    fn build_template_input() -> Value {
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "# AGENTS.md instructions for /Users/mr.j\n\n<INSTRUCTIONS>\n---\nname: engineer-professional\ndescription: 专业的软件工程师\n---\n</INSTRUCTIONS>"
+            }]
+        })
+    }
+
+    fn transform_messages(
+        messages: &[Message],
+        log_tx: Option<&broadcast::Sender<String>>,
+        logger: Option<&SessionLogger>,
+    ) -> Vec<Value> {
+        let mut input = Vec::new();
+        let mut skill_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 辅助函数：同时写入 broadcast 和文件
+        let log = |msg: &str| {
+            if is_debug_log_enabled() {
+                if let Some(tx) = log_tx {
+                    let _ = tx.send(msg.to_string());
+                }
+                if let Some(l) = logger {
+                    l.log(msg);
+                }
+            }
+        };
+
+        log(&format!("📝 [Messages] Processing {} messages", messages.len()));
+
+        // 第一遍：收集 skill tool ids
+        for msg in messages {
+            if let Some(MessageContent::Blocks(blocks)) = &msg.content {
+                for block in blocks {
+                    if let ContentBlock::ToolUse { id, name, .. } = block {
+                        if name.to_lowercase() == "skill" {
+                            if let Some(tool_id) = id {
+                                skill_tool_ids.insert(tool_id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 第二遍：转换消息
+        for (msg_idx, msg) in messages.iter().enumerate() {
+            if msg.role == "system" {
+                continue;
+            }
+
+            if msg.role != "user" && msg.role != "assistant" {
+                continue;
+            }
+
+            let text_type = if msg.role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
+
+            let Some(content) = &msg.content else {
+                log(&format!("📝 [Message #{}] role={}, content=null (skipped)", msg_idx, msg.role));
+                continue;
+            };
+
+            match content {
+                MessageContent::Text(text) => {
+                    log(&format!(
+                        "📝 [Message #{}] role={}, type=Text, len={}",
+                        msg_idx,
+                        msg.role,
+                        text.len()
+                    ));
+                    input.push(json!({
+                        "type": "message",
+                        "role": msg.role,
+                        "content": [{
+                            "type": text_type,
+                            "text": text
+                        }]
+                    }));
+                }
+                MessageContent::Blocks(blocks) => {
+                    log(&format!(
+                        "📝 [Message #{}] role={}, type=Blocks({})",
+                        msg_idx,
+                        msg.role,
+                        blocks.len()
+                    ));
+
+                    let mut current_content: Vec<Value> = Vec::new();
+
+                    for (block_idx, block) in blocks.iter().enumerate() {
+                        match block {
+                            ContentBlock::Text { text } => {
+                                current_content.push(json!({
+                                    "type": text_type,
+                                    "text": text
+                                }));
+                            }
+                            ContentBlock::Image { source } => {
+                                if let Some(src) = source {
+                                    let image_url = Self::resolve_image_url(src, &log, msg_idx, block_idx);
+                                    if !image_url.is_empty() {
+                                        if msg.role == "user" {
+                                            current_content.push(json!({
+                                                "type": "input_image",
+                                                "image_url": image_url,
+                                                "detail": "auto"
+                                            }));
+                                        } else {
+                                            log(&format!(
+                                                "🖼️ [Message #{} Block #{}] Image skipped (assistant role)",
+                                                msg_idx,
+                                                block_idx
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    log(&format!(
+                                        "🖼️ [Message #{} Block #{}] Image source is None",
+                                        msg_idx,
+                                        block_idx
+                                    ));
+                                }
+                            }
+                            ContentBlock::ImageUrl { image_url } => {
+                                let url = match image_url {
+                                    ImageUrlValue::Str(s) => s.clone(),
+                                    ImageUrlValue::ObjUrl { url } => url.clone(),
+                                    ImageUrlValue::ObjUri { uri } => uri.clone(),
+                                };
+                                log(&format!(
+                                    "🖼️ [Message #{} Block #{}] ImageUrl: {}",
+                                    msg_idx,
+                                    block_idx,
+                                    truncate_for_log(&url, 50)
+                                ));
+                                if msg.role == "user" {
+                                    current_content.push(json!({
+                                        "type": "input_image",
+                                        "image_url": url,
+                                        "detail": "auto"
+                                    }));
+                                } else {
+                                    log(&format!(
+                                        "🖼️ [Message #{} Block #{}] ImageUrl skipped (assistant role)",
+                                        msg_idx,
+                                        block_idx
+                                    ));
+                                }
+                            }
+                            ContentBlock::InputImage { image_url, url, .. } => {
+                                let resolved_url = match image_url {
+                                    Some(ImageUrlValue::Str(s)) => s.clone(),
+                                    Some(ImageUrlValue::ObjUrl { url }) => url.clone(),
+                                    Some(ImageUrlValue::ObjUri { uri }) => uri.clone(),
+                                    None => url.clone().unwrap_or_default(),
+                                };
+                                log(&format!(
+                                    "🖼️ [Message #{} Block #{}] InputImage: {}",
+                                    msg_idx,
+                                    block_idx,
+                                    truncate_for_log(&resolved_url, 50)
+                                ));
+                                if !resolved_url.is_empty() && msg.role == "user" {
+                                    current_content.push(json!({
+                                        "type": "input_image",
+                                        "image_url": resolved_url,
+                                        "detail": "auto"
+                                    }));
+                                }
+                            }
+                            ContentBlock::ToolUse { id, name, input: tool_input } => {
+                                // 先 flush 当前消息
+                                if !current_content.is_empty() {
+                                    input.push(json!({
+                                        "type": "message",
+                                        "role": msg.role,
+                                        "content": current_content
+                                    }));
+                                    current_content = Vec::new();
+                                }
+
+                                // name 为空时使用 "unknown"
+                                let tool_name = if name.is_empty() { "unknown" } else { name.as_str() };
+
+                                // 跳过 skill tool
+                                if tool_name.to_lowercase() == "skill" {
+                                    continue;
+                                }
+
+                                // call_id 缺失时生成唯一 ID
+                                let call_id = id.as_ref().map(|s| s.clone()).unwrap_or_else(|| {
+                                    format!("tool_{}", chrono::Utc::now().timestamp_millis())
+                                });
+                                input.push(json!({
+                                    "type": "function_call",
+                                    "call_id": call_id,
+                                    "name": tool_name,
+                                    "arguments": if tool_input.is_string() {
+                                        tool_input.as_str().unwrap_or("{}").to_string()
+                                    } else {
+                                        serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".to_string())
+                                    }
+                                }));
+                            }
+                            ContentBlock::ToolResult { tool_use_id, id, content } => {
+                                // 先 flush 当前消息
+                                if !current_content.is_empty() {
+                                    input.push(json!({
+                                        "type": "message",
+                                        "role": msg.role,
+                                        "content": current_content
+                                    }));
+                                    current_content = Vec::new();
+                                }
+
+                                // 优先使用 tool_use_id，备选 id，都没有则生成唯一 ID
+                                let call_id = tool_use_id.as_ref().or(id.as_ref()).map(|s| s.clone()).unwrap_or_else(|| {
+                                    format!("tool_{}", chrono::Utc::now().timestamp_millis())
+                                });
+
+                                // 跳过 skill tool result
+                                if skill_tool_ids.contains(&call_id) {
+                                    continue;
+                                }
+
+                                let result_text = Self::extract_tool_result_content(content);
+                                input.push(json!({
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": result_text
+                                }));
+                            }
+                            ContentBlock::Document { .. } => {
+                                current_content.push(json!({
+                                    "type": text_type,
+                                    "text": "[document omitted]"
+                                }));
+                            }
+                            ContentBlock::OtherValue(v) => {
+                                // 保留原始值的 JSON 字符串
+                                let text = serde_json::to_string(v).unwrap_or_else(|_| "[unknown content]".to_string());
+                                current_content.push(json!({
+                                    "type": text_type,
+                                    "text": text
+                                }));
+                            }
+                        }
+                    }
+
+                    if !current_content.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": msg.role,
+                            "content": current_content
+                        }));
+                    }
+                }
+            }
+        }
+
+        input
+    }
+
+    fn resolve_image_url<F>(
+        source: &ImageSource,
+        log: &F,
+        msg_idx: usize,
+        block_idx: usize,
+    ) -> String
+    where
+        F: Fn(&str),
+    {
+        if let Some(url) = &source.url {
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image source.url: {}",
+                msg_idx,
+                block_idx,
+                truncate_for_log(url, 50)
+            ));
+            return url.clone();
+        }
+
+        if let Some(uri) = &source.uri {
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image source.uri: {}",
+                msg_idx,
+                block_idx,
+                truncate_for_log(uri, 50)
+            ));
+            return uri.clone();
+        }
+
+        if let Some(data) = &source.data {
+            let media_type = source.media_type.as_deref()
+                .or(source.mime_type.as_deref())
+                .unwrap_or("image/png");
+
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image base64: media={}, size={} bytes, prefix={}",
+                msg_idx,
+                block_idx,
+                media_type,
+                data.len(),
+                truncate_for_log(data, 20)
+            ));
+
+            if data.starts_with("data:") {
+                return data.clone();
+            }
+            return format!("data:{};base64,{}", media_type, data);
+        }
+
+        log(&format!(
+            "🖼️ [Message #{} Block #{}] Image source is empty (no url/uri/data)",
+            msg_idx,
+            block_idx
+        ));
+        String::new()
+    }
+
+    fn extract_tool_result_content(content: &Option<Value>) -> String {
+        match content {
+            None => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| {
+                    if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                        Some(text.to_string())
+                    } else if v.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    } else {
+                        Some(serde_json::to_string(v).unwrap_or_default())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Some(v) => serde_json::to_string(v).unwrap_or_default(),
+        }
+    }
+
+    fn transform_tools(
+        tools: Option<&Vec<Value>>,
+        log_tx: Option<&broadcast::Sender<String>>,
+        logger: Option<&SessionLogger>,
+    ) -> Vec<Value> {
+        // 辅助函数：同时写入 broadcast 和文件
+        let log = |msg: &str| {
+            if is_debug_log_enabled() {
+                if let Some(tx) = log_tx {
+                    let _ = tx.send(msg.to_string());
+                }
+                if let Some(l) = logger {
+                    l.log(msg);
+                }
+            }
+        };
+
+        let Some(tools) = tools else {
+            log("🔧 [Tools] No tools provided, using defaults");
+            return Self::default_tools();
+        };
+
+        if tools.is_empty() {
+            log("🔧 [Tools] Empty tools array, using defaults");
+            return Self::default_tools();
+        }
+
+        log(&format!("🔧 [Tools] Processing {} tools", tools.len()));
+
+        tools
+            .iter()
+            .filter(|tool| {
+                let name = tool
+                    .get("name")
+                    .or_else(|| tool.get("function").and_then(|f| f.get("name")))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                if name.to_lowercase() == "skill" {
+                    log(&format!("🔧 [Tools] Filtered out: {}", name));
+                    return false;
+                }
+                true
+            })
+            .map(|tool| {
+                // Claude Code 格式: { name, description, input_schema }
+                if tool.get("name").is_some() && tool.get("type").is_none() {
+                    let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                    log(&format!("🔧 [Tools] {} (Claude Code format)", name));
+                    return json!({
+                        "type": "function",
+                        "name": name,
+                        "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                        "strict": false,
+                        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+                    });
+                }
+
+                // Anthropic 格式: { type: "tool", name, ... }
+                if tool.get("type").and_then(|t| t.as_str()) == Some("tool") {
+                    let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                    log(&format!("🔧 [Tools] {} (Anthropic format)", name));
+                    return json!({
+                        "type": "function",
+                        "name": name,
+                        "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                        "strict": false,
+                        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+                    });
+                }
+
+                // OpenAI 格式: { type: "function", function: {...} }
+                if tool.get("type").and_then(|t| t.as_str()) == Some("function") {
+                    let func = tool.get("function").unwrap_or(tool);
+                    let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                    log(&format!("🔧 [Tools] {} (OpenAI format)", name));
+                    return json!({
+                        "type": "function",
+                        "name": name,
+                        "description": func.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                        "strict": false,
+                        "parameters": func.get("parameters").cloned().unwrap_or(json!({}))
+                    });
+                }
+
+                // 未知格式
+                let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                log(&format!("🔧 [Tools] {} (unknown format)", name));
+                json!({
+                    "type": "function",
+                    "name": name,
+                    "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                    "strict": false,
+                    "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+                })
+            })
+            .collect()
+    }
+
+    fn default_tools() -> Vec<Value> {
+        vec![json!({
+            "type": "function",
+            "name": "shell_command",
+            "description": "Runs a shell command and returns its output.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell script to execute"
+                    }
+                },
+                "required": ["command"]
+            }
+        })]
+    }
+}
+
+/// 响应转换器 - Codex SSE -> Anthropic SSE
+pub struct TransformResponse {
+    message_id: String,
+    model: String,
+    content_index: usize,
+    open_text_index: Option<usize>,
+    open_tool_index: Option<usize>,
+    tool_call_id: Option<String>,
+    tool_name: Option<String>,
+    saw_tool_call: bool,
+    sent_message_start: bool,
+}
+
+impl TransformResponse {
+    pub fn new(model: &str) -> Self {
+        Self {
+            message_id: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
+            model: model.to_string(),
+            content_index: 0,
+            open_text_index: None,
+            open_tool_index: None,
+            tool_call_id: None,
+            tool_name: None,
+            saw_tool_call: false,
+            sent_message_start: false,
+        }
+    }
+
+    pub fn transform_line(&mut self, line: &str) -> Vec<String> {
+        let mut output = Vec::new();
+
+        if !line.starts_with("data: ") {
+            return output;
+        }
+
+        // 发送 message_start
+        if !self.sent_message_start {
+            self.sent_message_start = true;
+            output.push(format!(
+                "event: message_start\ndata: {}\n\n",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": self.message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": self.model,
+                        "stop_reason": null,
+                        "usage": { "input_tokens": 0, "output_tokens": 0 }
+                    }
+                })
+            ));
+        }
+
+        let Ok(data) = serde_json::from_str::<Value>(&line[6..]) else {
+            return output;
+        };
+
+        let event_type = data.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match event_type {
+            // 文本输出
+            "response.output_text.delta" => {
+                if self.open_text_index.is_none() {
+                    let idx = self.content_index;
+                    self.content_index += 1;
+                    self.open_text_index = Some(idx);
+                    output.push(format!(
+                        "event: content_block_start\ndata: {}\n\n",
+                        json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": { "type": "text", "text": "" }
+                        })
+                    ));
+                }
+
+                let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                output.push(format!(
+                    "event: content_block_delta\ndata: {}\n\n",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": self.open_text_index,
+                        "delta": { "type": "text_delta", "text": delta }
+                    })
+                ));
+            }
+
+            // 工具调用开始
+            "response.output_item.added" => {
+                if let Some(item) = data.get("item") {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        self.saw_tool_call = true;
+
+                        // 关闭文本块
+                        if let Some(idx) = self.open_text_index.take() {
+                            output.push(format!(
+                                "event: content_block_stop\ndata: {}\n\n",
+                                json!({ "type": "content_block_stop", "index": idx })
+                            ));
+                        }
+
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("tool_0")
+                            .to_string();
+                        let name = item
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        self.tool_call_id = Some(call_id.clone());
+                        self.tool_name = Some(name.clone());
+
+                        let idx = self.content_index;
+                        self.content_index += 1;
+                        self.open_tool_index = Some(idx);
+
+                        output.push(format!(
+                            "event: content_block_start\ndata: {}\n\n",
+                            json!({
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": call_id,
+                                    "name": name,
+                                    "input": {}
+                                }
+                            })
+                        ));
+                    }
+                }
+            }
+
+            // 工具调用参数
+            "response.function_call_arguments.delta" | "response.function_call_arguments_delta" => {
+                if self.open_tool_index.is_none() {
+                    self.saw_tool_call = true;
+
+                    // 关闭文本块
+                    if let Some(idx) = self.open_text_index.take() {
+                        output.push(format!(
+                            "event: content_block_stop\ndata: {}\n\n",
+                            json!({ "type": "content_block_stop", "index": idx })
+                        ));
+                    }
+
+                    let call_id = self
+                        .tool_call_id
+                        .clone()
+                        .unwrap_or_else(|| format!("tool_{}", chrono::Utc::now().timestamp_millis()));
+                    let name = self.tool_name.clone().unwrap_or_else(|| "unknown".to_string());
+
+                    let idx = self.content_index;
+                    self.content_index += 1;
+                    self.open_tool_index = Some(idx);
+
+                    output.push(format!(
+                        "event: content_block_start\ndata: {}\n\n",
+                        json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": call_id,
+                                "name": name,
+                                "input": {}
+                            }
+                        })
+                    ));
+                }
+
+                let delta = data
+                    .get("delta")
+                    .or_else(|| data.get("arguments"))
+                    .map(|d| {
+                        if d.is_string() {
+                            d.as_str().unwrap_or("").to_string()
+                        } else {
+                            serde_json::to_string(d).unwrap_or_default()
+                        }
+                    })
+                    .unwrap_or_default();
+
+                output.push(format!(
+                    "event: content_block_delta\ndata: {}\n\n",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": self.open_tool_index,
+                        "delta": { "type": "input_json_delta", "partial_json": delta }
+                    })
+                ));
+            }
+
+            // 工具调用完成
+            "response.output_item.done" => {
+                if let Some(idx) = self.open_tool_index.take() {
+                    output.push(format!(
+                        "event: content_block_stop\ndata: {}\n\n",
+                        json!({ "type": "content_block_stop", "index": idx })
+                    ));
+                }
+                self.tool_call_id = None;
+                self.tool_name = None;
+            }
+
+            // 响应完成
+            "response.completed" => {
+                // 关闭所有打开的块
+                if let Some(idx) = self.open_text_index.take() {
+                    output.push(format!(
+                        "event: content_block_stop\ndata: {}\n\n",
+                        json!({ "type": "content_block_stop", "index": idx })
+                    ));
+                }
+                if let Some(idx) = self.open_tool_index.take() {
+                    output.push(format!(
+                        "event: content_block_stop\ndata: {}\n\n",
+                        json!({ "type": "content_block_stop", "index": idx })
+                    ));
+                }
+
+                let stop_reason = if self.saw_tool_call {
+                    "tool_use"
+                } else {
+                    "end_turn"
+                };
+
+                // 发送 message_delta
+                let usage = data
+                    .get("response")
+                    .and_then(|r| r.get("usage"))
+                    .cloned()
+                    .unwrap_or(json!({}));
+
+                output.push(format!(
+                    "event: message_delta\ndata: {}\n\n",
+                    json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": stop_reason },
+                        "usage": {
+                            "input_tokens": usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                            "output_tokens": usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0)
+                        }
+                    })
+                ));
+
+                // 发送 message_stop
+                output.push(format!(
+                    "event: message_stop\ndata: {}\n\n",
+                    json!({ "type": "message_stop", "stop_reason": stop_reason })
+                ));
+            }
+
+            _ => {}
+        }
+
+        output
+    }
+}

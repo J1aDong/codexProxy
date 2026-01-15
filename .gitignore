@@ -1,2 +1,78 @@
+# 配置文件
 config.json
+
+# 文档（如果是自动生成的）
 /docs
+
+# macOS 系统文件
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# 日志文件
+*.log
+logs/
+*.log.*
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+.yarn/
+dist/
+build/
+
+# Tauri
+fronted-tauri/src-tauri/target/
+fronted-tauri/src-tauri/WixTools/
+fronted-tauri/dist/
+fronted-tauri/dist-ssr/
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# 临时文件和缓存
+*.tmp
+*.temp
+.cache/
+.temp/
+.sisyphus/
+
+# 备份文件
+*.backup
+*.bak
+*.old
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 构建产物
+*.exe
+*.dmg
+*.app
+*.deb
+*.rpm
+*.AppImage
+
+# 测试覆盖率
+coverage/
+.nyc_output/
+
+# 其他
+.opencode/
+.factory/
+.gemini/
+.iflow/
