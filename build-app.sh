@@ -3,16 +3,18 @@ set -e
 
 # 获取脚本所在目录
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-FRONTED_DIR="$BASE_DIR/fronted"
+FRONTED_DIR="$BASE_DIR/fronted-tauri"
 PACKAGE_JSON="$FRONTED_DIR/package.json"
+TAURI_CONF="$FRONTED_DIR/src-tauri/tauri.conf.json"
+CARGO_TOML="$FRONTED_DIR/src-tauri/Cargo.toml"
 
 echo "=========================================="
-echo "   🚀 Codex Proxy 构建与发布工具          "
+echo "   🚀 Codex Proxy 构建与发布工具 (Tauri)  "
 echo "=========================================="
 
 # 1. 检查目录
 if [ ! -d "$FRONTED_DIR" ]; then
-    echo "❌ 错误: 未找到 'fronted' 目录。"
+    echo "❌ 错误: 未找到 'fronted-tauri' 目录。"
     exit 1
 fi
 
@@ -43,15 +45,32 @@ else
     NEW_VERSION="${INPUT_VERSION:-$CURRENT_VERSION}"
 fi
 
-# 更新 package.json
+# 更新版本号 (package.json, tauri.conf.json, Cargo.toml)
 if [ "$NEW_VERSION" != "$CURRENT_VERSION" ]; then
-    echo "📝 正在更新 package.json..."
+    echo "📝 正在更新版本号..."
+
+    # 更新 package.json
     node -e "
         const fs = require('fs');
         const pkg = require('$PACKAGE_JSON');
         pkg.version = '$NEW_VERSION';
         fs.writeFileSync('$PACKAGE_JSON', JSON.stringify(pkg, null, 2));
     "
+    echo "  ✅ package.json"
+
+    # 更新 tauri.conf.json
+    node -e "
+        const fs = require('fs');
+        const conf = JSON.parse(fs.readFileSync('$TAURI_CONF', 'utf8'));
+        conf.version = '$NEW_VERSION';
+        fs.writeFileSync('$TAURI_CONF', JSON.stringify(conf, null, 2));
+    "
+    echo "  ✅ tauri.conf.json"
+
+    # 更新 Cargo.toml
+    sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" "$CARGO_TOML"
+    echo "  ✅ Cargo.toml"
+
     echo "✅ 版本号已更新为 $NEW_VERSION"
 fi
 
@@ -60,10 +79,10 @@ if [ "$MAIN_CHOICE" == "2" ]; then
     echo ""
     echo "☁️  准备推送到 GitHub..."
     TAG_NAME="v$NEW_VERSION"
-    
-    echo "📦 暂存 package.json..."
-    git add "$PACKAGE_JSON"
-    
+
+    echo "📦 暂存版本文件..."
+    git add "$PACKAGE_JSON" "$TAURI_CONF" "$CARGO_TOML"
+
     echo "💾 正在提交变更..."
     git commit -m "chore: bump version to $NEW_VERSION" || echo "⚠️  没有需要提交的内容"
 
@@ -101,27 +120,36 @@ cd "$FRONTED_DIR"
 
 # 检查依赖
 if [ ! -d "node_modules" ]; then
-    echo "⬇️  正在安装依赖..."
+    echo "⬇️  正在安装前端依赖..."
     npm install
 fi
 
 echo "请选择目标平台:"
 echo "  1) 当前系统 (默认)"
-echo "  2) 仅 macOS (mac)"
-echo "  3) 仅 Windows (win)"
-echo "  4) 所有平台 (mac + win)"
+echo "  2) macOS (Universal: Intel + Apple Silicon)"
+echo "  3) macOS (仅 Apple Silicon)"
+echo "  4) macOS (仅 Intel)"
 read -p "选择 [1-4, 默认 1]: " PLATFORM_CHOICE
 
 case $PLATFORM_CHOICE in
-    2) ARGS="--mac";;
-    3) ARGS="--win";;
-    4) ARGS="--mac --win";;
-    *) ARGS="";;
+    2)
+        echo "🏗️  构建 macOS Universal..."
+        npm run tauri build -- --target universal-apple-darwin
+        ;;
+    3)
+        echo "🏗️  构建 macOS Apple Silicon..."
+        npm run tauri build -- --target aarch64-apple-darwin
+        ;;
+    4)
+        echo "🏗️  构建 macOS Intel..."
+        npm run tauri build -- --target x86_64-apple-darwin
+        ;;
+    *)
+        echo "🏗️  构建当前系统..."
+        npm run tauri build
+        ;;
 esac
-
-echo "🏗️  正在构建，参数: $ARGS"
-npm run build -- $ARGS
 
 echo ""
 echo "✅ 本地构建完成!"
-echo "📁 产物目录: $FRONTED_DIR/release"
+echo "📁 产物目录: $FRONTED_DIR/src-tauri/target/release/bundle"

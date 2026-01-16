@@ -1,4 +1,4 @@
-use crate::transform::{AnthropicRequest, TransformRequest, TransformResponse};
+use crate::transform::{AnthropicRequest, TransformRequest, TransformResponse, AppLogger};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -35,6 +35,10 @@ impl ProxyServer {
         &mut self,
         log_tx: broadcast::Sender<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 初始化全局日志记录器
+        let logger = AppLogger::init(Some("logs"));
+        logger.log("=== Codex Proxy Started ===");
+
         let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
         let listener = TcpListener::bind(addr).await?;
 
@@ -49,6 +53,8 @@ impl ProxyServer {
             self.port
         ));
         let _ = log_tx.send(format!("🎯 Target: {}", self.target_url));
+        logger.log(&format!("Listening on http://localhost:{}", self.port));
+        logger.log(&format!("Target: {}", self.target_url));
 
         loop {
             let mut shutdown_rx = shutdown_tx.subscribe();
@@ -201,19 +207,36 @@ async fn handle_request(
         anthropic_body.tools.as_ref().map(|t| t.len()).unwrap_or(0)
     ));
 
-    // 转换请求（使用当前工作目录下的 logs 目录）
-    let log_dir = std::env::current_dir()
-        .map(|p| p.join("logs").to_string_lossy().to_string())
-        .ok();
-    let (codex_body, session_id, _session_logger) = TransformRequest::transform(
+    // 转换请求
+    let (codex_body, session_id) = TransformRequest::transform(
         &anthropic_body,
         Some(&log_tx),
-        log_dir.as_deref(),
     );
     let model = anthropic_body
         .model
         .clone()
         .unwrap_or_else(|| "gpt-5.2-codex".to_string());
+
+    // 获取全局日志记录器
+    let logger = AppLogger::get();
+
+    // 记录原始 Anthropic 请求到日志文件
+    if let Some(ref l) = logger {
+        l.log_anthropic_request(&body_bytes);
+    }
+
+    // 记录转换后的 Codex 请求（curl 格式）
+    if let Some(ref l) = logger {
+        let headers = vec![
+            ("Content-Type", "application/json"),
+            ("Authorization", "Bearer <API_KEY>"),
+            ("User-Agent", "Anthropic-Node/0.3.4"),
+            ("x-anthropic-version", &anthropic_version),
+            ("Accept", "text/event-stream"),
+            ("session_id", &session_id),
+        ];
+        l.log_curl_request("POST", &target_url, &headers, &codex_body);
+    }
 
     // 发送到目标服务器
     let client = reqwest::Client::builder()
@@ -253,6 +276,12 @@ async fn handle_request(
         let status = response.status().as_u16();
         let error_text = response.text().await.unwrap_or_default();
         let _ = log_tx.send(format!("[Error] Upstream returned {}: {}", status, error_text));
+
+        // 记录错误响应到日志文件
+        if let Some(ref l) = logger {
+            l.log_upstream_response(status, &error_text);
+        }
+
         return Ok(Response::builder()
             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
             .header("Content-Type", "application/json")
@@ -261,6 +290,8 @@ async fn handle_request(
     }
 
     let _ = log_tx.send("[✅] Anthropic Messages → Codex Responses API".to_string());
+
+    let upstream_status = response.status().as_u16();
 
     // 使用 channel 进行流式响应
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(256);
@@ -285,7 +316,16 @@ async fn handle_request(
                             continue;
                         }
 
+                        // 记录上游原始响应
+                        if let Some(ref l) = AppLogger::get() {
+                            l.log_upstream_response(upstream_status, &line);
+                        }
+
                         for output in transformer.transform_line(&line) {
+                            // 记录转换后的响应
+                            if let Some(ref l) = AppLogger::get() {
+                                l.log_anthropic_response(&output);
+                            }
                             let _ = tx.send(Ok(Frame::data(Bytes::from(output)))).await;
                         }
                     }
@@ -299,9 +339,25 @@ async fn handle_request(
 
         // 处理剩余的 buffer
         if !buffer.trim().is_empty() {
+            // 记录上游原始响应
+            if let Some(ref l) = AppLogger::get() {
+                l.log_upstream_response(upstream_status, &buffer);
+            }
+
             for output in transformer.transform_line(&buffer) {
+                // 记录转换后的响应
+                if let Some(ref l) = AppLogger::get() {
+                    l.log_anthropic_response(&output);
+                }
                 let _ = tx.send(Ok(Frame::data(Bytes::from(output)))).await;
             }
+        }
+
+        // 记录完成
+        if let Some(ref l) = AppLogger::get() {
+            l.log("════════════════════════════════════════════════════════════════");
+            l.log("✅ Request completed");
+            l.log("════════════════════════════════════════════════════════════════");
         }
     });
 

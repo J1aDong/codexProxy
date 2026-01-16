@@ -1,0 +1,206 @@
+use codex_proxy_core::{set_debug_log, is_debug_log_enabled, TransformRequest, AppLogger};
+use serde_json::json;
+use std::fs;
+
+#[test]
+fn test_debug_log_control() {
+    // 测试日志开关
+    set_debug_log(true);
+    assert!(is_debug_log_enabled());
+
+    set_debug_log(false);
+    assert!(!is_debug_log_enabled());
+
+    set_debug_log(true);
+    assert!(is_debug_log_enabled());
+
+    println!("✅ 日志开关测试通过");
+}
+
+#[test]
+fn test_app_logger() {
+    // 清理测试目录
+    let test_log_dir = "/tmp/codex_proxy_test_logs";
+    let _ = fs::remove_dir_all(test_log_dir);
+
+    // 强制开启日志
+    set_debug_log(true);
+
+    // 创建 AppLogger
+    let logger = AppLogger::init(Some(test_log_dir));
+
+    // 写入日志
+    logger.log("这是第一条测试日志");
+    logger.log("这是第二条测试日志");
+    logger.log("🖼️ [Image] base64 data: iVBORw0KGgo... (len=12345)");
+
+    // 检查日志文件
+    let log_path = logger.log_path();
+    println!("日志文件路径: {:?}", log_path);
+
+    assert!(log_path.exists(), "日志文件应该存在");
+
+    let content = fs::read_to_string(log_path).expect("应该能读取日志文件");
+    println!("日志内容:\n{}", content);
+
+    assert!(content.contains("这是第一条测试日志"));
+    assert!(content.contains("这是第二条测试日志"));
+    assert!(content.contains("🖼️ [Image]"));
+
+    // 清理
+    let _ = fs::remove_dir_all(test_log_dir);
+
+    println!("✅ AppLogger 测试通过");
+}
+
+#[test]
+fn test_transform_with_logging() {
+    // 强制开启日志
+    set_debug_log(true);
+
+    // 创建 broadcast channel
+    let (log_tx, mut log_rx) = tokio::sync::broadcast::channel::<String>(256);
+
+    // 构造测试请求 - 包含图片
+    let request_json = json!({
+        "model": "claude-3-opus-20240229",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "请描述这张图片"
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                        }
+                    }
+                ]
+            }
+        ],
+        "system": "你是一个有帮助的助手",
+        "tools": [
+            {
+                "name": "Read",
+                "description": "读取文件",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }
+            }
+        ],
+        "stream": true
+    });
+
+    // 解析请求
+    let anthropic_body: codex_proxy_core::AnthropicRequest =
+        serde_json::from_value(request_json).expect("应该能解析请求");
+
+    // 执行转换
+    let (codex_body, session_id) = TransformRequest::transform(
+        &anthropic_body,
+        Some(&log_tx),
+    );
+
+    println!("Session ID: {}", session_id);
+    println!("Codex Body: {}", serde_json::to_string_pretty(&codex_body).unwrap());
+
+    // 收集 broadcast 日志
+    let mut broadcast_logs = Vec::new();
+    while let Ok(msg) = log_rx.try_recv() {
+        println!("[Broadcast] {}", msg);
+        broadcast_logs.push(msg);
+    }
+
+    // 验证 broadcast 日志
+    assert!(!broadcast_logs.is_empty(), "应该有 broadcast 日志");
+
+    let all_logs = broadcast_logs.join("\n");
+    assert!(all_logs.contains("[Transform] Session"), "应该包含 Session 日志");
+    assert!(all_logs.contains("[Transform] Model"), "应该包含 Model 日志");
+    assert!(all_logs.contains("[Messages]"), "应该包含 Messages 日志");
+
+    println!("✅ Transform 日志测试通过");
+}
+
+#[test]
+fn test_image_in_message() {
+    // 强制开启日志
+    set_debug_log(true);
+
+    let (log_tx, mut log_rx) = tokio::sync::broadcast::channel::<String>(256);
+
+    // 测试各种图片格式
+    let request_json = json!({
+        "model": "claude-3-opus",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "图片1" },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+                        }
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "图片2 - URL" },
+                    {
+                        "type": "image",
+                        "source": {
+                            "url": "https://example.com/image.png"
+                        }
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "图片3 - image_url" },
+                    {
+                        "type": "image_url",
+                        "image_url": { "url": "https://example.com/another.png" }
+                    }
+                ]
+            }
+        ],
+        "stream": true
+    });
+
+    let anthropic_body: codex_proxy_core::AnthropicRequest =
+        serde_json::from_value(request_json).expect("应该能解析请求");
+
+    let (_codex_body, _session_id) = TransformRequest::transform(
+        &anthropic_body,
+        Some(&log_tx),
+    );
+
+    // 收集日志
+    let mut logs = Vec::new();
+    while let Ok(msg) = log_rx.try_recv() {
+        println!("{}", msg);
+        logs.push(msg);
+    }
+
+    let all_logs = logs.join("\n");
+
+    // 验证图片日志
+    assert!(all_logs.contains("🖼️"), "应该包含图片日志");
+    assert!(all_logs.contains("Image base64") || all_logs.contains("Image source"), "应该包含图片详情");
+
+    println!("✅ 图片消息日志测试通过");
+}

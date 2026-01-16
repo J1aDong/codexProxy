@@ -11,8 +11,7 @@ pub struct AppState {
 }
 
 fn main() {
-    // 开发模式下强制开启调试日志
-    #[cfg(debug_assertions)]
+    // 始终开启调试日志（用于排查问题）
     codex_proxy_core::set_debug_log(true);
 
     tauri::Builder::default()

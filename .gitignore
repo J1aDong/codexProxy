@@ -32,6 +32,9 @@ fronted-tauri/src-tauri/WixTools/
 fronted-tauri/dist/
 fronted-tauri/dist-ssr/
 
+# Rust
+main/target/
+
 # IDE 和编辑器
 .vscode/
 .idea/
