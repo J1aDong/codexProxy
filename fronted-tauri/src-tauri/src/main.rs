@@ -3,11 +3,18 @@
 mod proxy;
 
 use proxy::ProxyManager;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
-#[derive(Default)]
 pub struct AppState {
     pub proxy_manager: Mutex<ProxyManager>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            proxy_manager: Mutex::new(ProxyManager::default()),
+        }
+    }
 }
 
 fn main() {
@@ -23,6 +30,7 @@ fn main() {
             proxy::stop_proxy,
             proxy::load_config,
             proxy::save_config,
+            proxy::save_lang,
             proxy::check_port,
             proxy::kill_port,
         ])

@@ -8,8 +8,98 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-/// Codex 请求模板中的 instructions
 const CODEX_INSTRUCTIONS: &str = include_str!("instructions.txt");
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Xhigh,
+    High,
+    #[default]
+    Medium,
+    Low,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::Low => "low",
+        }
+    }
+}
+
+impl ReasoningEffort {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "low" => ReasoningEffort::Low,
+            "medium" => ReasoningEffort::Medium,
+            "high" => ReasoningEffort::High,
+            "xhigh" => ReasoningEffort::Xhigh,
+            _ => ReasoningEffort::Medium,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ReasoningEffortMapping {
+    #[serde(default = "default_opus")]
+    pub opus: ReasoningEffort,
+    #[serde(default = "default_sonnet")]
+    pub sonnet: ReasoningEffort,
+    #[serde(default = "default_haiku")]
+    pub haiku: ReasoningEffort,
+}
+
+fn default_opus() -> ReasoningEffort { ReasoningEffort::Xhigh }
+fn default_sonnet() -> ReasoningEffort { ReasoningEffort::Medium }
+fn default_haiku() -> ReasoningEffort { ReasoningEffort::Low }
+
+impl Default for ReasoningEffortMapping {
+    fn default() -> Self {
+        Self {
+            opus: default_opus(),
+            sonnet: default_sonnet(),
+            haiku: default_haiku(),
+        }
+    }
+}
+
+impl ReasoningEffortMapping {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_opus(mut self, effort: ReasoningEffort) -> Self {
+        self.opus = effort;
+        self
+    }
+
+    pub fn with_sonnet(mut self, effort: ReasoningEffort) -> Self {
+        self.sonnet = effort;
+        self
+    }
+
+    pub fn with_haiku(mut self, effort: ReasoningEffort) -> Self {
+        self.haiku = effort;
+        self
+    }
+}
+
+pub fn get_reasoning_effort(model: &str, mapping: &ReasoningEffortMapping) -> ReasoningEffort {
+    let model_lower = model.to_lowercase();
+    if model_lower.contains("opus") {
+        mapping.opus
+    } else if model_lower.contains("sonnet") {
+        mapping.sonnet
+    } else if model_lower.contains("haiku") {
+        mapping.haiku
+    } else {
+        ReasoningEffort::Medium
+    }
+}
 
 /// 日志目录
 const LOG_DIR: &str = "logs";
@@ -528,13 +618,13 @@ pub enum ImageUrlValue {
     ObjUri { uri: String },
 }
 
-/// 请求转换器
 pub struct TransformRequest;
 
 impl TransformRequest {
     pub fn transform(
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
+        reasoning_mapping: &ReasoningEffortMapping,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
         let cwd = std::env::current_dir()
@@ -558,8 +648,8 @@ impl TransformRequest {
 
         log(&format!("📋 [Transform] Session: {}", &session_id[..8]));
 
-        // 模型转换
         let original_model = anthropic_body.model.as_deref().unwrap_or("unknown");
+        let reasoning_effort = get_reasoning_effort(original_model, reasoning_mapping);
         let codex_model = anthropic_body
             .model
             .as_ref()
@@ -576,9 +666,8 @@ impl TransformRequest {
             })
             .unwrap_or_else(|| "gpt-5.2-codex".to_string());
 
-        log(&format!("📋 [Transform] Model: {} → {}", original_model, codex_model));
+        log(&format!("📋 [Transform] Model: {} → {} (reasoning: {})", original_model, codex_model, reasoning_effort.as_str()));
 
-        // 转换消息
         let chat_messages = Self::transform_messages(&anthropic_body.messages, log_tx);
 
         // 构建 input 数组
@@ -633,7 +722,7 @@ impl TransformRequest {
             "tools": transformed_tools,
             "tool_choice": "auto",
             "parallel_tool_calls": true,
-            "reasoning": { "summary": "auto" },
+            "reasoning": { "effort": reasoning_effort.as_str(), "summary": "auto" },
             "store": false,
             "stream": anthropic_body.stream,
             "include": ["reasoning.encrypted_content"],
@@ -1039,16 +1128,28 @@ impl TransformRequest {
                 true
             })
             .map(|tool| {
-                // Claude Code 格式: { name, description, input_schema }
+// Claude Code 格式: { name, description, input_schema }
                 if tool.get("name").is_some() && tool.get("type").is_none() {
                     let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                     log(&format!("🔧 [Tools] {} (Claude Code format)", name));
+
+                    let mut parameters = tool.get("input_schema").cloned().unwrap_or_else(|| {
+                        json!({
+                            "type": "object",
+                            "properties": {}
+                        })
+                    });
+
+                    if let Some(obj) = parameters.as_object_mut() {
+                        obj.entry("properties").or_insert_with(|| json!({}));
+                    }
+
                     return json!({
                         "type": "function",
                         "name": name,
                         "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
                         "strict": false,
-                        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+                        "parameters": parameters
                     });
                 }
 
@@ -1056,12 +1157,24 @@ impl TransformRequest {
                 if tool.get("type").and_then(|t| t.as_str()) == Some("tool") {
                     let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                     log(&format!("🔧 [Tools] {} (Anthropic format)", name));
+
+                    let mut parameters = tool.get("input_schema").cloned().unwrap_or_else(|| {
+                        json!({
+                            "type": "object",
+                            "properties": {}
+                        })
+                    });
+
+                    if let Some(obj) = parameters.as_object_mut() {
+                        obj.entry("properties").or_insert_with(|| json!({}));
+                    }
+
                     return json!({
                         "type": "function",
                         "name": name,
                         "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
                         "strict": false,
-                        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+                        "parameters": parameters
                     });
                 }
 
@@ -1070,24 +1183,48 @@ impl TransformRequest {
                     let func = tool.get("function").unwrap_or(tool);
                     let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                     log(&format!("🔧 [Tools] {} (OpenAI format)", name));
+
+                    let mut parameters = func.get("parameters").cloned().unwrap_or_else(|| {
+                        json!({
+                            "type": "object",
+                            "properties": {}
+                        })
+                    });
+
+                    if let Some(obj) = parameters.as_object_mut() {
+                        obj.entry("properties").or_insert_with(|| json!({}));
+                    }
+
                     return json!({
                         "type": "function",
                         "name": name,
                         "description": func.get("description").and_then(|d| d.as_str()).unwrap_or(""),
                         "strict": false,
-                        "parameters": func.get("parameters").cloned().unwrap_or(json!({}))
+                        "parameters": parameters
                     });
                 }
 
                 // 未知格式
                 let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                 log(&format!("🔧 [Tools] {} (unknown format)", name));
+
+                let mut parameters = tool.get("input_schema").cloned().unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {}
+                    })
+                });
+
+                if let Some(obj) = parameters.as_object_mut() {
+                    obj.entry("properties").or_insert_with(|| json!({}));
+                }
+
                 json!({
                     "type": "function",
                     "name": name,
                     "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
                     "strict": false,
-                    "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+                    "parameters": parameters
                 })
             })
             .collect()
@@ -1375,5 +1512,72 @@ impl TransformResponse {
         }
 
         output
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[test]
+    fn test_reasoning_effort_opus_default() {
+        let mapping = ReasoningEffortMapping::default();
+        let effort = get_reasoning_effort("claude-3-opus-20240229", &mapping);
+        assert_eq!(effort, ReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn test_reasoning_effort_sonnet_default() {
+        let mapping = ReasoningEffortMapping::default();
+        let effort = get_reasoning_effort("claude-sonnet-4-20250514", &mapping);
+        assert_eq!(effort, ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn test_reasoning_effort_haiku_default() {
+        let mapping = ReasoningEffortMapping::default();
+        let effort = get_reasoning_effort("claude-3-5-haiku-20241022", &mapping);
+        assert_eq!(effort, ReasoningEffort::Low);
+    }
+
+    #[test]
+    fn test_custom_mapping_applied() {
+        let mut mapping = ReasoningEffortMapping::default();
+        mapping.sonnet = ReasoningEffort::High;
+        
+        let effort = get_reasoning_effort("claude-sonnet-4-20250514", &mapping);
+        assert_eq!(effort, ReasoningEffort::High);
+    }
+
+    #[test]
+    fn test_reasoning_effort_as_str() {
+        assert_eq!(ReasoningEffort::Xhigh.as_str(), "xhigh");
+        assert_eq!(ReasoningEffort::High.as_str(), "high");
+        assert_eq!(ReasoningEffort::Medium.as_str(), "medium");
+        assert_eq!(ReasoningEffort::Low.as_str(), "low");
+    }
+
+    #[test]
+    fn test_reasoning_effort_from_str() {
+        assert_eq!(ReasoningEffort::from_str("xhigh"), ReasoningEffort::Xhigh);
+        assert_eq!(ReasoningEffort::from_str("HIGH"), ReasoningEffort::High);
+        assert_eq!(ReasoningEffort::from_str("Medium"), ReasoningEffort::Medium);
+        assert_eq!(ReasoningEffort::from_str("low"), ReasoningEffort::Low);
+        assert_eq!(ReasoningEffort::from_str("invalid"), ReasoningEffort::Medium); // default
+    }
+
+    #[test]
+    fn test_unknown_model_defaults_to_medium() {
+        let mapping = ReasoningEffortMapping::default();
+        let effort = get_reasoning_effort("gpt-4-turbo", &mapping);
+        assert_eq!(effort, ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn test_case_insensitive_model_matching() {
+        let mapping = ReasoningEffortMapping::default();
+        assert_eq!(get_reasoning_effort("CLAUDE-3-OPUS", &mapping), ReasoningEffort::Xhigh);
+        assert_eq!(get_reasoning_effort("Claude-Sonnet-4", &mapping), ReasoningEffort::Medium);
+        assert_eq!(get_reasoning_effort("claude-haiku", &mapping), ReasoningEffort::Low);
     }
 }

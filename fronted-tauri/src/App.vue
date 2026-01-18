@@ -48,6 +48,35 @@
             </div>
           </el-form-item>
 
+          <!-- Reasoning Effort Mapping -->
+          <el-divider content-position="left">{{ t.reasoningEffort }}</el-divider>
+          <el-row :gutter="16">
+            <el-col :span="8">
+              <el-form-item label="Opus">
+                <el-select v-model="form.reasoningEffort.opus" style="width: 100%">
+                  <el-option v-for="opt in effortOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="Sonnet">
+                <el-select v-model="form.reasoningEffort.sonnet" style="width: 100%">
+                  <el-option v-for="opt in effortOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="Haiku">
+                <el-select v-model="form.reasoningEffort.haiku" style="width: 100%">
+                  <el-option v-for="opt in effortOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <div class="form-tip" style="margin-top: -10px; margin-bottom: 20px;">
+            {{ t.reasoningEffortTip }}
+          </div>
+
           <div class="form-actions">
             <el-button @click="resetDefaults">{{ t.restoreDefaults }}</el-button>
             <el-button
@@ -123,6 +152,12 @@ const unlisteners: UnlistenFn[] = []
 const lang = ref<'zh' | 'en'>('zh')
 const toggleLang = () => {
   lang.value = lang.value === 'zh' ? 'en' : 'zh'
+  // Save lang preference immediately
+  saveLangPreference()
+}
+
+const saveLangPreference = () => {
+  invoke('save_lang', { lang: lang.value }).catch(console.error)
 }
 
 const translations = {
@@ -145,6 +180,8 @@ const translations = {
     copy: '复制',
     copied: '已复制',
     noLogs: '暂无日志...',
+    reasoningEffort: '推理强度配置',
+    reasoningEffortTip: '为不同的 Claude 模型系列设置默认推理强度级别。',
   },
   en: {
     statusRunning: 'Proxy Running',
@@ -165,18 +202,35 @@ const translations = {
     copy: 'Copy',
     copied: 'Copied',
     noLogs: 'No logs yet...',
+    reasoningEffort: 'Reasoning Effort',
+    reasoningEffortTip: 'Set default reasoning effort levels for different Claude model families.',
   }
 }
 
 const t = computed(() => translations[lang.value])
 
+const effortOptions = [
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'Extra High' },
+]
+
 const DEFAULT_CONFIG = {
   port: 8889,
   targetUrl: 'https://api.aicodemirror.com/api/codex/backend-api/codex/responses',
-  apiKey: ''
+  apiKey: '',
+  reasoningEffort: {
+    opus: 'xhigh',
+    sonnet: 'medium',
+    haiku: 'low',
+  }
 }
 
-const form = reactive({ ...DEFAULT_CONFIG })
+const form = reactive({ 
+  ...DEFAULT_CONFIG,
+  reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort }
+})
 
 const configExample = computed(() => {
   const tokenPlaceholder = lang.value === 'zh'
@@ -200,6 +254,7 @@ const resetDefaults = () => {
   form.port = DEFAULT_CONFIG.port
   form.targetUrl = DEFAULT_CONFIG.targetUrl
   form.apiKey = DEFAULT_CONFIG.apiKey
+  form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
 }
 
 const toggleProxy = () => {
@@ -211,6 +266,7 @@ const toggleProxy = () => {
         port: form.port,
         targetUrl: form.targetUrl,
         apiKey: form.apiKey,
+        reasoningEffort: form.reasoningEffort,
         force: false
       }
     }).catch(console.error)
@@ -241,12 +297,18 @@ watch(logs.value, () => {
 
 onMounted(() => {
   // Load saved config
-  invoke<{ port: number; targetUrl: string; apiKey: string } | null>('load_config')
+  invoke<{ port: number; targetUrl: string; apiKey: string; reasoningEffort?: { opus: string; sonnet: string; haiku: string }; lang?: string } | null>('load_config')
     .then((savedConfig) => {
       if (savedConfig) {
         if (savedConfig.port) form.port = savedConfig.port
         if (savedConfig.targetUrl) form.targetUrl = savedConfig.targetUrl
         if (savedConfig.apiKey) form.apiKey = savedConfig.apiKey
+        if (savedConfig.reasoningEffort) {
+          form.reasoningEffort = { ...savedConfig.reasoningEffort }
+        }
+        if (savedConfig.lang && (savedConfig.lang === 'zh' || savedConfig.lang === 'en')) {
+          lang.value = savedConfig.lang
+        }
       }
     })
     .catch(console.error)
@@ -282,6 +344,7 @@ onMounted(() => {
             port: form.port,
             targetUrl: form.targetUrl,
             apiKey: form.apiKey,
+            reasoningEffort: form.reasoningEffort,
             force: true
           }
         }).catch(console.error)

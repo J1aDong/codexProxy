@@ -1,4 +1,4 @@
-use crate::transform::{AnthropicRequest, TransformRequest, TransformResponse, AppLogger};
+use crate::transform::{AnthropicRequest, AppLogger, ReasoningEffortMapping, TransformRequest, TransformResponse};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -18,7 +18,7 @@ pub struct ProxyServer {
     port: u16,
     target_url: String,
     api_key: Option<String>,
-    shutdown_tx: Option<broadcast::Sender<()>>,
+    reasoning_mapping: ReasoningEffortMapping,
 }
 
 impl ProxyServer {
@@ -27,14 +27,21 @@ impl ProxyServer {
             port,
             target_url,
             api_key,
-            shutdown_tx: None,
+            reasoning_mapping: ReasoningEffortMapping::default(),
         }
     }
 
+    pub fn with_reasoning_mapping(mut self, mapping: ReasoningEffortMapping) -> Self {
+        self.reasoning_mapping = mapping;
+        self
+    }
+
+    /// Start the proxy server and return a shutdown sender
+    /// Send () to the returned sender to stop the server
     pub async fn start(
-        &mut self,
+        &self,
         log_tx: broadcast::Sender<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<broadcast::Sender<()>, Box<dyn std::error::Error + Send + Sync>> {
         // 初始化全局日志记录器
         let logger = AppLogger::init(Some("logs"));
         logger.log("=== Codex Proxy Started ===");
@@ -43,10 +50,11 @@ impl ProxyServer {
         let listener = TcpListener::bind(addr).await?;
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
-        self.shutdown_tx = Some(shutdown_tx.clone());
+        let shutdown_tx_clone = shutdown_tx.clone();
 
         let target_url = Arc::new(self.target_url.clone());
         let api_key = Arc::new(self.api_key.clone());
+        let reasoning_mapping = Arc::new(self.reasoning_mapping.clone());
 
         let _ = log_tx.send(format!(
             "🚀 Codex Proxy (Rust) listening on http://localhost:{}",
@@ -56,55 +64,54 @@ impl ProxyServer {
         logger.log(&format!("Listening on http://localhost:{}", self.port));
         logger.log(&format!("Target: {}", self.target_url));
 
-        loop {
-            let mut shutdown_rx = shutdown_tx.subscribe();
+        // Spawn the server loop in a separate task
+        tokio::spawn(async move {
+            loop {
+                let mut shutdown_rx = shutdown_tx_clone.subscribe();
 
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _)) => {
-                            let io = TokioIo::new(stream);
-                            let target_url = Arc::clone(&target_url);
-                            let api_key = Arc::clone(&api_key);
-                            let log_tx = log_tx.clone();
+                tokio::select! {
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _)) => {
+                                let io = TokioIo::new(stream);
+                                let target_url = Arc::clone(&target_url);
+                                let api_key = Arc::clone(&api_key);
+                                let reasoning_mapping = Arc::clone(&reasoning_mapping);
+                                let log_tx = log_tx.clone();
 
-                            tokio::spawn(async move {
-                                let service = service_fn(move |req| {
-                                    handle_request(
-                                        req,
-                                        Arc::clone(&target_url),
-                                        Arc::clone(&api_key),
-                                        log_tx.clone(),
-                                    )
+                                tokio::spawn(async move {
+                                    let service = service_fn(move |req| {
+                                        handle_request(
+                                            req,
+                                            Arc::clone(&target_url),
+                                            Arc::clone(&api_key),
+                                            Arc::clone(&reasoning_mapping),
+                                            log_tx.clone(),
+                                        )
+                                    });
+
+                                    if let Err(e) = http1::Builder::new()
+                                        .serve_connection(io, service)
+                                        .await
+                                    {
+                                        eprintln!("Connection error: {}", e);
+                                    }
                                 });
-
-                                if let Err(e) = http1::Builder::new()
-                                    .serve_connection(io, service)
-                                    .await
-                                {
-                                    eprintln!("Connection error: {}", e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            let _ = log_tx.send(format!("[Error] Accept failed: {}", e));
+                            }
+                            Err(e) => {
+                                let _ = log_tx.send(format!("[Error] Accept failed: {}", e));
+                            }
                         }
                     }
-                }
-                _ = shutdown_rx.recv() => {
-                    let _ = log_tx.send("[System] Proxy server shutting down...".to_string());
-                    break;
+                    _ = shutdown_rx.recv() => {
+                        let _ = log_tx.send("[System] Proxy server shutting down...".to_string());
+                        break;
+                    }
                 }
             }
-        }
+        });
 
-        Ok(())
-    }
-
-    pub fn stop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
+        Ok(shutdown_tx)
     }
 }
 
@@ -112,6 +119,7 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     target_url: Arc<String>,
     api_key: Arc<Option<String>>,
+    reasoning_mapping: Arc<ReasoningEffortMapping>,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path();
@@ -211,6 +219,7 @@ async fn handle_request(
     let (codex_body, session_id) = TransformRequest::transform(
         &anthropic_body,
         Some(&log_tx),
+        &reasoning_mapping,
     );
     let model = anthropic_body
         .model

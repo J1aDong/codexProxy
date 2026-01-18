@@ -1,11 +1,36 @@
-use codex_proxy_core::ProxyServer;
+use codex_proxy_core::{ProxyServer, ReasoningEffort, ReasoningEffortMapping};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::TcpListener;
 use std::process::Command;
-use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ReasoningEffortConfig {
+    pub opus: String,
+    pub sonnet: String,
+    pub haiku: String,
+}
+
+impl Default for ReasoningEffortConfig {
+    fn default() -> Self {
+        Self {
+            opus: "xhigh".to_string(),
+            sonnet: "medium".to_string(),
+            haiku: "low".to_string(),
+        }
+    }
+}
+
+impl ReasoningEffortConfig {
+    pub fn to_mapping(&self) -> ReasoningEffortMapping {
+        ReasoningEffortMapping::new()
+            .with_opus(ReasoningEffort::from_str(&self.opus))
+            .with_sonnet(ReasoningEffort::from_str(&self.sonnet))
+            .with_haiku(ReasoningEffort::from_str(&self.haiku))
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ProxyConfig {
@@ -16,17 +41,27 @@ pub struct ProxyConfig {
     pub api_key: String,
     #[serde(default)]
     pub force: bool,
+    #[serde(rename = "reasoningEffort", default)]
+    pub reasoning_effort: ReasoningEffortConfig,
+    #[serde(default = "default_lang")]
+    pub lang: String,
+}
+
+fn default_lang() -> String {
+    "zh".to_string()
 }
 
 pub struct ProxyManager {
-    server: Option<Arc<Mutex<ProxyServer>>>,
+    running: bool,
+    shutdown_tx: Option<broadcast::Sender<()>>,
     log_tx: Option<broadcast::Sender<String>>,
 }
 
 impl Default for ProxyManager {
     fn default() -> Self {
         Self {
-            server: None,
+            running: false,
+            shutdown_tx: None,
             log_tx: None,
         }
     }
@@ -34,17 +69,22 @@ impl Default for ProxyManager {
 
 impl ProxyManager {
     pub fn is_running(&self) -> bool {
-        self.server.is_some()
+        self.running
+    }
+
+    pub fn set_running(&mut self, running: bool) {
+        self.running = running;
+    }
+
+    pub fn set_shutdown_tx(&mut self, tx: broadcast::Sender<()>) {
+        self.shutdown_tx = Some(tx);
     }
 
     pub fn stop(&mut self) {
-        if let Some(server) = self.server.take() {
-            let server_clone = server.clone();
-            tokio::spawn(async move {
-                let mut s = server_clone.lock().await;
-                s.stop();
-            });
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
         }
+        self.running = false;
         self.log_tx = None;
     }
 }
@@ -75,6 +115,19 @@ pub fn save_config(config: ProxyConfig) -> Result<(), String> {
     }
     let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     fs::write(&path, content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn save_lang(lang: String) -> Result<(), String> {
+    let path = get_config_path()?;
+    let mut config = if path.exists() {
+        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        ProxyConfig::default()
+    };
+    config.lang = lang;
+    save_config(config)
 }
 
 #[tauri::command]
@@ -131,7 +184,7 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
 
     // Get state
     let state = app.state::<crate::AppState>();
-    let mut manager = state.proxy_manager.lock().map_err(|e| e.to_string())?;
+    let mut manager = state.proxy_manager.lock().await;
 
     if manager.is_running() {
         return Err("Proxy is already running".to_string());
@@ -156,13 +209,11 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
         Some(config.api_key.clone())
     };
 
-    let server = Arc::new(Mutex::new(ProxyServer::new(
+    let server = ProxyServer::new(
         config.port,
         config.target_url.clone(),
         api_key,
-    )));
-
-    manager.server = Some(server.clone());
+    ).with_reasoning_mapping(config.reasoning_effort.to_mapping());
 
     // 启动日志转发
     let app_clone = app.clone();
@@ -174,24 +225,27 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
 
     // 启动代理服务器
     let app_clone = app.clone();
-    tokio::spawn(async move {
-        let mut server_guard = server.lock().await;
-        if let Err(e) = server_guard.start(log_tx).await {
+    match server.start(log_tx).await {
+        Ok(shutdown_tx) => {
+            manager.set_shutdown_tx(shutdown_tx);
+            manager.set_running(true);
+            app.emit("proxy-status", "running")
+                .map_err(|e| e.to_string())?;
+        }
+        Err(e) => {
             let _ = app_clone.emit("proxy-log", format!("[Error] Server error: {}", e));
             let _ = app_clone.emit("proxy-status", "stopped");
+            return Err(e.to_string());
         }
-    });
-
-    app.emit("proxy-status", "running")
-        .map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn stop_proxy(app: AppHandle) -> Result<(), String> {
+pub async fn stop_proxy(app: AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
-    let mut manager = state.proxy_manager.lock().map_err(|e| e.to_string())?;
+    let mut manager = state.proxy_manager.lock().await;
 
     manager.stop();
 
