@@ -359,6 +359,7 @@ dependencies = [
 name = "codex-proxy-core"
 version = "0.0.4"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "env_logger",

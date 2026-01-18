@@ -481,7 +481,11 @@ fn parse_content_block(value: Value) -> ContentBlock {
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
     Text { text: String },
-    Image { source: Option<ImageSource> },
+    Image {
+        source: Option<ImageSource>,
+        source_raw: Option<Value>,
+        image_url: Option<ImageUrlValue>,
+    },
     ImageUrl { image_url: ImageUrlValue },
     InputImage {
         image_url: Option<ImageUrlValue>,
@@ -551,8 +555,10 @@ fn parse_content_block_from_value(value: Value) -> ContentBlock {
             ContentBlock::Text { text }
         }
         "image" => {
-            let source = obj.get("source").and_then(|s| serde_json::from_value(s.clone()).ok());
-            ContentBlock::Image { source }
+            let source_raw = obj.get("source").cloned();
+            let source = source_raw.as_ref().and_then(|s| serde_json::from_value(s.clone()).ok());
+            let image_url = obj.get("image_url").and_then(|u| serde_json::from_value(u.clone()).ok());
+            ContentBlock::Image { source, source_raw, image_url }
         }
         "image_url" => {
             let image_url = obj.get("image_url")
@@ -589,12 +595,36 @@ fn parse_content_block_from_value(value: Value) -> ContentBlock {
         }
         "" => {
             // 没有 type 字段，检查是否有 text 字段
+            if obj.get("image_url").is_some() {
+                let image_url = obj.get("image_url")
+                    .and_then(|u| serde_json::from_value(u.clone()).ok())
+                    .unwrap_or(ImageUrlValue::Str(String::new()));
+                return ContentBlock::ImageUrl { image_url };
+            }
+            if obj.get("source").is_some() {
+                let source_raw = obj.get("source").cloned();
+                let source = source_raw.as_ref().and_then(|s| serde_json::from_value(s.clone()).ok());
+                return ContentBlock::Image { source, source_raw, image_url: None };
+            }
             if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
                 return ContentBlock::Text { text: text.to_string() };
             }
             ContentBlock::OtherValue(value)
         }
-        _ => ContentBlock::OtherValue(value),
+        _ => {
+            if obj.get("image_url").is_some() {
+                let image_url = obj.get("image_url")
+                    .and_then(|u| serde_json::from_value(u.clone()).ok())
+                    .unwrap_or(ImageUrlValue::Str(String::new()));
+                return ContentBlock::ImageUrl { image_url };
+            }
+            if obj.get("source").is_some() {
+                let source_raw = obj.get("source").cloned();
+                let source = source_raw.as_ref().and_then(|s| serde_json::from_value(s.clone()).ok());
+                return ContentBlock::Image { source, source_raw, image_url: None };
+            }
+            ContentBlock::OtherValue(value)
+        }
     }
 }
 
@@ -602,12 +632,15 @@ fn parse_content_block_from_value(value: Value) -> ContentBlock {
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: Option<String>,
+    #[serde(alias = "mediaType")]
     pub media_type: Option<String>,
-    #[serde(alias = "mime_type")]
+    #[serde(alias = "mime_type", alias = "mimeType")]
     pub mime_type: Option<String>,
     pub data: Option<String>,
     pub url: Option<String>,
     pub uri: Option<String>,
+    #[serde(alias = "file_path", alias = "filePath", alias = "local_path", alias = "localPath", alias = "file")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -733,6 +766,19 @@ impl TransformRequest {
     }
 
     fn build_template_input() -> Value {
+        // 从 codex-request.json 读取完整的模板，与 JavaScript 版本保持一致
+        let template_path = std::path::Path::new("codex-request.json");
+        if let Ok(template_content) = std::fs::read_to_string(template_path) {
+            if let Ok(template) = serde_json::from_str::<Value>(&template_content) {
+                if let Some(input) = template.get("input").and_then(|i| i.as_array()) {
+                    if let Some(first_input) = input.first() {
+                        return first_input.clone();
+                    }
+                }
+            }
+        }
+        
+        // 如果无法读取模板，使用备用值
         json!({
             "type": "message",
             "role": "user",
@@ -838,27 +884,61 @@ impl TransformRequest {
                                     "text": text
                                 }));
                             }
-                            ContentBlock::Image { source } => {
-                                if let Some(src) = source {
-                                    let image_url = Self::resolve_image_url(src, &log, msg_idx, block_idx);
-                                    if !image_url.is_empty() {
-                                        if msg.role == "user" {
-                                            current_content.push(json!({
-                                                "type": "input_image",
-                                                "image_url": image_url,
-                                                "detail": "auto"
-                                            }));
-                                        } else {
-                                            log(&format!(
-                                                "🖼️ [Message #{} Block #{}] Image skipped (assistant role)",
-                                                msg_idx,
-                                                block_idx
-                                            ));
-                                        }
+                            ContentBlock::Image { source, source_raw, image_url } => {
+                                let mut resolved_url = if let Some(image_url) = image_url {
+                                    match image_url {
+                                        ImageUrlValue::Str(s) => s.clone(),
+                                        ImageUrlValue::ObjUrl { url } => url.clone(),
+                                        ImageUrlValue::ObjUri { uri } => uri.clone(),
                                     }
+                                } else if let Some(src) = source {
+                                    Self::resolve_image_url(src, &log, msg_idx, block_idx)
+                                } else {
+                                    String::new()
+                                };
+
+                                if !resolved_url.is_empty() {
+                                    let media_type = source.as_ref()
+                                        .and_then(|s| s.media_type.as_deref().or(s.mime_type.as_deref()));
+                                    resolved_url = Self::normalize_image_url(
+                                        resolved_url,
+                                        media_type,
+                                        &log,
+                                        msg_idx,
+                                        block_idx,
+                                    );
+                                }
+
+                                if resolved_url.is_empty() {
+                                    if let Some(raw) = source_raw {
+                                        resolved_url = Self::resolve_image_url_raw(raw, &log, msg_idx, block_idx);
+                                    }
+                                }
+
+                                if resolved_url.is_empty() {
+                                    log(&format!(
+                                        "🖼️ [Message #{} Block #{}] Image source is empty",
+                                        msg_idx,
+                                        block_idx
+                                    ));
+                                    continue;
+                                }
+
+                                log(&format!(
+                                    "🖼️ [Message #{} Block #{}] Image: {}",
+                                    msg_idx,
+                                    block_idx,
+                                    truncate_for_log(&resolved_url, 50)
+                                ));
+
+                                if msg.role == "user" {
+                                    current_content.push(json!({
+                                        "type": "input_image",
+                                        "image_url": resolved_url
+                                    }));
                                 } else {
                                     log(&format!(
-                                        "🖼️ [Message #{} Block #{}] Image source is None",
+                                        "🖼️ [Message #{} Block #{}] Image skipped (assistant role)",
                                         msg_idx,
                                         block_idx
                                     ));
@@ -870,17 +950,23 @@ impl TransformRequest {
                                     ImageUrlValue::ObjUrl { url } => url.clone(),
                                     ImageUrlValue::ObjUri { uri } => uri.clone(),
                                 };
+                                let url = Self::normalize_image_url(url, None, &log, msg_idx, block_idx);
                                 log(&format!(
                                     "🖼️ [Message #{} Block #{}] ImageUrl: {}",
                                     msg_idx,
                                     block_idx,
                                     truncate_for_log(&url, 50)
                                 ));
-                                if msg.role == "user" {
+                                if url.is_empty() {
+                                    log(&format!(
+                                        "🖼️ [Message #{} Block #{}] ImageUrl is empty",
+                                        msg_idx,
+                                        block_idx
+                                    ));
+                                } else if msg.role == "user" {
                                     current_content.push(json!({
                                         "type": "input_image",
-                                        "image_url": url,
-                                        "detail": "auto"
+                                        "image_url": url
                                     }));
                                 } else {
                                     log(&format!(
@@ -897,6 +983,7 @@ impl TransformRequest {
                                     Some(ImageUrlValue::ObjUri { uri }) => uri.clone(),
                                     None => url.clone().unwrap_or_default(),
                                 };
+                                let resolved_url = Self::normalize_image_url(resolved_url, None, &log, msg_idx, block_idx);
                                 log(&format!(
                                     "🖼️ [Message #{} Block #{}] InputImage: {}",
                                     msg_idx,
@@ -906,8 +993,7 @@ impl TransformRequest {
                                 if !resolved_url.is_empty() && msg.role == "user" {
                                     current_content.push(json!({
                                         "type": "input_image",
-                                        "image_url": resolved_url,
-                                        "detail": "auto"
+                                        "image_url": resolved_url
                                     }));
                                 }
                             }
@@ -1004,6 +1090,19 @@ impl TransformRequest {
         input
     }
 
+    fn normalize_image_url<F>(
+        url: String,
+        _media_type: Option<&str>,
+        _log: &F,
+        _msg_idx: usize,
+        _block_idx: usize,
+    ) -> String
+    where
+        F: Fn(&str),
+    {
+        url
+    }
+
     fn resolve_image_url<F>(
         source: &ImageSource,
         log: &F,
@@ -1014,23 +1113,50 @@ impl TransformRequest {
         F: Fn(&str),
     {
         if let Some(url) = &source.url {
+            let media_type = source.media_type.as_deref()
+                .or(source.mime_type.as_deref())
+                .unwrap_or("image/png");
+            let normalized = Self::normalize_image_url(url.clone(), Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source.url: {}",
                 msg_idx,
                 block_idx,
-                truncate_for_log(url, 50)
+                truncate_for_log(&normalized, 50)
             ));
-            return url.clone();
+            return normalized;
         }
 
         if let Some(uri) = &source.uri {
+            let media_type = source.media_type.as_deref()
+                .or(source.mime_type.as_deref())
+                .unwrap_or("image/png");
+            let normalized = Self::normalize_image_url(uri.clone(), Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source.uri: {}",
                 msg_idx,
                 block_idx,
-                truncate_for_log(uri, 50)
+                truncate_for_log(&normalized, 50)
             ));
-            return uri.clone();
+            return normalized;
+        }
+
+        if let Some(path) = &source.path {
+            let media_type = source.media_type.as_deref()
+                .or(source.mime_type.as_deref())
+                .unwrap_or("image/png");
+            let file_url = if path.starts_with("file://") {
+                path.clone()
+            } else {
+                format!("file://{}", path)
+            };
+            let normalized = Self::normalize_image_url(file_url, Some(media_type), log, msg_idx, block_idx);
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image source.path: {}",
+                msg_idx,
+                block_idx,
+                truncate_for_log(&normalized, 50)
+            ));
+            return normalized;
         }
 
         if let Some(data) = &source.data {
@@ -1055,6 +1181,145 @@ impl TransformRequest {
 
         log(&format!(
             "🖼️ [Message #{} Block #{}] Image source is empty (no url/uri/data)",
+            msg_idx,
+            block_idx
+        ));
+        String::new()
+    }
+
+    fn resolve_image_url_raw<F>(
+        source: &Value,
+        log: &F,
+        msg_idx: usize,
+        block_idx: usize,
+    ) -> String
+    where
+        F: Fn(&str),
+    {
+        let Some(obj) = source.as_object() else {
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image source raw is not object",
+                msg_idx,
+                block_idx
+            ));
+            return String::new();
+        };
+
+        let keys = obj.keys().cloned().collect::<Vec<_>>().join(",");
+        log(&format!(
+            "🖼️ [Message #{} Block #{}] Image source raw keys: {}",
+            msg_idx,
+            block_idx,
+            keys
+        ));
+
+        let media_type = obj.get("media_type")
+            .or_else(|| obj.get("mediaType"))
+            .or_else(|| obj.get("mime_type"))
+            .or_else(|| obj.get("mimeType"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("image/png");
+
+        let extract_str = |value: &Value| -> Option<String> {
+            if let Some(s) = value.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(obj) = value.as_object() {
+                if let Some(s) = obj.get("url").and_then(|v| v.as_str()) {
+                    return Some(s.to_string());
+                }
+                if let Some(s) = obj.get("uri").and_then(|v| v.as_str()) {
+                    return Some(s.to_string());
+                }
+                if let Some(s) = obj.get("data").and_then(|v| v.as_str()) {
+                    return Some(s.to_string());
+                }
+                if let Some(s) = obj.get("base64").and_then(|v| v.as_str()) {
+                    return Some(s.to_string());
+                }
+            }
+            None
+        };
+
+        if let Some(url) = obj.get("url").and_then(|v| extract_str(v)) {
+            let normalized = Self::normalize_image_url(url, Some(media_type), log, msg_idx, block_idx);
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image source raw.url: {}",
+                msg_idx,
+                block_idx,
+                truncate_for_log(&normalized, 50)
+            ));
+            return normalized;
+        }
+
+        if let Some(uri) = obj.get("uri").and_then(|v| extract_str(v)) {
+            let normalized = Self::normalize_image_url(uri, Some(media_type), log, msg_idx, block_idx);
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image source raw.uri: {}",
+                msg_idx,
+                block_idx,
+                truncate_for_log(&normalized, 50)
+            ));
+            return normalized;
+        }
+
+        if let Some(image_url) = obj.get("image_url").and_then(|v| extract_str(v)) {
+            let normalized = Self::normalize_image_url(image_url, Some(media_type), log, msg_idx, block_idx);
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image source raw.image_url: {}",
+                msg_idx,
+                block_idx,
+                truncate_for_log(&normalized, 50)
+            ));
+            return normalized;
+        }
+
+        let path_value = obj.get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| obj.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .or_else(|| obj.get("filePath").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .or_else(|| obj.get("local_path").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .or_else(|| obj.get("localPath").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .or_else(|| obj.get("file").and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+        if let Some(path) = path_value {
+            let file_url = if path.starts_with("file://") {
+                path
+            } else {
+                format!("file://{}", path)
+            };
+            let normalized = Self::normalize_image_url(file_url, Some(media_type), log, msg_idx, block_idx);
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image source raw.path: {}",
+                msg_idx,
+                block_idx,
+                truncate_for_log(&normalized, 50)
+            ));
+            return normalized;
+        }
+
+        let data = obj.get("data")
+            .and_then(|v| extract_str(v))
+            .or_else(|| obj.get("base64").and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+        if let Some(data) = data {
+            log(&format!(
+                "🖼️ [Message #{} Block #{}] Image raw base64: media={}, size={} bytes, prefix={}",
+                msg_idx,
+                block_idx,
+                media_type,
+                data.len(),
+                truncate_for_log(&data, 20)
+            ));
+            if data.starts_with("data:") {
+                return data;
+            }
+            return format!("data:{};base64,{}", media_type, data);
+        }
+
+        log(&format!(
+            "🖼️ [Message #{} Block #{}] Image source raw is empty",
             msg_idx,
             block_idx
         ));
