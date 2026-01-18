@@ -1231,6 +1231,15 @@ impl TransformRequest {
     }
 
     fn default_tools() -> Vec<Value> {
+        let template_path = std::path::Path::new("codex-request.json");
+        if let Ok(template_content) = std::fs::read_to_string(template_path) {
+            if let Ok(template) = serde_json::from_str::<Value>(&template_content) {
+                if let Some(tools) = template.get("tools").and_then(|t| t.as_array()) {
+                    return tools.clone();
+                }
+            }
+        }
+        
         vec![json!({
             "type": "function",
             "name": "shell_command",
