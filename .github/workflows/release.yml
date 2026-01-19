@@ -25,21 +25,19 @@ jobs:
         with:
           node-version: 20
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install Dependencies
-        run: |
-          cd fronted
-          npm install
+        working-directory: fronted-tauri
+        run: npm install
 
-      - name: Build Electron App
+      - name: Build and Release Tauri App
+        uses: tauri-apps/tauri-action@v0
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cd fronted
-          npm run build -- --publish always
-
-      # macOS: 移除隔离属性，防止"已损坏"提示
-      - name: Remove quarantine attribute (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          find fronted/release -name "*.app" -exec xattr -cr {} \; 2>/dev/null || true
-          find fronted/release -name "*.dmg" -exec xattr -cr {} \; 2>/dev/null || true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: fronted-tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "Codex Proxy ${{ github.ref_name }}"
+          releaseBody: "See the assets to download and install this version."
