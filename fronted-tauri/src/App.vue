@@ -9,6 +9,10 @@
         </div>
         <h1 class="app-title">{{ t.title }}</h1>
         <div class="header-actions">
+           <!-- About -->
+           <el-button circle text @click="showAbout = true">
+             <el-icon><InfoFilled /></el-icon>
+           </el-button>
            <!-- Language Switch -->
            <el-button circle text @click="toggleLang" class="lang-btn">
              {{ lang === 'zh' ? 'En' : '中' }}
@@ -129,21 +133,36 @@
         </div>
       </template>
     </el-drawer>
+
+    <!-- About Dialog -->
+    <el-dialog v-model="showAbout" :title="t.aboutTitle" width="360px">
+      <div class="about-body">
+        <div class="about-name">{{ t.appName }}</div>
+        <div class="about-version">{{ t.versionLabel }} v{{ appVersion }}</div>
+      </div>
+      <template #footer>
+        <div class="about-footer">
+          <el-button type="primary" @click="showAbout = false">OK</el-button>
+        </div>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script lang="ts" setup>
 import { reactive, ref, onMounted, computed, watch, onUnmounted } from 'vue'
-import { Document } from '@element-plus/icons-vue'
+import { Document, InfoFilled } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 
 const isRunning = ref(false)
 const showLogs = ref(false)
+const showAbout = ref(false)
 const logs = ref<string[]>([])
 const logsContainer = ref<HTMLElement | null>(null)
 const copied = ref(false)
+const appVersion = __APP_VERSION__
 
 // Event listeners
 const unlisteners: UnlistenFn[] = []
@@ -182,6 +201,9 @@ const translations = {
     noLogs: '暂无日志...',
     reasoningEffort: '推理强度配置',
     reasoningEffortTip: '为不同的 Claude 模型系列设置默认推理强度级别。',
+    aboutTitle: '关于',
+    versionLabel: '版本',
+    appName: 'Codex Proxy',
   },
   en: {
     statusRunning: 'Proxy Running',
@@ -204,6 +226,9 @@ const translations = {
     noLogs: 'No logs yet...',
     reasoningEffort: 'Reasoning Effort',
     reasoningEffortTip: 'Set default reasoning effort levels for different Claude model families.',
+    aboutTitle: 'About',
+    versionLabel: 'Version',
+    appName: 'Codex Proxy',
   }
 }
 
@@ -546,6 +571,27 @@ body {
   text-align: center;
   color: var(--text-secondary);
   margin-top: 40px;
+}
+
+.about-body {
+  text-align: center;
+  padding: 8px 0 4px;
+}
+
+.about-name {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.about-version {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.about-footer {
+  display: flex;
+  justify-content: flex-end;
 }
 
 /* Element Plus overrides */

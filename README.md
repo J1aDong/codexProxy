@@ -12,23 +12,22 @@
 - 图片支持
 - 推理强度配置（reasoning_effort）
 - 工具结果反馈循环
+- 桌面端安装包仅提供 macOS/Windows，Linux 请使用命令行启动
 
 ## 快速开始
 
-### 方式一：使用桌面应用（推荐）
+### 使用桌面应用
 
 从 [Releases](https://github.com/J1aDong/codexProxy/releases) 下载对应平台的安装包。
+
+说明：Release 资产文件名可能不带版本号，请以 Release 标题/发布时间为准选择最新版本。
+
+当前仅提供 macOS/Windows 安装包；Linux 暂无安装包，请使用命令行方式启动。
 
 > **macOS 用户注意**：如果打开应用时提示"已损坏"，请在终端执行：
 > ```bash
 > xattr -cr /Applications/Codex\ Proxy.app
 > ```
-
-### 方式二：命令行启动
-
-```bash
-node codex-proxy-anthropic.js
-```
 
 ### 配置 Claude Code
 
