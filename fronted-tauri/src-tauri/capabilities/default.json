@@ -8,6 +8,14 @@
     "core:event:allow-emit",
     "core:event:allow-listen",
     "shell:default",
-    "fs:default"
+    "fs:default",
+    "http:default",
+    {
+      "identifier": "http:allow-fetch",
+      "allow": [
+        "https://api.github.com/*",
+        "https://github.com/*"
+      ]
+    }
   ]
 }

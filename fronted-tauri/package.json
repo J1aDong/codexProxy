@@ -1,7 +1,7 @@
 {
   "name": "codex-proxy-desktop",
   "private": true,
-  "version": "0.0.7",
+  "version": "0.0.8",
   "type": "module",
   "description": "Desktop configuration UI for Codex Proxy (Tauri)",
   "repository": {
@@ -17,10 +17,12 @@
     "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-http": "^2.0.0",
+    "@tauri-apps/plugin-shell": "^2.3.4",
     "element-plus": "^2.9.0",
-    "vue": "^3.5.0",
-    "@element-plus/icons-vue": "^2.3.1"
+    "vue": "^3.5.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

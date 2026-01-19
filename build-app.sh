@@ -80,8 +80,8 @@ if [ "$MAIN_CHOICE" == "2" ]; then
     echo "☁️  准备推送到 GitHub..."
     TAG_NAME="v$NEW_VERSION"
 
-    echo "📦 暂存版本文件..."
-    git add "$PACKAGE_JSON" "$TAURI_CONF" "$CARGO_TOML"
+    echo "📦 暂存全部变更..."
+    git add -A
 
     echo "💾 正在提交变更..."
     git commit -m "chore: bump version to $NEW_VERSION" || echo "⚠️  没有需要提交的内容"

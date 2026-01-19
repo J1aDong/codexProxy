@@ -139,6 +139,12 @@
       <div class="about-body">
         <div class="about-name">{{ t.appName }}</div>
         <div class="about-version">{{ t.versionLabel }} v{{ appVersion }}</div>
+        <div class="about-update">
+          <div class="update-status">{{ updateStatusText }}</div>
+          <el-button size="small" type="primary" plain @click="openReleasePage">
+            {{ t.goToReleases }}
+          </el-button>
+        </div>
       </div>
       <template #footer>
         <div class="about-footer">
@@ -155,6 +161,8 @@ import { Document, InfoFilled } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
+import { open } from '@tauri-apps/plugin-shell'
+import { fetch } from '@tauri-apps/plugin-http'
 
 const isRunning = ref(false)
 const showLogs = ref(false)
@@ -163,6 +171,12 @@ const logs = ref<string[]>([])
 const logsContainer = ref<HTMLElement | null>(null)
 const copied = ref(false)
 const appVersion = __APP_VERSION__
+const updateStatus = ref<'idle' | 'checking' | 'latest' | 'available' | 'failed'>('idle')
+const latestVersion = ref('')
+const updateError = ref('')
+const updateRequestId = ref(0)
+
+const RELEASES_URL = 'https://github.com/J1aDong/codexProxy/releases'
 
 // Event listeners
 const unlisteners: UnlistenFn[] = []
@@ -204,6 +218,13 @@ const translations = {
     aboutTitle: '关于',
     versionLabel: '版本',
     appName: 'Codex Proxy',
+    updateIdle: '点击“前往 Release 页面”检查更新',
+    updateChecking: '正在检查更新...',
+    updateLatest: '当前已是最新版本',
+    updateAvailable: '发现新版本',
+    updateFailed: '检查更新失败',
+    updateRateLimited: '检查更新失败（GitHub 限流）',
+    goToReleases: '前往 Release 页面',
   },
   en: {
     statusRunning: 'Proxy Running',
@@ -229,10 +250,32 @@ const translations = {
     aboutTitle: 'About',
     versionLabel: 'Version',
     appName: 'Codex Proxy',
+    updateIdle: 'Click “Releases” to check updates',
+    updateChecking: 'Checking for updates...',
+    updateLatest: 'You are up to date',
+    updateAvailable: 'New version available',
+    updateFailed: 'Update check failed',
+    updateRateLimited: 'Update check failed (GitHub rate limit)',
+    goToReleases: 'Releases',
   }
 }
 
 const t = computed(() => translations[lang.value])
+
+const updateStatusText = computed(() => {
+  if (updateStatus.value === 'checking') return t.value.updateChecking
+  if (updateStatus.value === 'failed') {
+    if (updateError.value === 'rate_limited') return t.value.updateRateLimited
+    return updateError.value
+      ? `${t.value.updateFailed} (${updateError.value})`
+      : t.value.updateFailed
+  }
+  if (updateStatus.value === 'available') {
+    return `${t.value.updateAvailable} v${latestVersion.value}`
+  }
+  if (updateStatus.value === 'latest') return t.value.updateLatest
+  return t.value.updateIdle
+})
 
 const effortOptions = [
   { value: 'low', label: 'Low' },
@@ -240,6 +283,121 @@ const effortOptions = [
   { value: 'high', label: 'High' },
   { value: 'xhigh', label: 'Extra High' },
 ]
+
+const parseVersionParts = (version: string) => {
+  const cleaned = version.trim().replace(/^v/i, '')
+  const parts = cleaned.split('.')
+  const normalized = [0, 0, 0]
+  for (let i = 0; i < 3; i += 1) {
+    const value = Number(parts[i])
+    normalized[i] = Number.isFinite(value) ? value : 0
+  }
+  return normalized
+}
+
+const compareSemver = (current: string, latest: string) => {
+  const currentParts = parseVersionParts(current)
+  const latestParts = parseVersionParts(latest)
+  for (let i = 0; i < 3; i += 1) {
+    if (latestParts[i] > currentParts[i]) return 1
+    if (latestParts[i] < currentParts[i]) return -1
+  }
+  return 0
+}
+
+const extractTagName = (value: string) => {
+  const match = value.match(/\/tag\/(v?\d+\.\d+\.\d+)/i)
+  return match ? match[1] : ''
+}
+
+const fetchLatestReleaseFromWeb = () => {
+  const url = 'https://github.com/J1aDong/codexProxy/releases/latest'
+  return fetch(url, {
+    method: 'GET',
+    redirect: 'follow'
+  })
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error(`status ${response.status}`)
+      }
+      const tagFromUrl = extractTagName(response.url)
+      if (tagFromUrl) return tagFromUrl
+      return response.text().then((html) => {
+        const tagFromHtml = extractTagName(html)
+        if (!tagFromHtml) {
+          throw new Error('missing tag')
+        }
+        return tagFromHtml
+      })
+    })
+}
+
+const fetchLatestRelease = () => {
+  updateStatus.value = 'checking'
+  updateError.value = ''
+  updateRequestId.value += 1
+  const requestId = updateRequestId.value
+  const apiUrl = 'https://api.github.com/repos/J1aDong/codexProxy/releases/latest'
+  return fetch(apiUrl, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'codex-proxy-tauri'
+    }
+  })
+    .then((response) => {
+      if (!response.ok) {
+        if (response.status === 403) {
+          const remaining = response.headers.get('x-ratelimit-remaining')
+          if (remaining === '0') {
+            throw new Error('rate_limited')
+          }
+        }
+        throw new Error(`status ${response.status}`)
+      }
+      return response.json()
+    })
+    .then((data) => {
+      const tagName = typeof data?.tag_name === 'string' ? data.tag_name : ''
+      if (!tagName) {
+        throw new Error('missing tag')
+      }
+      return tagName
+    })
+    .catch((error) => {
+      if (error instanceof Error && error.message === 'rate_limited') {
+        return fetchLatestReleaseFromWeb()
+      }
+      throw error
+    })
+    .then((tagName) => {
+      if (requestId !== updateRequestId.value) return
+      latestVersion.value = tagName.replace(/^v/i, '')
+      updateStatus.value = compareSemver(appVersion, latestVersion.value) === 1
+        ? 'available'
+        : 'latest'
+    })
+    .catch((error) => {
+      if (requestId !== updateRequestId.value) return
+      updateStatus.value = 'failed'
+      updateError.value = typeof error === 'string'
+        ? error
+        : error instanceof Error
+          ? error.message
+          : JSON.stringify(error)
+    })
+}
+
+const openReleasePage = () => {
+  open(RELEASES_URL).catch(console.error)
+}
+
+watch(showAbout, (visible) => {
+  if (!visible) return
+  if (updateStatus.value === 'checking') return
+  fetchLatestRelease().catch(console.error)
+})
 
 const DEFAULT_CONFIG = {
   port: 8889,
@@ -584,8 +742,16 @@ body {
   margin-bottom: 6px;
 }
 
-.about-version {
-  font-size: 13px;
+.about-update {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.update-status {
+  font-size: 12px;
   color: var(--text-secondary);
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "codex-proxy-desktop"
-version = "0.0.7"
+version = "0.0.8"
 description = "Desktop configuration UI for Codex Proxy"
 authors = ["J1aDong"]
 edition = "2021"
@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-fs = "2"
+tauri-plugin-http = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
