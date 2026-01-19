@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 const CODEX_INSTRUCTIONS: &str = include_str!("instructions.txt");
+const IMAGE_SYSTEM_HINT: &str = "\n<system_hint>IMAGE PROVIDED. You can see the image above directly. Analyze it as requested. DO NOT ask for file paths.</system_hint>\n";
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -874,12 +875,16 @@ impl TransformRequest {
                         blocks.len()
                     ));
 
-                    let mut current_content: Vec<Value> = Vec::new();
+                    let mut current_content = Vec::new();
+                    // 收集图片块和文本块
+                    let mut image_blocks = Vec::new();
+                    let mut other_blocks = Vec::new();
+                    let mut has_image = false;
 
                     for (block_idx, block) in blocks.iter().enumerate() {
                         match block {
                             ContentBlock::Text { text } => {
-                                current_content.push(json!({
+                                other_blocks.push(json!({
                                     "type": text_type,
                                     "text": text
                                 }));
@@ -915,33 +920,19 @@ impl TransformRequest {
                                     }
                                 }
 
-                                if resolved_url.is_empty() {
+                                if !resolved_url.is_empty() && msg.role == "user" {
                                     log(&format!(
-                                        "🖼️ [Message #{} Block #{}] Image source is empty",
+                                        "🖼️ [Message #{} Block #{}] Image processed (len={})",
                                         msg_idx,
-                                        block_idx
+                                        block_idx,
+                                        resolved_url.len()
                                     ));
-                                    continue;
-                                }
-
-                                log(&format!(
-                                    "🖼️ [Message #{} Block #{}] Image: {}",
-                                    msg_idx,
-                                    block_idx,
-                                    truncate_for_log(&resolved_url, 50)
-                                ));
-
-                                if msg.role == "user" {
-                                    current_content.push(json!({
+                                    image_blocks.push(json!({
                                         "type": "input_image",
-                                        "image_url": resolved_url
+                                        "image_url": resolved_url,
+                                        "detail": "auto"
                                     }));
-                                } else {
-                                    log(&format!(
-                                        "🖼️ [Message #{} Block #{}] Image skipped (assistant role)",
-                                        msg_idx,
-                                        block_idx
-                                    ));
+                                    has_image = true;
                                 }
                             }
                             ContentBlock::ImageUrl { image_url } => {
@@ -951,29 +942,19 @@ impl TransformRequest {
                                     ImageUrlValue::ObjUri { uri } => uri.clone(),
                                 };
                                 let url = Self::normalize_image_url(url, None, &log, msg_idx, block_idx);
-                                log(&format!(
-                                    "🖼️ [Message #{} Block #{}] ImageUrl: {}",
-                                    msg_idx,
-                                    block_idx,
-                                    truncate_for_log(&url, 50)
-                                ));
-                                if url.is_empty() {
+                                if !url.is_empty() && msg.role == "user" {
                                     log(&format!(
-                                        "🖼️ [Message #{} Block #{}] ImageUrl is empty",
+                                        "🖼️ [Message #{} Block #{}] ImageUrl processed (len={})",
                                         msg_idx,
-                                        block_idx
+                                        block_idx,
+                                        url.len()
                                     ));
-                                } else if msg.role == "user" {
-                                    current_content.push(json!({
+                                    image_blocks.push(json!({
                                         "type": "input_image",
-                                        "image_url": url
+                                        "image_url": url,
+                                        "detail": "auto"
                                     }));
-                                } else {
-                                    log(&format!(
-                                        "🖼️ [Message #{} Block #{}] ImageUrl skipped (assistant role)",
-                                        msg_idx,
-                                        block_idx
-                                    ));
+                                    has_image = true;
                                 }
                             }
                             ContentBlock::InputImage { image_url, url, .. } => {
@@ -984,97 +965,80 @@ impl TransformRequest {
                                     None => url.clone().unwrap_or_default(),
                                 };
                                 let resolved_url = Self::normalize_image_url(resolved_url, None, &log, msg_idx, block_idx);
-                                log(&format!(
-                                    "🖼️ [Message #{} Block #{}] InputImage: {}",
-                                    msg_idx,
-                                    block_idx,
-                                    truncate_for_log(&resolved_url, 50)
-                                ));
                                 if !resolved_url.is_empty() && msg.role == "user" {
-                                    current_content.push(json!({
+                                    log(&format!(
+                                        "🖼️ [Message #{} Block #{}] InputImage processed (len={})",
+                                        msg_idx,
+                                        block_idx,
+                                        resolved_url.len()
+                                    ));
+                                    image_blocks.push(json!({
                                         "type": "input_image",
-                                        "image_url": resolved_url
+                                        "image_url": resolved_url,
+                                        "detail": "auto"
                                     }));
+                                    has_image = true;
                                 }
                             }
-                            ContentBlock::ToolUse { id, name, input: tool_input } => {
-                                // 先 flush 当前消息
-                                if !current_content.is_empty() {
-                                    input.push(json!({
-                                        "type": "message",
-                                        "role": msg.role,
-                                        "content": current_content
-                                    }));
-                                    current_content = Vec::new();
-                                }
-
-                                // name 为空时使用 "unknown"
-                                let tool_name = if name.is_empty() { "unknown" } else { name.as_str() };
-
-                                // 跳过 skill tool
-                                if tool_name.to_lowercase() == "skill" {
-                                    continue;
-                                }
-
-                                // call_id 缺失时生成唯一 ID
-                                let call_id = id.as_ref().map(|s| s.clone()).unwrap_or_else(|| {
-                                    format!("tool_{}", chrono::Utc::now().timestamp_millis())
-                                });
-                                input.push(json!({
+                            ContentBlock::ToolUse { id, name, input } => {
+                                other_blocks.push(json!({
                                     "type": "function_call",
-                                    "call_id": call_id,
-                                    "name": tool_name,
-                                    "arguments": if tool_input.is_string() {
-                                        tool_input.as_str().unwrap_or("{}").to_string()
-                                    } else {
-                                        serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".to_string())
-                                    }
+                                    "call_id": id,
+                                    "name": name,
+                                    "arguments": serde_json::to_string(input).unwrap_or_default()
                                 }));
                             }
-                            ContentBlock::ToolResult { tool_use_id, id, content } => {
-                                // 先 flush 当前消息
-                                if !current_content.is_empty() {
-                                    input.push(json!({
-                                        "type": "message",
-                                        "role": msg.role,
-                                        "content": current_content
-                                    }));
-                                    current_content = Vec::new();
-                                }
-
-                                // 优先使用 tool_use_id，备选 id，都没有则生成唯一 ID
-                                let call_id = tool_use_id.as_ref().or(id.as_ref()).map(|s| s.clone()).unwrap_or_else(|| {
-                                    format!("tool_{}", chrono::Utc::now().timestamp_millis())
-                                });
-
-                                // 跳过 skill tool result
-                                if skill_tool_ids.contains(&call_id) {
-                                    continue;
-                                }
-
-                                let result_text = Self::extract_tool_result_content(content);
-                                input.push(json!({
+                            ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                                let result_text = if let Some(content_val) = content {
+                                    match content_val {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        serde_json::Value::Array(arr) => {
+                                            // 尝试从数组块中提取文本
+                                            arr.iter().filter_map(|item| {
+                                                if let serde_json::Value::Object(obj) = item {
+                                                    if let Some(serde_json::Value::String(text)) = obj.get("text") {
+                                                        return Some(text.clone());
+                                                    }
+                                                }
+                                                None
+                                            }).collect::<Vec<_>>().join("\n")
+                                        },
+                                        _ => content_val.to_string(),
+                                    }
+                                } else {
+                                    String::new()
+                                };
+                                other_blocks.push(json!({
                                     "type": "function_call_output",
-                                    "call_id": call_id,
+                                    "call_id": tool_use_id,
                                     "output": result_text
                                 }));
                             }
                             ContentBlock::Document { .. } => {
-                                current_content.push(json!({
+                                other_blocks.push(json!({
                                     "type": text_type,
                                     "text": "[document omitted]"
                                 }));
                             }
                             ContentBlock::OtherValue(v) => {
-                                // 保留原始值的 JSON 字符串
                                 let text = serde_json::to_string(v).unwrap_or_else(|_| "[unknown content]".to_string());
-                                current_content.push(json!({
+                                other_blocks.push(json!({
                                     "type": text_type,
                                     "text": text
                                 }));
                             }
                         }
                     }
+
+                    // 组合：图片在前，其他在后
+                    if has_image && msg.role == "user" {
+                        other_blocks.insert(0, json!({
+                            "type": "input_text",
+                            "text": IMAGE_SYSTEM_HINT
+                        }));
+                    }
+                    current_content.extend(image_blocks);
+                    current_content.extend(other_blocks);
 
                     if !current_content.is_empty() {
                         input.push(json!({
@@ -1324,27 +1288,6 @@ impl TransformRequest {
             block_idx
         ));
         String::new()
-    }
-
-    fn extract_tool_result_content(content: &Option<Value>) -> String {
-        match content {
-            None => String::new(),
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| {
-                    if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-                        Some(text.to_string())
-                    } else if v.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                    } else {
-                        Some(serde_json::to_string(v).unwrap_or_default())
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Some(v) => serde_json::to_string(v).unwrap_or_default(),
-        }
     }
 
     fn transform_tools(
