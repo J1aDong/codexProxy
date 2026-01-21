@@ -805,12 +805,13 @@ impl TransformRequest {
         })
     }
 
-    fn transform_messages(
+    pub(crate) fn transform_messages(
         messages: &[Message],
         log_tx: Option<&broadcast::Sender<String>>,
     ) -> (Vec<Value>, Vec<String>) {
         let mut input = Vec::new();
         let mut extracted_skills = Vec::new();
+        let mut extracted_skill_names = std::collections::HashSet::new();
         let mut skill_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // 获取全局日志记录器
@@ -1023,16 +1024,28 @@ impl TransformRequest {
                                     current_msg_content = Vec::new();
                                 }
 
+                                let mut final_tool_input = tool_input.clone();
                                 if name.to_lowercase() == "skill" {
-                                    log(&format!("🔧 [ToolUse] Skipping Skill tool_use: {:?}", id));
-                                    continue;
+                                    if let serde_json::Value::Object(ref mut obj) = final_tool_input {
+                                        if let Some(skill_name) = obj.get("skill").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                                            let mut cmd = skill_name;
+                                            if let Some(args) = obj.get("args").and_then(|v| v.as_str()) {
+                                                if !args.is_empty() {
+                                                    cmd.push(' ');
+                                                    cmd.push_str(args);
+                                                }
+                                            }
+                                            obj.clear();
+                                            obj.insert("command".to_string(), serde_json::Value::String(cmd));
+                                        }
+                                    }
                                 }
 
                                 input.push(json!({
                                     "type": "function_call",
                                     "call_id": id,
                                     "name": name,
-                                    "arguments": serde_json::to_string(tool_input).unwrap_or_default()
+                                    "arguments": serde_json::to_string(&final_tool_input).unwrap_or_default()
                                 }));
                             }
                             ContentBlock::ToolResult { tool_use_id, content: tool_content, .. } => {
@@ -1042,12 +1055,19 @@ impl TransformRequest {
                                     false
                                 };
 
+                                let mut override_result_text = None;
+
                                 if is_skill || Self::is_potential_skill_result(tool_content) {
                                     if let Some((s_name, s_content)) = Self::extract_skill_info(tool_content) {
-                                        let skill_formatted = Self::convert_to_codex_skill_format(&s_name, &s_content);
-                                        extracted_skills.push(skill_formatted);
-                                        log(&format!("🎯 Skill extracted: {}", s_name));
-                                        continue;
+                                        if !extracted_skill_names.contains(&s_name) {
+                                            let skill_formatted = Self::convert_to_codex_skill_format(&s_name, &s_content);
+                                            extracted_skills.push(skill_formatted);
+                                            extracted_skill_names.insert(s_name.clone());
+                                            log(&format!("🎯 Skill extracted: {}", s_name));
+                                        } else {
+                                            log(&format!("🎯 Skill already extracted (deduped): {}", s_name));
+                                        }
+                                        override_result_text = Some(format!("Skill '{}' loaded.", s_name));
                                     }
                                 }
 
@@ -1060,7 +1080,9 @@ impl TransformRequest {
                                     current_msg_content = Vec::new();
                                 }
 
-                                let result_text = if let Some(cv) = tool_content {
+                                let result_text = if let Some(override_text) = override_result_text {
+                                    override_text
+                                } else if let Some(cv) = tool_content {
                                     match cv {
                                         serde_json::Value::String(s) => s.clone(),
                                         serde_json::Value::Array(arr) => {
@@ -1384,18 +1406,6 @@ impl TransformRequest {
 
         tools
             .iter()
-            .filter(|tool| {
-                let name = tool
-                    .get("name")
-                    .or_else(|| tool.get("function").and_then(|f| f.get("name")))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                if name.to_lowercase() == "skill" {
-                    log(&format!("🔧 [Tools] Filtered out: {}", name));
-                    return false;
-                }
-                true
-            })
             .map(|tool| {
 // Claude Code 格式: { name, description, input_schema }
                 if tool.get("name").is_some() && tool.get("type").is_none() {
@@ -1934,5 +1944,105 @@ mod integration_tests {
         assert_eq!(get_reasoning_effort("CLAUDE-3-OPUS", &mapping), ReasoningEffort::Xhigh);
         assert_eq!(get_reasoning_effort("Claude-Sonnet-4", &mapping), ReasoningEffort::Medium);
         assert_eq!(get_reasoning_effort("claude-haiku", &mapping), ReasoningEffort::Low);
+    }
+
+    // Helper to create a fake tool use block
+    fn create_tool_use(id: &str, name: &str, input: Value) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: Some(id.to_string()),
+            name: name.to_string(),
+            input,
+        }
+    }
+
+    // Helper to create a fake tool result block
+    fn create_tool_result(tool_use_id: &str, content: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: Some(tool_use_id.to_string()),
+            id: Some("result_id".to_string()),
+            content: Some(json!(content)),
+        }
+    }
+
+    #[test]
+    fn test_skill_transformation() {
+        // Mock messages
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    create_tool_use("call_1", "skill", json!({
+                        "skill": "test-skill",
+                        "args": "arg1"
+                    }))
+                ]))
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    create_tool_result("call_1", "<command-name>test-skill</command-name>\nBase Path: /tmp\nSome content")
+                ]))
+            }
+        ];
+
+        let (input, skills) = TransformRequest::transform_messages(&messages, None);
+
+        // Verify skills extracted
+        assert_eq!(skills.len(), 1);
+        assert!(skills[0].contains("<name>test-skill</name>"));
+        assert!(skills[0].contains("Some content"));
+
+        // Verify input structure
+        // Find function_call
+        let func_call = input.iter().find(|v| v["type"] == "function_call").expect("Should have function_call");
+        assert_eq!(func_call["name"], "skill");
+        let args_str = func_call["arguments"].as_str().unwrap();
+        let args: Value = serde_json::from_str(args_str).unwrap();
+        assert_eq!(args["command"], "test-skill arg1");
+
+        // Find function_call_output
+        let func_out = input.iter().find(|v| v["type"] == "function_call_output").expect("Should have function_call_output");
+        assert_eq!(func_out["output"], "Skill 'test-skill' loaded.");
+    }
+
+    #[test]
+    fn test_skill_deduplication() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    create_tool_use("call_1", "skill", json!({"command": "test-skill"}))
+                ]))
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    create_tool_result("call_1", "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent 1")
+                ]))
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    create_tool_use("call_2", "skill", json!({"command": "test-skill"}))
+                ]))
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    create_tool_result("call_2", "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent 1")
+                ]))
+            }
+        ];
+
+        let (input, skills) = TransformRequest::transform_messages(&messages, None);
+
+        // Should only extract once
+        assert_eq!(skills.len(), 1);
+        
+        // But should have two outputs
+        let outputs: Vec<_> = input.iter().filter(|v| v["type"] == "function_call_output").collect();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0]["output"], "Skill 'test-skill' loaded.");
+        assert_eq!(outputs[1]["output"], "Skill 'test-skill' loaded.");
     }
 }
