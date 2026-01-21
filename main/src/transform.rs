@@ -702,7 +702,7 @@ impl TransformRequest {
 
         log(&format!("📋 [Transform] Model: {} → {} (reasoning: {})", original_model, codex_model, reasoning_effort.as_str()));
 
-        let chat_messages = Self::transform_messages(&anthropic_body.messages, log_tx);
+        let (chat_messages, extracted_skills) = Self::transform_messages(&anthropic_body.messages, log_tx);
 
         // 构建 input 数组
         let mut final_input: Vec<Value> = vec![Self::build_template_input()];
@@ -735,6 +735,21 @@ impl TransformRequest {
 </environment_context>"#, cwd, std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string()))
                 }]
             }));
+        }
+
+        // 注入提取的 Skills
+        if !extracted_skills.is_empty() {
+            log(&format!("🎯 [Transform] Injecting {} skill(s)", extracted_skills.len()));
+            for skill in extracted_skills {
+                final_input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": skill
+                    }]
+                }));
+            }
         }
 
         // 追加对话历史
@@ -793,8 +808,9 @@ impl TransformRequest {
     fn transform_messages(
         messages: &[Message],
         log_tx: Option<&broadcast::Sender<String>>,
-    ) -> Vec<Value> {
+    ) -> (Vec<Value>, Vec<String>) {
         let mut input = Vec::new();
+        let mut extracted_skills = Vec::new();
         let mut skill_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // 获取全局日志记录器
@@ -875,16 +891,33 @@ impl TransformRequest {
                         blocks.len()
                     ));
 
-                    let mut current_content = Vec::new();
-                    // 收集图片块和文本块
-                    let mut image_blocks = Vec::new();
-                    let mut other_blocks = Vec::new();
-                    let mut has_image = false;
+                    let mut current_msg_content = Vec::new();
+                    let mut image_hint_added = false;
+                    let mut ensure_image_hint = |current_msg_content: &mut Vec<Value>| {
+                        if image_hint_added {
+                            return;
+                        }
+                        let already_has_hint = current_msg_content.iter().any(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("input_text")
+                                && item
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                    .map(|t| t.contains("IMAGE PROVIDED"))
+                                    .unwrap_or(false)
+                        });
+                        if !already_has_hint {
+                            current_msg_content.push(json!({
+                                "type": "input_text",
+                                "text": IMAGE_SYSTEM_HINT
+                            }));
+                        }
+                        image_hint_added = true;
+                    };
 
                     for (block_idx, block) in blocks.iter().enumerate() {
                         match block {
                             ContentBlock::Text { text } => {
-                                other_blocks.push(json!({
+                                current_msg_content.push(json!({
                                     "type": text_type,
                                     "text": text
                                 }));
@@ -921,18 +954,18 @@ impl TransformRequest {
                                 }
 
                                 if !resolved_url.is_empty() && msg.role == "user" {
+                                    ensure_image_hint(&mut current_msg_content);
                                     log(&format!(
                                         "🖼️ [Message #{} Block #{}] Image processed (len={})",
                                         msg_idx,
                                         block_idx,
                                         resolved_url.len()
                                     ));
-                                    image_blocks.push(json!({
+                                    current_msg_content.push(json!({
                                         "type": "input_image",
                                         "image_url": resolved_url,
                                         "detail": "auto"
                                     }));
-                                    has_image = true;
                                 }
                             }
                             ContentBlock::ImageUrl { image_url } => {
@@ -943,18 +976,18 @@ impl TransformRequest {
                                 };
                                 let url = Self::normalize_image_url(url, None, &log, msg_idx, block_idx);
                                 if !url.is_empty() && msg.role == "user" {
+                                    ensure_image_hint(&mut current_msg_content);
                                     log(&format!(
                                         "🖼️ [Message #{} Block #{}] ImageUrl processed (len={})",
                                         msg_idx,
                                         block_idx,
                                         url.len()
                                     ));
-                                    image_blocks.push(json!({
+                                    current_msg_content.push(json!({
                                         "type": "input_image",
                                         "image_url": url,
                                         "detail": "auto"
                                     }));
-                                    has_image = true;
                                 }
                             }
                             ContentBlock::InputImage { image_url, url, .. } => {
@@ -966,34 +999,71 @@ impl TransformRequest {
                                 };
                                 let resolved_url = Self::normalize_image_url(resolved_url, None, &log, msg_idx, block_idx);
                                 if !resolved_url.is_empty() && msg.role == "user" {
+                                    ensure_image_hint(&mut current_msg_content);
                                     log(&format!(
                                         "🖼️ [Message #{} Block #{}] InputImage processed (len={})",
                                         msg_idx,
                                         block_idx,
                                         resolved_url.len()
                                     ));
-                                    image_blocks.push(json!({
+                                    current_msg_content.push(json!({
                                         "type": "input_image",
                                         "image_url": resolved_url,
                                         "detail": "auto"
                                     }));
-                                    has_image = true;
                                 }
                             }
-                            ContentBlock::ToolUse { id, name, input } => {
-                                other_blocks.push(json!({
+                            ContentBlock::ToolUse { id, name, input: tool_input } => {
+                                if !current_msg_content.is_empty() {
+                                    input.push(json!({
+                                        "type": "message",
+                                        "role": msg.role,
+                                        "content": current_msg_content
+                                    }));
+                                    current_msg_content = Vec::new();
+                                }
+
+                                if name.to_lowercase() == "skill" {
+                                    log(&format!("🔧 [ToolUse] Skipping Skill tool_use: {:?}", id));
+                                    continue;
+                                }
+
+                                input.push(json!({
                                     "type": "function_call",
                                     "call_id": id,
                                     "name": name,
-                                    "arguments": serde_json::to_string(input).unwrap_or_default()
+                                    "arguments": serde_json::to_string(tool_input).unwrap_or_default()
                                 }));
                             }
-                            ContentBlock::ToolResult { tool_use_id, content, .. } => {
-                                let result_text = if let Some(content_val) = content {
-                                    match content_val {
+                            ContentBlock::ToolResult { tool_use_id, content: tool_content, .. } => {
+                                let is_skill = if let Some(tid) = tool_use_id {
+                                    skill_tool_ids.contains(tid)
+                                } else {
+                                    false
+                                };
+
+                                if is_skill || Self::is_potential_skill_result(tool_content) {
+                                    if let Some((s_name, s_content)) = Self::extract_skill_info(tool_content) {
+                                        let skill_formatted = Self::convert_to_codex_skill_format(&s_name, &s_content);
+                                        extracted_skills.push(skill_formatted);
+                                        log(&format!("🎯 Skill extracted: {}", s_name));
+                                        continue;
+                                    }
+                                }
+
+                                if !current_msg_content.is_empty() {
+                                    input.push(json!({
+                                        "type": "message",
+                                        "role": msg.role,
+                                        "content": current_msg_content
+                                    }));
+                                    current_msg_content = Vec::new();
+                                }
+
+                                let result_text = if let Some(cv) = tool_content {
+                                    match cv {
                                         serde_json::Value::String(s) => s.clone(),
                                         serde_json::Value::Array(arr) => {
-                                            // 尝试从数组块中提取文本
                                             arr.iter().filter_map(|item| {
                                                 if let serde_json::Value::Object(obj) = item {
                                                     if let Some(serde_json::Value::String(text)) = obj.get("text") {
@@ -1003,26 +1073,27 @@ impl TransformRequest {
                                                 None
                                             }).collect::<Vec<_>>().join("\n")
                                         },
-                                        _ => content_val.to_string(),
+                                        _ => cv.to_string(),
                                     }
                                 } else {
                                     String::new()
                                 };
-                                other_blocks.push(json!({
+
+                                input.push(json!({
                                     "type": "function_call_output",
                                     "call_id": tool_use_id,
                                     "output": result_text
                                 }));
                             }
                             ContentBlock::Document { .. } => {
-                                other_blocks.push(json!({
+                                current_msg_content.push(json!({
                                     "type": text_type,
                                     "text": "[document omitted]"
                                 }));
                             }
                             ContentBlock::OtherValue(v) => {
                                 let text = serde_json::to_string(v).unwrap_or_else(|_| "[unknown content]".to_string());
-                                other_blocks.push(json!({
+                                current_msg_content.push(json!({
                                     "type": text_type,
                                     "text": text
                                 }));
@@ -1030,28 +1101,18 @@ impl TransformRequest {
                         }
                     }
 
-                    // 组合：图片在前，其他在后
-                    if has_image && msg.role == "user" {
-                        other_blocks.insert(0, json!({
-                            "type": "input_text",
-                            "text": IMAGE_SYSTEM_HINT
-                        }));
-                    }
-                    current_content.extend(image_blocks);
-                    current_content.extend(other_blocks);
-
-                    if !current_content.is_empty() {
+                    if !current_msg_content.is_empty() {
                         input.push(json!({
                             "type": "message",
                             "role": msg.role,
-                            "content": current_content
+                            "content": current_msg_content
                         }));
                     }
                 }
             }
         }
 
-        input
+        (input, extracted_skills)
     }
 
     fn normalize_image_url<F>(
@@ -1464,6 +1525,83 @@ impl TransformRequest {
                 "required": ["command"]
             }
         })]
+    }
+
+    fn is_potential_skill_result(content: &Option<Value>) -> bool {
+        let Some(content_val) = content else { return false; };
+        let text = match content_val {
+            Value::String(s) => s.as_str(),
+            Value::Array(arr) => {
+                for item in arr {
+                    if let Value::Object(obj) = item {
+                        if let Some(Value::String(t)) = obj.get("text") {
+                            if t.contains("<command-name>") || t.contains("Base Path:") {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                ""
+            }
+            _ => "",
+        };
+        text.contains("<command-name>") || text.contains("Base Path:")
+    }
+
+    fn extract_skill_info(content: &Option<Value>) -> Option<(String, String)> {
+        let content_val = content.as_ref()?;
+        let full_text = match content_val {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|item| {
+                    if let Value::Object(obj) = item {
+                        if let Some(Value::String(text)) = obj.get("text") {
+                            return Some(text.clone());
+                        }
+                    }
+                    if let Value::String(s) = item {
+                        return Some(s.clone());
+                    }
+                    None
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => content_val.to_string(),
+        };
+
+        if !full_text.contains("<command-name>") && !full_text.contains("Base Path:") {
+            return None;
+        }
+
+        let skill_name = if let Some(start) = full_text.find("<command-name>") {
+            let sub = &full_text[start + 14..];
+            let end = sub.find("</command-name>")?;
+            sub[..end].trim().trim_start_matches('/').to_string()
+        } else {
+            return None;
+        };
+
+        let skill_content = if let Some(path_idx) = full_text.find("Base Path:") {
+            let next_line = full_text[path_idx..].find('\n')?;
+            full_text[path_idx + next_line..].trim().to_string()
+        } else {
+            full_text
+                .replace(&format!("<command-name>{}</command-name>", skill_name), "")
+                .replace(&format!("<command-name>/{}</command-name>", skill_name), "")
+                .trim()
+                .to_string()
+        };
+
+        if skill_name.is_empty() || skill_content.is_empty() {
+            return None;
+        }
+
+        Some((skill_name, skill_content))
+    }
+
+    fn convert_to_codex_skill_format(name: &str, content: &str) -> String {
+        format!("<skill>\n<name>{}</name>\n<path>unknown</path>\n{}\n</skill>", name, content)
     }
 }
 
