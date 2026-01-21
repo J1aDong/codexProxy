@@ -109,6 +109,7 @@ fn test_transform_with_logging() {
         &anthropic_body,
         Some(&log_tx),
         &reasoning_mapping,
+        "",
     );
 
     println!("Session ID: {}", session_id);
@@ -191,6 +192,7 @@ fn test_image_in_message() {
         &anthropic_body,
         Some(&log_tx),
         &reasoning_mapping,
+        "",
     );
 
     // 收集日志
@@ -256,7 +258,7 @@ fn test_transform_with_custom_reasoning_effort() {
         serde_json::from_value(opus_request).expect("应该能解析请求");
     
     let default_mapping = ReasoningEffortMapping::default();
-    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping);
+    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping, "");
     
     let body_str = serde_json::to_string(&codex_body).unwrap();
     assert!(body_str.contains("\"reasoning\""), "Should contain reasoning field");
@@ -271,7 +273,7 @@ fn test_transform_with_custom_reasoning_effort() {
     let anthropic_body: codex_proxy_core::AnthropicRequest =
         serde_json::from_value(sonnet_request).expect("应该能解析请求");
     
-    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping);
+    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping, "");
     
     let body_str = serde_json::to_string(&codex_body).unwrap();
     assert!(body_str.contains("\"effort\":\"medium\""), "Sonnet should have medium effort");
@@ -285,7 +287,7 @@ fn test_transform_with_custom_reasoning_effort() {
     let anthropic_body: codex_proxy_core::AnthropicRequest =
         serde_json::from_value(haiku_request).expect("应该能解析请求");
     
-    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping);
+    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping, "");
     
     let body_str = serde_json::to_string(&codex_body).unwrap();
     assert!(body_str.contains("\"effort\":\"low\""), "Haiku should have low effort");

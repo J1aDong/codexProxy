@@ -4,23 +4,28 @@ The user wants to control how the AI agent handles Skill dependencies (e.g., mis
 ## Goals
 - Allow users to configure a global "Skill Injection Prompt".
 - Provide a default prompt that encourages auto-installation of dependencies.
-- Persist this setting across sessions.
+- Persist this setting via existing `proxy-config.json` mechanism.
 
 ## Decisions
+- **Architecture**: Leverage existing `start_proxy` command which already accepts a `ProxyConfig` object and handles persistence (`save_config`).
+  - *Implication*: Changing the setting requires restarting the proxy to take effect (since config is passed at start time). This is acceptable for an MVP.
 - **UI Location**: A generic "Settings" button in the header is better than cluttering the main dashboard. This allows for future expansion.
-- **Config Propagation**: The frontend passes config to the backend via `start_proxy`. We will extend this payload. This avoids needing a separate dynamic config update mechanism during runtime (restart required to apply changes is acceptable for now, or dynamic if easy).
-- **Injection Strategy**: The prompt will be added as a separate `system` or `user` message alongside the injected skills, or appended to the skill description. 
-  - *Decision*: Append as a separate context block or instruction in the `AGENTS.md` injection, or a standalone message. Since `AGENTS.md` is constructed in `transform.rs`, we can append it there.
-  - Actually, `transform.rs` injects skills as `user` messages. We can add this instruction as a `user` message *after* the skills are injected, to reinforce the instruction.
-
-## Data Flow
-1. User saves settings in Vue (persisted via `tauri-plugin-store` or simple file IO if already used, currently `load_config`/`save_config` commands seem to exist).
-2. User clicks "Start Proxy".
-3. Frontend calls `start_proxy` with `config` object.
-4. Rust backend initializes `ProxyServer` with this config.
-5. On request, `ProxyServer` passes config to `TransformRequest`.
-6. `TransformRequest` uses config to format output.
+- **Data Flow**:
+  1. Frontend (Vue) maintains the `skillInjectionPrompt` in its reactive state.
+  2. `save_config` (backend) stores it in JSON.
+  3. `start_proxy` receives the full config, initializes `ProxyServer`.
+  4. `ProxyServer` passes the prompt string to `TransformRequest`.
+  5. `TransformRequest` injects the prompt if and only if skills are present in the request.
+- **Injection Strategy**:
+  - The prompt will be injected as a **User** message.
+  - Position: **After** the injected skills. This ensures the instruction ("if dependencies are missing...") overrides or contextualizes the skills provided before it.
+  - Format: A standalone user message block.
+- **Defaults & Localization**:
+  - The default prompt will adapt to the UI language (Chinese/English).
+  - If the user clears the input, no prompt is injected.
+- **Constraints**:
+  - Max length: 500 characters to prevent context bloat.
 
 ## Risks
-- If the prompt is too long, it consumes context window.
-- If the prompt contradicts specific skill instructions, model might be confused. (User responsibility).
+- **Prompt Injection**: Users might input prompts that degrade model performance. We should provide a safe, proven default.
+- **Context Window**: Long prompts reduce available tokens. Length limit mitigates this.

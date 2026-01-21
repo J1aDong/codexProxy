@@ -659,6 +659,7 @@ impl TransformRequest {
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
         reasoning_mapping: &ReasoningEffortMapping,
+        skill_injection_prompt: &str,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
         let cwd = std::env::current_dir()
@@ -747,6 +748,18 @@ impl TransformRequest {
                     "content": [{
                         "type": "input_text",
                         "text": skill
+                    }]
+                }));
+            }
+
+            if !skill_injection_prompt.trim().is_empty() {
+                log(&format!("🎯 [Transform] Injecting custom skill prompt ({} chars)", skill_injection_prompt.len()));
+                final_input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": skill_injection_prompt
                     }]
                 }));
             }
@@ -2044,5 +2057,52 @@ mod integration_tests {
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0]["output"], "Skill 'test-skill' loaded.");
         assert_eq!(outputs[1]["output"], "Skill 'test-skill' loaded.");
+    }
+
+    #[test]
+    fn test_skill_injection_prompt() {
+        // Setup request with skill usage
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    create_tool_use("call_1", "skill", json!({"command": "test-skill"}))
+                ]))
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    create_tool_result("call_1", "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent")
+                ]))
+            }
+        ];
+        
+        let request = AnthropicRequest {
+            model: Some("claude-3-opus".to_string()),
+            messages,
+            system: None,
+            stream: false,
+            tools: None,
+        };
+
+        let mapping = ReasoningEffortMapping::default();
+        let prompt = "Auto-install dependencies please.";
+        
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, prompt);
+        
+        let input_arr = body.get("input").unwrap().as_array().unwrap();
+        
+        // Find the injected prompt
+        // It should be after the skill injection.
+        // Input structure: [Template, Skill, Prompt, ...History]
+        // Since history starts with assistant, and we inject user messages.
+        
+        // Let's look for the prompt text
+        let prompt_msg = input_arr.iter().find(|msg| {
+            msg["role"] == "user" && 
+            msg["content"][0]["text"].as_str().unwrap_or("") == prompt
+        });
+        
+        assert!(prompt_msg.is_some(), "Should inject custom prompt");
     }
 }

@@ -17,6 +17,10 @@
            <el-button circle text @click="toggleLang" class="lang-btn">
              {{ lang === 'zh' ? 'En' : '中' }}
            </el-button>
+           <!-- Settings -->
+           <el-button circle text @click="showSettings = true">
+             <el-icon><Setting /></el-icon>
+           </el-button>
            <!-- Logs Toggle -->
            <el-button circle text @click="showLogs = true">
              <el-icon><Document /></el-icon>
@@ -134,6 +138,33 @@
       </template>
     </el-drawer>
 
+    <!-- Settings Dialog -->
+    <el-dialog v-model="showSettings" :title="t.settingsTitle" width="500px">
+      <el-form label-position="top">
+        <el-form-item :label="t.skillInjection">
+          <el-input
+            v-model="form.skillInjectionPrompt"
+            type="textarea"
+            :rows="4"
+            :placeholder="t.skillInjectionPlaceholder"
+            maxlength="500"
+            show-word-limit
+          />
+          <div class="form-tip">{{ t.skillInjectionTip }}</div>
+          <div style="margin-top: 8px">
+            <el-button size="small" link type="primary" @click="useDefaultPrompt">
+              {{ t.useDefaultPrompt }}
+            </el-button>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <div class="about-footer">
+          <el-button type="primary" @click="showSettings = false">OK</el-button>
+        </div>
+      </template>
+    </el-dialog>
+
     <!-- About Dialog -->
     <el-dialog v-model="showAbout" :title="t.aboutTitle" width="360px">
       <div class="about-body">
@@ -157,7 +188,7 @@
 
 <script lang="ts" setup>
 import { reactive, ref, onMounted, computed, watch, onUnmounted } from 'vue'
-import { Document, InfoFilled } from '@element-plus/icons-vue'
+import { Document, InfoFilled, Setting } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
@@ -167,6 +198,7 @@ import { fetch } from '@tauri-apps/plugin-http'
 const isRunning = ref(false)
 const showLogs = ref(false)
 const showAbout = ref(false)
+const showSettings = ref(false)
 const logs = ref<string[]>([])
 const logsContainer = ref<HTMLElement | null>(null)
 const copied = ref(false)
@@ -225,6 +257,11 @@ const translations = {
     updateFailed: '检查更新失败',
     updateRateLimited: '检查更新失败（GitHub 限流）',
     goToReleases: '前往 Release 页面',
+    settingsTitle: '设置',
+    skillInjection: '技能注入配置',
+    skillInjectionTip: '当使用 Skill 时，将此提示词注入到 User Message 中。留空则不注入。',
+    skillInjectionPlaceholder: '例如：如果依赖缺失，请自动安装...',
+    useDefaultPrompt: '使用默认提示词',
   },
   en: {
     statusRunning: 'Proxy Running',
@@ -257,6 +294,11 @@ const translations = {
     updateFailed: 'Update check failed',
     updateRateLimited: 'Update check failed (GitHub rate limit)',
     goToReleases: 'Releases',
+    settingsTitle: 'Settings',
+    skillInjection: 'Skill Injection Config',
+    skillInjectionTip: 'Inject this prompt into User Message when Skills are used. Leave empty to disable.',
+    skillInjectionPlaceholder: 'E.g. Auto-install dependencies if missing...',
+    useDefaultPrompt: 'Use Default Prompt',
   }
 }
 
@@ -407,13 +449,21 @@ const DEFAULT_CONFIG = {
     opus: 'xhigh',
     sonnet: 'medium',
     haiku: 'low',
-  }
+  },
+  skillInjectionPrompt: '',
 }
+
+const DEFAULT_PROMPT_ZH = "skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择"
+const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose."
 
 const form = reactive({ 
   ...DEFAULT_CONFIG,
   reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort }
 })
+
+const useDefaultPrompt = () => {
+  form.skillInjectionPrompt = lang.value === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
+}
 
 const configExample = computed(() => {
   const tokenPlaceholder = lang.value === 'zh'
@@ -438,6 +488,7 @@ const resetDefaults = () => {
   form.targetUrl = DEFAULT_CONFIG.targetUrl
   form.apiKey = DEFAULT_CONFIG.apiKey
   form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
+  useDefaultPrompt()
 }
 
 const toggleProxy = () => {
@@ -450,6 +501,7 @@ const toggleProxy = () => {
         targetUrl: form.targetUrl,
         apiKey: form.apiKey,
         reasoningEffort: form.reasoningEffort,
+        skillInjectionPrompt: form.skillInjectionPrompt,
         force: false
       }
     }).catch(console.error)
@@ -480,7 +532,7 @@ watch(logs.value, () => {
 
 onMounted(() => {
   // Load saved config
-  invoke<{ port: number; targetUrl: string; apiKey: string; reasoningEffort?: { opus: string; sonnet: string; haiku: string }; lang?: string } | null>('load_config')
+  invoke<{ port: number; targetUrl: string; apiKey: string; reasoningEffort?: { opus: string; sonnet: string; haiku: string }; skillInjectionPrompt?: string; lang?: string } | null>('load_config')
     .then((savedConfig) => {
       if (savedConfig) {
         if (savedConfig.port) form.port = savedConfig.port
@@ -489,9 +541,21 @@ onMounted(() => {
         if (savedConfig.reasoningEffort) {
           form.reasoningEffort = { ...savedConfig.reasoningEffort }
         }
+        if (savedConfig.skillInjectionPrompt !== undefined) {
+          form.skillInjectionPrompt = savedConfig.skillInjectionPrompt
+        } else {
+          // Default for new feature
+          useDefaultPrompt()
+        }
         if (savedConfig.lang && (savedConfig.lang === 'zh' || savedConfig.lang === 'en')) {
           lang.value = savedConfig.lang
+          // If using default prompt (not loaded from config), update it to match loaded lang
+          if (savedConfig.skillInjectionPrompt === undefined) {
+            useDefaultPrompt()
+          }
         }
+      } else {
+        useDefaultPrompt()
       }
     })
     .catch(console.error)
@@ -528,6 +592,7 @@ onMounted(() => {
             targetUrl: form.targetUrl,
             apiKey: form.apiKey,
             reasoningEffort: form.reasoningEffort,
+            skillInjectionPrompt: form.skillInjectionPrompt,
             force: true
           }
         }).catch(console.error)

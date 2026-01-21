@@ -19,6 +19,7 @@ pub struct ProxyServer {
     target_url: String,
     api_key: Option<String>,
     reasoning_mapping: ReasoningEffortMapping,
+    skill_injection_prompt: String,
 }
 
 impl ProxyServer {
@@ -28,11 +29,17 @@ impl ProxyServer {
             target_url,
             api_key,
             reasoning_mapping: ReasoningEffortMapping::default(),
+            skill_injection_prompt: String::new(),
         }
     }
 
     pub fn with_reasoning_mapping(mut self, mapping: ReasoningEffortMapping) -> Self {
         self.reasoning_mapping = mapping;
+        self
+    }
+
+    pub fn with_skill_injection_prompt(mut self, prompt: String) -> Self {
+        self.skill_injection_prompt = prompt;
         self
     }
 
@@ -55,6 +62,7 @@ impl ProxyServer {
         let target_url = Arc::new(self.target_url.clone());
         let api_key = Arc::new(self.api_key.clone());
         let reasoning_mapping = Arc::new(self.reasoning_mapping.clone());
+        let skill_injection_prompt = Arc::new(self.skill_injection_prompt.clone());
 
         let _ = log_tx.send(format!(
             "🚀 Codex Proxy (Rust) listening on http://localhost:{}",
@@ -77,6 +85,7 @@ impl ProxyServer {
                                 let target_url = Arc::clone(&target_url);
                                 let api_key = Arc::clone(&api_key);
                                 let reasoning_mapping = Arc::clone(&reasoning_mapping);
+                                let skill_injection_prompt = Arc::clone(&skill_injection_prompt);
                                 let log_tx = log_tx.clone();
 
                                 tokio::spawn(async move {
@@ -86,6 +95,7 @@ impl ProxyServer {
                                             Arc::clone(&target_url),
                                             Arc::clone(&api_key),
                                             Arc::clone(&reasoning_mapping),
+                                            Arc::clone(&skill_injection_prompt),
                                             log_tx.clone(),
                                         )
                                     });
@@ -120,6 +130,7 @@ async fn handle_request(
     target_url: Arc<String>,
     api_key: Arc<Option<String>>,
     reasoning_mapping: Arc<ReasoningEffortMapping>,
+    skill_injection_prompt: Arc<String>,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path();
@@ -220,6 +231,7 @@ async fn handle_request(
         &anthropic_body,
         Some(&log_tx),
         &reasoning_mapping,
+        &skill_injection_prompt,
     );
     let model = anthropic_body
         .model
