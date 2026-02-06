@@ -8,7 +8,7 @@
 
 ✅ **完整功能支持**
 - 文本对话流式响应
-- 工具调用（shell_command、apply_patch、view_image、MCP 等）
+- 工具调用（以 Claude Code 传入的 tools 为准）
 - 图片支持
 - 推理强度配置（reasoning_effort）
 - 工具结果反馈循环
@@ -84,23 +84,15 @@ Claude Code 配置文件路径：`~/.claude/settings.json`
 
 ## 支持的工具
 
-| 工具名称 | 类型 | 说明 |
-|----------|------|------|
-| `shell_command` | function | 执行 Shell 命令 |
-| `apply_patch` | custom | 文件编辑（FREEFORM） |
-| `view_image` | function | 查看本地图片 |
-| `list_mcp_resources` | function | 列出 MCP 资源 |
-| `list_mcp_resource_templates` | function | 列出 MCP 资源模板 |
-| `read_mcp_resource` | function | 读取 MCP 资源 |
-| `update_plan` | function | 更新任务计划 |
+工具清单以 Claude Code 请求中的 `tools` 为准，代理不再自动注入 Codex 模板工具。若未传入 `tools`，则不会触发工具调用。
 
 ## 故障排除
 
 ### 问题：工具调用不触发
 
-**原因**：工具定义格式不完整
+**原因**：工具定义格式不完整或未传入 tools
 
-**解决**：确保使用 Codex 模板中的完整工具定义，或让代理自动使用模板工具
+**解决**：确保 Claude Code 请求包含完整的 tools 定义
 
 ### 问题：图片无法识别
 

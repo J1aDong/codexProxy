@@ -564,8 +564,12 @@ function transformRequest(anthropicBody) {
   // 获取 instructions (必须与模板完全一致)
   const instructions = TEMPLATE.instructions;
   
-  // 转换工具
+  // 转换工具（仅使用客户端传入的工具，避免返回 Claude Code 不存在的工具）
   const transformedTools = transformTools(tools);
+  const toolsForCodex = transformedTools;
+  if (toolsForCodex.length === 0) {
+    console.log("⚠️ No client tools provided; sending empty tools list to Codex to avoid tool-name mismatch.");
+  }
   
   // 自动转换 Claude 模型名为 Codex 模型名
   let codexModel = model || TEMPLATE.model;
@@ -579,7 +583,7 @@ function transformRequest(anthropicBody) {
       model: codexModel,
       instructions,
       input: finalInput,
-      tools: transformedTools.length > 0 ? transformedTools : TEMPLATE.tools,
+      tools: toolsForCodex,
       tool_choice: "auto",
       parallel_tool_calls: true,
       reasoning: TEMPLATE.reasoning,
