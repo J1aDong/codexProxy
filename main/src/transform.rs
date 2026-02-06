@@ -660,6 +660,7 @@ impl TransformRequest {
         log_tx: Option<&broadcast::Sender<String>>,
         reasoning_mapping: &ReasoningEffortMapping,
         skill_injection_prompt: &str,
+        codex_model: &str,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
         let cwd = std::env::current_dir()
@@ -685,23 +686,12 @@ impl TransformRequest {
 
         let original_model = anthropic_body.model.as_deref().unwrap_or("unknown");
         let reasoning_effort = get_reasoning_effort(original_model, reasoning_mapping);
-        let codex_model = anthropic_body
-            .model
-            .as_ref()
-            .map(|m| {
-                if m.to_lowercase().contains("claude")
-                    || m.to_lowercase().contains("sonnet")
-                    || m.to_lowercase().contains("opus")
-                    || m.to_lowercase().contains("haiku")
-                {
-                    "gpt-5.3-codex".to_string()
-                } else {
-                    m.clone()
-                }
-            })
-            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        // 使用用户配置的 codex_model（从前端传入）
+        let final_codex_model = codex_model.trim().is_empty()
+            .then(|| "gpt-5.3-codex")
+            .unwrap_or(codex_model);
 
-        log(&format!("📋 [Transform] Model: {} → {} (reasoning: {})", original_model, codex_model, reasoning_effort.as_str()));
+        log(&format!("🤖 [Transform] {} → {} | 🧠 reasoning: {} (from {})", original_model, final_codex_model, reasoning_effort.as_str(), original_model));
 
         let (chat_messages, extracted_skills) = Self::transform_messages(&anthropic_body.messages, log_tx);
 
@@ -778,7 +768,7 @@ impl TransformRequest {
         ));
 
         let body = json!({
-            "model": codex_model,
+            "model": final_codex_model,
             "instructions": CODEX_INSTRUCTIONS,
             "input": final_input,
             "tools": transformed_tools,
@@ -2088,7 +2078,7 @@ mod integration_tests {
         let mapping = ReasoningEffortMapping::default();
         let prompt = "Auto-install dependencies please.";
         
-        let (body, _) = TransformRequest::transform(&request, None, &mapping, prompt);
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, prompt, "gpt-5.3-codex");
         
         let input_arr = body.get("input").unwrap().as_array().unwrap();
         

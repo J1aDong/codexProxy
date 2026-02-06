@@ -548,12 +548,13 @@ watch(logs.value, () => {
 
 onMounted(() => {
   // Load saved config
-  invoke<{ port: number; targetUrl: string; apiKey: string; reasoningEffort?: { opus: string; sonnet: string; haiku: string }; skillInjectionPrompt?: string; lang?: string } | null>('load_config')
+  invoke<{ port: number; targetUrl: string; apiKey: string; codexModel?: string; reasoningEffort?: { opus: string; sonnet: string; haiku: string }; skillInjectionPrompt?: string; lang?: string } | null>('load_config')
     .then((savedConfig) => {
       if (savedConfig) {
         if (savedConfig.port) form.port = savedConfig.port
         if (savedConfig.targetUrl) form.targetUrl = savedConfig.targetUrl
         if (savedConfig.apiKey) form.apiKey = savedConfig.apiKey
+        if (savedConfig.codexModel) form.codexModel = savedConfig.codexModel
         if (savedConfig.reasoningEffort) {
           form.reasoningEffort = { ...savedConfig.reasoningEffort }
         }
@@ -607,6 +608,7 @@ onMounted(() => {
             port: form.port,
             targetUrl: form.targetUrl,
             apiKey: form.apiKey,
+            codexModel: form.codexModel,
             reasoningEffort: form.reasoningEffort,
             skillInjectionPrompt: form.skillInjectionPrompt,
             force: true

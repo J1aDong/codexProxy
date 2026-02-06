@@ -243,6 +243,7 @@ async fn handle_request(
         Some(&log_tx),
         &reasoning_mapping,
         &skill_injection_prompt,
+        &codex_model,
     );
     let model = anthropic_body
         .model

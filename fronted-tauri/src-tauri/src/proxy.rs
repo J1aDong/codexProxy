@@ -221,7 +221,9 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
         config.port,
         config.target_url.clone(),
         api_key,
-    ).with_reasoning_mapping(config.reasoning_effort.to_mapping());
+    )
+    .with_reasoning_mapping(config.reasoning_effort.to_mapping())
+    .with_codex_model(config.codex_model.clone());
 
     // 启动日志转发
     let app_clone = app.clone();
