@@ -32,12 +32,12 @@
       <el-card class="config-card" shadow="never">
         <el-form :model="form" label-position="top" class="apple-form">
           <el-row :gutter="20">
-            <el-col :span="8">
+            <el-col :span="12">
               <el-form-item :label="t.port">
                 <el-input v-model.number="form.port" placeholder="8889" />
               </el-form-item>
             </el-col>
-            <el-col :span="16">
+            <el-col :span="12">
               <el-form-item :label="t.targetUrl">
                 <el-input v-model="form.targetUrl" placeholder="https://..." />
               </el-form-item>
@@ -54,6 +54,12 @@
             <div class="form-tip">
               {{ t.apiKeyTip }}
             </div>
+          </el-form-item>
+
+          <el-form-item :label="t.codexModel">
+            <el-select v-model="form.codexModel" style="width: 100%">
+              <el-option v-for="opt in modelOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+            </el-select>
           </el-form-item>
 
           <!-- Reasoning Effort Mapping -->
@@ -231,6 +237,7 @@ const translations = {
     statusStopped: '代理已停止',
     title: 'Codex 代理',
     port: '端口',
+    codexModel: 'Codex 模型',
     targetUrl: '目标地址',
     apiKey: 'Codex API 密钥',
     apiKeyPlaceholder: '选填 - 将覆盖客户端提供的密钥',
@@ -250,7 +257,7 @@ const translations = {
     aboutTitle: '关于',
     versionLabel: '版本',
     appName: 'Codex Proxy',
-    updateIdle: '点击“前往 Release 页面”检查更新',
+    updateIdle: '点击"前往 Release 页面"检查更新',
     updateChecking: '正在检查更新...',
     updateLatest: '当前已是最新版本',
     updateAvailable: '发现新版本',
@@ -268,6 +275,7 @@ const translations = {
     statusStopped: 'Proxy Stopped',
     title: 'Codex Proxy',
     port: 'Port',
+    codexModel: 'Codex Model',
     targetUrl: 'Target URL',
     apiKey: 'Codex API Key',
     apiKeyPlaceholder: 'Optional - Overrides client key',
@@ -287,7 +295,7 @@ const translations = {
     aboutTitle: 'About',
     versionLabel: 'Version',
     appName: 'Codex Proxy',
-    updateIdle: 'Click “Releases” to check updates',
+    updateIdle: 'Click "Releases" to check updates',
     updateChecking: 'Checking for updates...',
     updateLatest: 'You are up to date',
     updateAvailable: 'New version available',
@@ -324,6 +332,11 @@ const effortOptions = [
   { value: 'medium', label: 'Medium' },
   { value: 'high', label: 'High' },
   { value: 'xhigh', label: 'Extra High' },
+]
+
+const modelOptions = [
+  { value: 'gpt-5.3-codex', label: 'GPT-5.3-Codex (推荐)' },
+  { value: 'gpt-5.2-codex', label: 'GPT-5.2-Codex' },
 ]
 
 const parseVersionParts = (version: string) => {
@@ -445,6 +458,7 @@ const DEFAULT_CONFIG = {
   port: 8889,
   targetUrl: 'https://api.aicodemirror.com/api/codex/backend-api/codex/responses',
   apiKey: '',
+  codexModel: 'gpt-5.3-codex',
   reasoningEffort: {
     opus: 'xhigh',
     sonnet: 'medium',
@@ -456,7 +470,7 @@ const DEFAULT_CONFIG = {
 const DEFAULT_PROMPT_ZH = "skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择"
 const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose."
 
-const form = reactive({ 
+const form = reactive({
   ...DEFAULT_CONFIG,
   reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort }
 })
@@ -487,6 +501,7 @@ const resetDefaults = () => {
   form.port = DEFAULT_CONFIG.port
   form.targetUrl = DEFAULT_CONFIG.targetUrl
   form.apiKey = DEFAULT_CONFIG.apiKey
+  form.codexModel = DEFAULT_CONFIG.codexModel
   form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
   useDefaultPrompt()
 }
@@ -500,6 +515,7 @@ const toggleProxy = () => {
         port: form.port,
         targetUrl: form.targetUrl,
         apiKey: form.apiKey,
+        codexModel: form.codexModel,
         reasoningEffort: form.reasoningEffort,
         skillInjectionPrompt: form.skillInjectionPrompt,
         force: false

@@ -2,6 +2,8 @@
 
 本项目专为 **Claude Code** 设计，将 Codex Responses API 格式转换为 Anthropic Messages API 格式，使 Claude Code 能够使用 aicodemirror 的 Codex API。
 
+**当前版本：** Tauri 重写版本，支持 `gpt-5.3-codex` 和 `gpt-5.2-codex` 模型
+
 ![应用截图](imgs/img1.png)
 
 ## 功能特性
@@ -12,13 +14,18 @@
 - 图片支持
 - 推理强度配置（reasoning_effort）
 - 工具结果反馈循环
+- **模型选择**：支持 `gpt-5.3-codex`（默认）和 `gpt-5.2-codex`
 - 桌面端安装包仅提供 macOS/Windows，Linux 请使用命令行启动
 
 ## 快速开始
 
-### 使用桌面应用
+### 使用桌面应用（推荐）
 
 从 [Releases](https://github.com/J1aDong/codexProxy/releases) 下载对应平台的安装包。
+
+**新功能：** 应用内置模型选择功能，支持：
+- `gpt-5.3-codex` - 默认推荐模型
+- `gpt-5.2-codex` - 兼容性支持
 
 说明：Release 资产文件名可能不带版本号，请以 Release 标题/发布时间为准选择最新版本。
 
@@ -28,6 +35,19 @@
 > ```bash
 > xattr -cr /Applications/Codex\ Proxy.app
 > ```
+
+### 开发模式启动
+
+```bash
+# 克隆项目
+git clone https://github.com/J1aDong/codexProxy.git
+cd codexProxy
+
+# 启动 Tauri 开发服务器
+cd fronted-tauri
+npm install
+npm run tauri dev
+```
 
 ### 配置 Claude Code
 
@@ -87,6 +107,15 @@ Claude Code 配置文件路径：`~/.claude/settings.json`
 工具清单以 Claude Code 请求中的 `tools` 为准，代理不再自动注入 Codex 模板工具。若未传入 `tools`，则不会触发工具调用。
 
 ## 故障排除
+
+### 问题：模型选择不生效
+
+**原因**：使用了旧版本或配置未更新
+
+**解决**：
+1. 确保使用最新的 Tauri 版本
+2. 在应用界面中选择 `gpt-5.3-codex` 或 `gpt-5.2-codex`
+3. 重启代理服务
 
 ### 问题：工具调用不触发
 

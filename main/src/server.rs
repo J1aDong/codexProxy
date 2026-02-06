@@ -20,6 +20,7 @@ pub struct ProxyServer {
     api_key: Option<String>,
     reasoning_mapping: ReasoningEffortMapping,
     skill_injection_prompt: String,
+    codex_model: String,
 }
 
 impl ProxyServer {
@@ -30,6 +31,7 @@ impl ProxyServer {
             api_key,
             reasoning_mapping: ReasoningEffortMapping::default(),
             skill_injection_prompt: String::new(),
+            codex_model: "gpt-5.3-codex".to_string(),
         }
     }
 
@@ -40,6 +42,11 @@ impl ProxyServer {
 
     pub fn with_skill_injection_prompt(mut self, prompt: String) -> Self {
         self.skill_injection_prompt = prompt;
+        self
+    }
+
+    pub fn with_codex_model(mut self, model: String) -> Self {
+        self.codex_model = model;
         self
     }
 
@@ -63,6 +70,7 @@ impl ProxyServer {
         let api_key = Arc::new(self.api_key.clone());
         let reasoning_mapping = Arc::new(self.reasoning_mapping.clone());
         let skill_injection_prompt = Arc::new(self.skill_injection_prompt.clone());
+        let codex_model = Arc::new(self.codex_model.clone());
 
         let _ = log_tx.send(format!(
             "🚀 Codex Proxy (Rust) listening on http://localhost:{}",
@@ -86,6 +94,7 @@ impl ProxyServer {
                                 let api_key = Arc::clone(&api_key);
                                 let reasoning_mapping = Arc::clone(&reasoning_mapping);
                                 let skill_injection_prompt = Arc::clone(&skill_injection_prompt);
+                                let codex_model = Arc::clone(&codex_model);
                                 let log_tx = log_tx.clone();
 
                                 tokio::spawn(async move {
@@ -96,6 +105,7 @@ impl ProxyServer {
                                             Arc::clone(&api_key),
                                             Arc::clone(&reasoning_mapping),
                                             Arc::clone(&skill_injection_prompt),
+                                            Arc::clone(&codex_model),
                                             log_tx.clone(),
                                         )
                                     });
@@ -131,6 +141,7 @@ async fn handle_request(
     api_key: Arc<Option<String>>,
     reasoning_mapping: Arc<ReasoningEffortMapping>,
     skill_injection_prompt: Arc<String>,
+    codex_model: Arc<String>,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path();
@@ -236,7 +247,7 @@ async fn handle_request(
     let model = anthropic_body
         .model
         .clone()
-        .unwrap_or_else(|| "gpt-5.2-codex".to_string());
+        .unwrap_or_else(|| codex_model.as_ref().clone());
 
     // 获取全局日志记录器
     let logger = AppLogger::get();

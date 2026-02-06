@@ -39,6 +39,8 @@ pub struct ProxyConfig {
     pub target_url: String,
     #[serde(rename = "apiKey")]
     pub api_key: String,
+    #[serde(rename = "codexModel", default = "default_codex_model")]
+    pub codex_model: String,
     #[serde(default)]
     pub force: bool,
     #[serde(rename = "reasoningEffort", default)]
@@ -51,6 +53,10 @@ pub struct ProxyConfig {
 
 fn default_lang() -> String {
     "zh".to_string()
+}
+
+fn default_codex_model() -> String {
+    "gpt-5.3-codex".to_string()
 }
 
 pub struct ProxyManager {

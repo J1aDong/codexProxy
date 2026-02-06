@@ -694,12 +694,12 @@ impl TransformRequest {
                     || m.to_lowercase().contains("opus")
                     || m.to_lowercase().contains("haiku")
                 {
-                    "gpt-5.2-codex".to_string()
+                    "gpt-5.3-codex".to_string()
                 } else {
                     m.clone()
                 }
             })
-            .unwrap_or_else(|| "gpt-5.2-codex".to_string());
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
 
         log(&format!("📋 [Transform] Model: {} → {} (reasoning: {})", original_model, codex_model, reasoning_effort.as_str()));
 

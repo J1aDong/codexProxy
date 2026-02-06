@@ -24,6 +24,20 @@ const PORT = parseInt(process.env.PORT || "8889", 10);
 const DEFAULT_TARGET = "https://api.aicodemirror.com/api/codex/backend-api/codex/responses";
 const targetUrl = new URL(process.env.CODEX_PROXY_TARGET || DEFAULT_TARGET);
 
+// 支持的 Codex 模型列表
+const SUPPORTED_CODEX_MODELS = {
+  "gpt-5.2-codex": "gpt-5.2-codex",
+  "gpt-5.3-codex": "gpt-5.3-codex"
+};
+
+// 默认模型（gpt-5.3-codex 作为新默认）
+const DEFAULT_CODEX_MODEL = "gpt-5.3-codex";
+
+// 从环境变量或配置获取默认模型
+const getDefaultModel = () => {
+  return process.env.CODEX_DEFAULT_MODEL || DEFAULT_CODEX_MODEL;
+};
+
 // 加载模板文件
 const TEMPLATE_PATH = path.resolve(__dirname, "codex-request.json");
 const TEMPLATE = JSON.parse(fs.readFileSync(TEMPLATE_PATH, "utf8"));
@@ -571,11 +585,21 @@ function transformRequest(anthropicBody) {
     console.log("⚠️ No client tools provided; sending empty tools list to Codex to avoid tool-name mismatch.");
   }
   
-  // 自动转换 Claude 模型名为 Codex 模型名
-  let codexModel = model || TEMPLATE.model;
+  // 智能模型选择和转换
+  let codexModel = model || TEMPLATE.model || getDefaultModel();
+
+  // 如果是 Claude 模型，转换为 Codex 模型
   if (model && /claude|sonnet|opus|haiku/i.test(model)) {
-    console.log(`🔄 Auto-converting model: ${model} → gpt-5.2-codex`);
-    codexModel = "gpt-5.2-codex";
+    const defaultModel = getDefaultModel();
+    console.log(`🔄 Auto-converting model: ${model} → ${defaultModel}`);
+    codexModel = defaultModel;
+  }
+
+  // 验证模型是否支持，如果不支持则使用默认模型
+  if (!SUPPORTED_CODEX_MODELS[codexModel]) {
+    const fallbackModel = getDefaultModel();
+    console.log(`⚠️ Unsupported model: ${codexModel}, falling back to: ${fallbackModel}`);
+    codexModel = fallbackModel;
   }
   
   return {
@@ -604,7 +628,7 @@ class CodexToAnthropicTransform extends Transform {
     this.messageId = "msg_" + Date.now();
     this.created = Math.floor(Date.now() / 1000);
     this.sentMessageStart = false;  // 标记是否已发送 message_start
-    this.model = model || "gpt-5.2-codex";
+    this.model = model || getDefaultModel();
     this.contentIndex = 0;
     this.openTextIndex = null;
     this.openToolIndex = null;
