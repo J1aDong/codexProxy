@@ -32,6 +32,28 @@ impl ReasoningEffortConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EndpointOption {
+    pub id: String,
+    pub alias: String,
+    pub url: String,
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+}
+
+fn default_endpoint_options() -> Vec<EndpointOption> {
+    vec![EndpointOption {
+        id: "aicodemirror-default".to_string(),
+        alias: "aicodemirror".to_string(),
+        url: "https://api.aicodemirror.com/api/codex/backend-api/codex/responses".to_string(),
+        api_key: String::new(),
+    }]
+}
+
+fn default_selected_endpoint_id() -> String {
+    "aicodemirror-default".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ProxyConfig {
     pub port: u16,
@@ -39,6 +61,10 @@ pub struct ProxyConfig {
     pub target_url: String,
     #[serde(rename = "apiKey")]
     pub api_key: String,
+    #[serde(rename = "endpointOptions", default = "default_endpoint_options")]
+    pub endpoint_options: Vec<EndpointOption>,
+    #[serde(rename = "selectedEndpointId", default = "default_selected_endpoint_id")]
+    pub selected_endpoint_id: String,
     #[serde(rename = "codexModel", default = "default_codex_model")]
     pub codex_model: String,
     #[serde(default)]
@@ -203,25 +229,33 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
         format!("[System] Starting proxy on port {}...", config.port),
     )
     .map_err(|e| e.to_string())?;
-    app.emit("proxy-log", format!("[System] Target: {}", config.target_url))
+    let selected_endpoint = config
+        .endpoint_options
+        .iter()
+        .find(|item| item.id == config.selected_endpoint_id);
+
+    let resolved_target_url = selected_endpoint
+        .map(|item| item.url.clone())
+        .unwrap_or_else(|| config.target_url.clone());
+
+    app.emit("proxy-log", format!("[System] Target: {}", resolved_target_url))
         .map_err(|e| e.to_string())?;
 
     // 创建日志通道
     let (log_tx, mut log_rx) = broadcast::channel::<String>(256);
     manager.log_tx = Some(log_tx.clone());
 
-    // 创建代理服务器
-    let api_key = if config.api_key.is_empty() {
+    let resolved_api_key = selected_endpoint
+        .map(|item| item.api_key.clone())
+        .unwrap_or_else(|| config.api_key.clone());
+
+    let api_key = if resolved_api_key.is_empty() {
         None
     } else {
-        Some(config.api_key.clone())
+        Some(resolved_api_key)
     };
 
-    let server = ProxyServer::new(
-        config.port,
-        config.target_url.clone(),
-        api_key,
-    )
+    let server = ProxyServer::new(config.port, resolved_target_url.clone(), api_key)
     .with_reasoning_mapping(config.reasoning_effort.to_mapping())
     .with_codex_model(config.codex_model.clone());
 

@@ -23,6 +23,19 @@ pub struct ProxyServer {
     codex_model: String,
 }
 
+fn detect_model_family(model: &str) -> Option<&'static str> {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("opus") {
+        Some("opus")
+    } else if lower.contains("sonnet") {
+        Some("sonnet")
+    } else if lower.contains("haiku") {
+        Some("haiku")
+    } else {
+        None
+    }
+}
+
 impl ProxyServer {
     pub fn new(port: u16, target_url: String, api_key: Option<String>) -> Self {
         Self {
@@ -73,10 +86,10 @@ impl ProxyServer {
         let codex_model = Arc::new(self.codex_model.clone());
 
         let _ = log_tx.send(format!(
-            "🚀 Codex Proxy (Rust) listening on http://localhost:{}",
+            "[System] Init success: Codex Proxy (Rust) listening on http://localhost:{}",
             self.port
         ));
-        let _ = log_tx.send(format!("🎯 Target: {}", self.target_url));
+        let _ = log_tx.send(format!("[System] Target: {}", self.target_url));
         logger.log(&format!("Listening on http://localhost:{}", self.port));
         logger.log(&format!("Target: {}", self.target_url));
 
@@ -230,8 +243,16 @@ async fn handle_request(
         }
     };
 
+    let model_name = anthropic_body
+        .model
+        .clone()
+        .unwrap_or_else(|| codex_model.as_ref().clone());
+    if let Some(family) = detect_model_family(&model_name) {
+        let _ = log_tx.send(format!("[Stat] model_request:{}", family));
+    }
+
     let _ = log_tx.send(format!(
-        "📥 Anthropic Request: model={:?}, messages={}, tools={}",
+        "[Request] Sending request: model={:?}, messages={}, tools={}",
         anthropic_body.model,
         anthropic_body.messages.len(),
         anthropic_body.tools.as_ref().map(|t| t.len()).unwrap_or(0)
@@ -245,10 +266,7 @@ async fn handle_request(
         &skill_injection_prompt,
         &codex_model,
     );
-    let model = anthropic_body
-        .model
-        .clone()
-        .unwrap_or_else(|| codex_model.as_ref().clone());
+    let model = model_name;
 
     // 获取全局日志记录器
     let logger = AppLogger::get();
@@ -322,7 +340,7 @@ async fn handle_request(
             .unwrap());
     }
 
-    let _ = log_tx.send("[✅] Anthropic Messages → Codex Responses API".to_string());
+    let _ = log_tx.send("[System] Request transformed and forwarding to Codex Responses API".to_string());
 
     let upstream_status = response.status().as_u16();
 

@@ -1,213 +1,119 @@
 <template>
   <div class="app-container">
-    <div class="main-content">
+    <div class="main-content max-w-3xl mx-auto px-5 py-10">
       <!-- Header -->
-      <div class="header-section">
-        <div class="status-badge" :class="{ running: isRunning }">
-          <div class="status-dot"></div>
-          <span class="status-text">{{ isRunning ? t.statusRunning : t.statusStopped }}</span>
-        </div>
-        <h1 class="app-title">{{ t.title }}</h1>
-        <div class="header-actions">
-           <!-- About -->
-           <el-button circle text @click="showAbout = true">
-             <el-icon><InfoFilled /></el-icon>
-           </el-button>
-           <!-- Language Switch -->
-           <el-button circle text @click="toggleLang" class="lang-btn">
-             {{ lang === 'zh' ? 'En' : '中' }}
-           </el-button>
-           <!-- Settings -->
-           <el-button circle text @click="showSettings = true">
-             <el-icon><Setting /></el-icon>
-           </el-button>
-           <!-- Logs Toggle -->
-           <el-button circle text @click="showLogs = true">
-             <el-icon><Document /></el-icon>
-           </el-button>
-        </div>
-      </div>
+      <Header
+        :isRunning="isRunning"
+        :lang="lang"
+        :t="t"
+        @toggleLang="toggleLang"
+        @showAbout="showAbout = true"
+        @showSettings="showSettings = true"
+        @showLogs="showLogs = true"
+      />
 
       <!-- Config Card -->
-      <el-card class="config-card" shadow="never">
-        <el-form :model="form" label-position="top" class="apple-form">
-          <el-row :gutter="20">
-            <el-col :span="12">
-              <el-form-item :label="t.port">
-                <el-input v-model.number="form.port" placeholder="8889" />
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item :label="t.targetUrl">
-                <el-input v-model="form.targetUrl" placeholder="https://..." />
-              </el-form-item>
-            </el-col>
-          </el-row>
-
-          <el-form-item :label="t.apiKey">
-            <el-input
-              v-model="form.apiKey"
-              type="password"
-              :placeholder="t.apiKeyPlaceholder"
-              show-password
-            />
-            <div class="form-tip">
-              {{ t.apiKeyTip }}
-            </div>
-          </el-form-item>
-
-          <el-form-item :label="t.codexModel">
-            <el-select v-model="form.codexModel" style="width: 100%">
-              <el-option v-for="opt in modelOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-            </el-select>
-          </el-form-item>
-
-          <!-- Reasoning Effort Mapping -->
-          <el-divider content-position="left">{{ t.reasoningEffort }}</el-divider>
-          <el-row :gutter="16">
-            <el-col :span="8">
-              <el-form-item label="Opus">
-                <el-select v-model="form.reasoningEffort.opus" style="width: 100%">
-                  <el-option v-for="opt in effortOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-                </el-select>
-              </el-form-item>
-            </el-col>
-            <el-col :span="8">
-              <el-form-item label="Sonnet">
-                <el-select v-model="form.reasoningEffort.sonnet" style="width: 100%">
-                  <el-option v-for="opt in effortOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-                </el-select>
-              </el-form-item>
-            </el-col>
-            <el-col :span="8">
-              <el-form-item label="Haiku">
-                <el-select v-model="form.reasoningEffort.haiku" style="width: 100%">
-                  <el-option v-for="opt in effortOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-                </el-select>
-              </el-form-item>
-            </el-col>
-          </el-row>
-          <div class="form-tip" style="margin-top: -10px; margin-bottom: 20px;">
-            {{ t.reasoningEffortTip }}
-          </div>
-
-          <div class="form-actions">
-            <el-button @click="resetDefaults">{{ t.restoreDefaults }}</el-button>
-            <el-button
-              :type="isRunning ? 'danger' : 'primary'"
-              @click="toggleProxy"
-              class="primary-btn"
-            >
-              {{ isRunning ? t.stopProxy : t.startProxy }}
-            </el-button>
-          </div>
-        </el-form>
-      </el-card>
+      <ConfigCard
+        :form="form"
+        :isRunning="isRunning"
+        :t="t"
+        @update:form="updateForm"
+        @reset="resetDefaults"
+        @toggle="toggleProxy"
+        @addEndpoint="showEndpointDialog = true"
+      />
 
       <!-- Guide Section -->
-      <div class="guide-section">
-        <h3>{{ t.guideTitle }}</h3>
-        <p class="guide-desc">
-          {{ t.guideDesc }}<br>
-          <code class="path">~/.claude/settings.json</code>
-        </p>
-
-        <div class="code-block-wrapper">
-          <pre class="code-block">{{ configExample }}</pre>
-          <div class="copy-action">
-            <el-button size="small" link type="info" @click="copyConfig">
-              {{ copied ? t.copied : t.copy }}
-            </el-button>
-          </div>
-        </div>
-      </div>
+      <GuideSection
+        :port="form.port"
+        :lang="lang"
+        :t="t"
+      />
     </div>
 
-    <!-- Logs Drawer -->
-    <el-drawer
-      v-model="showLogs"
-      :title="t.logsTitle"
-      direction="rtl"
-      size="400px"
-    >
-      <div class="logs-container" ref="logsContainer">
-        <div v-for="(log, index) in logs" :key="index" class="log-item">
-          <span class="log-time">{{ new Date().toLocaleTimeString() }}</span>
-          <span class="log-content">{{ log }}</span>
-        </div>
-        <div v-if="logs.length === 0" class="empty-logs">{{ t.noLogs }}</div>
-      </div>
-      <template #footer>
-        <div style="flex: auto">
-          <el-button @click="clearLogs">{{ t.clearLogs }}</el-button>
-        </div>
-      </template>
-    </el-drawer>
+    <!-- Logs Panel -->
+    <LogsPanel
+      :visible="showLogs"
+      :logs="logs"
+      :modelRequestStats="modelRequestStats"
+      :t="t"
+      @close="showLogs = false"
+      @clear="clearLogs"
+    />
+
+    <!-- Endpoint Dialog -->
+    <EndpointDialog
+      :visible="showEndpointDialog"
+      :t="dialogT"
+      @close="showEndpointDialog = false"
+      @add="addEndpoint"
+    />
 
     <!-- Settings Dialog -->
-    <el-dialog v-model="showSettings" :title="t.settingsTitle" width="500px">
-      <el-form label-position="top">
-        <el-form-item :label="t.skillInjection">
-          <el-input
-            v-model="form.skillInjectionPrompt"
-            type="textarea"
-            :rows="4"
-            :placeholder="t.skillInjectionPlaceholder"
-            maxlength="500"
-            show-word-limit
-          />
-          <div class="form-tip">{{ t.skillInjectionTip }}</div>
-          <div style="margin-top: 8px">
-            <el-button size="small" link type="primary" @click="useDefaultPrompt">
-              {{ t.useDefaultPrompt }}
-            </el-button>
-          </div>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <div class="about-footer">
-          <el-button type="primary" @click="showSettings = false">OK</el-button>
-        </div>
-      </template>
-    </el-dialog>
+    <SettingsDialog
+      :visible="showSettings"
+      :skillInjectionPrompt="form.skillInjectionPrompt"
+      :lang="lang"
+      :t="t"
+      @close="showSettings = false"
+      @update="updateSkillInjectionPrompt"
+    />
 
     <!-- About Dialog -->
-    <el-dialog v-model="showAbout" :title="t.aboutTitle" width="360px">
-      <div class="about-body">
-        <div class="about-name">{{ t.appName }}</div>
-        <div class="about-version">{{ t.versionLabel }} v{{ appVersion }}</div>
-        <div class="about-update">
-          <div class="update-status">{{ updateStatusText }}</div>
-          <el-button size="small" type="primary" plain @click="openReleasePage">
-            {{ t.goToReleases }}
-          </el-button>
-        </div>
-      </div>
-      <template #footer>
-        <div class="about-footer">
-          <el-button type="primary" @click="showAbout = false">OK</el-button>
-        </div>
-      </template>
-    </el-dialog>
+    <AboutDialog
+      :visible="showAbout"
+      :appVersion="appVersion"
+      :updateStatus="updateStatus"
+      :latestVersion="latestVersion"
+      :updateError="updateError"
+      :t="t"
+      @close="showAbout = false"
+      @checkUpdate="fetchLatestRelease"
+      @openReleases="openReleasePage"
+    />
   </div>
 </template>
 
 <script lang="ts" setup>
-import { reactive, ref, onMounted, computed, watch, onUnmounted } from 'vue'
-import { Document, InfoFilled, Setting } from '@element-plus/icons-vue'
-import { ElMessageBox } from 'element-plus'
+import { reactive, ref, onMounted, computed, onUnmounted, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
 
+import Header from './components/features/Header.vue'
+import ConfigCard from './components/features/ConfigCard.vue'
+import GuideSection from './components/features/GuideSection.vue'
+import LogsPanel from './components/features/LogsPanel.vue'
+import EndpointDialog from './components/features/EndpointDialog.vue'
+import SettingsDialog from './components/features/SettingsDialog.vue'
+import AboutDialog from './components/features/AboutDialog.vue'
+
 const isRunning = ref(false)
 const showLogs = ref(false)
 const showAbout = ref(false)
 const showSettings = ref(false)
-const logs = ref<string[]>([])
-const logsContainer = ref<HTMLElement | null>(null)
-const copied = ref(false)
+const showEndpointDialog = ref(false)
+
+type EndpointOption = {
+  id: string
+  alias: string
+  url: string
+  apiKey: string
+}
+
+type LogItem = {
+  time: string
+  content: string
+}
+
+const logs = ref<LogItem[]>([])
+const modelRequestStats = reactive({
+  opus: 0,
+  sonnet: 0,
+  haiku: 0,
+})
+
 const appVersion = __APP_VERSION__
 const updateStatus = ref<'idle' | 'checking' | 'latest' | 'available' | 'failed'>('idle')
 const latestVersion = ref('')
@@ -223,7 +129,6 @@ const unlisteners: UnlistenFn[] = []
 const lang = ref<'zh' | 'en'>('zh')
 const toggleLang = () => {
   lang.value = lang.value === 'zh' ? 'en' : 'zh'
-  // Save lang preference immediately
   saveLangPreference()
 }
 
@@ -239,6 +144,11 @@ const translations = {
     port: '端口',
     codexModel: 'Codex 模型',
     targetUrl: '目标地址',
+    addEndpoint: '添加地址',
+    endpointAlias: '别名',
+    endpointAliasPlaceholder: '例如：自建节点',
+    endpointUrl: '地址',
+    endpointApiKey: '密钥',
     apiKey: 'Codex API 密钥',
     apiKeyPlaceholder: '选填 - 将覆盖客户端提供的密钥',
     apiKeyTip: '如果在此处配置，您可以在 Claude Code 中使用任意随机字符串作为 API 密钥。',
@@ -269,6 +179,8 @@ const translations = {
     skillInjectionTip: '当使用 Skill 时，将此提示词注入到 User Message 中。留空则不注入。',
     skillInjectionPlaceholder: '例如：如果依赖缺失，请自动安装...',
     useDefaultPrompt: '使用默认提示词',
+    cancel: '取消',
+    add: '添加',
   },
   en: {
     statusRunning: 'Proxy Running',
@@ -277,6 +189,11 @@ const translations = {
     port: 'Port',
     codexModel: 'Codex Model',
     targetUrl: 'Target URL',
+    addEndpoint: 'Add Endpoint',
+    endpointAlias: 'Alias',
+    endpointAliasPlaceholder: 'E.g. Custom Node',
+    endpointUrl: 'URL',
+    endpointApiKey: 'API Key',
     apiKey: 'Codex API Key',
     apiKeyPlaceholder: 'Optional - Overrides client key',
     apiKeyTip: 'If configured here, you can use any random string as the API key in Claude Code.',
@@ -307,38 +224,166 @@ const translations = {
     skillInjectionTip: 'Inject this prompt into User Message when Skills are used. Leave empty to disable.',
     skillInjectionPlaceholder: 'E.g. Auto-install dependencies if missing...',
     useDefaultPrompt: 'Use Default Prompt',
+    cancel: 'Cancel',
+    add: 'Add',
   }
 }
 
 const t = computed(() => translations[lang.value])
 
-const updateStatusText = computed(() => {
-  if (updateStatus.value === 'checking') return t.value.updateChecking
-  if (updateStatus.value === 'failed') {
-    if (updateError.value === 'rate_limited') return t.value.updateRateLimited
-    return updateError.value
-      ? `${t.value.updateFailed} (${updateError.value})`
-      : t.value.updateFailed
-  }
-  if (updateStatus.value === 'available') {
-    return `${t.value.updateAvailable} v${latestVersion.value}`
-  }
-  if (updateStatus.value === 'latest') return t.value.updateLatest
-  return t.value.updateIdle
+const dialogT = computed(() => ({
+  addEndpoint: t.value.addEndpoint,
+  endpointAlias: t.value.endpointAlias,
+  endpointAliasPlaceholder: t.value.endpointAliasPlaceholder,
+  endpointUrl: t.value.endpointUrl,
+  endpointApiKey: t.value.endpointApiKey,
+  apiKeyPlaceholder: t.value.apiKeyPlaceholder,
+  cancel: t.value.cancel,
+  add: t.value.add,
+}))
+
+const DEFAULT_ENDPOINT_OPTION: EndpointOption = {
+  id: 'aicodemirror-default',
+  alias: 'aicodemirror',
+  url: 'https://api.aicodemirror.com/api/codex/backend-api/codex/responses',
+  apiKey: '',
+}
+
+const DEFAULT_CONFIG = {
+  port: 8889,
+  targetUrl: DEFAULT_ENDPOINT_OPTION.url,
+  apiKey: '',
+  endpointOptions: [DEFAULT_ENDPOINT_OPTION],
+  selectedEndpointId: DEFAULT_ENDPOINT_OPTION.id,
+  codexModel: 'gpt-5.3-codex',
+  reasoningEffort: {
+    opus: 'xhigh',
+    sonnet: 'medium',
+    haiku: 'low',
+  },
+  skillInjectionPrompt: '',
+}
+
+const DEFAULT_PROMPT_ZH = "skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择"
+const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose."
+
+const form = reactive({
+  ...DEFAULT_CONFIG,
+  endpointOptions: [...DEFAULT_CONFIG.endpointOptions],
+  selectedEndpointId: DEFAULT_CONFIG.selectedEndpointId,
+  reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort }
 })
 
-const effortOptions = [
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'xhigh', label: 'Extra High' },
-]
+const updateSkillInjectionPrompt = (prompt: string) => {
+  form.skillInjectionPrompt = prompt
+}
 
-const modelOptions = [
-  { value: 'gpt-5.3-codex', label: 'GPT-5.3-Codex (推荐)' },
-  { value: 'gpt-5.2-codex', label: 'GPT-5.2-Codex' },
-]
+const useDefaultPrompt = () => {
+  form.skillInjectionPrompt = lang.value === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
+}
 
+const currentEndpoint = computed(() => {
+  const matched = form.endpointOptions.find((item) => item.id === form.selectedEndpointId)
+  return matched ?? form.endpointOptions[0] ?? DEFAULT_ENDPOINT_OPTION
+})
+
+const syncEndpointFromSelection = () => {
+  form.targetUrl = currentEndpoint.value.url
+  form.apiKey = currentEndpoint.value.apiKey
+}
+
+const updateSelectedEndpointApiKey = (nextApiKey: string) => {
+  form.endpointOptions = form.endpointOptions.map((item) => {
+    if (item.id !== form.selectedEndpointId) return item
+    if (item.apiKey === nextApiKey) return item
+    return {
+      ...item,
+      apiKey: nextApiKey,
+    }
+  })
+}
+
+// Watch for API key changes to update endpoint options
+const unwatchApiKey = watch(() => form.apiKey, (newValue: string) => {
+  updateSelectedEndpointApiKey(newValue)
+})
+
+const updateForm = (newForm: any) => {
+  Object.assign(form, newForm)
+}
+
+const addEndpoint = (newEndpoint: { alias: string; url: string; apiKey: string }) => {
+  const nextId = `endpoint-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const nextOption: EndpointOption = {
+    id: nextId,
+    ...newEndpoint,
+  }
+
+  form.endpointOptions = [...form.endpointOptions, nextOption]
+  form.selectedEndpointId = nextId
+  syncEndpointFromSelection()
+}
+
+const shouldShowLog = (message: string) => {
+  if (message.startsWith('[Stat]')) return false
+  if (message.includes('[Error]')) return true
+  if (message.includes('[System] Init success')) return true
+  if (message.includes('[Request] Sending request')) return true
+  return false
+}
+
+const pushLog = (message: string) => {
+  if (!shouldShowLog(message)) return
+  const nextLog: LogItem = {
+    time: new Date().toLocaleTimeString(),
+    content: message,
+  }
+  logs.value = [...logs.value, nextLog].slice(-20)
+}
+
+const tryCountModelStat = (message: string) => {
+  if (!message.startsWith('[Stat] model_request:')) return
+  const family = message.replace('[Stat] model_request:', '').trim()
+  if (family === 'opus') modelRequestStats.opus += 1
+  if (family === 'sonnet') modelRequestStats.sonnet += 1
+  if (family === 'haiku') modelRequestStats.haiku += 1
+}
+
+const resetDefaults = () => {
+  form.port = DEFAULT_CONFIG.port
+  form.endpointOptions = [...DEFAULT_CONFIG.endpointOptions]
+  form.selectedEndpointId = DEFAULT_CONFIG.selectedEndpointId
+  syncEndpointFromSelection()
+  form.codexModel = DEFAULT_CONFIG.codexModel
+  form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
+  useDefaultPrompt()
+}
+
+const toggleProxy = () => {
+  if (isRunning.value) {
+    invoke('stop_proxy').catch(console.error)
+  } else {
+    invoke('start_proxy', {
+      config: {
+        port: form.port,
+        targetUrl: form.targetUrl,
+        apiKey: form.apiKey,
+        endpointOptions: form.endpointOptions,
+        selectedEndpointId: form.selectedEndpointId,
+        codexModel: form.codexModel,
+        reasoningEffort: form.reasoningEffort,
+        skillInjectionPrompt: form.skillInjectionPrompt,
+        force: false
+      }
+    }).catch(console.error)
+  }
+}
+
+const clearLogs = () => {
+  logs.value = []
+}
+
+// Version checking
 const parseVersionParts = (version: string) => {
   const cleaned = version.trim().replace(/^v/i, '')
   const parts = cleaned.split('.')
@@ -448,112 +493,42 @@ const openReleasePage = () => {
   open(RELEASES_URL).catch(console.error)
 }
 
-watch(showAbout, (visible) => {
-  if (!visible) return
-  if (updateStatus.value === 'checking') return
-  fetchLatestRelease().catch(console.error)
-})
-
-const DEFAULT_CONFIG = {
-  port: 8889,
-  targetUrl: 'https://api.aicodemirror.com/api/codex/backend-api/codex/responses',
-  apiKey: '',
-  codexModel: 'gpt-5.3-codex',
-  reasoningEffort: {
-    opus: 'xhigh',
-    sonnet: 'medium',
-    haiku: 'low',
-  },
-  skillInjectionPrompt: '',
-}
-
-const DEFAULT_PROMPT_ZH = "skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择"
-const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose."
-
-const form = reactive({
-  ...DEFAULT_CONFIG,
-  reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort }
-})
-
-const useDefaultPrompt = () => {
-  form.skillInjectionPrompt = lang.value === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
-}
-
-const configExample = computed(() => {
-  const tokenPlaceholder = lang.value === 'zh'
-    ? "替换为真实的key或者假如在proxy页面中配置了则任意字符串"
-    : "Replace with real key (or any string if configured in proxy page)";
-
-  return `{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:${form.port}",
-    "ANTHROPIC_AUTH_TOKEN": "${tokenPlaceholder}"
-  },
-  "forceLoginMethod": "claudeai",
-  "permissions": {
-    "allow": [],
-    "deny": []
-  }
-}`
-})
-
-const resetDefaults = () => {
-  form.port = DEFAULT_CONFIG.port
-  form.targetUrl = DEFAULT_CONFIG.targetUrl
-  form.apiKey = DEFAULT_CONFIG.apiKey
-  form.codexModel = DEFAULT_CONFIG.codexModel
-  form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
-  useDefaultPrompt()
-}
-
-const toggleProxy = () => {
-  if (isRunning.value) {
-    invoke('stop_proxy').catch(console.error)
-  } else {
-    invoke('start_proxy', {
-      config: {
-        port: form.port,
-        targetUrl: form.targetUrl,
-        apiKey: form.apiKey,
-        codexModel: form.codexModel,
-        reasoningEffort: form.reasoningEffort,
-        skillInjectionPrompt: form.skillInjectionPrompt,
-        force: false
-      }
-    }).catch(console.error)
-  }
-}
-
-const clearLogs = () => {
-  logs.value = []
-}
-
-const copyConfig = () => {
-  navigator.clipboard.writeText(configExample.value)
-    .then(() => {
-      copied.value = true
-      setTimeout(() => { copied.value = false }, 2000)
-    })
-    .catch(console.error)
-}
-
-// Auto scroll logs
-watch(logs.value, () => {
-  if (showLogs.value && logsContainer.value) {
-    setTimeout(() => {
-      logsContainer.value!.scrollTop = logsContainer.value!.scrollHeight
-    }, 0)
-  }
-})
-
 onMounted(() => {
   // Load saved config
-  invoke<{ port: number; targetUrl: string; apiKey: string; codexModel?: string; reasoningEffort?: { opus: string; sonnet: string; haiku: string }; skillInjectionPrompt?: string; lang?: string } | null>('load_config')
+  invoke<{
+    port: number
+    targetUrl: string
+    apiKey: string
+    endpointOptions?: EndpointOption[]
+    selectedEndpointId?: string
+    codexModel?: string
+    reasoningEffort?: { opus: string; sonnet: string; haiku: string }
+    skillInjectionPrompt?: string
+    lang?: string
+  } | null>('load_config')
     .then((savedConfig) => {
       if (savedConfig) {
         if (savedConfig.port) form.port = savedConfig.port
-        if (savedConfig.targetUrl) form.targetUrl = savedConfig.targetUrl
-        if (savedConfig.apiKey) form.apiKey = savedConfig.apiKey
+        if (savedConfig.endpointOptions && savedConfig.endpointOptions.length > 0) {
+          form.endpointOptions = [...savedConfig.endpointOptions]
+          if (savedConfig.selectedEndpointId) {
+            form.selectedEndpointId = savedConfig.selectedEndpointId
+          }
+          const hasSelected = form.endpointOptions.some((item) => item.id === form.selectedEndpointId)
+          if (!hasSelected) {
+            form.selectedEndpointId = form.endpointOptions[0].id
+          }
+        } else {
+          const legacyOption: EndpointOption = {
+            id: DEFAULT_ENDPOINT_OPTION.id,
+            alias: 'aicodemirror',
+            url: savedConfig.targetUrl || DEFAULT_ENDPOINT_OPTION.url,
+            apiKey: savedConfig.apiKey || '',
+          }
+          form.endpointOptions = [legacyOption]
+          form.selectedEndpointId = legacyOption.id
+        }
+        syncEndpointFromSelection()
         if (savedConfig.codexModel) form.codexModel = savedConfig.codexModel
         if (savedConfig.reasoningEffort) {
           form.reasoningEffort = { ...savedConfig.reasoningEffort }
@@ -561,17 +536,16 @@ onMounted(() => {
         if (savedConfig.skillInjectionPrompt !== undefined) {
           form.skillInjectionPrompt = savedConfig.skillInjectionPrompt
         } else {
-          // Default for new feature
           useDefaultPrompt()
         }
         if (savedConfig.lang && (savedConfig.lang === 'zh' || savedConfig.lang === 'en')) {
           lang.value = savedConfig.lang
-          // If using default prompt (not loaded from config), update it to match loaded lang
           if (savedConfig.skillInjectionPrompt === undefined) {
             useDefaultPrompt()
           }
         }
       } else {
+        syncEndpointFromSelection()
         useDefaultPrompt()
       }
     })
@@ -584,280 +558,55 @@ onMounted(() => {
 
   // Listen for proxy logs
   listen<string>('proxy-log', (event) => {
-    logs.value.push(event.payload)
-    if (logs.value.length > 2000) logs.value.shift()
+    const message = event.payload
+    tryCountModelStat(message)
+    pushLog(message)
   }).then(unlisten => unlisteners.push(unlisten))
 
   // Listen for port-in-use
   listen<number>('port-in-use', (event) => {
     const port = event.payload
-    ElMessageBox.confirm(
+    const confirmed = confirm(
       lang.value === 'zh'
         ? `端口 ${port} 已被占用。是否终止该端口上的服务并启动代理？`
-        : `Port ${port} is in use. Do you want to terminate the service on this port and start the proxy?`,
-      lang.value === 'zh' ? '端口冲突' : 'Port Conflict',
-      {
-        confirmButtonText: lang.value === 'zh' ? '终止并启动' : 'Kill & Start',
-        cancelButtonText: lang.value === 'zh' ? '取消' : 'Cancel',
-        type: 'warning',
-      }
+        : `Port ${port} is in use. Do you want to terminate the service on this port and start the proxy?`
     )
-      .then(() => {
-        invoke('start_proxy', {
-          config: {
-            port: form.port,
-            targetUrl: form.targetUrl,
-            apiKey: form.apiKey,
-            codexModel: form.codexModel,
-            reasoningEffort: form.reasoningEffort,
-            skillInjectionPrompt: form.skillInjectionPrompt,
-            force: true
-          }
-        }).catch(console.error)
-      })
-      .catch(() => {
-        isRunning.value = false
-      })
+    if (confirmed) {
+      invoke('start_proxy', {
+        config: {
+          port: form.port,
+          targetUrl: form.targetUrl,
+          apiKey: form.apiKey,
+          endpointOptions: form.endpointOptions,
+          selectedEndpointId: form.selectedEndpointId,
+          codexModel: form.codexModel,
+          reasoningEffort: form.reasoningEffort,
+          skillInjectionPrompt: form.skillInjectionPrompt,
+          force: true
+        }
+      }).catch(console.error)
+    } else {
+      isRunning.value = false
+    }
   }).then(unlisten => unlisteners.push(unlisten))
 })
 
 onUnmounted(() => {
   unlisteners.forEach(unlisten => unlisten())
+  unwatchApiKey()
 })
 </script>
 
-<style>
-/* Global resets & vars */
-:root {
-  --bg-color: #f5f5f7;
-  --card-bg: #ffffff;
-  --text-primary: #1d1d1f;
-  --text-secondary: #86868b;
-  --accent-color: #0071e3;
-  --danger-color: #ff3b30;
-  --success-color: #34c759;
-  --border-radius: 12px;
-}
-
-body {
-  margin: 0;
-  background-color: var(--bg-color);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-  color: var(--text-primary);
-}
-
+<style scoped>
 .app-container {
+  min-height: 100vh;
+  background-color: #f5f5f7;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+}
+
+.main-content {
   max-width: 600px;
   margin: 0 auto;
   padding: 40px 20px;
-}
-
-.header-section {
-  display: flex;
-  align-items: center;
-  margin-bottom: 30px;
-  justify-content: space-between;
-}
-
-.app-title {
-  font-size: 24px;
-  font-weight: 600;
-  margin: 0;
-  flex-grow: 1;
-  text-align: center;
-}
-
-.status-badge {
-  display: flex;
-  align-items: center;
-  padding: 6px 12px;
-  background: #e5e5e5;
-  border-radius: 20px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  transition: all 0.3s ease;
-}
-
-.status-badge.running {
-  background: #e1f5e6;
-  color: #008a2e;
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background-color: currentColor;
-  margin-right: 6px;
-}
-
-.lang-btn {
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-
-/* Card Styling */
-.config-card {
-  border: none !important;
-  border-radius: var(--border-radius) !important;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.04) !important;
-  margin-bottom: 30px;
-}
-
-.apple-form .el-form-item__label {
-  font-weight: 500;
-  color: var(--text-primary);
-  padding-bottom: 8px;
-}
-
-.form-tip {
-  font-size: 12px;
-  color: var(--text-secondary);
-  margin-top: 6px;
-  line-height: 1.4;
-}
-
-.form-actions {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 30px;
-  padding-top: 20px;
-  border-top: 1px solid #ebedf0;
-}
-
-.primary-btn {
-  min-width: 120px;
-  font-weight: 500;
-}
-
-/* Guide Section */
-.guide-section {
-  padding: 0 10px;
-}
-
-.guide-section h3 {
-  font-size: 14px;
-  font-weight: 600;
-  text-transform: uppercase;
-  color: var(--text-secondary);
-  letter-spacing: 0.5px;
-  margin-bottom: 15px;
-}
-
-.guide-desc {
-  font-size: 13px;
-  color: var(--text-primary);
-  margin-bottom: 15px;
-  line-height: 1.5;
-}
-
-.path {
-  background: #eaeaec;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: "SF Mono", monospace;
-  font-size: 12px;
-}
-
-.code-block-wrapper {
-  background: #1e1e1e;
-  border-radius: var(--border-radius);
-  padding: 15px;
-  position: relative;
-  overflow: hidden;
-}
-
-.code-block {
-  margin: 0;
-  font-family: "SF Mono", monospace;
-  font-size: 12px;
-  color: #a9b7c6;
-  white-space: pre-wrap;
-  line-height: 1.5;
-}
-
-.copy-action {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-}
-
-/* Logs */
-.logs-container {
-  height: 100%;
-  overflow-y: auto;
-  font-family: "SF Mono", monospace;
-  font-size: 11px;
-  padding: 10px;
-}
-
-.log-item {
-  margin-bottom: 6px;
-  display: flex;
-  gap: 8px;
-}
-
-.log-time {
-  color: var(--text-secondary);
-  flex-shrink: 0;
-}
-
-.log-content {
-  color: var(--text-primary);
-  word-break: break-all;
-}
-
-.empty-logs {
-  text-align: center;
-  color: var(--text-secondary);
-  margin-top: 40px;
-}
-
-.about-body {
-  text-align: center;
-  padding: 8px 0 4px;
-}
-
-.about-name {
-  font-size: 16px;
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-
-.about-update {
-  margin-top: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.update-status {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.about-footer {
-  display: flex;
-  justify-content: flex-end;
-}
-
-/* Element Plus overrides */
-.el-input__wrapper {
-  box-shadow: none !important;
-  background-color: #f5f5f7 !important;
-  border-radius: 8px !important;
-  padding: 8px 12px !important;
-}
-
-.el-input__wrapper.is-focus {
-  background-color: #ffffff !important;
-  box-shadow: 0 0 0 2px var(--accent-color) !important;
-}
-
-.el-button {
-  border-radius: 8px !important;
-  height: 36px !important;
 }
 </style>
