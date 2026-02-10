@@ -12,7 +12,7 @@
         {{ isRunning ? t.statusRunning : t.statusStopped }}
       </div>
     </div>
-    <h1 class="text-2xl font-semibold text-apple-text-primary">
+    <h1 class="text-2xl font-semibold text-apple-text-primary font-pixel">
       {{ t.title }}
     </h1>
     <div class="flex items-center gap-2">
@@ -98,3 +98,12 @@ const handleShowLogs = () => {
   emit('showLogs')
 }
 </script>
+
+<style scoped>
+.font-pixel {
+  font-family: "DotGothic16", sans-serif;
+  line-height: 1.5;
+  font-size: 1.25rem;
+  padding-top: 4px;
+}
+</style>
