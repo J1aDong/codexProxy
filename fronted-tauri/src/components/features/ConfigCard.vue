@@ -108,7 +108,7 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import Button from '../base/Button.vue'
 import Input from '../base/Input.vue'
 import Select from '../base/Select.vue'
@@ -154,6 +154,10 @@ const emit = defineEmits(['update:form', 'reset', 'toggle', 'addEndpoint', 'edit
 
 const localPort = ref(props.form.port)
 const localApiKey = ref(props.form.apiKey)
+
+watch(() => props.form.apiKey, (newVal) => {
+  localApiKey.value = newVal
+})
 
 const modelOptions = [
   { value: 'gpt-5.3-codex', label: 'GPT-5.3-Codex (推荐)' },

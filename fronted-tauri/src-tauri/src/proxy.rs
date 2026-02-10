@@ -89,6 +89,7 @@ pub struct ProxyManager {
     running: bool,
     shutdown_tx: Option<broadcast::Sender<()>>,
     log_tx: Option<broadcast::Sender<String>>,
+    server_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for ProxyManager {
@@ -97,6 +98,7 @@ impl Default for ProxyManager {
             running: false,
             shutdown_tx: None,
             log_tx: None,
+            server_handle: None,
         }
     }
 }
@@ -117,6 +119,9 @@ impl ProxyManager {
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(handle) = self.server_handle.take() {
+            handle.abort();
         }
         self.running = false;
         self.log_tx = None;
@@ -279,8 +284,9 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
     // 启动代理服务器
     let app_clone = app.clone();
     match server.start(log_tx).await {
-        Ok(shutdown_tx) => {
+        Ok((shutdown_tx, server_handle)) => {
             manager.set_shutdown_tx(shutdown_tx);
+            manager.server_handle = Some(server_handle);
             manager.set_running(true);
             app.emit("proxy-status", "running")
                 .map_err(|e| e.to_string())?;

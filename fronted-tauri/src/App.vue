@@ -320,8 +320,8 @@ const updateForm = (newForm: any) => {
 const editingEndpointId = ref('')
 
 const currentEditingEndpoint = computed(() => {
-  if (!editingEndpointId.value) return null
-  return form.endpointOptions.find(opt => opt.id === editingEndpointId.value) || null
+  if (!editingEndpointId.value) return undefined
+  return form.endpointOptions.find(opt => opt.id === editingEndpointId.value)
 })
 
 const openAddEndpointDialog = () => {

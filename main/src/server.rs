@@ -63,12 +63,12 @@ impl ProxyServer {
         self
     }
 
-    /// Start the proxy server and return a shutdown sender
+    /// Start the proxy server and return a shutdown sender + JoinHandle
     /// Send () to the returned sender to stop the server
     pub async fn start(
         &self,
         log_tx: broadcast::Sender<String>,
-    ) -> Result<broadcast::Sender<()>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(broadcast::Sender<()>, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
         // 初始化全局日志记录器
         let logger = AppLogger::init(Some("logs"));
         logger.log("=== Codex Proxy Started ===");
@@ -101,7 +101,9 @@ impl ProxyServer {
         logger.log(&format!("Target: {}", self.target_url));
 
         // Spawn the server loop in a separate task
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let mut conn_tasks = tokio::task::JoinSet::new();
+
             loop {
                 let mut shutdown_rx = shutdown_tx_clone.subscribe();
 
@@ -118,7 +120,7 @@ impl ProxyServer {
                                 let http_client = Arc::clone(&http_client);
                                 let log_tx = log_tx.clone();
 
-                                tokio::spawn(async move {
+                                conn_tasks.spawn(async move {
                                     let service = service_fn(move |req| {
                                         handle_request(
                                             req,
@@ -146,14 +148,15 @@ impl ProxyServer {
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        let _ = log_tx.send("[System] Proxy server shutting down...".to_string());
+                        let _ = log_tx.send("[System] Proxy server shutting down, aborting all connections...".to_string());
+                        conn_tasks.abort_all();
                         break;
                     }
                 }
             }
         });
 
-        Ok(shutdown_tx)
+        Ok((shutdown_tx, handle))
     }
 }
 
