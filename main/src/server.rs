@@ -84,6 +84,13 @@ impl ProxyServer {
         let reasoning_mapping = Arc::new(self.reasoning_mapping.clone());
         let skill_injection_prompt = Arc::new(self.skill_injection_prompt.clone());
         let codex_model = Arc::new(self.codex_model.clone());
+        let http_client = Arc::new(
+            reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .tcp_keepalive(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap(),
+        );
 
         let _ = log_tx.send(format!(
             "[System] Init success: Codex Proxy (Rust) listening on http://localhost:{}",
@@ -108,6 +115,7 @@ impl ProxyServer {
                                 let reasoning_mapping = Arc::clone(&reasoning_mapping);
                                 let skill_injection_prompt = Arc::clone(&skill_injection_prompt);
                                 let codex_model = Arc::clone(&codex_model);
+                                let http_client = Arc::clone(&http_client);
                                 let log_tx = log_tx.clone();
 
                                 tokio::spawn(async move {
@@ -119,6 +127,7 @@ impl ProxyServer {
                                             Arc::clone(&reasoning_mapping),
                                             Arc::clone(&skill_injection_prompt),
                                             Arc::clone(&codex_model),
+                                            Arc::clone(&http_client),
                                             log_tx.clone(),
                                         )
                                     });
@@ -155,6 +164,7 @@ async fn handle_request(
     reasoning_mapping: Arc<ReasoningEffortMapping>,
     skill_injection_prompt: Arc<String>,
     codex_model: Arc<String>,
+    http_client: Arc<reqwest::Client>,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path();
@@ -289,13 +299,8 @@ async fn handle_request(
         l.log_curl_request("POST", &target_url, &headers, &codex_body);
     }
 
-    // 发送到目标服务器
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-
-    let response = match client
+    // 发送到目标服务器（复用共享的 Client 连接池）
+    let response = match http_client
         .post(&*target_url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", final_api_key))
@@ -353,36 +358,49 @@ async fn handle_request(
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
 
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+        loop {
+            // 添加 60 秒读取超时
+            match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
+                Ok(Some(chunk_result)) => {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                    // 按行处理
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].to_string();
-                        buffer = buffer[pos + 1..].to_string();
+                            // 按行处理
+                            while let Some(pos) = buffer.find('\n') {
+                                let line = buffer[..pos].to_string();
+                                buffer = buffer[pos + 1..].to_string();
 
-                        if line.trim().is_empty() {
-                            continue;
-                        }
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
 
-                        // 记录上游原始响应
-                        if let Some(ref l) = AppLogger::get() {
-                            l.log_upstream_response(upstream_status, &line);
-                        }
+                                // 记录上游原始响应
+                                if let Some(ref l) = AppLogger::get() {
+                                    l.log_upstream_response(upstream_status, &line);
+                                }
 
-                        for output in transformer.transform_line(&line) {
-                            // 记录转换后的响应
-                            if let Some(ref l) = AppLogger::get() {
-                                l.log_anthropic_response(&output);
+                                for output in transformer.transform_line(&line) {
+                                    // 记录转换后的响应
+                                    if let Some(ref l) = AppLogger::get() {
+                                        l.log_anthropic_response(&output);
+                                    }
+                                    if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
+                                        let _ = log_tx_clone.send("[Warning] Client disconnected, stopping stream".to_string());
+                                        return; // 客户端断开，停止处理
+                                    }
+                                }
                             }
-                            let _ = tx.send(Ok(Frame::data(Bytes::from(output)))).await;
+                        }
+                        Err(e) => {
+                            let _ = log_tx_clone.send(format!("[Error] Stream error: {}", e));
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    let _ = log_tx_clone.send(format!("[Error] Stream error: {}", e));
+                Ok(None) => break, // 流结束
+                Err(_) => {
+                    let _ = log_tx_clone.send("[Error] Upstream read timeout (300s)".to_string());
                     break;
                 }
             }
@@ -400,7 +418,10 @@ async fn handle_request(
                 if let Some(ref l) = AppLogger::get() {
                     l.log_anthropic_response(&output);
                 }
-                let _ = tx.send(Ok(Frame::data(Bytes::from(output)))).await;
+                if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
+                    let _ = log_tx_clone.send("[Warning] Client disconnected during flush".to_string());
+                    return;
+                }
             }
         }
 
