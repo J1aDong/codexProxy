@@ -241,8 +241,8 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
     app.emit("proxy-log", format!("[System] Target: {}", resolved_target_url))
         .map_err(|e| e.to_string())?;
 
-    // 创建日志通道
-    let (log_tx, mut log_rx) = broadcast::channel::<String>(256);
+    // 创建日志通道（容量 2048 减少高频场景下的 lag）
+    let (log_tx, mut log_rx) = broadcast::channel::<String>(2048);
     manager.log_tx = Some(log_tx.clone());
 
     let resolved_api_key = selected_endpoint
@@ -259,11 +259,20 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
     .with_reasoning_mapping(config.reasoning_effort.to_mapping())
     .with_codex_model(config.codex_model.clone());
 
-    // 启动日志转发
+    // 启动日志转发（Lagged 时跳过丢失的消息继续接收，不退出）
     let app_clone = app.clone();
     tokio::spawn(async move {
-        while let Ok(msg) = log_rx.recv().await {
-            let _ = app_clone.emit("proxy-log", msg);
+        loop {
+            match log_rx.recv().await {
+                Ok(msg) => {
+                    let _ = app_clone.emit("proxy-log", msg);
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    let _ = app_clone.emit("proxy-log",
+                        format!("[Warning] Log receiver lagged, skipped {} messages", n));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 
