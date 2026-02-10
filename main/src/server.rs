@@ -1,4 +1,6 @@
-use crate::transform::{AnthropicRequest, AppLogger, ReasoningEffortMapping, TransformRequest, TransformResponse};
+use crate::logger::AppLogger;
+use crate::models::{AnthropicRequest, ReasoningEffortMapping};
+use crate::transform::{TransformBackend, TransformContext, CodexBackend};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -12,7 +14,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 
 pub struct ProxyServer {
     port: u16,
@@ -21,6 +23,7 @@ pub struct ProxyServer {
     reasoning_mapping: ReasoningEffortMapping,
     skill_injection_prompt: String,
     codex_model: String,
+    max_concurrency: u32,
 }
 
 fn detect_model_family(model: &str) -> Option<&'static str> {
@@ -45,6 +48,7 @@ impl ProxyServer {
             reasoning_mapping: ReasoningEffortMapping::default(),
             skill_injection_prompt: String::new(),
             codex_model: "gpt-5.3-codex".to_string(),
+            max_concurrency: 0,
         }
     }
 
@@ -60,6 +64,11 @@ impl ProxyServer {
 
     pub fn with_codex_model(mut self, model: String) -> Self {
         self.codex_model = model;
+        self
+    }
+
+    pub fn with_max_concurrency(mut self, max: u32) -> Self {
+        self.max_concurrency = max;
         self
     }
 
@@ -81,9 +90,25 @@ impl ProxyServer {
 
         let target_url = Arc::new(self.target_url.clone());
         let api_key = Arc::new(self.api_key.clone());
-        let reasoning_mapping = Arc::new(self.reasoning_mapping.clone());
-        let skill_injection_prompt = Arc::new(self.skill_injection_prompt.clone());
-        let codex_model = Arc::new(self.codex_model.clone());
+
+        // 构建共享的 TransformContext
+        let ctx = Arc::new(TransformContext {
+            reasoning_mapping: self.reasoning_mapping.clone(),
+            skill_injection_prompt: self.skill_injection_prompt.clone(),
+            codex_model: self.codex_model.clone(),
+        });
+
+        // 创建后端（目前固定为 CodexBackend，未来可配置）
+        let backend: Arc<dyn TransformBackend> = Arc::new(CodexBackend);
+
+        // 并发控制：0 = 不限制
+        let semaphore: Option<Arc<Semaphore>> = if self.max_concurrency > 0 {
+            let _ = log_tx.send(format!("[System] Max concurrency: {}", self.max_concurrency));
+            Some(Arc::new(Semaphore::new(self.max_concurrency as usize)))
+        } else {
+            None
+        };
+
         let http_client = Arc::new(
             reqwest::Client::builder()
                 .danger_accept_invalid_certs(true)
@@ -114,10 +139,10 @@ impl ProxyServer {
                                 let io = TokioIo::new(stream);
                                 let target_url = Arc::clone(&target_url);
                                 let api_key = Arc::clone(&api_key);
-                                let reasoning_mapping = Arc::clone(&reasoning_mapping);
-                                let skill_injection_prompt = Arc::clone(&skill_injection_prompt);
-                                let codex_model = Arc::clone(&codex_model);
+                                let ctx = Arc::clone(&ctx);
+                                let backend = Arc::clone(&backend);
                                 let http_client = Arc::clone(&http_client);
+                                let semaphore = semaphore.clone();
                                 let log_tx = log_tx.clone();
 
                                 conn_tasks.spawn(async move {
@@ -126,10 +151,10 @@ impl ProxyServer {
                                             req,
                                             Arc::clone(&target_url),
                                             Arc::clone(&api_key),
-                                            Arc::clone(&reasoning_mapping),
-                                            Arc::clone(&skill_injection_prompt),
-                                            Arc::clone(&codex_model),
+                                            Arc::clone(&ctx),
+                                            Arc::clone(&backend),
                                             Arc::clone(&http_client),
+                                            semaphore.clone(),
                                             log_tx.clone(),
                                         )
                                     });
@@ -164,10 +189,10 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     target_url: Arc<String>,
     api_key: Arc<Option<String>>,
-    reasoning_mapping: Arc<ReasoningEffortMapping>,
-    skill_injection_prompt: Arc<String>,
-    codex_model: Arc<String>,
+    ctx: Arc<TransformContext>,
+    backend: Arc<dyn TransformBackend>,
     http_client: Arc<reqwest::Client>,
+    semaphore: Option<Arc<Semaphore>>,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path();
@@ -182,6 +207,18 @@ async fn handle_request(
             ))
             .unwrap());
     }
+
+    // 并发控制：获取许可证，FIFO 排队
+    let _permit = if let Some(ref sem) = semaphore {
+        let _ = log_tx.send(format!(
+            "[System] Waiting for concurrency permit (available: {}/{})",
+            sem.available_permits(),
+            sem.available_permits() + 1
+        ));
+        Some(sem.acquire().await.expect("semaphore closed"))
+    } else {
+        None
+    };
 
     // 获取认证信息
     let auth_header = req
@@ -259,7 +296,7 @@ async fn handle_request(
     let model_name = anthropic_body
         .model
         .clone()
-        .unwrap_or_else(|| codex_model.as_ref().clone());
+        .unwrap_or_else(|| ctx.codex_model.clone());
     if let Some(family) = detect_model_family(&model_name) {
         let _ = log_tx.send(format!("[Stat] model_request:{}", family));
     }
@@ -271,13 +308,11 @@ async fn handle_request(
         anthropic_body.tools.as_ref().map(|t| t.len()).unwrap_or(0)
     ));
 
-    // 转换请求
-    let (codex_body, session_id) = TransformRequest::transform(
+    // 通过 trait 转换请求
+    let (codex_body, session_id) = backend.transform_request(
         &anthropic_body,
         Some(&log_tx),
-        &reasoning_mapping,
-        &skill_injection_prompt,
-        &codex_model,
+        &ctx,
     );
     let model = model_name;
 
@@ -302,22 +337,18 @@ async fn handle_request(
         l.log_curl_request("POST", &target_url, &headers, &codex_body);
     }
 
-    // 发送到目标服务器（复用共享的 Client 连接池）
-    let response = match http_client
-        .post(&*target_url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", final_api_key))
-        .header("x-api-key", &final_api_key)
-        .header("User-Agent", "Anthropic-Node/0.3.4")
-        .header("x-anthropic-version", &anthropic_version)
-        .header("originator", "codex_cli_rs")
-        .header("Accept", "text/event-stream")
-        .header("conversation_id", &session_id)
-        .header("session_id", &session_id)
-        .body(codex_body.to_string())
-        .send()
-        .await
-    {
+    // 通过 trait 构建上游请求
+    let upstream_req = backend.build_upstream_request(
+        &http_client,
+        &target_url,
+        &final_api_key,
+        &codex_body,
+        &session_id,
+        &anthropic_version,
+    );
+
+    // 发送到目标服务器
+    let response = match upstream_req.send().await {
         Ok(resp) => resp,
         Err(e) => {
             let _ = log_tx.send(format!("[Error] Request failed: {}", e));
@@ -355,14 +386,16 @@ async fn handle_request(
     // 使用 channel 进行流式响应
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(256);
 
+    // 通过 trait 创建响应转换器
+    let mut transformer = backend.create_response_transformer(&model);
+
     let log_tx_clone = log_tx.clone();
     tokio::spawn(async move {
-        let mut transformer = TransformResponse::new(&model);
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
 
         loop {
-            // 添加 60 秒读取超时
+            // 添加 300 秒读取超时
             match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
                 Ok(Some(chunk_result)) => {
                     match chunk_result {

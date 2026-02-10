@@ -9,6 +9,7 @@
         @toggleLang="toggleLang"
         @showAbout="showAbout = true"
         @showSettings="showSettings = true"
+        @showConcurrency="showConcurrency = true"
         @showLogs="showLogs = true"
       />
 
@@ -73,6 +74,39 @@
       @checkUpdate="fetchLatestRelease"
       @openReleases="openReleasePage"
     />
+
+    <!-- Concurrency Dialog -->
+    <div v-if="showConcurrency" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div class="bg-white rounded-xl w-full max-w-sm mx-4">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200">
+          <h2 class="text-lg font-semibold text-apple-text-primary">{{ t.concurrencyTitle }}</h2>
+          <button class="text-gray-400 hover:text-gray-600 transition-colors" @click="showConcurrency = false">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+          </button>
+        </div>
+        <div class="p-4 space-y-3">
+          <div class="flex items-center gap-3">
+            <input
+              type="number"
+              v-model.number="localMaxConcurrency"
+              min="0"
+              max="100"
+              class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
+              :placeholder="t.concurrencyPlaceholder"
+            />
+          </div>
+          <div class="text-apple-text-secondary text-xs">{{ t.concurrencyTip }}</div>
+        </div>
+        <div class="p-4 border-t border-gray-200 flex justify-end">
+          <button
+            class="px-4 py-2 bg-apple-blue text-white rounded-lg text-sm font-medium hover:bg-blue-600 transition-colors"
+            @click="saveConcurrency"
+          >
+            {{ t.save }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -96,7 +130,10 @@ const isRunning = ref(false)
 const showLogs = ref(false)
 const showAbout = ref(false)
 const showSettings = ref(false)
+const showConcurrency = ref(false)
 const showEndpointDialog = ref(false)
+
+const localMaxConcurrency = ref<number | null>(null)
 
 
 
@@ -163,6 +200,12 @@ const translations = {
     noLogs: '暂无日志...',
     reasoningEffort: '推理强度配置',
     reasoningEffortTip: '为不同的 Claude 模型系列设置默认推理强度级别。',
+    menuPromptSettings: '提示词设置',
+    menuConcurrency: '并发数设置',
+    menuAbout: '关于',
+    concurrencyTitle: '并发数设置',
+    concurrencyTip: '设置最大并发请求数。0 或留空表示不限制。(优化比如teammate多并发功能一般推荐5)',
+    concurrencyPlaceholder: '0 = 不限制',
     aboutTitle: '关于',
     versionLabel: '版本',
     appName: 'Codex Proxy',
@@ -210,6 +253,12 @@ const translations = {
     noLogs: 'No logs yet...',
     reasoningEffort: 'Reasoning Effort',
     reasoningEffortTip: 'Set default reasoning effort levels for different Claude model families.',
+    menuPromptSettings: 'Prompt Settings',
+    menuConcurrency: 'Concurrency',
+    menuAbout: 'About',
+    concurrencyTitle: 'Concurrency Settings',
+    concurrencyTip: 'Max concurrent requests. 0 or empty means unlimited. (Optimized for features like Teammate, recommended: 5)',
+    concurrencyPlaceholder: '0 = unlimited',
     aboutTitle: 'About',
     versionLabel: 'Version',
     appName: 'Codex Proxy',
@@ -260,6 +309,7 @@ const DEFAULT_CONFIG = {
   endpointOptions: [DEFAULT_ENDPOINT_OPTION],
   selectedEndpointId: DEFAULT_ENDPOINT_OPTION.id,
   codexModel: 'gpt-5.3-codex',
+  maxConcurrency: 0,
   reasoningEffort: {
     opus: 'xhigh',
     sonnet: 'medium',
@@ -275,11 +325,18 @@ const form = reactive({
   ...DEFAULT_CONFIG,
   endpointOptions: [...DEFAULT_CONFIG.endpointOptions],
   selectedEndpointId: DEFAULT_CONFIG.selectedEndpointId,
+  maxConcurrency: DEFAULT_CONFIG.maxConcurrency,
   reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort }
 })
 
 const updateSkillInjectionPrompt = (prompt: string) => {
   form.skillInjectionPrompt = prompt
+  saveConfig(buildProxyConfig()).catch(console.error)
+}
+
+const saveConcurrency = () => {
+  form.maxConcurrency = localMaxConcurrency.value ?? 0
+  showConcurrency.value = false
   saveConfig(buildProxyConfig()).catch(console.error)
 }
 
@@ -399,6 +456,7 @@ const resetDefaults = () => {
   syncEndpointFromSelection()
   form.codexModel = DEFAULT_CONFIG.codexModel
   form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
+  form.maxConcurrency = DEFAULT_CONFIG.maxConcurrency
   useDefaultPrompt()
 }
 
@@ -409,6 +467,7 @@ const buildProxyConfig = (force = false): ProxyConfig => ({
   endpointOptions: form.endpointOptions,
   selectedEndpointId: form.selectedEndpointId,
   codexModel: form.codexModel,
+  maxConcurrency: form.maxConcurrency,
   reasoningEffort: form.reasoningEffort,
   skillInjectionPrompt: form.skillInjectionPrompt,
   lang: lang.value,
@@ -577,6 +636,10 @@ onMounted(() => {
             useDefaultPrompt()
           }
         }
+        if (typeof savedConfig.maxConcurrency === 'number') {
+          form.maxConcurrency = savedConfig.maxConcurrency
+        }
+        localMaxConcurrency.value = form.maxConcurrency
       } else {
         syncEndpointFromSelection()
         useDefaultPrompt()

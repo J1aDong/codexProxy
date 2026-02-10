@@ -67,6 +67,8 @@ pub struct ProxyConfig {
     pub selected_endpoint_id: String,
     #[serde(rename = "codexModel", default = "default_codex_model")]
     pub codex_model: String,
+    #[serde(rename = "maxConcurrency", default)]
+    pub max_concurrency: u32,
     #[serde(default)]
     pub force: bool,
     #[serde(rename = "reasoningEffort", default)]
@@ -262,7 +264,8 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
 
     let server = ProxyServer::new(config.port, resolved_target_url.clone(), api_key)
     .with_reasoning_mapping(config.reasoning_effort.to_mapping())
-    .with_codex_model(config.codex_model.clone());
+    .with_codex_model(config.codex_model.clone())
+    .with_max_concurrency(config.max_concurrency);
 
     // 启动日志转发（Lagged 时跳过丢失的消息继续接收，不退出）
     let app_clone = app.clone();

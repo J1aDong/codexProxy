@@ -1,0 +1,95 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Xhigh,
+    High,
+    #[default]
+    Medium,
+    Low,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::Low => "low",
+        }
+    }
+}
+
+impl ReasoningEffort {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "xhigh" => ReasoningEffort::Xhigh,
+            "high" => ReasoningEffort::High,
+            "medium" => ReasoningEffort::Medium,
+            "low" => ReasoningEffort::Low,
+            _ => ReasoningEffort::Medium,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ReasoningEffortMapping {
+    #[serde(default = "default_opus")]
+    pub opus: ReasoningEffort,
+    #[serde(default = "default_sonnet")]
+    pub sonnet: ReasoningEffort,
+    #[serde(default = "default_haiku")]
+    pub haiku: ReasoningEffort,
+}
+
+fn default_opus() -> ReasoningEffort { ReasoningEffort::Xhigh }
+fn default_sonnet() -> ReasoningEffort { ReasoningEffort::Medium }
+fn default_haiku() -> ReasoningEffort { ReasoningEffort::Low }
+
+impl Default for ReasoningEffortMapping {
+    fn default() -> Self {
+        Self {
+            opus: default_opus(),
+            sonnet: default_sonnet(),
+            haiku: default_haiku(),
+        }
+    }
+}
+
+impl ReasoningEffortMapping {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_opus(mut self, effort: ReasoningEffort) -> Self {
+        self.opus = effort;
+        self
+    }
+
+    pub fn with_sonnet(mut self, effort: ReasoningEffort) -> Self {
+        self.sonnet = effort;
+        self
+    }
+
+    pub fn with_haiku(mut self, effort: ReasoningEffort) -> Self {
+        self.haiku = effort;
+        self
+    }
+}
+
+pub fn get_reasoning_effort(model: &str, mapping: &ReasoningEffortMapping) -> ReasoningEffort {
+    let model_lower = model.to_lowercase();
+
+    if model_lower.contains("opus") {
+        return mapping.opus;
+    }
+    if model_lower.contains("sonnet") {
+        return mapping.sonnet;
+    }
+    if model_lower.contains("haiku") {
+        return mapping.haiku;
+    }
+
+    ReasoningEffort::Medium
+}

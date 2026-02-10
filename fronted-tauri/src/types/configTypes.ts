@@ -18,6 +18,7 @@ export interface ProxyConfig {
     endpointOptions: EndpointOption[]
     selectedEndpointId: string
     codexModel: string
+    maxConcurrency: number
     reasoningEffort: ReasoningEffort
     skillInjectionPrompt: string
     lang: string

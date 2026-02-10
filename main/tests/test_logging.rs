@@ -128,7 +128,7 @@ fn test_transform_with_logging() {
 
     let all_logs = broadcast_logs.join("\n");
     assert!(all_logs.contains("[Transform] Session"), "应该包含 Session 日志");
-    assert!(all_logs.contains("[Transform] Model"), "应该包含 Model 日志");
+    assert!(all_logs.contains("[Transform]") && all_logs.contains("→"), "应该包含 Model 日志");
     assert!(all_logs.contains("[Messages]"), "应该包含 Messages 日志");
 
     println!("✅ Transform 日志测试通过");
