@@ -31,11 +31,13 @@
         <div
           v-for="option in options"
           :key="option.value"
-          class="px-3 py-2.5 cursor-pointer hover:bg-gray-50 text-sm transition-colors duration-150"
+          class="px-3 py-2.5 cursor-pointer hover:bg-gray-50 text-sm transition-colors duration-150 flex items-center justify-between group"
           :class="{ 'text-apple-blue bg-blue-50': selectedOption?.value === option.value }"
           @click="selectOption(option)"
         >
-          {{ option.label }}
+          <slot name="option" :option="option">
+            <span>{{ option.label }}</span>
+          </slot>
         </div>
       </div>
     </div>

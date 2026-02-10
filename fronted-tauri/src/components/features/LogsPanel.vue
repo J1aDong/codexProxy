@@ -9,7 +9,7 @@
       ></div>
     </Transition>
 
-    <div class="fixed inset-y-0 right-0 w-96 bg-white shadow-2xl z-50 transform transition-transform duration-300 ease-in-out"
+    <div class="fixed inset-y-0 right-0 w-96 bg-white shadow-2xl z-50 flex flex-col transform transition-transform duration-300 ease-in-out"
          :class="{ 'translate-x-full': !visible, 'translate-x-0': visible }">
       <div class="flex items-center justify-between p-4 border-b border-gray-200">
         <h2 class="text-lg font-semibold text-apple-text-primary">{{ t.logsTitle }}</h2>
@@ -26,15 +26,24 @@
       </div>
 
       <div class="p-4 border-b border-gray-200">
-        <div class="flex items-center gap-3 text-sm text-apple-text-secondary">
-          <span>Opus: {{ modelRequestStats.opus }}</span>
-          <span>Sonnet: {{ modelRequestStats.sonnet }}</span>
-          <span>Haiku: {{ modelRequestStats.haiku }}</span>
+        <div class="flex items-center gap-3 text-sm">
+          <span class="flex items-center gap-1.5">
+            <span class="bg-red-500 text-white text-xs font-medium px-2 py-0.5 rounded-md">Opus</span>
+            <span class="text-apple-text-primary font-medium">{{ modelRequestStats.opus }}</span>
+          </span>
+          <span class="flex items-center gap-1.5">
+            <span class="bg-green-500 text-white text-xs font-medium px-2 py-0.5 rounded-md">Sonnet</span>
+            <span class="text-apple-text-primary font-medium">{{ modelRequestStats.sonnet }}</span>
+          </span>
+          <span class="flex items-center gap-1.5">
+            <span class="bg-gray-800 text-white text-xs font-medium px-2 py-0.5 rounded-md">Haiku</span>
+            <span class="text-apple-text-primary font-medium">{{ modelRequestStats.haiku }}</span>
+          </span>
         </div>
       </div>
 
-      <div class="flex-1 overflow-y-auto p-4" ref="logsContainer">
-        <div v-if="logs.length === 0" class="text-center text-apple-text-secondary mt-10">
+      <div class="flex-1 overflow-y-auto p-4 overscroll-contain flex flex-col" ref="logsContainer">
+        <div v-if="logs.length === 0" class="flex-1 flex items-center justify-center text-apple-text-secondary min-h-[50px]">
           {{ t.noLogs }}
         </div>
         <div v-else>

@@ -20,7 +20,8 @@
         @update:form="updateForm"
         @reset="resetDefaults"
         @toggle="toggleProxy"
-        @addEndpoint="showEndpointDialog = true"
+        @addEndpoint="openAddEndpointDialog"
+        @editEndpoint="handleEditEndpoint"
       />
 
       <!-- Guide Section -->
@@ -44,9 +45,10 @@
     <!-- Endpoint Dialog -->
     <EndpointDialog
       :visible="showEndpointDialog"
+      :initial-data="currentEditingEndpoint"
       :t="dialogT"
-      @close="showEndpointDialog = false"
-      @add="addEndpoint"
+      @close="closeEndpointDialog"
+      @add="handleEndpointSubmit"
     />
 
     <!-- Settings Dialog -->
@@ -76,10 +78,11 @@
 
 <script lang="ts" setup>
 import { reactive, ref, onMounted, computed, onUnmounted, watch } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
+import { loadConfig, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
+import type { EndpointOption, ProxyConfig } from './types/configTypes'
 
 import Header from './components/features/Header.vue'
 import ConfigCard from './components/features/ConfigCard.vue'
@@ -95,12 +98,7 @@ const showAbout = ref(false)
 const showSettings = ref(false)
 const showEndpointDialog = ref(false)
 
-type EndpointOption = {
-  id: string
-  alias: string
-  url: string
-  apiKey: string
-}
+
 
 type LogItem = {
   time: string
@@ -133,7 +131,7 @@ const toggleLang = () => {
 }
 
 const saveLangPreference = () => {
-  invoke('save_lang', { lang: lang.value }).catch(console.error)
+  saveLang(lang.value).catch(console.error)
 }
 
 const translations = {
@@ -145,6 +143,7 @@ const translations = {
     codexModel: 'Codex 模型',
     targetUrl: '目标地址',
     addEndpoint: '添加地址',
+    editEndpoint: '编辑地址',
     endpointAlias: '别名',
     endpointAliasPlaceholder: '例如：自建节点',
     endpointUrl: '地址',
@@ -181,6 +180,7 @@ const translations = {
     useDefaultPrompt: '使用默认提示词',
     cancel: '取消',
     add: '添加',
+    save: '保存',
   },
   en: {
     statusRunning: 'Proxy Running',
@@ -190,6 +190,7 @@ const translations = {
     codexModel: 'Codex Model',
     targetUrl: 'Target URL',
     addEndpoint: 'Add Endpoint',
+    editEndpoint: 'Edit Endpoint',
     endpointAlias: 'Alias',
     endpointAliasPlaceholder: 'E.g. Custom Node',
     endpointUrl: 'URL',
@@ -226,6 +227,7 @@ const translations = {
     useDefaultPrompt: 'Use Default Prompt',
     cancel: 'Cancel',
     add: 'Add',
+    save: 'Save',
   }
 }
 
@@ -240,6 +242,8 @@ const dialogT = computed(() => ({
   apiKeyPlaceholder: t.value.apiKeyPlaceholder,
   cancel: t.value.cancel,
   add: t.value.add,
+  save: t.value.save,
+  editEndpoint: t.value.editEndpoint,
 }))
 
 const DEFAULT_ENDPOINT_OPTION: EndpointOption = {
@@ -276,6 +280,7 @@ const form = reactive({
 
 const updateSkillInjectionPrompt = (prompt: string) => {
   form.skillInjectionPrompt = prompt
+  saveConfig(buildProxyConfig()).catch(console.error)
 }
 
 const useDefaultPrompt = () => {
@@ -312,16 +317,54 @@ const updateForm = (newForm: any) => {
   Object.assign(form, newForm)
 }
 
-const addEndpoint = (newEndpoint: { alias: string; url: string; apiKey: string }) => {
-  const nextId = `endpoint-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  const nextOption: EndpointOption = {
-    id: nextId,
-    ...newEndpoint,
-  }
+const editingEndpointId = ref('')
 
-  form.endpointOptions = [...form.endpointOptions, nextOption]
-  form.selectedEndpointId = nextId
-  syncEndpointFromSelection()
+const currentEditingEndpoint = computed(() => {
+  if (!editingEndpointId.value) return null
+  return form.endpointOptions.find(opt => opt.id === editingEndpointId.value) || null
+})
+
+const openAddEndpointDialog = () => {
+  editingEndpointId.value = ''
+  showEndpointDialog.value = true
+}
+
+const handleEditEndpoint = (id: string) => {
+  editingEndpointId.value = id
+  showEndpointDialog.value = true
+}
+
+const closeEndpointDialog = () => {
+  showEndpointDialog.value = false
+  editingEndpointId.value = ''
+}
+
+const handleEndpointSubmit = (endpointData: { alias: string; url: string; apiKey: string }) => {
+  if (editingEndpointId.value) {
+    // Edit mode
+    const index = form.endpointOptions.findIndex(opt => opt.id === editingEndpointId.value)
+    if (index !== -1) {
+      form.endpointOptions[index] = {
+        ...form.endpointOptions[index],
+        ...endpointData
+      }
+      if (form.selectedEndpointId === editingEndpointId.value) {
+        syncEndpointFromSelection()
+      }
+    }
+  } else {
+    // Add mode
+    const nextId = `endpoint-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const nextOption: EndpointOption = {
+      id: nextId,
+      ...endpointData,
+    }
+
+    form.endpointOptions = [...form.endpointOptions, nextOption]
+    form.selectedEndpointId = nextId
+    syncEndpointFromSelection()
+  }
+  closeEndpointDialog()
 }
 
 const shouldShowLog = (message: string) => {
@@ -359,23 +402,24 @@ const resetDefaults = () => {
   useDefaultPrompt()
 }
 
+const buildProxyConfig = (force = false): ProxyConfig => ({
+  port: form.port,
+  targetUrl: form.targetUrl,
+  apiKey: form.apiKey,
+  endpointOptions: form.endpointOptions,
+  selectedEndpointId: form.selectedEndpointId,
+  codexModel: form.codexModel,
+  reasoningEffort: form.reasoningEffort,
+  skillInjectionPrompt: form.skillInjectionPrompt,
+  lang: lang.value,
+  force,
+})
+
 const toggleProxy = () => {
   if (isRunning.value) {
-    invoke('stop_proxy').catch(console.error)
+    stopProxy().catch(console.error)
   } else {
-    invoke('start_proxy', {
-      config: {
-        port: form.port,
-        targetUrl: form.targetUrl,
-        apiKey: form.apiKey,
-        endpointOptions: form.endpointOptions,
-        selectedEndpointId: form.selectedEndpointId,
-        codexModel: form.codexModel,
-        reasoningEffort: form.reasoningEffort,
-        skillInjectionPrompt: form.skillInjectionPrompt,
-        force: false
-      }
-    }).catch(console.error)
+    startProxy(buildProxyConfig(false)).catch(console.error)
   }
 }
 
@@ -494,18 +538,7 @@ const openReleasePage = () => {
 }
 
 onMounted(() => {
-  // Load saved config
-  invoke<{
-    port: number
-    targetUrl: string
-    apiKey: string
-    endpointOptions?: EndpointOption[]
-    selectedEndpointId?: string
-    codexModel?: string
-    reasoningEffort?: { opus: string; sonnet: string; haiku: string }
-    skillInjectionPrompt?: string
-    lang?: string
-  } | null>('load_config')
+  loadConfig()
     .then((savedConfig) => {
       if (savedConfig) {
         if (savedConfig.port) form.port = savedConfig.port
@@ -533,20 +566,21 @@ onMounted(() => {
         if (savedConfig.reasoningEffort) {
           form.reasoningEffort = { ...savedConfig.reasoningEffort }
         }
-        if (savedConfig.skillInjectionPrompt !== undefined) {
+        if (savedConfig.skillInjectionPrompt) {
           form.skillInjectionPrompt = savedConfig.skillInjectionPrompt
         } else {
           useDefaultPrompt()
         }
         if (savedConfig.lang && (savedConfig.lang === 'zh' || savedConfig.lang === 'en')) {
           lang.value = savedConfig.lang
-          if (savedConfig.skillInjectionPrompt === undefined) {
+          if (!savedConfig.skillInjectionPrompt) {
             useDefaultPrompt()
           }
         }
       } else {
         syncEndpointFromSelection()
         useDefaultPrompt()
+        saveConfig(buildProxyConfig()).catch(console.error)
       }
     })
     .catch(console.error)
@@ -572,19 +606,7 @@ onMounted(() => {
         : `Port ${port} is in use. Do you want to terminate the service on this port and start the proxy?`
     )
     if (confirmed) {
-      invoke('start_proxy', {
-        config: {
-          port: form.port,
-          targetUrl: form.targetUrl,
-          apiKey: form.apiKey,
-          endpointOptions: form.endpointOptions,
-          selectedEndpointId: form.selectedEndpointId,
-          codexModel: form.codexModel,
-          reasoningEffort: form.reasoningEffort,
-          skillInjectionPrompt: form.skillInjectionPrompt,
-          force: true
-        }
-      }).catch(console.error)
+      startProxy(buildProxyConfig(true)).catch(console.error)
     } else {
       isRunning.value = false
     }

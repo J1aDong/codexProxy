@@ -49,7 +49,7 @@
 </template>
 
 <script lang="ts" setup>
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import Button from '../base/Button.vue'
 
 const props = defineProps({
@@ -74,6 +74,12 @@ const props = defineProps({
 const emit = defineEmits(['close', 'update'])
 
 const localPrompt = ref(props.skillInjectionPrompt)
+
+watch(() => props.visible, (val) => {
+  if (val) {
+    localPrompt.value = props.skillInjectionPrompt
+  }
+})
 
 const DEFAULT_PROMPT_ZH = "skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择"
 const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose."

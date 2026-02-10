@@ -71,7 +71,7 @@ pub struct ProxyConfig {
     pub force: bool,
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: ReasoningEffortConfig,
-    #[serde(default)]
+    #[serde(rename = "skillInjectionPrompt", default)]
     pub skill_injection_prompt: String,
     #[serde(default = "default_lang")]
     pub lang: String,

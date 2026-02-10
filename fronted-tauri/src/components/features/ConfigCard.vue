@@ -29,7 +29,20 @@
           :options="endpointSelectOptions"
           placeholder="选择目标地址"
           @change="handleEndpointChange"
-        />
+        >
+          <template #option="{ option }">
+            <span>{{ option.label }}</span>
+            <button 
+              class="text-gray-400 hover:text-apple-blue opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-blue-50 focus:outline-none"
+              @click.stop="handleEditEndpoint(option.value)"
+              title="编辑"
+            >
+              <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+              </svg>
+            </button>
+          </template>
+        </Select>
       </div>
     </div>
 
@@ -137,7 +150,7 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['update:form', 'reset', 'toggle', 'addEndpoint'])
+const emit = defineEmits(['update:form', 'reset', 'toggle', 'addEndpoint', 'editEndpoint'])
 
 const localPort = ref(props.form.port)
 const localApiKey = ref(props.form.apiKey)
@@ -202,5 +215,9 @@ const handleToggle = () => {
 
 const handleAddEndpoint = () => {
   emit('addEndpoint')
+}
+
+const handleEditEndpoint = (id: string | number) => {
+  emit('editEndpoint', String(id))
 }
 </script>

@@ -2,7 +2,7 @@
   <div v-if="visible" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
     <div class="bg-white rounded-xl w-full max-w-md mx-4">
       <div class="flex items-center justify-between p-4 border-b border-gray-200">
-        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t.addEndpoint }}</h2>
+        <h2 class="text-lg font-semibold text-apple-text-primary">{{ isEdit ? t.editEndpoint : t.addEndpoint }}</h2>
         <Button
           type="text"
           size="small"
@@ -36,18 +36,18 @@
 
       <div class="p-4 border-t border-gray-200 flex justify-end gap-2">
         <Button @click="handleClose">{{ t.cancel }}</Button>
-        <Button type="primary" @click="handleAdd">{{ t.add }}</Button>
+        <Button type="primary" @click="handleAdd">{{ isEdit ? t.save : t.add }}</Button>
       </div>
     </div>
   </div>
 </template>
 
 <script lang="ts" setup>
-import { reactive } from 'vue'
+import { reactive, watch, computed } from 'vue'
 import Button from '../base/Button.vue'
 import Input from '../base/Input.vue'
 
-defineProps({
+const props = defineProps({
   visible: {
     type: Boolean,
     required: true,
@@ -55,6 +55,10 @@ defineProps({
   t: {
     type: Object,
     required: true,
+  },
+  initialData: {
+    type: Object,
+    default: null,
   },
 })
 
@@ -64,6 +68,22 @@ const endpointDraft = reactive({
   alias: '',
   url: '',
   apiKey: '',
+})
+
+const isEdit = computed(() => !!props.initialData)
+
+watch(() => props.visible, (val) => {
+  if (val) {
+    if (props.initialData) {
+      endpointDraft.alias = props.initialData.alias
+      endpointDraft.url = props.initialData.url
+      endpointDraft.apiKey = props.initialData.apiKey
+    } else {
+      endpointDraft.alias = ''
+      endpointDraft.url = ''
+      endpointDraft.apiKey = ''
+    }
+  }
 })
 
 const handleClose = () => {
