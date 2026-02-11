@@ -7,7 +7,7 @@
         @toggleLang="toggleLang"
         @showAbout="showAbout = true"
         @showSettings="showSettings = true"
-        @showConcurrency="showConcurrency = true"
+        @showAdvancedSettings="openAdvancedSettings"
         @showLogs="showLogs = true"
       />
 
@@ -66,32 +66,53 @@
       @openReleases="openReleasePage"
     />
 
-    <!-- Concurrency Dialog -->
-    <div v-if="showConcurrency" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div class="bg-white rounded-xl w-full max-w-sm mx-4">
+    <!-- Advanced Settings Dialog -->
+    <div v-if="showAdvancedSettings" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div class="bg-white rounded-xl w-full max-w-md mx-4">
         <div class="flex items-center justify-between p-4 border-b border-gray-200">
-          <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('concurrencyTitle') }}</h2>
-          <button class="text-gray-400 hover:text-gray-600 transition-colors" @click="showConcurrency = false">
+          <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('advancedSettingsTitle') }}</h2>
+          <button class="text-gray-400 hover:text-gray-600 transition-colors" @click="showAdvancedSettings = false">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
           </button>
         </div>
-        <div class="p-4 space-y-3">
-          <div class="flex items-center gap-3">
+        <div class="p-4 space-y-4">
+          <div class="space-y-2">
+            <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedMaxConcurrencyLabel') }}</label>
             <input
               type="number"
               v-model.number="localMaxConcurrency"
               min="0"
               max="100"
               class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
-              :placeholder="t('concurrencyPlaceholder')"
+              :placeholder="t('advancedMaxConcurrencyPlaceholder')"
             />
+            <div class="text-apple-text-secondary text-xs">{{ t('advancedMaxConcurrencyTip') }}</div>
           </div>
-          <div class="text-apple-text-secondary text-xs">{{ t('concurrencyTip') }}</div>
+
+          <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
+            <input v-model="localIgnoreProbeRequests" type="checkbox" class="mt-1" />
+            <div class="flex-1">
+              <div class="text-sm font-medium text-apple-text-primary">{{ t('advancedIgnoreProbeLabel') }}</div>
+              <div class="text-xs text-apple-text-secondary mt-1">{{ t('advancedIgnoreProbeTip') }}</div>
+            </div>
+          </label>
+
+          <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
+            <input v-model="localAllowCountTokensFallbackEstimate" type="checkbox" class="mt-1" />
+            <div class="flex-1">
+              <div class="text-sm font-medium text-apple-text-primary">{{ t('advancedCountTokensFallbackLabel') }}</div>
+              <div class="text-xs text-apple-text-secondary mt-1">{{ t('advancedCountTokensFallbackTip') }}</div>
+            </div>
+          </label>
+
+          <div class="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            {{ t('advancedSettingsRiskTip') }}
+          </div>
         </div>
         <div class="p-4 border-t border-gray-200 flex justify-end">
           <button
             class="px-4 py-2 bg-apple-blue text-white rounded-lg text-sm font-medium hover:bg-blue-600 transition-colors"
-            @click="saveConcurrency"
+            @click="saveAdvancedSettings"
           >
             {{ t('save') }}
           </button>
@@ -124,10 +145,12 @@ const isRunning = ref(false)
 const showLogs = ref(false)
 const showAbout = ref(false)
 const showSettings = ref(false)
-const showConcurrency = ref(false)
+const showAdvancedSettings = ref(false)
 const showEndpointDialog = ref(false)
 
 const localMaxConcurrency = ref<number | null>(null)
+const localIgnoreProbeRequests = ref(false)
+const localAllowCountTokensFallbackEstimate = ref(true)
 
 
 
@@ -182,6 +205,8 @@ const DEFAULT_CONFIG = {
   converter: 'codex' as 'codex' | 'gemini',
   codexModel: 'gpt-5.3-codex',
   maxConcurrency: 0,
+  ignoreProbeRequests: false,
+  allowCountTokensFallbackEstimate: true,
   reasoningEffort: {
     opus: 'xhigh',
     sonnet: 'medium',
@@ -203,6 +228,8 @@ const form = reactive({
   endpointOptions: [...DEFAULT_CONFIG.endpointOptions],
   selectedEndpointId: DEFAULT_CONFIG.selectedEndpointId,
   maxConcurrency: DEFAULT_CONFIG.maxConcurrency,
+  ignoreProbeRequests: DEFAULT_CONFIG.ignoreProbeRequests,
+  allowCountTokensFallbackEstimate: DEFAULT_CONFIG.allowCountTokensFallbackEstimate,
   reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort },
   converter: DEFAULT_CONFIG.converter,
   geminiReasoningEffort: { ...DEFAULT_CONFIG.geminiReasoningEffort },
@@ -213,9 +240,18 @@ const updateSkillInjectionPrompt = (prompt: string) => {
   saveConfig(buildProxyConfig()).catch(console.error)
 }
 
-const saveConcurrency = () => {
+const openAdvancedSettings = () => {
+  localMaxConcurrency.value = form.maxConcurrency
+  localIgnoreProbeRequests.value = form.ignoreProbeRequests
+  localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
+  showAdvancedSettings.value = true
+}
+
+const saveAdvancedSettings = () => {
   form.maxConcurrency = localMaxConcurrency.value ?? 0
-  showConcurrency.value = false
+  form.ignoreProbeRequests = localIgnoreProbeRequests.value
+  form.allowCountTokensFallbackEstimate = localAllowCountTokensFallbackEstimate.value
+  showAdvancedSettings.value = false
   saveConfig(buildProxyConfig()).catch(console.error)
 }
 
@@ -360,6 +396,10 @@ const handleDeleteEndpoint = (id: string) => {
 const shouldShowLog = (message: string) => {
   if (message.startsWith('[Stat]')) return false
   if (message.includes('[Error]')) return true
+  if (message.startsWith('[Req]')) return true
+  if (message.startsWith('[ReqPayload]')) return true
+  if (message.startsWith('[RateLimit]')) return true
+  if (message.startsWith('[Tokens]')) return true
   if (message.includes('[System] Init success')) return true
   if (message.includes('[Request] Sending request')) return true
   return false
@@ -392,6 +432,8 @@ const resetDefaults = () => {
   form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
   form.geminiReasoningEffort = { ...DEFAULT_CONFIG.geminiReasoningEffort }
   form.maxConcurrency = DEFAULT_CONFIG.maxConcurrency
+  form.ignoreProbeRequests = DEFAULT_CONFIG.ignoreProbeRequests
+  form.allowCountTokensFallbackEstimate = DEFAULT_CONFIG.allowCountTokensFallbackEstimate
   useDefaultPrompt()
 }
 
@@ -404,6 +446,8 @@ const buildProxyConfig = (force = false): ProxyConfig => ({
   converter: form.converter,
   codexModel: form.codexModel,
   maxConcurrency: form.maxConcurrency,
+  ignoreProbeRequests: form.ignoreProbeRequests,
+  allowCountTokensFallbackEstimate: form.allowCountTokensFallbackEstimate,
   reasoningEffort: form.reasoningEffort,
   geminiReasoningEffort: form.geminiReasoningEffort,
   skillInjectionPrompt: form.skillInjectionPrompt,
@@ -569,7 +613,15 @@ onMounted(() => {
         if (typeof savedConfig.maxConcurrency === 'number') {
           form.maxConcurrency = savedConfig.maxConcurrency
         }
+        if (typeof savedConfig.ignoreProbeRequests === 'boolean') {
+          form.ignoreProbeRequests = savedConfig.ignoreProbeRequests
+        }
+        if (typeof savedConfig.allowCountTokensFallbackEstimate === 'boolean') {
+          form.allowCountTokensFallbackEstimate = savedConfig.allowCountTokensFallbackEstimate
+        }
         localMaxConcurrency.value = form.maxConcurrency
+        localIgnoreProbeRequests.value = form.ignoreProbeRequests
+        localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
       } else {
         syncEndpointFromSelection()
         useDefaultPrompt()
@@ -607,6 +659,19 @@ onMounted(() => {
 onUnmounted(() => {
   unlisteners.forEach(unlisten => unlisten())
 })
+
+watch(
+  [
+    () => form.maxConcurrency,
+    () => form.ignoreProbeRequests,
+    () => form.allowCountTokensFallbackEstimate,
+  ],
+  () => {
+    if (!isSyncing.value) {
+      saveConfig(buildProxyConfig()).catch(console.error)
+    }
+  }
+)
 </script>
 
 <style scoped>

@@ -96,6 +96,10 @@ pub struct ProxyConfig {
 
     #[serde(rename = "maxConcurrency", default)]
     pub max_concurrency: u32,
+    #[serde(rename = "ignoreProbeRequests", default)]
+    pub ignore_probe_requests: bool,
+    #[serde(rename = "allowCountTokensFallbackEstimate", default = "default_allow_count_tokens_fallback_estimate")]
+    pub allow_count_tokens_fallback_estimate: bool,
     #[serde(default)]
     pub force: bool,
     #[serde(rename = "reasoningEffort", default)]
@@ -118,6 +122,10 @@ fn default_converter() -> String {
 
 fn default_codex_model() -> String {
     "gpt-5.3-codex".to_string()
+}
+
+fn default_allow_count_tokens_fallback_estimate() -> bool {
+    true
 }
 
 
@@ -305,6 +313,8 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
         .with_converter(config.converter.clone())
         .with_codex_model(config.codex_model.clone())
         .with_gemini_reasoning_effort(config.gemini_reasoning_effort.to_gemini_mapping())
+        .with_ignore_probe_requests(config.ignore_probe_requests)
+        .with_allow_count_tokens_fallback_estimate(config.allow_count_tokens_fallback_estimate)
         .with_max_concurrency(config.max_concurrency);
 
     // 启动日志转发（Lagged 时跳过丢失的消息继续接收，不退出）

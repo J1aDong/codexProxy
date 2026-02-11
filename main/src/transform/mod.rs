@@ -1,5 +1,6 @@
 pub mod codex;
 pub mod gemini;
+pub mod processor;
 
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -55,3 +56,4 @@ pub trait ResponseTransformer: Send {
 // Re-export backends
 pub use codex::CodexBackend;
 pub use gemini::GeminiBackend;
+pub use processor::MessageProcessor;

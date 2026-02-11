@@ -131,6 +131,7 @@ fn parse_content_block(value: Value) -> ContentBlock {
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
     Text { text: String },
+    Thinking { thinking: String, signature: Option<String> },
     Image {
         source: Option<ImageSource>,
         source_raw: Option<Value>,
@@ -146,6 +147,7 @@ pub enum ContentBlock {
         id: Option<String>,
         name: String,
         input: Value,
+        signature: Option<String>,
     },
     ToolResult {
         tool_use_id: Option<String>,
@@ -168,6 +170,30 @@ impl Serialize for ContentBlock {
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("type", "text")?;
                 map.serialize_entry("text", text)?;
+                map.end()
+            }
+            ContentBlock::Thinking { thinking, signature } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("type", "thinking")?;
+                map.serialize_entry("thinking", thinking)?;
+                if let Some(sig) = signature {
+                    map.serialize_entry("signature", sig)?;
+                }
+                map.end()
+            }
+            ContentBlock::ToolUse { id, name, input, signature } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(4))?;
+                map.serialize_entry("type", "tool_use")?;
+                if let Some(id_val) = id {
+                    map.serialize_entry("id", id_val)?;
+                }
+                map.serialize_entry("name", name)?;
+                map.serialize_entry("input", input)?;
+                if let Some(sig) = signature {
+                    map.serialize_entry("signature", sig)?;
+                }
                 map.end()
             }
             ContentBlock::OtherValue(v) => v.serialize(serializer),
@@ -204,6 +230,15 @@ fn parse_content_block_from_value(value: Value) -> ContentBlock {
             let text = obj.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
             ContentBlock::Text { text }
         }
+        "thinking" | "thought" => {
+            let thinking = obj.get("thinking")
+                .or_else(|| obj.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let signature = obj.get("signature").and_then(|s| s.as_str()).map(|s| s.to_string());
+            ContentBlock::Thinking { thinking, signature }
+        }
         "image" => {
             let source_raw = obj.get("source").cloned();
             let source = source_raw.as_ref().and_then(|s| serde_json::from_value(s.clone()).ok());
@@ -230,7 +265,12 @@ fn parse_content_block_from_value(value: Value) -> ContentBlock {
                 .filter(|v| !v.is_null())
                 .cloned()
                 .unwrap_or(json!({}));
-            ContentBlock::ToolUse { id, name, input }
+            let signature = obj.get("signature")
+                .or_else(|| obj.get("thought_signature"))
+                .or_else(|| obj.get("thoughtSignature"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            ContentBlock::ToolUse { id, name, input, signature }
         }
         "tool_result" => {
             let tool_use_id = obj.get("tool_use_id").and_then(|i| i.as_str()).map(|s| s.to_string());

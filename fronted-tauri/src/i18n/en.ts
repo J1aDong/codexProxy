@@ -50,14 +50,20 @@ export default {
 
     // Menu
     menuPromptSettings: 'Prompt Settings',
-    menuConcurrency: 'Concurrency',
+    menuAdvancedSettings: 'Advanced Settings',
     menuAbout: 'About',
     menuLogs: 'Logs',
 
-    // Concurrency
-    concurrencyTitle: 'Concurrency Settings',
-    concurrencyTip: 'Max concurrent requests. 0 or empty means unlimited. (Optimized for features like Teammate, recommended: 5)',
-    concurrencyPlaceholder: '0 = unlimited',
+    // Advanced Settings
+    advancedSettingsTitle: 'Advanced Settings',
+    advancedMaxConcurrencyLabel: 'Max Concurrent Requests',
+    advancedMaxConcurrencyTip: '0 or empty means unlimited. Start with 2-4 and increase gradually.',
+    advancedMaxConcurrencyPlaceholder: '0 = unlimited',
+    advancedIgnoreProbeLabel: 'Ignore startup probe requests (foo/count)',
+    advancedIgnoreProbeTip: 'Return locally for probe-like requests to reduce pointless upstream calls and 429 risk.',
+    advancedCountTokensFallbackLabel: 'Allow estimate fallback when count_tokens fails',
+    advancedCountTokensFallbackTip: 'Enabled is more stable; disable to surface upstream failures for debugging.',
+    advancedSettingsRiskTip: 'Note: ignoring probe requests may affect capability detection for a few clients.',
 
     // About
     aboutTitle: 'About',

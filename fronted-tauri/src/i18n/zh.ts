@@ -50,14 +50,20 @@ export default {
 
     // Menu
     menuPromptSettings: '提示词设置',
-    menuConcurrency: '并发数设置',
+    menuAdvancedSettings: '高级设置',
     menuAbout: '关于',
     menuLogs: '日志',
 
-    // Concurrency
-    concurrencyTitle: '并发数设置',
-    concurrencyTip: '设置最大并发请求数。0 或留空表示不限制。(优化比如teammate多并发功能一般推荐5)',
-    concurrencyPlaceholder: '0 = 不限制',
+    // Advanced Settings
+    advancedSettingsTitle: '高级设置',
+    advancedMaxConcurrencyLabel: '最大并发请求数',
+    advancedMaxConcurrencyTip: '0 或留空表示不限制。建议从 2-4 开始逐步调高。',
+    advancedMaxConcurrencyPlaceholder: '0 = 不限制',
+    advancedIgnoreProbeLabel: '忽略启动探测请求（foo/count）',
+    advancedIgnoreProbeTip: '仅对短探测请求本地快速返回，减少无意义上游调用与 429 风险。',
+    advancedCountTokensFallbackLabel: 'count_tokens 失败时允许估算回退',
+    advancedCountTokensFallbackTip: '开启后更稳定；关闭后会在上游失败时直接返回错误，便于排查。',
+    advancedSettingsRiskTip: '注意：忽略探测请求可能影响极少数客户端的能力检测行为。',
 
     // About
     aboutTitle: '关于',

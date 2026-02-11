@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::models::AnthropicRequest;
 
-use super::{codex::TransformRequest, ResponseTransformer, TransformBackend, TransformContext};
+use super::{ResponseTransformer, TransformBackend, TransformContext, MessageProcessor};
 
 pub struct GeminiBackend;
 
@@ -20,6 +20,15 @@ impl GeminiBackend {
             "text" | "input_text" | "output_text" => {
                 let text = block.get("text").and_then(|t| t.as_str())?;
                 Some(json!({ "text": text }))
+            },
+            "thinking" | "thought" | "reasoning" => {
+                let text = block.get("thinking").or_else(|| block.get("text")).and_then(|t| t.as_str())?;
+                let sig = block.get("signature").and_then(|s| s.as_str());
+                if let Some(s) = sig {
+                    Some(json!({ "text": text, "thought": true, "thought_signature": s }))
+                } else {
+                    Some(json!({ "text": text, "thought": true }))
+                }
             },
             "image" | "image_url" | "input_image" => {
                 let source = block.get("source").or_else(|| block.get("image_url"));
@@ -103,17 +112,26 @@ impl GeminiBackend {
                  let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                  let args_str = item.get("arguments").and_then(|s| s.as_str()).unwrap_or("{}");
                  let args = serde_json::from_str::<Value>(args_str).unwrap_or(json!({}));
+                 let signature = item.get("signature").and_then(|s| s.as_str());
                  
                  if let Some(id) = item.get("call_id").and_then(|i| i.as_str()) {
                      tool_id_name_map.insert(id.to_string(), name.to_string());
                  }
 
-                 let part = json!({
-                     "function_call": {
-                         "name": name,
-                         "args": args
-                     }
+                 let fc_obj = json!({
+                     "name": name,
+                     "args": args
                  });
+                 
+                 let mut part = json!({
+                     "functionCall": fc_obj
+                 });
+
+                 if let Some(s) = signature {
+                     if let Some(obj) = part.as_object_mut() {
+                         obj.insert("thought_signature".to_string(), json!(s));
+                     }
+                 }
                  
                  let gemini_role = "model";
                  if let Some(last_msg) = gemini_messages.last_mut() {
@@ -137,7 +155,7 @@ impl GeminiBackend {
                  let content = json!({ "result": output_text });
 
                  let part = json!({
-                    "function_response": {
+                    "functionResponse": {
                         "name": name,
                         "response": content
                     }
@@ -166,6 +184,11 @@ impl GeminiBackend {
         
         gemini_messages
     }
+
+    pub(crate) fn build_contents_for_count(messages: &[Value]) -> Vec<Value> {
+        Self::build_contents(messages)
+    }
+
     fn convert_tools(tools: Option<&Vec<Value>>) -> Option<Vec<Value>> {
         let tools = tools?;
         if tools.is_empty() {
@@ -225,7 +248,7 @@ impl TransformBackend for GeminiBackend {
         // So yes, we can reuse `TransformRequest::transform_messages` to handle the heavy lifting of image resolution!
         // Note: we pass None for log_tx to avoid double logging or just pass it if we want.
         
-        let (messages, _) = TransformRequest::transform_messages(&anthropic_body.messages, log_tx);
+        let (messages, _) = MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
         let contents = Self::build_contents(&messages);
 
         let system_instruction = if let Some(system) = &anthropic_body.system {
@@ -334,12 +357,20 @@ pub struct GeminiResponseTransformer {
     model: String,
     content_index: usize,
     open_text_index: Option<usize>,
+    open_text_block_kind: Option<TextBlockKind>,
     open_tool_index: Option<usize>,
     tool_call_id: Option<String>,
     tool_name: Option<String>,
     saw_tool_call: bool,
     sent_message_start: bool,
     sent_message_stop: bool,
+    thought_signature: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextBlockKind {
+    Text,
+    Thinking,
 }
 
 impl GeminiResponseTransformer {
@@ -349,12 +380,14 @@ impl GeminiResponseTransformer {
             model: model.to_string(),
             content_index: 0,
             open_text_index: None,
+            open_text_block_kind: None,
             open_tool_index: None,
             tool_call_id: None,
             tool_name: None,
             saw_tool_call: false,
             sent_message_start: false,
             sent_message_stop: false,
+            thought_signature: None,
         }
     }
 
@@ -382,11 +415,16 @@ impl GeminiResponseTransformer {
 
     fn open_text_block_if_needed(&mut self, out: &mut Vec<String>) {
         if self.open_text_index.is_some() {
-            return;
+            if self.open_text_block_kind == Some(TextBlockKind::Text) {
+                return;
+            }
+            self.close_text_block(out);
         }
+
         let idx = self.content_index;
         self.content_index += 1;
         self.open_text_index = Some(idx);
+        self.open_text_block_kind = Some(TextBlockKind::Text);
         out.push(format!(
             "event: content_block_start\ndata: {}\n\n",
             json!({
@@ -404,6 +442,7 @@ impl GeminiResponseTransformer {
                 json!({ "type": "content_block_stop", "index": idx })
             ));
         }
+        self.open_text_block_kind = None;
     }
 
     fn open_tool_block_if_needed(&mut self, out: &mut Vec<String>) {
@@ -450,6 +489,33 @@ impl GeminiResponseTransformer {
         }
     }
 
+    fn open_thinking_block_if_needed(&mut self, out: &mut Vec<String>, signature: Option<&str>) {
+        if self.open_text_index.is_some() {
+            if self.open_text_block_kind == Some(TextBlockKind::Thinking) {
+                return;
+            }
+            self.close_text_block(out);
+        }
+
+        let idx = self.content_index;
+        self.content_index += 1;
+        self.open_text_index = Some(idx);
+        self.open_text_block_kind = Some(TextBlockKind::Thinking);
+
+        out.push(format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": signature
+                }
+            })
+        ));
+    }
+
     fn emit_message_stop(&mut self, out: &mut Vec<String>, stop_reason: &str) {
         if self.sent_message_stop {
             return;
@@ -473,7 +539,7 @@ impl GeminiResponseTransformer {
         ));
     }
 
-    fn extract_text_from_candidates(data: &Value) -> Vec<String> {
+    fn extract_thinking_from_candidates(data: &Value) -> Vec<String> {
         data.get("candidates")
             .and_then(|v| v.as_array())
             .map(|candidates| {
@@ -488,9 +554,13 @@ impl GeminiResponseTransformer {
                                 parts
                                     .iter()
                                     .filter_map(|part| {
-                                        part.get("text")
-                                            .and_then(|t| t.as_str())
-                                            .map(|s| s.to_string())
+                                        if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                            part.get("text")
+                                                .and_then(|t| t.as_str())
+                                                .map(|s| s.to_string())
+                                        } else {
+                                            None
+                                        }
                                     })
                                     .collect::<Vec<_>>()
                             })
@@ -499,6 +569,25 @@ impl GeminiResponseTransformer {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
+    }
+
+    fn extract_thought_signature(data: &Value) -> Option<String> {
+        let candidates = data.get("candidates")?.as_array()?;
+        for candidate in candidates {
+            // Check top-level of candidate first
+            if let Some(sig) = candidate.get("thoughtSignature").and_then(|v| v.as_str()) {
+                return Some(sig.to_string());
+            }
+            // Check in parts (sometimes it's inside a part)
+            if let Some(parts) = candidate.get("content").and_then(|v| v.get("parts")).and_then(|v| v.as_array()) {
+                for part in parts {
+                    if let Some(sig) = part.get("thoughtSignature").and_then(|v| v.as_str()) {
+                        return Some(sig.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn extract_tool_call(data: &Value) -> Option<(String, Value)> {
@@ -561,20 +650,55 @@ impl ResponseTransformer for GeminiResponseTransformer {
             return output;
         };
 
-        for text in Self::extract_text_from_candidates(&data) {
-            if text.is_empty() {
-                continue;
-            }
-            self.open_text_block_if_needed(&mut output);
+        // 1. Extract thought signature if present
+        if let Some(sig) = Self::extract_thought_signature(&data) {
+            self.thought_signature = Some(sig);
+        }
+
+        // 2. Process Thinking/Thought
+        let sig = self.thought_signature.clone();
+        for thinking in Self::extract_thinking_from_candidates(&data) {
+            if thinking.is_empty() { continue; }
+            self.open_thinking_block_if_needed(&mut output, sig.as_deref());
             output.push(format!(
                 "event: content_block_delta\ndata: {}\n\n",
                 json!({
                     "type": "content_block_delta",
                     "index": self.open_text_index,
-                    "delta": { "type": "text_delta", "text": text }
+                    "delta": { "type": "thinking_delta", "thinking": thinking }
                 })
             ));
         }
+
+        // 3. Process normal text
+        data.get("candidates")
+            .and_then(|v| v.as_array())
+            .map(|candidates| {
+                for candidate in candidates {
+                    if let Some(parts) = candidate.get("content").and_then(|v| v.get("parts")).and_then(|v| v.as_array()) {
+                        for part in parts {
+                            // Only process text that is NOT thought
+                            if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                continue;
+                            }
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                if text.is_empty() { continue; }
+                                self.open_text_block_if_needed(&mut output);
+                                output.push(format!(
+                                    "event: content_block_delta\ndata: {}\n\n",
+                                    json!({
+                                        "type": "content_block_delta",
+                                        "index": self.open_text_index,
+                                        "delta": { "type": "text_delta", "text": text }
+                                    })
+                                ));
+                            }
+                        }
+                    }
+                }
+            });
+
+        // 4. Process tool calls
 
         if let Some((tool_name, args)) = Self::extract_tool_call(&data) {
             self.tool_name = Some(tool_name);
@@ -608,3 +732,107 @@ impl ResponseTransformer for GeminiResponseTransformer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_sse_event(raw: &str) -> (String, Value) {
+        let mut event = None;
+        let mut data = None;
+
+        for line in raw.lines() {
+            if let Some(value) = line.strip_prefix("event: ") {
+                event = Some(value.to_string());
+            }
+            if let Some(value) = line.strip_prefix("data: ") {
+                data = serde_json::from_str::<Value>(value).ok();
+            }
+        }
+
+        (
+            event.expect("missing SSE event name"),
+            data.expect("missing SSE data payload"),
+        )
+    }
+
+    #[test]
+    fn switches_to_dedicated_text_block_after_thinking() {
+        let mut transformer = GeminiResponseTransformer::new("gemini-test");
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"internal reasoning"},{"text":"final answer"}]}}]}"#;
+
+        let events = transformer.transform_line(line);
+        let parsed_events: Vec<(String, Value)> = events.iter().map(|event| parse_sse_event(event)).collect();
+
+        let thinking_start = parsed_events
+            .iter()
+            .position(|(name, payload)| {
+                name == "content_block_start"
+                    && payload
+                        .get("content_block")
+                        .and_then(|block| block.get("type"))
+                        .and_then(|value| value.as_str())
+                        == Some("thinking")
+            })
+            .expect("missing thinking block start event");
+
+        let thinking_index = parsed_events[thinking_start]
+            .1
+            .get("index")
+            .and_then(|value| value.as_u64())
+            .expect("thinking block index should exist");
+
+        let thinking_stop = parsed_events
+            .iter()
+            .position(|(name, payload)| {
+                name == "content_block_stop"
+                    && payload
+                        .get("index")
+                        .and_then(|value| value.as_u64())
+                        == Some(thinking_index)
+            })
+            .expect("missing thinking block stop event");
+
+        let text_start = parsed_events
+            .iter()
+            .position(|(name, payload)| {
+                name == "content_block_start"
+                    && payload
+                        .get("content_block")
+                        .and_then(|block| block.get("type"))
+                        .and_then(|value| value.as_str())
+                        == Some("text")
+            })
+            .expect("missing text block start event");
+
+        let text_index = parsed_events[text_start]
+            .1
+            .get("index")
+            .and_then(|value| value.as_u64())
+            .expect("text block index should exist");
+
+        let text_delta = parsed_events
+            .iter()
+            .position(|(name, payload)| {
+                name == "content_block_delta"
+                    && payload
+                        .get("index")
+                        .and_then(|value| value.as_u64())
+                        == Some(text_index)
+                    && payload
+                        .get("delta")
+                        .and_then(|delta| delta.get("type"))
+                        .and_then(|value| value.as_str())
+                        == Some("text_delta")
+                    && payload
+                        .get("delta")
+                        .and_then(|delta| delta.get("text"))
+                        .and_then(|value| value.as_str())
+                        == Some("final answer")
+            })
+            .expect("missing text delta on text block");
+
+        assert_ne!(thinking_index, text_index, "thinking/text should use different block indices");
+        assert!(thinking_stop < text_start, "thinking block should stop before text starts");
+        assert!(text_start < text_delta, "text delta should follow text block start");
+    }
+}

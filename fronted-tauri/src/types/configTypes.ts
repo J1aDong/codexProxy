@@ -26,6 +26,8 @@ export interface ProxyConfig {
     converter: ConverterType
     codexModel: string
     maxConcurrency: number
+    ignoreProbeRequests: boolean
+    allowCountTokensFallbackEstimate: boolean
     reasoningEffort: ReasoningEffort
     geminiReasoningEffort: ReasoningEffort
     skillInjectionPrompt: string
