@@ -59,8 +59,17 @@
 
     <div class="mt-5">
       <Select
+        v-model="form.converter"
+        :options="converterOptions"
+        :label="t('converter')"
+      />
+    </div>
+
+    <div class="mt-5">
+      <Select
+        v-if="form.converter === 'codex'"
         v-model="form.codexModel"
-        :options="modelOptions"
+        :options="codexModelOptions"
         :label="t('codexModel')"
       />
     </div>
@@ -70,6 +79,13 @@
       <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
         <div>
           <Select
+            v-if="form.converter === 'gemini'"
+            v-model="form.geminiReasoningEffort.opus"
+            :options="geminiModelOptions"
+            label="Opus"
+          />
+          <Select
+            v-else
             v-model="form.reasoningEffort.opus"
             :options="effortOptions"
             label="Opus"
@@ -77,6 +93,13 @@
         </div>
         <div>
           <Select
+            v-if="form.converter === 'gemini'"
+            v-model="form.geminiReasoningEffort.sonnet"
+            :options="geminiModelOptions"
+            label="Sonnet"
+          />
+          <Select
+            v-else
             v-model="form.reasoningEffort.sonnet"
             :options="effortOptions"
             label="Sonnet"
@@ -84,6 +107,13 @@
         </div>
         <div>
           <Select
+            v-if="form.converter === 'gemini'"
+            v-model="form.geminiReasoningEffort.haiku"
+            :options="geminiModelOptions"
+            label="Haiku"
+          />
+          <Select
+            v-else
             v-model="form.reasoningEffort.haiku"
             :options="effortOptions"
             label="Haiku"
@@ -91,7 +121,7 @@
         </div>
       </div>
       <div class="text-apple-text-secondary text-xs mt-2">
-        {{ t('reasoningEffortTip') }}
+        {{ form.converter === 'gemini' ? t('geminiReasoningEffortTip') : t('reasoningEffortTip') }}
       </div>
     </div>
 
@@ -123,14 +153,22 @@ interface EndpointOption {
   apiKey: string
 }
 
+type ConverterType = 'codex' | 'gemini'
+
 interface FormData {
   port: number
   targetUrl: string
   apiKey: string
   endpointOptions: EndpointOption[]
   selectedEndpointId: string
+  converter: ConverterType
   codexModel: string
   reasoningEffort: {
+    opus: string
+    sonnet: string
+    haiku: string
+  }
+  geminiReasoningEffort: {
     opus: string
     sonnet: string
     haiku: string
@@ -158,9 +196,19 @@ watch(() => props.form.apiKey, (newVal) => {
   localApiKey.value = newVal
 })
 
-const modelOptions = computed(() => [
+const codexModelOptions = computed(() => [
   { value: 'gpt-5.3-codex', label: t('modelRecommended') },
   { value: 'gpt-5.2-codex', label: 'GPT-5.2-Codex' },
+])
+
+const geminiModelOptions = computed(() => [
+  { value: 'gemini-3-pro-preview', label: 'Gemini 3 Pro Preview' },
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview' },
+])
+
+const converterOptions = computed(() => [
+  { value: 'codex', label: t('converterCodex') },
+  { value: 'gemini', label: t('converterGemini') },
 ])
 
 const effortOptions = [

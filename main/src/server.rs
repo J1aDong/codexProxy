@@ -1,6 +1,6 @@
 use crate::logger::AppLogger;
-use crate::models::{AnthropicRequest, ReasoningEffortMapping};
-use crate::transform::{TransformBackend, TransformContext, CodexBackend};
+use crate::models::{AnthropicRequest, ReasoningEffort, ReasoningEffortMapping, GeminiReasoningEffortMapping};
+use crate::transform::{CodexBackend, GeminiBackend, TransformBackend, TransformContext};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -22,7 +22,9 @@ pub struct ProxyServer {
     api_key: Option<String>,
     reasoning_mapping: ReasoningEffortMapping,
     skill_injection_prompt: String,
+    converter: String,
     codex_model: String,
+    gemini_reasoning_effort: GeminiReasoningEffortMapping,
     max_concurrency: u32,
 }
 
@@ -47,7 +49,9 @@ impl ProxyServer {
             api_key,
             reasoning_mapping: ReasoningEffortMapping::default(),
             skill_injection_prompt: String::new(),
+            converter: "codex".to_string(),
             codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
             max_concurrency: 0,
         }
     }
@@ -62,8 +66,20 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_converter(mut self, converter: String) -> Self {
+        self.converter = converter;
+        self
+    }
+
     pub fn with_codex_model(mut self, model: String) -> Self {
         self.codex_model = model;
+        self
+    }
+
+
+
+    pub fn with_gemini_reasoning_effort(mut self, effort: GeminiReasoningEffortMapping) -> Self {
+        self.gemini_reasoning_effort = effort;
         self
     }
 
@@ -95,11 +111,17 @@ impl ProxyServer {
         let ctx = Arc::new(TransformContext {
             reasoning_mapping: self.reasoning_mapping.clone(),
             skill_injection_prompt: self.skill_injection_prompt.clone(),
+            converter: self.converter.clone(),
             codex_model: self.codex_model.clone(),
+            gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),
         });
 
-        // 创建后端（目前固定为 CodexBackend，未来可配置）
-        let backend: Arc<dyn TransformBackend> = Arc::new(CodexBackend);
+        // 按 converter 选择后端，默认走 Codex
+        let backend: Arc<dyn TransformBackend> = if self.converter.eq_ignore_ascii_case("gemini") {
+            Arc::new(GeminiBackend)
+        } else {
+            Arc::new(CodexBackend)
+        };
 
         // 并发控制：0 = 不限制
         let semaphore: Option<Arc<Semaphore>> = if self.max_concurrency > 0 {
@@ -293,11 +315,53 @@ async fn handle_request(
         }
     };
 
-    let model_name = anthropic_body
-        .model
-        .clone()
-        .unwrap_or_else(|| ctx.codex_model.clone());
-    if let Some(family) = detect_model_family(&model_name) {
+    let model_name = if ctx.converter.eq_ignore_ascii_case("gemini") {
+        // Map Anthropic model to Gemini model using reasoning effort configuration
+        let input_model = anthropic_body.model.as_deref().unwrap_or("claude-3-5-sonnet-20240620");
+        let effort = crate::models::get_reasoning_effort(
+            input_model,
+            &ctx.reasoning_mapping
+        );
+
+        if let Some(ref l) = AppLogger::get() {
+            l.log(&format!("[Debug] Mapping Gemini - Input: {}, Effort: {:?}", input_model, effort));
+            l.log(&format!("[Debug] Current Gemini Config: {:?}", ctx.gemini_reasoning_effort));
+        }
+
+        match effort {
+            ReasoningEffort::Xhigh => {
+                let msg = format!("[Debug] Mapping to Opus (Xhigh) -> {}", ctx.gemini_reasoning_effort.opus);
+                let _ = log_tx.send(msg.clone());
+                if let Some(ref l) = AppLogger::get() { l.log(&msg); }
+                ctx.gemini_reasoning_effort.opus.clone()
+            },
+            ReasoningEffort::High | ReasoningEffort::Medium => {
+                let msg = format!("[Debug] Mapping to Sonnet (High/Medium) -> {}", ctx.gemini_reasoning_effort.sonnet);
+                let _ = log_tx.send(msg.clone());
+                if let Some(ref l) = AppLogger::get() { l.log(&msg); }
+                ctx.gemini_reasoning_effort.sonnet.clone()
+            },
+            ReasoningEffort::Low => {
+                let msg = format!("[Debug] Mapping to Haiku (Low) -> {}", ctx.gemini_reasoning_effort.haiku);
+                let _ = log_tx.send(msg.clone());
+                if let Some(ref l) = AppLogger::get() { l.log(&msg); }
+                ctx.gemini_reasoning_effort.haiku.clone()
+            },
+        }
+    } else {
+        // 对于 Codex 模式，如果用户在 UI 配置了目标模型，则强制使用该模型覆盖客户端传来的名
+        // 这样可以确保像 Claude Code 这种硬编码模型名的客户端也能正确映射到上游
+        if !ctx.codex_model.trim().is_empty() {
+            ctx.codex_model.clone()
+        } else {
+            anthropic_body
+                .model
+                .clone()
+                .unwrap_or_else(|| ctx.codex_model.clone())
+        }
+    };
+    let input_model = anthropic_body.model.as_deref().unwrap_or("claude-3-5-sonnet-20240620");
+    if let Some(family) = detect_model_family(input_model) {
         let _ = log_tx.send(format!("[Stat] model_request:{}", family));
     }
 
@@ -313,6 +377,7 @@ async fn handle_request(
         &anthropic_body,
         Some(&log_tx),
         &ctx,
+        Some(model_name.clone()),
     );
     let model = model_name;
 

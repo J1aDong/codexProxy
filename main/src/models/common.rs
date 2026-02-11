@@ -93,3 +93,26 @@ pub fn get_reasoning_effort(model: &str, mapping: &ReasoningEffortMapping) -> Re
 
     ReasoningEffort::Medium
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GeminiReasoningEffortMapping {
+    #[serde(default = "default_gemini_pro")]
+    pub opus: String,
+    #[serde(default = "default_gemini_flash")]
+    pub sonnet: String,
+    #[serde(default = "default_gemini_flash")]
+    pub haiku: String,
+}
+
+fn default_gemini_pro() -> String { "gemini-3-pro-preview".to_string() }
+fn default_gemini_flash() -> String { "gemini-3-flash-preview".to_string() }
+
+impl Default for GeminiReasoningEffortMapping {
+    fn default() -> Self {
+        Self {
+            opus: default_gemini_pro(),
+            sonnet: default_gemini_flash(),
+            haiku: default_gemini_flash(),
+        }
+    }
+}

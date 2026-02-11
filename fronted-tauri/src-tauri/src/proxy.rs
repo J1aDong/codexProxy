@@ -1,4 +1,4 @@
-use codex_proxy_core::{ProxyServer, ReasoningEffort, ReasoningEffortMapping};
+use codex_proxy_core::{ProxyServer, ReasoningEffort, ReasoningEffortMapping, GeminiReasoningEffortMapping};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::TcpListener;
@@ -30,6 +30,14 @@ impl ReasoningEffortConfig {
             .with_sonnet(ReasoningEffort::from_str(&self.sonnet))
             .with_haiku(ReasoningEffort::from_str(&self.haiku))
     }
+
+    pub fn to_gemini_mapping(&self) -> GeminiReasoningEffortMapping {
+        GeminiReasoningEffortMapping {
+            opus: self.opus.clone(),
+            sonnet: self.sonnet.clone(),
+            haiku: self.haiku.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -39,6 +47,18 @@ pub struct EndpointOption {
     pub url: String,
     #[serde(rename = "apiKey")]
     pub api_key: String,
+
+    #[serde(default)]
+    pub converter: Option<String>,
+
+    #[serde(rename = "codexModel", default)]
+    pub codex_model: Option<String>,
+
+    #[serde(rename = "reasoningEffort", default)]
+    pub reasoning_effort: Option<ReasoningEffortConfig>,
+
+    #[serde(rename = "geminiReasoningEffort", default)]
+    pub gemini_reasoning_effort: Option<ReasoningEffortConfig>,
 }
 
 fn default_endpoint_options() -> Vec<EndpointOption> {
@@ -47,6 +67,10 @@ fn default_endpoint_options() -> Vec<EndpointOption> {
         alias: "aicodemirror".to_string(),
         url: "https://api.aicodemirror.com/api/codex/backend-api/codex/responses".to_string(),
         api_key: String::new(),
+        converter: None,
+        codex_model: None,
+        reasoning_effort: None,
+        gemini_reasoning_effort: None,
     }]
 }
 
@@ -65,14 +89,19 @@ pub struct ProxyConfig {
     pub endpoint_options: Vec<EndpointOption>,
     #[serde(rename = "selectedEndpointId", default = "default_selected_endpoint_id")]
     pub selected_endpoint_id: String,
+    #[serde(default = "default_converter")]
+    pub converter: String,
     #[serde(rename = "codexModel", default = "default_codex_model")]
     pub codex_model: String,
+
     #[serde(rename = "maxConcurrency", default)]
     pub max_concurrency: u32,
     #[serde(default)]
     pub force: bool,
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: ReasoningEffortConfig,
+    #[serde(rename = "geminiReasoningEffort", default)]
+    pub gemini_reasoning_effort: ReasoningEffortConfig,
     #[serde(rename = "skillInjectionPrompt", default)]
     pub skill_injection_prompt: String,
     #[serde(default = "default_lang")]
@@ -83,9 +112,17 @@ fn default_lang() -> String {
     "zh".to_string()
 }
 
+fn default_converter() -> String {
+    "codex".to_string()
+}
+
 fn default_codex_model() -> String {
     "gpt-5.3-codex".to_string()
 }
+
+
+
+
 
 pub struct ProxyManager {
     running: bool,
@@ -263,9 +300,12 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
     };
 
     let server = ProxyServer::new(config.port, resolved_target_url.clone(), api_key)
-    .with_reasoning_mapping(config.reasoning_effort.to_mapping())
-    .with_codex_model(config.codex_model.clone())
-    .with_max_concurrency(config.max_concurrency);
+        .with_reasoning_mapping(config.reasoning_effort.to_mapping())
+        .with_skill_injection_prompt(config.skill_injection_prompt.clone())
+        .with_converter(config.converter.clone())
+        .with_codex_model(config.codex_model.clone())
+        .with_gemini_reasoning_effort(config.gemini_reasoning_effort.to_gemini_mapping())
+        .with_max_concurrency(config.max_concurrency);
 
     // 启动日志转发（Lagged 时跳过丢失的消息继续接收，不退出）
     let app_clone = app.clone();

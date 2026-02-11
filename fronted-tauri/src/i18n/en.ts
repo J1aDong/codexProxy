@@ -16,8 +16,14 @@ export default {
     apiKeyPlaceholder: 'Optional - Overrides client key',
     apiKeyTip: 'If configured here, you can use any random string as the API key in Claude Code.',
     modelRecommended: 'GPT-5.3-Codex (Recommended)',
+    converter: 'Converter',
+    converterCodex: 'Codex',
+    converterGemini: 'Gemini',
+    geminiModel: 'Gemini Model',
     reasoningEffort: 'Reasoning Effort',
+    geminiReasoningEffort: 'Gemini Reasoning Effort',
     reasoningEffortTip: 'Set default reasoning effort levels for different Claude model families.',
+    geminiReasoningEffortTip: 'Gemini converter uses a single reasoning effort level.',
     restoreDefaults: 'Restore Defaults',
     startProxy: 'Start Proxy',
     stopProxy: 'Stop Proxy',
@@ -76,8 +82,12 @@ export default {
     cancel: 'Cancel',
     add: 'Add',
     save: 'Save',
+    delete: 'Delete',
     ok: 'OK',
 
     // System
     portInUse: 'Port {port} is in use. Terminate the service and start proxy?',
+    confirmDeleteEndpoint: 'Are you sure you want to delete endpoint "{name}"?',
+    confirmDeleteEndpointFinal: 'Warning: This action cannot be undone. Are you sure?',
+    deleteLastEndpointError: 'At least one endpoint must be kept.',
 }

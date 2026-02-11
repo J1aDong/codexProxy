@@ -1264,13 +1264,14 @@ impl TransformBackend for CodexBackend {
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
         ctx: &TransformContext,
+        model_override: Option<String>,
     ) -> (Value, String) {
         TransformRequest::transform(
             anthropic_body,
             log_tx,
             &ctx.reasoning_mapping,
             &ctx.skill_injection_prompt,
-            &ctx.codex_model,
+            model_override.as_deref().unwrap_or(&ctx.codex_model),
         )
     }
 

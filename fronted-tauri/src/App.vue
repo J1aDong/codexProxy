@@ -43,6 +43,7 @@
       :initial-data="currentEditingEndpoint"
       @close="closeEndpointDialog"
       @add="handleEndpointSubmit"
+      @delete="handleDeleteEndpoint"
     />
 
     <!-- Settings Dialog -->
@@ -101,7 +102,7 @@
 </template>
 
 <script lang="ts" setup>
-import { reactive, ref, onMounted, computed, onUnmounted, watch } from 'vue'
+import { reactive, ref, onMounted, computed, onUnmounted, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
@@ -178,12 +179,18 @@ const DEFAULT_CONFIG = {
   apiKey: '',
   endpointOptions: [DEFAULT_ENDPOINT_OPTION],
   selectedEndpointId: DEFAULT_ENDPOINT_OPTION.id,
+  converter: 'codex' as 'codex' | 'gemini',
   codexModel: 'gpt-5.3-codex',
   maxConcurrency: 0,
   reasoningEffort: {
     opus: 'xhigh',
     sonnet: 'medium',
     haiku: 'low',
+  },
+  geminiReasoningEffort: {
+    opus: 'gemini-3-pro-preview',
+    sonnet: 'gemini-3-flash-preview',
+    haiku: 'gemini-3-flash-preview',
   },
   skillInjectionPrompt: '',
 }
@@ -196,7 +203,9 @@ const form = reactive({
   endpointOptions: [...DEFAULT_CONFIG.endpointOptions],
   selectedEndpointId: DEFAULT_CONFIG.selectedEndpointId,
   maxConcurrency: DEFAULT_CONFIG.maxConcurrency,
-  reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort }
+  reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort },
+  converter: DEFAULT_CONFIG.converter,
+  geminiReasoningEffort: { ...DEFAULT_CONFIG.geminiReasoningEffort },
 })
 
 const updateSkillInjectionPrompt = (prompt: string) => {
@@ -214,31 +223,63 @@ const useDefaultPrompt = () => {
   form.skillInjectionPrompt = lang.value === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
 }
 
+const isSyncing = ref(false)
+
 const currentEndpoint = computed(() => {
   const matched = form.endpointOptions.find((item) => item.id === form.selectedEndpointId)
   return matched ?? form.endpointOptions[0] ?? DEFAULT_ENDPOINT_OPTION
 })
 
 const syncEndpointFromSelection = () => {
-  form.targetUrl = currentEndpoint.value.url
-  form.apiKey = currentEndpoint.value.apiKey
+  const endpoint = currentEndpoint.value
+  form.targetUrl = endpoint.url
+  form.apiKey = endpoint.apiKey
+  if (endpoint.converter) form.converter = endpoint.converter
+  if (endpoint.codexModel) form.codexModel = endpoint.codexModel
+  if (endpoint.reasoningEffort) form.reasoningEffort = { ...endpoint.reasoningEffort }
+  if (endpoint.geminiReasoningEffort) form.geminiReasoningEffort = { ...endpoint.geminiReasoningEffort }
 }
 
-const updateSelectedEndpointApiKey = (nextApiKey: string) => {
+// Watch for endpoint selection changes to load corresponding config
+watch(() => form.selectedEndpointId, async () => {
+  isSyncing.value = true
+  syncEndpointFromSelection()
+  await nextTick()
+  isSyncing.value = false
+})
+
+const updateSelectedEndpointConfig = () => {
   form.endpointOptions = form.endpointOptions.map((item) => {
     if (item.id !== form.selectedEndpointId) return item
-    if (item.apiKey === nextApiKey) return item
     return {
       ...item,
-      apiKey: nextApiKey,
+      url: form.targetUrl,
+      apiKey: form.apiKey,
+      converter: form.converter,
+      codexModel: form.codexModel,
+      reasoningEffort: { ...form.reasoningEffort },
+      geminiReasoningEffort: { ...form.geminiReasoningEffort },
     }
   })
 }
 
-// Watch for API key changes to update endpoint options
-const unwatchApiKey = watch(() => form.apiKey, (newValue: string) => {
-  updateSelectedEndpointApiKey(newValue)
-})
+// Watch for changes in current form fields to update back to endpoint options
+watch(
+  [
+    () => form.targetUrl,
+    () => form.apiKey,
+    () => form.converter,
+    () => form.codexModel,
+    () => form.reasoningEffort,
+    () => form.geminiReasoningEffort,
+  ],
+  () => {
+    if (isSyncing.value) return
+    updateSelectedEndpointConfig()
+    saveConfig(buildProxyConfig()).catch(console.error)
+  },
+  { deep: true }
+)
 
 const updateForm = (newForm: any) => {
   Object.assign(form, newForm)
@@ -266,7 +307,7 @@ const closeEndpointDialog = () => {
   editingEndpointId.value = ''
 }
 
-const handleEndpointSubmit = (endpointData: { alias: string; url: string; apiKey: string }) => {
+const handleEndpointSubmit = (endpointData: any) => {
   if (editingEndpointId.value) {
     // Edit mode
     const index = form.endpointOptions.findIndex(opt => opt.id === editingEndpointId.value)
@@ -285,11 +326,33 @@ const handleEndpointSubmit = (endpointData: { alias: string; url: string; apiKey
     const nextOption: EndpointOption = {
       id: nextId,
       ...endpointData,
+      converter: endpointData.converter || form.converter,
+      codexModel: endpointData.codexModel || form.codexModel,
+      reasoningEffort: endpointData.reasoningEffort || { ...form.reasoningEffort },
+      geminiReasoningEffort: endpointData.geminiReasoningEffort || { ...form.geminiReasoningEffort },
     }
 
     form.endpointOptions = [...form.endpointOptions, nextOption]
     form.selectedEndpointId = nextId
     syncEndpointFromSelection()
+  }
+  closeEndpointDialog()
+}
+
+const handleDeleteEndpoint = (id: string) => {
+  if (form.endpointOptions.length <= 1) {
+    alert(t('deleteLastEndpointError'))
+    return
+  }
+  
+  const index = form.endpointOptions.findIndex(opt => opt.id === id)
+  if (index !== -1) {
+    form.endpointOptions.splice(index, 1)
+    if (form.selectedEndpointId === id) {
+      form.selectedEndpointId = form.endpointOptions[0].id
+      syncEndpointFromSelection()
+    }
+    saveConfig(buildProxyConfig()).catch(console.error)
   }
   closeEndpointDialog()
 }
@@ -324,8 +387,10 @@ const resetDefaults = () => {
   form.endpointOptions = [...DEFAULT_CONFIG.endpointOptions]
   form.selectedEndpointId = DEFAULT_CONFIG.selectedEndpointId
   syncEndpointFromSelection()
+  form.converter = DEFAULT_CONFIG.converter
   form.codexModel = DEFAULT_CONFIG.codexModel
   form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
+  form.geminiReasoningEffort = { ...DEFAULT_CONFIG.geminiReasoningEffort }
   form.maxConcurrency = DEFAULT_CONFIG.maxConcurrency
   useDefaultPrompt()
 }
@@ -336,9 +401,11 @@ const buildProxyConfig = (force = false): ProxyConfig => ({
   apiKey: form.apiKey,
   endpointOptions: form.endpointOptions,
   selectedEndpointId: form.selectedEndpointId,
+  converter: form.converter,
   codexModel: form.codexModel,
   maxConcurrency: form.maxConcurrency,
   reasoningEffort: form.reasoningEffort,
+  geminiReasoningEffort: form.geminiReasoningEffort,
   skillInjectionPrompt: form.skillInjectionPrompt,
   lang: locale.value,
   force,
@@ -491,10 +558,6 @@ onMounted(() => {
           form.selectedEndpointId = legacyOption.id
         }
         syncEndpointFromSelection()
-        if (savedConfig.codexModel) form.codexModel = savedConfig.codexModel
-        if (savedConfig.reasoningEffort) {
-          form.reasoningEffort = { ...savedConfig.reasoningEffort }
-        }
         if (savedConfig.skillInjectionPrompt) {
           form.skillInjectionPrompt = savedConfig.skillInjectionPrompt
         } else {
@@ -502,9 +565,6 @@ onMounted(() => {
         }
         if (savedConfig.lang && (savedConfig.lang === 'zh' || savedConfig.lang === 'en')) {
           locale.value = savedConfig.lang
-          if (!savedConfig.skillInjectionPrompt) {
-            useDefaultPrompt()
-          }
         }
         if (typeof savedConfig.maxConcurrency === 'number') {
           form.maxConcurrency = savedConfig.maxConcurrency
@@ -546,7 +606,6 @@ onMounted(() => {
 
 onUnmounted(() => {
   unlisteners.forEach(unlisten => unlisten())
-  unwatchApiKey()
 })
 </script>
 

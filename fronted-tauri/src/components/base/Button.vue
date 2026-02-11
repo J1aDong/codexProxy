@@ -8,8 +8,9 @@
         'rounded-full': circle,
         'bg-apple-blue text-white hover:bg-blue-600 focus:ring-blue-500': type === 'primary',
         'bg-gray-100 text-apple-text-primary hover:bg-gray-200 focus:ring-gray-500': type === 'default',
-        'bg-apple-danger text-white hover:bg-red-600 focus:ring-red-500': type === 'danger',
-        'bg-transparent text-apple-text-secondary hover:text-apple-text-primary hover:bg-gray-100 focus:ring-gray-500': type === 'text',
+        'bg-red-500 text-white hover:bg-red-600 focus:ring-red-500': type === 'danger',
+        'bg-transparent text-apple-text-secondary hover:text-apple-text-primary hover:bg-gray-100 focus:ring-gray-500': type === 'text' && !danger,
+        'bg-transparent text-red-500 hover:bg-red-100 focus:ring-red-500': type === 'text' && danger,
         'bg-transparent text-apple-blue hover:bg-blue-50 focus:ring-blue-500': type === 'link',
         'flex items-center justify-center': circle,
         'w-8 h-8 p-0': circle && size === 'small',
@@ -53,6 +54,10 @@ const props = defineProps({
     default: false,
   },
   disabled: {
+    type: Boolean,
+    default: false,
+  },
+  danger: {
     type: Boolean,
     default: false,
   },

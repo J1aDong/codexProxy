@@ -16,8 +16,14 @@ export default {
     apiKeyPlaceholder: '选填 - 将覆盖客户端提供的密钥',
     apiKeyTip: '如果在此处配置，您可以在 Claude Code 中使用任意随机字符串作为 API 密钥。',
     modelRecommended: 'GPT-5.3-Codex (推荐)',
+    converter: '转换器',
+    converterCodex: 'Codex',
+    converterGemini: 'Gemini',
+    geminiModel: 'Gemini 模型',
     reasoningEffort: '推理强度配置',
+    geminiReasoningEffort: 'Gemini 推理强度',
     reasoningEffortTip: '为不同的 Claude 模型系列设置默认推理强度级别。',
+    geminiReasoningEffortTip: 'Gemini 转换器使用单一推理强度。',
     restoreDefaults: '恢复默认',
     startProxy: '启动代理',
     stopProxy: '停止代理',
@@ -76,8 +82,12 @@ export default {
     cancel: '取消',
     add: '添加',
     save: '保存',
+    delete: '删除',
     ok: '确定',
 
     // System
     portInUse: '端口 {port} 已被占用。是否终止该端口上的服务并启动代理？',
+    confirmDeleteEndpoint: '确定要删除地址 "{name}" 吗？',
+    confirmDeleteEndpointFinal: '警告：此操作不可撤销，确定删除吗？',
+    deleteLastEndpointError: '必须保留至少一个地址。',
 }

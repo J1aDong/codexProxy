@@ -10,6 +10,11 @@ pub struct AnthropicRequest {
     pub tools: Option<Vec<Value>>,
     #[serde(default = "default_stream")]
     pub stream: bool,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub stop_sequences: Option<Vec<String>>,
 }
 
 fn default_stream() -> bool {

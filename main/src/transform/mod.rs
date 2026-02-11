@@ -1,15 +1,18 @@
 pub mod codex;
+pub mod gemini;
 
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::models::{AnthropicRequest, ReasoningEffortMapping};
+use crate::models::{AnthropicRequest, ReasoningEffortMapping, GeminiReasoningEffortMapping};
 
 /// 转换上下文 —— 从 ProxyServer 配置派生，传入 transform 方法
 pub struct TransformContext {
     pub reasoning_mapping: ReasoningEffortMapping,
     pub skill_injection_prompt: String,
+    pub converter: String,
     pub codex_model: String,
+    pub gemini_reasoning_effort: GeminiReasoningEffortMapping,
 }
 
 /// 协议转换后端 —— 每种上游 API 实现一份
@@ -25,6 +28,7 @@ pub trait TransformBackend: Send + Sync {
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
         ctx: &TransformContext,
+        model_override: Option<String>,
     ) -> (Value, String);
 
     /// 构建发送给上游的 reqwest::RequestBuilder
@@ -48,5 +52,6 @@ pub trait ResponseTransformer: Send {
     fn transform_line(&mut self, line: &str) -> Vec<String>;
 }
 
-// Re-export CodexBackend 作为默认后端
+// Re-export backends
 pub use codex::CodexBackend;
+pub use gemini::GeminiBackend;
