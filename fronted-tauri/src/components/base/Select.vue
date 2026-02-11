@@ -12,9 +12,16 @@
         :disabled="disabled"
         @click="toggleDropdown"
       >
-        <span>{{ selectedOption?.label || placeholder }}</span>
+        <span class="block min-w-0 flex-1 pr-2 overflow-hidden">
+          <span
+            ref="labelRef"
+            class="block w-full whitespace-nowrap leading-[1.2]"
+          >
+            {{ selectedOption?.label || placeholder }}
+          </span>
+        </span>
         <svg
-          class="w-4 h-4 text-apple-text-secondary transition-transform duration-200"
+          class="w-4 h-4 text-apple-text-secondary transition-transform duration-200 shrink-0"
           :class="{ 'transform rotate-180': isOpen }"
           fill="none"
           stroke="currentColor"
@@ -48,7 +55,8 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import fitty, { type FittyInstance } from 'fitty'
 
 interface Option {
   value: string | number
@@ -85,6 +93,8 @@ const props = defineProps({
 const emit = defineEmits(['update:modelValue', 'change'])
 
 const isOpen = ref(false)
+const labelRef = ref<HTMLSpanElement | null>(null)
+let fittyInstance: FittyInstance | null = null
 
 const selectedOption = computed(() => {
   return props.options.find(option => option.value === props.modelValue)
@@ -105,4 +115,41 @@ const selectOption = (option: Option) => {
   emit('change', option.value)
   isOpen.value = false
 }
+
+const fitLabelToWidth = async () => {
+  await nextTick()
+  fittyInstance?.fit({ sync: true })
+}
+
+watch(
+  () => [props.modelValue, props.placeholder, props.options],
+  () => {
+    fitLabelToWidth().catch(() => {})
+  },
+  { deep: true }
+)
+
+onMounted(() => {
+  if (labelRef.value) {
+    fittyInstance = fitty(labelRef.value, {
+      minSize: 11,
+      maxSize: 16,
+      multiLine: false,
+      observeMutations: {
+        subtree: true,
+        childList: true,
+        characterData: true,
+      },
+    })
+  }
+
+  fitLabelToWidth().catch(() => {})
+})
+
+onUnmounted(() => {
+  if (fittyInstance) {
+    fittyInstance.unsubscribe()
+    fittyInstance = null
+  }
+})
 </script>
