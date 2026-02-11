@@ -4,8 +4,6 @@
       <!-- Header -->
       <Header
         :isRunning="isRunning"
-        :lang="lang"
-        :t="t"
         @toggleLang="toggleLang"
         @showAbout="showAbout = true"
         @showSettings="showSettings = true"
@@ -17,7 +15,6 @@
       <ConfigCard
         :form="form"
         :isRunning="isRunning"
-        :t="t"
         @update:form="updateForm"
         @reset="resetDefaults"
         @toggle="toggleProxy"
@@ -28,8 +25,6 @@
       <!-- Guide Section -->
       <GuideSection
         :port="form.port"
-        :lang="lang"
-        :t="t"
       />
     </div>
 
@@ -38,7 +33,6 @@
       :visible="showLogs"
       :logs="logs"
       :modelRequestStats="modelRequestStats"
-      :t="t"
       @close="showLogs = false"
       @clear="clearLogs"
     />
@@ -47,7 +41,6 @@
     <EndpointDialog
       :visible="showEndpointDialog"
       :initial-data="currentEditingEndpoint"
-      :t="dialogT"
       @close="closeEndpointDialog"
       @add="handleEndpointSubmit"
     />
@@ -56,8 +49,6 @@
     <SettingsDialog
       :visible="showSettings"
       :skillInjectionPrompt="form.skillInjectionPrompt"
-      :lang="lang"
-      :t="t"
       @close="showSettings = false"
       @update="updateSkillInjectionPrompt"
     />
@@ -69,7 +60,6 @@
       :updateStatus="updateStatus"
       :latestVersion="latestVersion"
       :updateError="updateError"
-      :t="t"
       @close="showAbout = false"
       @checkUpdate="fetchLatestRelease"
       @openReleases="openReleasePage"
@@ -79,7 +69,7 @@
     <div v-if="showConcurrency" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div class="bg-white rounded-xl w-full max-w-sm mx-4">
         <div class="flex items-center justify-between p-4 border-b border-gray-200">
-          <h2 class="text-lg font-semibold text-apple-text-primary">{{ t.concurrencyTitle }}</h2>
+          <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('concurrencyTitle') }}</h2>
           <button class="text-gray-400 hover:text-gray-600 transition-colors" @click="showConcurrency = false">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
           </button>
@@ -92,17 +82,17 @@
               min="0"
               max="100"
               class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
-              :placeholder="t.concurrencyPlaceholder"
+              :placeholder="t('concurrencyPlaceholder')"
             />
           </div>
-          <div class="text-apple-text-secondary text-xs">{{ t.concurrencyTip }}</div>
+          <div class="text-apple-text-secondary text-xs">{{ t('concurrencyTip') }}</div>
         </div>
         <div class="p-4 border-t border-gray-200 flex justify-end">
           <button
             class="px-4 py-2 bg-apple-blue text-white rounded-lg text-sm font-medium hover:bg-blue-600 transition-colors"
             @click="saveConcurrency"
           >
-            {{ t.save }}
+            {{ t('save') }}
           </button>
         </div>
       </div>
@@ -112,6 +102,7 @@
 
 <script lang="ts" setup>
 import { reactive, ref, onMounted, computed, onUnmounted, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
@@ -125,6 +116,8 @@ import LogsPanel from './components/features/LogsPanel.vue'
 import EndpointDialog from './components/features/EndpointDialog.vue'
 import SettingsDialog from './components/features/SettingsDialog.vue'
 import AboutDialog from './components/features/AboutDialog.vue'
+
+const { t, locale } = useI18n()
 
 const isRunning = ref(false)
 const showLogs = ref(false)
@@ -161,139 +154,16 @@ const RELEASES_URL = 'https://github.com/J1aDong/codexProxy/releases'
 const unlisteners: UnlistenFn[] = []
 
 // Language Support
-const lang = ref<'zh' | 'en'>('zh')
+const lang = computed(() => locale.value as 'zh' | 'en')
 const toggleLang = () => {
-  lang.value = lang.value === 'zh' ? 'en' : 'zh'
+  locale.value = locale.value === 'zh' ? 'en' : 'zh'
   saveLangPreference()
 }
 
 const saveLangPreference = () => {
-  saveLang(lang.value).catch(console.error)
+  saveLang(locale.value).catch(console.error)
 }
 
-const translations = {
-  zh: {
-    statusRunning: '代理运行中',
-    statusStopped: '代理已停止',
-    title: 'Codex 代理',
-    port: '端口',
-    codexModel: 'Codex 模型',
-    targetUrl: '目标地址',
-    addEndpoint: '添加地址',
-    editEndpoint: '编辑地址',
-    endpointAlias: '别名',
-    endpointAliasPlaceholder: '例如：自建节点',
-    endpointUrl: '地址',
-    endpointApiKey: '密钥',
-    apiKey: 'Codex API 密钥',
-    apiKeyPlaceholder: '选填 - 将覆盖客户端提供的密钥',
-    apiKeyTip: '如果在此处配置，您可以在 Claude Code 中使用任意随机字符串作为 API 密钥。',
-    restoreDefaults: '恢复默认',
-    startProxy: '启动代理',
-    stopProxy: '停止代理',
-    guideTitle: '配置指南',
-    guideDesc: '请将以下内容添加到您的 Claude Code 配置文件：',
-    logsTitle: '系统日志',
-    clearLogs: '清除日志',
-    copy: '复制',
-    copied: '已复制',
-    noLogs: '暂无日志...',
-    reasoningEffort: '推理强度配置',
-    reasoningEffortTip: '为不同的 Claude 模型系列设置默认推理强度级别。',
-    menuPromptSettings: '提示词设置',
-    menuConcurrency: '并发数设置',
-    menuAbout: '关于',
-    concurrencyTitle: '并发数设置',
-    concurrencyTip: '设置最大并发请求数。0 或留空表示不限制。(优化比如teammate多并发功能一般推荐5)',
-    concurrencyPlaceholder: '0 = 不限制',
-    aboutTitle: '关于',
-    versionLabel: '版本',
-    appName: 'Codex Proxy',
-    updateIdle: '点击"前往 Release 页面"检查更新',
-    updateChecking: '正在检查更新...',
-    updateLatest: '当前已是最新版本',
-    updateAvailable: '发现新版本',
-    updateFailed: '检查更新失败',
-    updateRateLimited: '检查更新失败（GitHub 限流）',
-    goToReleases: '前往 Release 页面',
-    settingsTitle: '设置',
-    skillInjection: '技能注入配置',
-    skillInjectionTip: '当使用 Skill 时，将此提示词注入到 User Message 中。留空则不注入。',
-    skillInjectionPlaceholder: '例如：如果依赖缺失，请自动安装...',
-    useDefaultPrompt: '使用默认提示词',
-    cancel: '取消',
-    add: '添加',
-    save: '保存',
-  },
-  en: {
-    statusRunning: 'Proxy Running',
-    statusStopped: 'Proxy Stopped',
-    title: 'Codex Proxy',
-    port: 'Port',
-    codexModel: 'Codex Model',
-    targetUrl: 'Target URL',
-    addEndpoint: 'Add Endpoint',
-    editEndpoint: 'Edit Endpoint',
-    endpointAlias: 'Alias',
-    endpointAliasPlaceholder: 'E.g. Custom Node',
-    endpointUrl: 'URL',
-    endpointApiKey: 'API Key',
-    apiKey: 'Codex API Key',
-    apiKeyPlaceholder: 'Optional - Overrides client key',
-    apiKeyTip: 'If configured here, you can use any random string as the API key in Claude Code.',
-    restoreDefaults: 'Restore Defaults',
-    startProxy: 'Start Proxy',
-    stopProxy: 'Stop Proxy',
-    guideTitle: 'Configuration Guide',
-    guideDesc: 'Add the following to your Claude Code settings file:',
-    logsTitle: 'System Logs',
-    clearLogs: 'Clear Logs',
-    copy: 'Copy',
-    copied: 'Copied',
-    noLogs: 'No logs yet...',
-    reasoningEffort: 'Reasoning Effort',
-    reasoningEffortTip: 'Set default reasoning effort levels for different Claude model families.',
-    menuPromptSettings: 'Prompt Settings',
-    menuConcurrency: 'Concurrency',
-    menuAbout: 'About',
-    concurrencyTitle: 'Concurrency Settings',
-    concurrencyTip: 'Max concurrent requests. 0 or empty means unlimited. (Optimized for features like Teammate, recommended: 5)',
-    concurrencyPlaceholder: '0 = unlimited',
-    aboutTitle: 'About',
-    versionLabel: 'Version',
-    appName: 'Codex Proxy',
-    updateIdle: 'Click "Releases" to check updates',
-    updateChecking: 'Checking for updates...',
-    updateLatest: 'You are up to date',
-    updateAvailable: 'New version available',
-    updateFailed: 'Update check failed',
-    updateRateLimited: 'Update check failed (GitHub rate limit)',
-    goToReleases: 'Releases',
-    settingsTitle: 'Settings',
-    skillInjection: 'Skill Injection Config',
-    skillInjectionTip: 'Inject this prompt into User Message when Skills are used. Leave empty to disable.',
-    skillInjectionPlaceholder: 'E.g. Auto-install dependencies if missing...',
-    useDefaultPrompt: 'Use Default Prompt',
-    cancel: 'Cancel',
-    add: 'Add',
-    save: 'Save',
-  }
-}
-
-const t = computed(() => translations[lang.value])
-
-const dialogT = computed(() => ({
-  addEndpoint: t.value.addEndpoint,
-  endpointAlias: t.value.endpointAlias,
-  endpointAliasPlaceholder: t.value.endpointAliasPlaceholder,
-  endpointUrl: t.value.endpointUrl,
-  endpointApiKey: t.value.endpointApiKey,
-  apiKeyPlaceholder: t.value.apiKeyPlaceholder,
-  cancel: t.value.cancel,
-  add: t.value.add,
-  save: t.value.save,
-  editEndpoint: t.value.editEndpoint,
-}))
 
 const DEFAULT_ENDPOINT_OPTION: EndpointOption = {
   id: 'aicodemirror-default',
@@ -470,7 +340,7 @@ const buildProxyConfig = (force = false): ProxyConfig => ({
   maxConcurrency: form.maxConcurrency,
   reasoningEffort: form.reasoningEffort,
   skillInjectionPrompt: form.skillInjectionPrompt,
-  lang: lang.value,
+  lang: locale.value,
   force,
 })
 
@@ -631,7 +501,7 @@ onMounted(() => {
           useDefaultPrompt()
         }
         if (savedConfig.lang && (savedConfig.lang === 'zh' || savedConfig.lang === 'en')) {
-          lang.value = savedConfig.lang
+          locale.value = savedConfig.lang
           if (!savedConfig.skillInjectionPrompt) {
             useDefaultPrompt()
           }
@@ -664,9 +534,7 @@ onMounted(() => {
   listen<number>('port-in-use', (event) => {
     const port = event.payload
     const confirmed = confirm(
-      lang.value === 'zh'
-        ? `端口 ${port} 已被占用。是否终止该端口上的服务并启动代理？`
-        : `Port ${port} is in use. Do you want to terminate the service on this port and start the proxy?`
+      t('portInUse', { port })
     )
     if (confirmed) {
       startProxy(buildProxyConfig(true)).catch(console.error)

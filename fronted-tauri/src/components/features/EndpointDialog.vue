@@ -2,7 +2,7 @@
   <div v-if="visible" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
     <div class="bg-white rounded-xl w-full max-w-md mx-4">
       <div class="flex items-center justify-between p-4 border-b border-gray-200">
-        <h2 class="text-lg font-semibold text-apple-text-primary">{{ isEdit ? t.editEndpoint : t.addEndpoint }}</h2>
+        <h2 class="text-lg font-semibold text-apple-text-primary">{{ isEdit ? t('editEndpoint') : t('addEndpoint') }}</h2>
         <Button
           type="text"
           size="small"
@@ -18,25 +18,25 @@
       <div class="p-4 space-y-4">
         <Input
           v-model="endpointDraft.alias"
-          label="别名"
-          placeholder="例如：自建节点"
+          :label="t('endpointAlias')"
+          :placeholder="t('endpointAliasPlaceholder')"
         />
         <Input
           v-model="endpointDraft.url"
-          label="地址"
+          :label="t('endpointUrl')"
           placeholder="https://..."
         />
         <Input
           v-model="endpointDraft.apiKey"
-          label="密钥"
+          :label="t('endpointApiKey')"
           type="password"
-          placeholder="选填 - 将覆盖客户端提供的密钥"
+          :placeholder="t('apiKeyPlaceholder')"
         />
       </div>
 
       <div class="p-4 border-t border-gray-200 flex justify-end gap-2">
-        <Button @click="handleClose">{{ t.cancel }}</Button>
-        <Button type="primary" @click="handleAdd">{{ isEdit ? t.save : t.add }}</Button>
+        <Button @click="handleClose">{{ t('cancel') }}</Button>
+        <Button type="primary" @click="handleAdd">{{ isEdit ? t('save') : t('add') }}</Button>
       </div>
     </div>
   </div>
@@ -44,16 +44,15 @@
 
 <script lang="ts" setup>
 import { reactive, watch, computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import Button from '../base/Button.vue'
 import Input from '../base/Input.vue'
+
+const { t } = useI18n()
 
 const props = defineProps({
   visible: {
     type: Boolean,
-    required: true,
-  },
-  t: {
-    type: Object,
     required: true,
   },
   initialData: {

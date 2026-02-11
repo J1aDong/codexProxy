@@ -2,7 +2,7 @@
   <div v-if="visible" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
     <div class="bg-white rounded-xl w-full max-w-md mx-4">
       <div class="flex items-center justify-between p-4 border-b border-gray-200">
-        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t.settingsTitle }}</h2>
+        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('settingsTitle') }}</h2>
         <Button
           type="text"
           size="small"
@@ -18,17 +18,17 @@
       <div class="p-4 space-y-4">
         <div>
           <label class="block text-sm font-medium text-apple-text-primary mb-1">
-            {{ t.skillInjection }}
+            {{ t('skillInjection') }}
           </label>
           <textarea
             v-model="localPrompt"
             rows="4"
             class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none resize-none"
-            :placeholder="t.skillInjectionPlaceholder"
+            :placeholder="t('skillInjectionPlaceholder')"
             maxlength="500"
           />
           <div class="text-apple-text-secondary text-xs mt-1">
-            {{ t.skillInjectionTip }}
+            {{ t('skillInjectionTip') }}
           </div>
           <Button
             type="link"
@@ -36,13 +36,13 @@
             @click="handleUseDefault"
             class="mt-2"
           >
-            {{ t.useDefaultPrompt }}
+            {{ t('useDefaultPrompt') }}
           </Button>
         </div>
       </div>
 
       <div class="p-4 border-t border-gray-200 flex justify-end">
-        <Button type="primary" @click="handleSave">OK</Button>
+        <Button type="primary" @click="handleSave">{{ t('ok') }}</Button>
       </div>
     </div>
   </div>
@@ -50,7 +50,10 @@
 
 <script lang="ts" setup>
 import { ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import Button from '../base/Button.vue'
+
+const { t, locale } = useI18n()
 
 const props = defineProps({
   visible: {
@@ -59,14 +62,6 @@ const props = defineProps({
   },
   skillInjectionPrompt: {
     type: String,
-    required: true,
-  },
-  lang: {
-    type: String,
-    required: true,
-  },
-  t: {
-    type: Object,
     required: true,
   },
 })
@@ -89,7 +84,7 @@ const handleClose = () => {
 }
 
 const handleUseDefault = () => {
-  localPrompt.value = props.lang === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
+  localPrompt.value = locale.value === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
 }
 
 const handleSave = () => {

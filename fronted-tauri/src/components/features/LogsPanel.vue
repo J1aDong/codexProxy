@@ -12,7 +12,7 @@
     <div class="fixed inset-y-0 right-0 w-96 bg-white shadow-2xl z-50 flex flex-col transform transition-transform duration-300 ease-in-out"
          :class="{ 'translate-x-full': !visible, 'translate-x-0': visible }">
       <div class="flex items-center justify-between p-4 border-b border-gray-200">
-        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t.logsTitle }}</h2>
+        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('logsTitle') }}</h2>
         <Button
           type="text"
           size="small"
@@ -44,7 +44,7 @@
 
       <div class="flex-1 overflow-y-auto p-4 overscroll-contain flex flex-col" ref="logsContainer">
         <div v-if="logs.length === 0" class="flex-1 flex items-center justify-center text-apple-text-secondary min-h-[50px]">
-          {{ t.noLogs }}
+          {{ t('noLogs') }}
         </div>
         <div v-else>
           <div v-for="(log, index) in logs" :key="index" class="mb-2 flex gap-2">
@@ -55,7 +55,7 @@
       </div>
 
       <div class="p-4 border-t border-gray-200 flex justify-end">
-        <Button @click="handleClear">{{ t.clearLogs }}</Button>
+        <Button @click="handleClear">{{ t('clearLogs') }}</Button>
       </div>
     </div>
   </div>
@@ -63,7 +63,10 @@
 
 <script lang="ts" setup>
 import { ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import Button from '../base/Button.vue'
+
+const { t } = useI18n()
 
 interface LogItem {
   time: string
@@ -87,10 +90,6 @@ const props = defineProps({
   },
   modelRequestStats: {
     type: Object as () => ModelStats,
-    required: true,
-  },
-  t: {
-    type: Object,
     required: true,
   },
 })

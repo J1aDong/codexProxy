@@ -2,7 +2,7 @@
   <div v-if="visible" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
     <div class="bg-white rounded-xl w-full max-w-md mx-4">
       <div class="flex items-center justify-between p-4 border-b border-gray-200">
-        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t.aboutTitle }}</h2>
+        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('aboutTitle') }}</h2>
         <Button
           type="text"
           size="small"
@@ -16,9 +16,9 @@
       </div>
 
       <div class="p-4 text-center">
-        <div class="text-lg font-semibold text-apple-text-primary mb-2">{{ t.appName }}</div>
+        <div class="text-lg font-semibold text-apple-text-primary mb-2">{{ t('appName') }}</div>
         <div class="text-sm text-apple-text-secondary mb-4">
-          {{ t.versionLabel }} v{{ appVersion }}
+          {{ t('versionLabel') }} v{{ appVersion }}
         </div>
 
         <div class="mb-4">
@@ -29,13 +29,13 @@
             plain
             @click="handleOpenReleases"
           >
-            {{ t.goToReleases }}
+            {{ t('goToReleases') }}
           </Button>
         </div>
       </div>
 
       <div class="p-4 border-t border-gray-200 flex justify-end">
-        <Button type="primary" @click="handleClose">OK</Button>
+        <Button type="primary" @click="handleClose">{{ t('ok') }}</Button>
       </div>
     </div>
   </div>
@@ -43,7 +43,10 @@
 
 <script lang="ts" setup>
 import { computed, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import Button from '../base/Button.vue'
+
+const { t } = useI18n()
 
 const props = defineProps({
   visible: {
@@ -66,28 +69,23 @@ const props = defineProps({
     type: String,
     required: true,
   },
-  t: {
-    type: Object,
-    required: true,
-  },
 })
 
 const emit = defineEmits(['close', 'checkUpdate', 'openReleases'])
 
 const updateStatusText = computed(() => {
-  const { updateStatus, updateError, latestVersion, t } = props
-  if (updateStatus === 'checking') return t.updateChecking
-  if (updateStatus === 'failed') {
-    if (updateError === 'rate_limited') return t.updateRateLimited
-    return updateError
-      ? `${t.updateFailed} (${updateError})`
-      : t.updateFailed
+  if (props.updateStatus === 'checking') return t('updateChecking')
+  if (props.updateStatus === 'failed') {
+    if (props.updateError === 'rate_limited') return t('updateRateLimited')
+    return props.updateError
+      ? `${t('updateFailed')} (${props.updateError})`
+      : t('updateFailed')
   }
-  if (updateStatus === 'available') {
-    return `${t.updateAvailable} v${latestVersion}`
+  if (props.updateStatus === 'available') {
+    return `${t('updateAvailable')} v${props.latestVersion}`
   }
-  if (updateStatus === 'latest') return t.updateLatest
-  return t.updateIdle
+  if (props.updateStatus === 'latest') return t('updateLatest')
+  return t('updateIdle')
 })
 
 watch(() => props.visible, (visible) => {
