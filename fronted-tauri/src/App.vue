@@ -67,87 +67,86 @@
     />
 
     <!-- Advanced Settings Dialog -->
-    <div v-if="showAdvancedSettings" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div class="bg-white rounded-xl w-full max-w-md mx-4">
-        <div class="flex items-center justify-between p-4 border-b border-gray-200">
-          <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('advancedSettingsTitle') }}</h2>
-          <button class="text-gray-400 hover:text-gray-600 transition-colors" @click="showAdvancedSettings = false">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
-          </button>
+    <Dialog
+      :visible="showAdvancedSettings"
+      :title="t('advancedSettingsTitle')"
+      @close="showAdvancedSettings = false"
+    >
+      <div class="space-y-4">
+        <div class="space-y-2">
+          <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedMaxConcurrencyLabel') }}</label>
+          <input
+            type="number"
+            v-model.number="localMaxConcurrency"
+            min="0"
+            max="100"
+            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
+            :placeholder="t('advancedMaxConcurrencyPlaceholder')"
+          />
+          <div class="text-apple-text-secondary text-xs">{{ t('advancedMaxConcurrencyTip') }}</div>
         </div>
-        <div class="p-4 space-y-4">
-          <div class="space-y-2">
-            <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedMaxConcurrencyLabel') }}</label>
-            <input
-              type="number"
-              v-model.number="localMaxConcurrency"
-              min="0"
-              max="100"
-              class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
-              :placeholder="t('advancedMaxConcurrencyPlaceholder')"
-            />
-            <div class="text-apple-text-secondary text-xs">{{ t('advancedMaxConcurrencyTip') }}</div>
+
+        <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
+          <input v-model="localIgnoreProbeRequests" type="checkbox" class="mt-1" />
+          <div class="flex-1">
+            <div class="text-sm font-medium text-apple-text-primary">{{ t('advancedIgnoreProbeLabel') }}</div>
+            <div class="text-xs text-apple-text-secondary mt-1">{{ t('advancedIgnoreProbeTip') }}</div>
           </div>
+        </label>
 
-          <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
-            <input v-model="localIgnoreProbeRequests" type="checkbox" class="mt-1" />
-            <div class="flex-1">
-              <div class="text-sm font-medium text-apple-text-primary">{{ t('advancedIgnoreProbeLabel') }}</div>
-              <div class="text-xs text-apple-text-secondary mt-1">{{ t('advancedIgnoreProbeTip') }}</div>
-            </div>
-          </label>
-
-          <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
-            <input v-model="localAllowCountTokensFallbackEstimate" type="checkbox" class="mt-1" />
-            <div class="flex-1">
-              <div class="text-sm font-medium text-apple-text-primary">{{ t('advancedCountTokensFallbackLabel') }}</div>
-              <div class="text-xs text-apple-text-secondary mt-1">{{ t('advancedCountTokensFallbackTip') }}</div>
-            </div>
-          </label>
-
-          <div class="space-y-2">
-            <div class="flex items-center justify-between">
-              <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedCodexCapabilityPresetLabel') }}</label>
-              <button
-                class="text-xs text-apple-blue hover:text-blue-700 transition-colors"
-                @click="resetCodexCapabilityPreset"
-              >
-                {{ t('restoreDefaults') }}
-              </button>
-            </div>
-            <textarea
-              v-model="localCodexCapabilityJson"
-              rows="8"
-              class="w-full px-3 py-2 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
-            />
-            <div class="text-xs text-apple-text-secondary">{{ t('advancedCodexCapabilityPresetTip') }}</div>
-            <div v-if="advancedSettingsError" class="text-xs text-red-500">{{ advancedSettingsError }}</div>
+        <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
+          <input v-model="localAllowCountTokensFallbackEstimate" type="checkbox" class="mt-1" />
+          <div class="flex-1">
+            <div class="text-sm font-medium text-apple-text-primary">{{ t('advancedCountTokensFallbackLabel') }}</div>
+            <div class="text-xs text-apple-text-secondary mt-1">{{ t('advancedCountTokensFallbackTip') }}</div>
           </div>
+        </label>
 
-          <div class="space-y-2">
-            <div class="flex items-center justify-between">
-              <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedGeminiModelPresetLabel') }}</label>
-              <button
-                class="text-xs text-apple-blue hover:text-blue-700 transition-colors"
-                @click="resetGeminiModelPreset"
-              >
-                {{ t('restoreDefaults') }}
-              </button>
-            </div>
-            <textarea
-              v-model="localGeminiModelPresetJson"
-              rows="5"
-              class="w-full px-3 py-2 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
-            />
-            <div class="text-xs text-apple-text-secondary">{{ t('advancedGeminiModelPresetTip') }}</div>
-            <div v-if="advancedGeminiPresetError" class="text-xs text-red-500">{{ advancedGeminiPresetError }}</div>
+        <div class="space-y-2">
+          <div class="flex items-center justify-between">
+            <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedCodexCapabilityPresetLabel') }}</label>
+            <button
+              class="text-xs text-apple-blue hover:text-blue-700 transition-colors"
+              @click="resetCodexCapabilityPreset"
+            >
+              {{ t('restoreDefaults') }}
+            </button>
           </div>
-
-          <div class="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-            {{ t('advancedSettingsRiskTip') }}
-          </div>
+          <textarea
+            v-model="localCodexCapabilityJson"
+            rows="8"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
+          />
+          <div class="text-xs text-apple-text-secondary">{{ t('advancedCodexCapabilityPresetTip') }}</div>
+          <div v-if="advancedSettingsError" class="text-xs text-red-500">{{ advancedSettingsError }}</div>
         </div>
-        <div class="p-4 border-t border-gray-200 flex justify-end">
+
+        <div class="space-y-2">
+          <div class="flex items-center justify-between">
+            <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedGeminiModelPresetLabel') }}</label>
+            <button
+              class="text-xs text-apple-blue hover:text-blue-700 transition-colors"
+              @click="resetGeminiModelPreset"
+            >
+              {{ t('restoreDefaults') }}
+            </button>
+          </div>
+          <textarea
+            v-model="localGeminiModelPresetJson"
+            rows="5"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
+          />
+          <div class="text-xs text-apple-text-secondary">{{ t('advancedGeminiModelPresetTip') }}</div>
+          <div v-if="advancedGeminiPresetError" class="text-xs text-red-500">{{ advancedGeminiPresetError }}</div>
+        </div>
+
+        <div class="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          {{ t('advancedSettingsRiskTip') }}
+        </div>
+      </div>
+
+      <template #footer>
+        <div class="p-4 flex justify-end">
           <button
             class="px-4 py-2 bg-apple-blue text-white rounded-lg text-sm font-medium hover:bg-blue-600 transition-colors"
             @click="saveAdvancedSettings"
@@ -155,8 +154,8 @@
             {{ t('save') }}
           </button>
         </div>
-      </div>
-    </div>
+      </template>
+    </Dialog>
   </div>
 </template>
 
@@ -176,6 +175,7 @@ import LogsPanel from './components/features/LogsPanel.vue'
 import EndpointDialog from './components/features/EndpointDialog.vue'
 import SettingsDialog from './components/features/SettingsDialog.vue'
 import AboutDialog from './components/features/AboutDialog.vue'
+import Dialog from './components/base/Dialog.vue'
 
 const { t, locale } = useI18n()
 

@@ -1,50 +1,41 @@
 <template>
-  <div v-if="visible" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-    <div class="bg-white rounded-xl w-full max-w-md mx-4">
-      <div class="flex items-center justify-between p-4 border-b border-gray-200">
-        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('aboutTitle') }}</h2>
+  <Dialog
+    :visible="visible"
+    :title="t('aboutTitle')"
+    @close="handleClose"
+  >
+    <div class="text-center">
+      <div class="text-lg font-semibold text-apple-text-primary mb-2">{{ t('appName') }}</div>
+      <div class="text-sm text-apple-text-secondary mb-4">
+        {{ t('versionLabel') }} v{{ appVersion }}
+      </div>
+
+      <div class="mb-4">
+        <div class="text-xs text-apple-text-secondary mb-2">{{ updateStatusText }}</div>
         <Button
-          type="text"
+          type="primary"
           size="small"
-          circle
-          @click="handleClose"
+          plain
+          @click="handleOpenReleases"
         >
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-          </svg>
+          {{ t('goToReleases') }}
         </Button>
       </div>
+    </div>
 
-      <div class="p-4 text-center">
-        <div class="text-lg font-semibold text-apple-text-primary mb-2">{{ t('appName') }}</div>
-        <div class="text-sm text-apple-text-secondary mb-4">
-          {{ t('versionLabel') }} v{{ appVersion }}
-        </div>
-
-        <div class="mb-4">
-          <div class="text-xs text-apple-text-secondary mb-2">{{ updateStatusText }}</div>
-          <Button
-            type="primary"
-            size="small"
-            plain
-            @click="handleOpenReleases"
-          >
-            {{ t('goToReleases') }}
-          </Button>
-        </div>
-      </div>
-
-      <div class="p-4 border-t border-gray-200 flex justify-end">
+    <template #footer>
+      <div class="p-4 flex justify-end">
         <Button type="primary" @click="handleClose">{{ t('ok') }}</Button>
       </div>
-    </div>
-  </div>
+    </template>
+  </Dialog>
 </template>
 
 <script lang="ts" setup>
 import { computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Button from '../base/Button.vue'
+import Dialog from '../base/Dialog.vue'
 
 const { t } = useI18n()
 
