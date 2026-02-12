@@ -18,7 +18,7 @@ pub struct AnthropicRequest {
 }
 
 fn default_stream() -> bool {
-    true
+    false
 }
 
 /// system 字段可以是字符串或数组

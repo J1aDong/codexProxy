@@ -136,7 +136,7 @@ impl TransformRequest {
             "parallel_tool_calls": true,
             "reasoning": { "effort": reasoning_effort.as_str(), "summary": "auto" },
             "store": false,
-            "stream": anthropic_body.stream,
+            "stream": true,
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": session_id
         });

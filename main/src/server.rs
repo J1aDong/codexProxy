@@ -10,7 +10,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -103,6 +103,152 @@ fn summarize_request_messages(messages: &[Message]) -> String {
         .collect();
 
     tail_chars(&msg_summaries.join(" > "), 80)
+}
+
+fn parse_sse_chunk(chunk: &str) -> Option<(String, Value)> {
+    let mut event_name: Option<String> = None;
+    let mut data: Option<Value> = None;
+
+    for line in chunk.lines() {
+        if let Some(v) = line.strip_prefix("event: ") {
+            event_name = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("data: ") {
+            if let Ok(parsed) = serde_json::from_str::<Value>(v) {
+                data = Some(parsed);
+            }
+        }
+    }
+
+    match (event_name, data) {
+        (Some(event), Some(payload)) => Some((event, payload)),
+        _ => None,
+    }
+}
+
+fn append_block_text(block: &mut Value, field: &str, delta: &str) {
+    if let Some(obj) = block.as_object_mut() {
+        let current = obj
+            .get(field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        obj.insert(field.to_string(), json!(format!("{}{}", current, delta)));
+    }
+}
+
+fn finalize_tool_input_block(
+    index: usize,
+    blocks: &mut BTreeMap<usize, Value>,
+    tool_input_buffers: &mut HashMap<usize, String>,
+) {
+    let Some(partial_json) = tool_input_buffers.remove(&index) else {
+        return;
+    };
+
+    let parsed_input = serde_json::from_str::<Value>(&partial_json).unwrap_or_else(|_| json!({}));
+    if let Some(block) = blocks.get_mut(&index) {
+        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+            if let Some(obj) = block.as_object_mut() {
+                obj.insert("input".to_string(), parsed_input);
+            }
+        }
+    }
+}
+
+fn apply_sse_chunk_to_non_stream_message(
+    chunk: &str,
+    message_state: &mut Option<Value>,
+    blocks: &mut BTreeMap<usize, Value>,
+    tool_input_buffers: &mut HashMap<usize, String>,
+    stop_reason_state: &mut Option<String>,
+    usage_input_tokens: &mut u64,
+    usage_output_tokens: &mut u64,
+) {
+    let Some((event, payload)) = parse_sse_chunk(chunk) else {
+        return;
+    };
+
+    match event.as_str() {
+        "message_start" => {
+            *message_state = payload.get("message").cloned();
+        }
+        "content_block_start" => {
+            if let Some(index) = payload.get("index").and_then(|v| v.as_u64()) {
+                if let Some(block) = payload.get("content_block") {
+                    blocks.insert(index as usize, block.clone());
+                }
+            }
+        }
+        "content_block_delta" => {
+            let Some(index) = payload.get("index").and_then(|v| v.as_u64()).map(|v| v as usize) else {
+                return;
+            };
+
+            let Some(delta_obj) = payload.get("delta") else {
+                return;
+            };
+
+            let delta_type = delta_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match delta_type {
+                "text_delta" => {
+                    if let Some(text_delta) = delta_obj.get("text").and_then(|v| v.as_str()) {
+                        if let Some(block) = blocks.get_mut(&index) {
+                            append_block_text(block, "text", text_delta);
+                        }
+                    }
+                }
+                "thinking_delta" => {
+                    if let Some(thinking_delta) = delta_obj.get("thinking").and_then(|v| v.as_str()) {
+                        if let Some(block) = blocks.get_mut(&index) {
+                            append_block_text(block, "thinking", thinking_delta);
+                        }
+                    }
+                }
+                "input_json_delta" => {
+                    let partial = delta_obj
+                        .get("partial_json")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !partial.is_empty() {
+                        let entry = tool_input_buffers.entry(index).or_default();
+                        entry.push_str(partial);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "content_block_stop" => {
+            if let Some(index) = payload.get("index").and_then(|v| v.as_u64()) {
+                finalize_tool_input_block(index as usize, blocks, tool_input_buffers);
+            }
+        }
+        "message_delta" => {
+            if let Some(reason) = payload
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(|v| v.as_str())
+            {
+                *stop_reason_state = Some(reason.to_string());
+            }
+
+            if let Some(usage) = payload.get("usage") {
+                *usage_input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(*usage_input_tokens);
+                *usage_output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(*usage_output_tokens);
+            }
+        }
+        "message_stop" => {
+            if let Some(reason) = payload.get("stop_reason").and_then(|v| v.as_str()) {
+                *stop_reason_state = Some(reason.to_string());
+            }
+        }
+        _ => {}
+    }
 }
 
 fn sorted_object_keys(value: &Value) -> Vec<String> {
@@ -1190,7 +1336,159 @@ async fn handle_request(
 
     let upstream_status = response.status().as_u16();
 
-    // 使用 channel 进行流式响应
+    // 非流式：把上游 SSE 聚合成 Anthropic JSON
+    if !anthropic_body.stream {
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut transformer = backend.create_response_transformer(&model);
+
+        let mut message_state: Option<Value> = None;
+        let mut blocks: BTreeMap<usize, Value> = BTreeMap::new();
+        let mut tool_input_buffers: HashMap<usize, String> = HashMap::new();
+        let mut stop_reason_state: Option<String> = None;
+        let mut usage_input_tokens: u64 = 0;
+        let mut usage_output_tokens: u64 = 0;
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
+                Ok(Some(chunk_result)) => {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                            while let Some(pos) = buffer.find('\n') {
+                                let line = buffer[..pos].to_string();
+                                buffer = buffer[pos + 1..].to_string();
+
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
+
+                                if let Some(ref l) = AppLogger::get() {
+                                    l.log_upstream_response(upstream_status, &line);
+                                }
+
+                                for event_chunk in transformer.transform_line(&line) {
+                                    if let Some(ref l) = AppLogger::get() {
+                                        l.log_anthropic_response(&event_chunk);
+                                    }
+                                    apply_sse_chunk_to_non_stream_message(
+                                        &event_chunk,
+                                        &mut message_state,
+                                        &mut blocks,
+                                        &mut tool_input_buffers,
+                                        &mut stop_reason_state,
+                                        &mut usage_input_tokens,
+                                        &mut usage_output_tokens,
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = log_tx.send(format!("[Error] #{} Stream error: {}", request_id, e));
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_GATEWAY)
+                                .header("Content-Type", "application/json")
+                                .body(full_body(
+                                    json!({"error": {"message": format!("Upstream stream error: {}", e)}}).to_string(),
+                                ))
+                                .unwrap());
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    let _ = log_tx.send(format!(
+                        "[Error] #{} Upstream read timeout (300s)",
+                        request_id
+                    ));
+                    return Ok(Response::builder()
+                        .status(StatusCode::GATEWAY_TIMEOUT)
+                        .header("Content-Type", "application/json")
+                        .body(full_body(
+                            json!({"error": {"message": "Upstream read timeout (300s)"}}).to_string(),
+                        ))
+                        .unwrap());
+                }
+            }
+        }
+
+        if !buffer.trim().is_empty() {
+            if let Some(ref l) = AppLogger::get() {
+                l.log_upstream_response(upstream_status, &buffer);
+            }
+
+            for event_chunk in transformer.transform_line(&buffer) {
+                if let Some(ref l) = AppLogger::get() {
+                    l.log_anthropic_response(&event_chunk);
+                }
+                apply_sse_chunk_to_non_stream_message(
+                    &event_chunk,
+                    &mut message_state,
+                    &mut blocks,
+                    &mut tool_input_buffers,
+                    &mut stop_reason_state,
+                    &mut usage_input_tokens,
+                    &mut usage_output_tokens,
+                );
+            }
+        }
+
+        let pending_tool_indices: Vec<usize> = tool_input_buffers.keys().copied().collect();
+        for idx in pending_tool_indices {
+            finalize_tool_input_block(idx, &mut blocks, &mut tool_input_buffers);
+        }
+
+        let mut message = message_state.unwrap_or_else(|| {
+            json!({
+                "id": format!("msg_{}", chrono::Utc::now().timestamp_millis()),
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
+            })
+        });
+
+        let content: Vec<Value> = blocks.into_values().collect();
+        let stop_reason = stop_reason_state.unwrap_or_else(|| "end_turn".to_string());
+        if let Some(message_obj) = message.as_object_mut() {
+            message_obj.insert("content".to_string(), Value::Array(content));
+            message_obj.insert("stop_reason".to_string(), json!(stop_reason));
+
+            let usage = json!({
+                "input_tokens": usage_input_tokens,
+                "output_tokens": usage_output_tokens,
+            });
+            message_obj.insert("usage".to_string(), usage);
+        }
+
+        let payload = json!({
+            "id": message.get("id").cloned().unwrap_or_else(|| json!(format!("msg_{}", chrono::Utc::now().timestamp_millis()))),
+            "type": "message",
+            "role": "assistant",
+            "model": message.get("model").cloned().unwrap_or_else(|| json!(model)),
+            "content": message.get("content").cloned().unwrap_or_else(|| json!([])),
+            "stop_reason": message.get("stop_reason").cloned().unwrap_or_else(|| json!("end_turn")),
+            "usage": message.get("usage").cloned().unwrap_or_else(|| json!({"input_tokens":0,"output_tokens":0}))
+        });
+
+        if let Some(ref l) = AppLogger::get() {
+            l.log("════════════════════════════════════════════════════════════════");
+            l.log("✅ Request completed");
+            l.log("════════════════════════════════════════════════════════════════");
+        }
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(full_body(payload.to_string()))
+            .unwrap());
+    }
+
+    // 流式：使用 channel 进行 SSE 转发
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(256);
 
     // 通过 trait 创建响应转换器

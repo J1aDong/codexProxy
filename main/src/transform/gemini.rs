@@ -835,4 +835,5 @@ mod tests {
         assert!(thinking_stop < text_start, "thinking block should stop before text starts");
         assert!(text_start < text_delta, "text delta should follow text block start");
     }
+
 }
