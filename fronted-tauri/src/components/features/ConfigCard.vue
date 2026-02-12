@@ -65,15 +65,6 @@
       />
     </div>
 
-    <div class="mt-5">
-      <Select
-        v-if="form.converter === 'codex'"
-        v-model="form.codexModel"
-        :options="codexModelOptions"
-        :label="t('codexModel')"
-      />
-    </div>
-
     <div class="mt-5 pt-4 border-t border-gray-200">
       <h3 class="text-sm font-semibold text-apple-text-primary mb-3">{{ t('reasoningEffort') }}</h3>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
@@ -86,10 +77,17 @@
           />
           <Select
             v-else
-            v-model="form.reasoningEffort.opus"
-            :options="effortOptions"
+            v-model="form.codexModelMapping.opus"
+            :options="codexModelOptions"
             label="Opus"
           />
+          <div v-if="form.converter === 'codex'" class="mt-2">
+            <Select
+              v-model="form.reasoningEffort.opus"
+              :options="codexEffortOptionsBySlot.opus"
+              :label="t('effortLevel')"
+            />
+          </div>
         </div>
         <div>
           <Select
@@ -100,10 +98,17 @@
           />
           <Select
             v-else
-            v-model="form.reasoningEffort.sonnet"
-            :options="effortOptions"
+            v-model="form.codexModelMapping.sonnet"
+            :options="codexModelOptions"
             label="Sonnet"
           />
+          <div v-if="form.converter === 'codex'" class="mt-2">
+            <Select
+              v-model="form.reasoningEffort.sonnet"
+              :options="codexEffortOptionsBySlot.sonnet"
+              :label="t('effortLevel')"
+            />
+          </div>
         </div>
         <div>
           <Select
@@ -114,10 +119,17 @@
           />
           <Select
             v-else
-            v-model="form.reasoningEffort.haiku"
-            :options="effortOptions"
+            v-model="form.codexModelMapping.haiku"
+            :options="codexModelOptions"
             label="Haiku"
           />
+          <div v-if="form.converter === 'codex'" class="mt-2">
+            <Select
+              v-model="form.reasoningEffort.haiku"
+              :options="codexEffortOptionsBySlot.haiku"
+              :label="t('effortLevel')"
+            />
+          </div>
         </div>
       </div>
       <div class="text-apple-text-secondary text-xs mt-2">
@@ -162,7 +174,13 @@ interface FormData {
   endpointOptions: EndpointOption[]
   selectedEndpointId: string
   converter: ConverterType
-  codexModel: string
+  codexModelMapping: {
+    opus: string
+    sonnet: string
+    haiku: string
+  }
+  codexEffortCapabilityMap: Record<string, string[]>
+  geminiModelPreset: string[]
   reasoningEffort: {
     opus: string
     sonnet: string
@@ -199,11 +217,17 @@ watch(() => props.form.apiKey, (newVal) => {
 const codexModelOptions = computed(() => [
   { value: 'gpt-5.3-codex', label: t('modelRecommended') },
   { value: 'gpt-5.2-codex', label: 'GPT-5.2-Codex' },
+  { value: 'gpt-5-codex', label: 'GPT-5-Codex' },
+  { value: 'gpt-5.1-codex-max', label: 'GPT-5.1-Codex-Max' },
+  { value: 'gpt-5.1-codex', label: 'GPT-5.1-Codex' },
+  { value: 'gpt-5.1-codex-mini', label: 'GPT-5.1-Codex-Mini' },
 ])
 
 const geminiModelOptions = computed(() => [
-  { value: 'gemini-3-pro-preview', label: 'Gemini 3 Pro Preview' },
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview' },
+  ...props.form.geminiModelPreset.map((model) => ({
+    value: model,
+    label: model,
+  })),
 ])
 
 const converterOptions = computed(() => [
@@ -211,12 +235,86 @@ const converterOptions = computed(() => [
   { value: 'gemini', label: t('converterGemini') },
 ])
 
-const effortOptions = [
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'xhigh', label: 'Extra High' },
-]
+const effortLabelMap: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra High',
+}
+
+const toEffortOptions = (efforts: string[]) =>
+  efforts.map((effort) => ({ value: effort, label: effortLabelMap[effort] || effort }))
+
+const codexEffortOptionsBySlot = computed(() => {
+  const getSlotOptions = (model: string) => {
+    const capabilities = props.form.codexEffortCapabilityMap[model] || ['medium', 'high']
+    return toEffortOptions(capabilities)
+  }
+
+  return {
+    opus: getSlotOptions(props.form.codexModelMapping.opus),
+    sonnet: getSlotOptions(props.form.codexModelMapping.sonnet),
+    haiku: getSlotOptions(props.form.codexModelMapping.haiku),
+  }
+})
+
+const ensureEffortCompatible = (slot: 'opus' | 'sonnet' | 'haiku') => {
+  const model = props.form.codexModelMapping[slot]
+  const currentEffort = props.form.reasoningEffort[slot]
+  const allowed = props.form.codexEffortCapabilityMap[model] || ['medium', 'high']
+  if (!allowed.includes(currentEffort)) {
+    emit('update:form', {
+      ...props.form,
+      reasoningEffort: {
+        ...props.form.reasoningEffort,
+        [slot]: allowed[0],
+      },
+    })
+  }
+}
+
+const ensureGeminiModelCompatible = (slot: 'opus' | 'sonnet' | 'haiku') => {
+  const allowed = props.form.geminiModelPreset
+  if (allowed.length === 0) return
+
+  const currentModel = props.form.geminiReasoningEffort[slot]
+  if (!allowed.includes(currentModel)) {
+    emit('update:form', {
+      ...props.form,
+      geminiReasoningEffort: {
+        ...props.form.geminiReasoningEffort,
+        [slot]: allowed[0],
+      },
+    })
+  }
+}
+
+watch(() => props.form.codexModelMapping.opus, () => ensureEffortCompatible('opus'))
+watch(() => props.form.codexModelMapping.sonnet, () => ensureEffortCompatible('sonnet'))
+watch(() => props.form.codexModelMapping.haiku, () => ensureEffortCompatible('haiku'))
+watch(
+  () => props.form.geminiModelPreset,
+  () => {
+    ensureGeminiModelCompatible('opus')
+    ensureGeminiModelCompatible('sonnet')
+    ensureGeminiModelCompatible('haiku')
+  },
+  { deep: true }
+)
+
+watch(
+  () => [
+    props.form.codexModelMapping.opus,
+    props.form.codexModelMapping.sonnet,
+    props.form.codexModelMapping.haiku,
+  ],
+  () => {
+    emit('update:form', {
+      ...props.form,
+      codexModel: props.form.codexModelMapping.sonnet,
+    })
+  }
+)
 
 const endpointSelectOptions = computed(() => {
   return props.form.endpointOptions.map(option => ({

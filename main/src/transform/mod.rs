@@ -5,11 +5,12 @@ pub mod processor;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::models::{AnthropicRequest, ReasoningEffortMapping, GeminiReasoningEffortMapping};
+use crate::models::{AnthropicRequest, ReasoningEffortMapping, GeminiReasoningEffortMapping, CodexModelMapping};
 
 /// 转换上下文 —— 从 ProxyServer 配置派生，传入 transform 方法
 pub struct TransformContext {
     pub reasoning_mapping: ReasoningEffortMapping,
+    pub codex_model_mapping: CodexModelMapping,
     pub skill_injection_prompt: String,
     pub converter: String,
     pub codex_model: String,

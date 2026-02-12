@@ -1,4 +1,4 @@
-use codex_proxy_core::{ProxyServer, ReasoningEffort, ReasoningEffortMapping, GeminiReasoningEffortMapping};
+use codex_proxy_core::{ProxyServer, ReasoningEffort, ReasoningEffortMapping, GeminiReasoningEffortMapping, CodexModelMapping};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::TcpListener;
@@ -11,6 +11,23 @@ pub struct ReasoningEffortConfig {
     pub opus: String,
     pub sonnet: String,
     pub haiku: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexModelMappingConfig {
+    pub opus: String,
+    pub sonnet: String,
+    pub haiku: String,
+}
+
+impl Default for CodexModelMappingConfig {
+    fn default() -> Self {
+        Self {
+            opus: "gpt-5.3-codex".to_string(),
+            sonnet: "gpt-5.2-codex".to_string(),
+            haiku: "gpt-5.1-codex-mini".to_string(),
+        }
+    }
 }
 
 impl Default for ReasoningEffortConfig {
@@ -54,6 +71,12 @@ pub struct EndpointOption {
     #[serde(rename = "codexModel", default)]
     pub codex_model: Option<String>,
 
+    #[serde(rename = "codexModelMapping", default)]
+    pub codex_model_mapping: Option<CodexModelMappingConfig>,
+
+    #[serde(rename = "geminiModelPreset", default)]
+    pub gemini_model_preset: Option<Vec<String>>,
+
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: Option<ReasoningEffortConfig>,
 
@@ -69,6 +92,8 @@ fn default_endpoint_options() -> Vec<EndpointOption> {
         api_key: String::new(),
         converter: None,
         codex_model: None,
+        codex_model_mapping: None,
+        gemini_model_preset: None,
         reasoning_effort: None,
         gemini_reasoning_effort: None,
     }]
@@ -93,6 +118,11 @@ pub struct ProxyConfig {
     pub converter: String,
     #[serde(rename = "codexModel", default = "default_codex_model")]
     pub codex_model: String,
+    #[serde(rename = "codexModelMapping", default)]
+    pub codex_model_mapping: CodexModelMappingConfig,
+
+    #[serde(rename = "geminiModelPreset", default = "default_gemini_model_preset")]
+    pub gemini_model_preset: Vec<String>,
 
     #[serde(rename = "maxConcurrency", default)]
     pub max_concurrency: u32,
@@ -126,6 +156,17 @@ fn default_codex_model() -> String {
 
 fn default_allow_count_tokens_fallback_estimate() -> bool {
     true
+}
+
+fn default_gemini_model_preset() -> Vec<String> {
+    vec![
+        "gemini-2.5-flash-lite".to_string(),
+        "gemini-3-pro-preview".to_string(),
+        "gemini-3-pro-image-preview".to_string(),
+        "gemini-3-flash-preview".to_string(),
+        "gemini-2.5-flash".to_string(),
+        "gemini-2.5-pro".to_string(),
+    ]
 }
 
 
@@ -312,6 +353,11 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
         .with_skill_injection_prompt(config.skill_injection_prompt.clone())
         .with_converter(config.converter.clone())
         .with_codex_model(config.codex_model.clone())
+        .with_codex_model_mapping(CodexModelMapping {
+            opus: config.codex_model_mapping.opus.clone(),
+            sonnet: config.codex_model_mapping.sonnet.clone(),
+            haiku: config.codex_model_mapping.haiku.clone(),
+        })
         .with_gemini_reasoning_effort(config.gemini_reasoning_effort.to_gemini_mapping())
         .with_ignore_probe_requests(config.ignore_probe_requests)
         .with_allow_count_tokens_fallback_estimate(config.allow_count_tokens_fallback_estimate)

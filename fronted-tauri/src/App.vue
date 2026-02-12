@@ -105,6 +105,44 @@
             </div>
           </label>
 
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedCodexCapabilityPresetLabel') }}</label>
+              <button
+                class="text-xs text-apple-blue hover:text-blue-700 transition-colors"
+                @click="resetCodexCapabilityPreset"
+              >
+                {{ t('restoreDefaults') }}
+              </button>
+            </div>
+            <textarea
+              v-model="localCodexCapabilityJson"
+              rows="8"
+              class="w-full px-3 py-2 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
+            />
+            <div class="text-xs text-apple-text-secondary">{{ t('advancedCodexCapabilityPresetTip') }}</div>
+            <div v-if="advancedSettingsError" class="text-xs text-red-500">{{ advancedSettingsError }}</div>
+          </div>
+
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedGeminiModelPresetLabel') }}</label>
+              <button
+                class="text-xs text-apple-blue hover:text-blue-700 transition-colors"
+                @click="resetGeminiModelPreset"
+              >
+                {{ t('restoreDefaults') }}
+              </button>
+            </div>
+            <textarea
+              v-model="localGeminiModelPresetJson"
+              rows="5"
+              class="w-full px-3 py-2 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
+            />
+            <div class="text-xs text-apple-text-secondary">{{ t('advancedGeminiModelPresetTip') }}</div>
+            <div v-if="advancedGeminiPresetError" class="text-xs text-red-500">{{ advancedGeminiPresetError }}</div>
+          </div>
+
           <div class="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
             {{ t('advancedSettingsRiskTip') }}
           </div>
@@ -129,7 +167,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
 import { loadConfig, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
-import type { EndpointOption, ProxyConfig } from './types/configTypes'
+import type { CodexEffortCapabilityMap, EndpointOption, GeminiModelPreset, ProxyConfig } from './types/configTypes'
 
 import Header from './components/features/Header.vue'
 import ConfigCard from './components/features/ConfigCard.vue'
@@ -151,6 +189,10 @@ const showEndpointDialog = ref(false)
 const localMaxConcurrency = ref<number | null>(null)
 const localIgnoreProbeRequests = ref(false)
 const localAllowCountTokensFallbackEstimate = ref(true)
+const localCodexCapabilityJson = ref('')
+const localGeminiModelPresetJson = ref('')
+const advancedSettingsError = ref('')
+const advancedGeminiPresetError = ref('')
 
 
 
@@ -204,6 +246,27 @@ const DEFAULT_CONFIG = {
   selectedEndpointId: DEFAULT_ENDPOINT_OPTION.id,
   converter: 'codex' as 'codex' | 'gemini',
   codexModel: 'gpt-5.3-codex',
+  codexModelMapping: {
+    opus: 'gpt-5.3-codex',
+    sonnet: 'gpt-5.2-codex',
+    haiku: 'gpt-5.1-codex-mini',
+  },
+  codexEffortCapabilityMap: {
+    'gpt-5.3-codex': ['low', 'medium', 'high', 'xhigh'],
+    'gpt-5.2-codex': ['low', 'medium', 'high', 'xhigh'],
+    'gpt-5-codex': ['medium', 'high'],
+    'gpt-5.1-codex-max': ['low', 'medium', 'high', 'xhigh'],
+    'gpt-5.1-codex': ['medium', 'high'],
+    'gpt-5.1-codex-mini': ['medium', 'high'],
+  } as CodexEffortCapabilityMap,
+  geminiModelPreset: [
+    'gemini-2.5-flash-lite',
+    'gemini-3-pro-preview',
+    'gemini-3-pro-image-preview',
+    'gemini-3-flash-preview',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+  ] as GeminiModelPreset,
   maxConcurrency: 0,
   ignoreProbeRequests: false,
   allowCountTokensFallbackEstimate: true,
@@ -232,8 +295,59 @@ const form = reactive({
   allowCountTokensFallbackEstimate: DEFAULT_CONFIG.allowCountTokensFallbackEstimate,
   reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort },
   converter: DEFAULT_CONFIG.converter,
+  codexModel: DEFAULT_CONFIG.codexModel,
+  codexModelMapping: { ...DEFAULT_CONFIG.codexModelMapping },
+  codexEffortCapabilityMap: JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap)),
+  geminiModelPreset: [...DEFAULT_CONFIG.geminiModelPreset],
   geminiReasoningEffort: { ...DEFAULT_CONFIG.geminiReasoningEffort },
 })
+
+const migrateCodexModel = (model: string): string => {
+  return model === 'codex-mini-latest' ? 'gpt-5.1-codex-mini' : model
+}
+
+const migrateCodexModelMapping = (mapping: { opus: string; sonnet: string; haiku: string }) => ({
+  opus: migrateCodexModel(mapping.opus),
+  sonnet: migrateCodexModel(mapping.sonnet),
+  haiku: migrateCodexModel(mapping.haiku),
+})
+
+const normalizeCapabilityMap = (input: unknown): CodexEffortCapabilityMap => {
+  const allowedEfforts = new Set(['low', 'medium', 'high', 'xhigh'])
+  const fallback = JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap)) as CodexEffortCapabilityMap
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return fallback
+  }
+
+  const result: CodexEffortCapabilityMap = {}
+  for (const [model, effortsValue] of Object.entries(input as Record<string, unknown>)) {
+    if (!model.trim() || !Array.isArray(effortsValue)) continue
+    const normalizedEfforts = effortsValue
+      .map((effort) => (typeof effort === 'string' ? effort.toLowerCase() : ''))
+      .filter((effort, index, arr) => effort && allowedEfforts.has(effort) && arr.indexOf(effort) === index)
+
+    if (normalizedEfforts.length > 0) {
+      result[model] = normalizedEfforts
+    }
+  }
+
+  if (Object.keys(result).length === 0) {
+    return fallback
+  }
+
+  return result
+}
+
+const normalizeGeminiModelPreset = (input: unknown): GeminiModelPreset => {
+  const fallback = [...DEFAULT_CONFIG.geminiModelPreset]
+  if (!Array.isArray(input)) return fallback
+
+  const result = input
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter((item, index, arr) => item.length > 0 && arr.indexOf(item) === index)
+
+  return result.length > 0 ? result : fallback
+}
 
 const updateSkillInjectionPrompt = (prompt: string) => {
   form.skillInjectionPrompt = prompt
@@ -244,15 +358,45 @@ const openAdvancedSettings = () => {
   localMaxConcurrency.value = form.maxConcurrency
   localIgnoreProbeRequests.value = form.ignoreProbeRequests
   localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
+  localCodexCapabilityJson.value = JSON.stringify(form.codexEffortCapabilityMap, null, 2)
+  localGeminiModelPresetJson.value = JSON.stringify(form.geminiModelPreset, null, 2)
+  advancedSettingsError.value = ''
+  advancedGeminiPresetError.value = ''
   showAdvancedSettings.value = true
 }
 
 const saveAdvancedSettings = () => {
+  try {
+    const parsed = JSON.parse(localCodexCapabilityJson.value || '{}')
+    form.codexEffortCapabilityMap = normalizeCapabilityMap(parsed)
+    advancedSettingsError.value = ''
+  } catch {
+    advancedSettingsError.value = t('advancedCapabilityJsonError')
+    return
+  }
+
+  try {
+    const parsed = JSON.parse(localGeminiModelPresetJson.value || '[]')
+    form.geminiModelPreset = normalizeGeminiModelPreset(parsed)
+    advancedGeminiPresetError.value = ''
+  } catch {
+    advancedGeminiPresetError.value = t('advancedGeminiPresetJsonError')
+    return
+  }
+
   form.maxConcurrency = localMaxConcurrency.value ?? 0
   form.ignoreProbeRequests = localIgnoreProbeRequests.value
   form.allowCountTokensFallbackEstimate = localAllowCountTokensFallbackEstimate.value
   showAdvancedSettings.value = false
   saveConfig(buildProxyConfig()).catch(console.error)
+}
+
+const resetCodexCapabilityPreset = () => {
+  localCodexCapabilityJson.value = JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap, null, 2)
+}
+
+const resetGeminiModelPreset = () => {
+  localGeminiModelPresetJson.value = JSON.stringify(DEFAULT_CONFIG.geminiModelPreset, null, 2)
 }
 
 const useDefaultPrompt = () => {
@@ -271,7 +415,14 @@ const syncEndpointFromSelection = () => {
   form.targetUrl = endpoint.url
   form.apiKey = endpoint.apiKey
   if (endpoint.converter) form.converter = endpoint.converter
-  if (endpoint.codexModel) form.codexModel = endpoint.codexModel
+  if (endpoint.codexModel) form.codexModel = migrateCodexModel(endpoint.codexModel)
+  if (endpoint.codexModelMapping) form.codexModelMapping = migrateCodexModelMapping(endpoint.codexModelMapping)
+  if (endpoint.codexEffortCapabilityMap) {
+    form.codexEffortCapabilityMap = normalizeCapabilityMap(endpoint.codexEffortCapabilityMap)
+  }
+  if (endpoint.geminiModelPreset) {
+    form.geminiModelPreset = normalizeGeminiModelPreset(endpoint.geminiModelPreset)
+  }
   if (endpoint.reasoningEffort) form.reasoningEffort = { ...endpoint.reasoningEffort }
   if (endpoint.geminiReasoningEffort) form.geminiReasoningEffort = { ...endpoint.geminiReasoningEffort }
 }
@@ -293,6 +444,9 @@ const updateSelectedEndpointConfig = () => {
       apiKey: form.apiKey,
       converter: form.converter,
       codexModel: form.codexModel,
+      codexModelMapping: { ...form.codexModelMapping },
+      codexEffortCapabilityMap: JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
+      geminiModelPreset: [...form.geminiModelPreset],
       reasoningEffort: { ...form.reasoningEffort },
       geminiReasoningEffort: { ...form.geminiReasoningEffort },
     }
@@ -306,6 +460,9 @@ watch(
     () => form.apiKey,
     () => form.converter,
     () => form.codexModel,
+    () => form.codexModelMapping,
+    () => form.codexEffortCapabilityMap,
+    () => form.geminiModelPreset,
     () => form.reasoningEffort,
     () => form.geminiReasoningEffort,
   ],
@@ -364,6 +521,9 @@ const handleEndpointSubmit = (endpointData: any) => {
       ...endpointData,
       converter: endpointData.converter || form.converter,
       codexModel: endpointData.codexModel || form.codexModel,
+      codexModelMapping: endpointData.codexModelMapping || { ...form.codexModelMapping },
+      codexEffortCapabilityMap: endpointData.codexEffortCapabilityMap || JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
+      geminiModelPreset: endpointData.geminiModelPreset || [...form.geminiModelPreset],
       reasoningEffort: endpointData.reasoningEffort || { ...form.reasoningEffort },
       geminiReasoningEffort: endpointData.geminiReasoningEffort || { ...form.geminiReasoningEffort },
     }
@@ -429,6 +589,9 @@ const resetDefaults = () => {
   syncEndpointFromSelection()
   form.converter = DEFAULT_CONFIG.converter
   form.codexModel = DEFAULT_CONFIG.codexModel
+  form.codexModelMapping = { ...DEFAULT_CONFIG.codexModelMapping }
+  form.codexEffortCapabilityMap = JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap))
+  form.geminiModelPreset = [...DEFAULT_CONFIG.geminiModelPreset]
   form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
   form.geminiReasoningEffort = { ...DEFAULT_CONFIG.geminiReasoningEffort }
   form.maxConcurrency = DEFAULT_CONFIG.maxConcurrency
@@ -445,6 +608,9 @@ const buildProxyConfig = (force = false): ProxyConfig => ({
   selectedEndpointId: form.selectedEndpointId,
   converter: form.converter,
   codexModel: form.codexModel,
+  codexModelMapping: form.codexModelMapping,
+  codexEffortCapabilityMap: form.codexEffortCapabilityMap,
+  geminiModelPreset: form.geminiModelPreset,
   maxConcurrency: form.maxConcurrency,
   ignoreProbeRequests: form.ignoreProbeRequests,
   allowCountTokensFallbackEstimate: form.allowCountTokensFallbackEstimate,
@@ -582,8 +748,17 @@ onMounted(() => {
     .then((savedConfig) => {
       if (savedConfig) {
         if (savedConfig.port) form.port = savedConfig.port
+        if (savedConfig.codexModel) {
+          form.codexModel = migrateCodexModel(savedConfig.codexModel)
+        }
         if (savedConfig.endpointOptions && savedConfig.endpointOptions.length > 0) {
-          form.endpointOptions = [...savedConfig.endpointOptions]
+          form.endpointOptions = savedConfig.endpointOptions.map((item) => ({
+            ...item,
+            codexModel: item.codexModel ? migrateCodexModel(item.codexModel) : item.codexModel,
+            codexModelMapping: item.codexModelMapping
+              ? migrateCodexModelMapping(item.codexModelMapping)
+              : item.codexModelMapping,
+          }))
           if (savedConfig.selectedEndpointId) {
             form.selectedEndpointId = savedConfig.selectedEndpointId
           }
@@ -612,6 +787,19 @@ onMounted(() => {
         }
         if (typeof savedConfig.maxConcurrency === 'number') {
           form.maxConcurrency = savedConfig.maxConcurrency
+        }
+        if (savedConfig.codexModelMapping) {
+          form.codexModelMapping = migrateCodexModelMapping({
+            opus: savedConfig.codexModelMapping.opus || DEFAULT_CONFIG.codexModelMapping.opus,
+            sonnet: savedConfig.codexModelMapping.sonnet || DEFAULT_CONFIG.codexModelMapping.sonnet,
+            haiku: savedConfig.codexModelMapping.haiku || DEFAULT_CONFIG.codexModelMapping.haiku,
+          })
+        }
+        if (savedConfig.codexEffortCapabilityMap) {
+          form.codexEffortCapabilityMap = normalizeCapabilityMap(savedConfig.codexEffortCapabilityMap)
+        }
+        if (savedConfig.geminiModelPreset) {
+          form.geminiModelPreset = normalizeGeminiModelPreset(savedConfig.geminiModelPreset)
         }
         if (typeof savedConfig.ignoreProbeRequests === 'boolean') {
           form.ignoreProbeRequests = savedConfig.ignoreProbeRequests

@@ -116,3 +116,27 @@ impl Default for GeminiReasoningEffortMapping {
         }
     }
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexModelMapping {
+    #[serde(default = "default_codex_opus")]
+    pub opus: String,
+    #[serde(default = "default_codex_sonnet")]
+    pub sonnet: String,
+    #[serde(default = "default_codex_haiku")]
+    pub haiku: String,
+}
+
+fn default_codex_opus() -> String { "gpt-5.3-codex".to_string() }
+fn default_codex_sonnet() -> String { "gpt-5.2-codex".to_string() }
+fn default_codex_haiku() -> String { "gpt-5.1-codex-mini".to_string() }
+
+impl Default for CodexModelMapping {
+    fn default() -> Self {
+        Self {
+            opus: default_codex_opus(),
+            sonnet: default_codex_sonnet(),
+            haiku: default_codex_haiku(),
+        }
+    }
+}

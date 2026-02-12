@@ -21,6 +21,7 @@ export default {
     converterGemini: 'Gemini',
     geminiModel: 'Gemini Model',
     reasoningEffort: 'Reasoning Effort',
+    effortLevel: 'Effort Level',
     geminiReasoningEffort: 'Gemini Reasoning Effort',
     reasoningEffortTip: 'Set default reasoning effort levels for different Claude model families.',
     geminiReasoningEffortTip: 'Gemini converter uses a single reasoning effort level.',
@@ -63,6 +64,12 @@ export default {
     advancedIgnoreProbeTip: 'Return locally for probe-like requests to reduce pointless upstream calls and 429 risk.',
     advancedCountTokensFallbackLabel: 'Allow estimate fallback when count_tokens fails',
     advancedCountTokensFallbackTip: 'Enabled is more stable; disable to surface upstream failures for debugging.',
+    advancedCodexCapabilityPresetLabel: 'Codex Model-Effort Preset (JSON)',
+    advancedCodexCapabilityPresetTip: 'Keys are model names, values are allowed efforts (low/medium/high/xhigh). Saved value is normalized automatically.',
+    advancedGeminiModelPresetLabel: 'Gemini Model Preset (JSON)',
+    advancedGeminiModelPresetTip: 'Array of model names used for Gemini converter dropdown options. Empty values are removed and duplicates are deduplicated.',
+    advancedCapabilityJsonError: 'Invalid JSON format. Please fix and try again.',
+    advancedGeminiPresetJsonError: 'Invalid Gemini model preset JSON. Please fix and try again.',
     advancedSettingsRiskTip: 'Note: ignoring probe requests may affect capability detection for a few clients.',
 
     // About

@@ -21,6 +21,7 @@ export default {
     converterGemini: 'Gemini',
     geminiModel: 'Gemini 模型',
     reasoningEffort: '推理强度配置',
+    effortLevel: '推理强度',
     geminiReasoningEffort: 'Gemini 推理强度',
     reasoningEffortTip: '为不同的 Claude 模型系列设置默认推理强度级别。',
     geminiReasoningEffortTip: 'Gemini 转换器使用单一推理强度。',
@@ -63,6 +64,12 @@ export default {
     advancedIgnoreProbeTip: '仅对短探测请求本地快速返回，减少无意义上游调用与 429 风险。',
     advancedCountTokensFallbackLabel: 'count_tokens 失败时允许估算回退',
     advancedCountTokensFallbackTip: '开启后更稳定；关闭后会在上游失败时直接返回错误，便于排查。',
+    advancedCodexCapabilityPresetLabel: 'Codex 模型-强度预设(JSON)',
+    advancedCodexCapabilityPresetTip: '键为模型名，值为允许强度数组（low/medium/high/xhigh）。保存时会自动规范化。',
+    advancedGeminiModelPresetLabel: 'Gemini 模型预设(JSON)',
+    advancedGeminiModelPresetTip: '值为模型名称数组，用于 Gemini 转换器下拉选项。保存时会去重并过滤空值。',
+    advancedCapabilityJsonError: 'JSON 格式错误，请检查后重试。',
+    advancedGeminiPresetJsonError: 'Gemini 模型预设 JSON 格式错误，请检查后重试。',
     advancedSettingsRiskTip: '注意：忽略探测请求可能影响极少数客户端的能力检测行为。',
 
     // About

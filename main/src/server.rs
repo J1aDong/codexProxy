@@ -1,5 +1,5 @@
 use crate::logger::AppLogger;
-use crate::models::{AnthropicRequest, ContentBlock, GeminiReasoningEffortMapping, Message, MessageContent, ReasoningEffort, ReasoningEffortMapping};
+use crate::models::{AnthropicRequest, CodexModelMapping, ContentBlock, GeminiReasoningEffortMapping, Message, MessageContent, ReasoningEffort, ReasoningEffortMapping};
 use crate::transform::{CodexBackend, GeminiBackend, TransformBackend, TransformContext};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -27,6 +27,7 @@ pub struct ProxyServer {
     skill_injection_prompt: String,
     converter: String,
     codex_model: String,
+    codex_model_mapping: CodexModelMapping,
     gemini_reasoning_effort: GeminiReasoningEffortMapping,
     max_concurrency: u32,
     ignore_probe_requests: bool,
@@ -493,6 +494,7 @@ impl ProxyServer {
             skill_injection_prompt: String::new(),
             converter: "codex".to_string(),
             codex_model: "gpt-5.3-codex".to_string(),
+            codex_model_mapping: CodexModelMapping::default(),
             gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
             max_concurrency: 0,
             ignore_probe_requests: false,
@@ -517,6 +519,11 @@ impl ProxyServer {
 
     pub fn with_codex_model(mut self, model: String) -> Self {
         self.codex_model = model;
+        self
+    }
+
+    pub fn with_codex_model_mapping(mut self, mapping: CodexModelMapping) -> Self {
+        self.codex_model_mapping = mapping;
         self
     }
 
@@ -567,6 +574,7 @@ impl ProxyServer {
         // 构建共享的 TransformContext
         let ctx = Arc::new(TransformContext {
             reasoning_mapping: self.reasoning_mapping.clone(),
+            codex_model_mapping: self.codex_model_mapping.clone(),
             skill_injection_prompt: self.skill_injection_prompt.clone(),
             converter: self.converter.clone(),
             codex_model: self.codex_model.clone(),
@@ -865,15 +873,12 @@ async fn handle_request(
             },
         }
     } else {
-        // 对于 Codex 模式，如果用户在 UI 配置了目标模型，则强制使用该模型覆盖客户端传来的名
-        // 这样可以确保像 Claude Code 这种硬编码模型名的客户端也能正确映射到上游
-        if !ctx.codex_model.trim().is_empty() {
-            ctx.codex_model.clone()
-        } else {
-            anthropic_body
-                .model
-                .clone()
-                .unwrap_or_else(|| ctx.codex_model.clone())
+        let input_model = anthropic_body.model.as_deref().unwrap_or("claude-3-5-sonnet-20240620");
+        let effort = crate::models::get_reasoning_effort(input_model, &ctx.reasoning_mapping);
+        match effort {
+            ReasoningEffort::Xhigh => ctx.codex_model_mapping.opus.clone(),
+            ReasoningEffort::High | ReasoningEffort::Medium => ctx.codex_model_mapping.sonnet.clone(),
+            ReasoningEffort::Low => ctx.codex_model_mapping.haiku.clone(),
         }
     };
     let input_model = anthropic_body.model.as_deref().unwrap_or("claude-3-5-sonnet-20240620");
