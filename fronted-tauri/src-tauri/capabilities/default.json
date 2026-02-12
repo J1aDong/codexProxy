@@ -9,6 +9,10 @@
     "core:event:allow-listen",
     "shell:default",
     "fs:default",
+    "fs:allow-write-text-file",
+    "dialog:default",
+    "dialog:allow-save",
+    "dialog:allow-open",
     "http:default",
     {
       "identifier": "http:allow-fetch",

@@ -24,6 +24,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
@@ -34,6 +35,8 @@ fn main() {
             proxy::save_lang,
             proxy::check_port,
             proxy::kill_port,
+            proxy::export_config,
+            proxy::import_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

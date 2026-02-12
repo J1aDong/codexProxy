@@ -8,6 +8,7 @@
         @showAbout="showAbout = true"
         @showSettings="showSettings = true"
         @showAdvancedSettings="openAdvancedSettings"
+        @showImportExport="showImportExport = true"
         @showLogs="showLogs = true"
       />
 
@@ -64,6 +65,13 @@
       @close="showAbout = false"
       @checkUpdate="fetchLatestRelease"
       @openReleases="openReleasePage"
+    />
+
+    <!-- Import/Export Dialog -->
+    <ImportExportDialog
+      :visible="showImportExport"
+      @close="showImportExport = false"
+      @configImported="handleConfigImported"
     />
 
     <!-- Advanced Settings Dialog -->
@@ -175,6 +183,7 @@ import LogsPanel from './components/features/LogsPanel.vue'
 import EndpointDialog from './components/features/EndpointDialog.vue'
 import SettingsDialog from './components/features/SettingsDialog.vue'
 import AboutDialog from './components/features/AboutDialog.vue'
+import ImportExportDialog from './components/features/ImportExportDialog.vue'
 import Dialog from './components/base/Dialog.vue'
 
 const { t, locale } = useI18n()
@@ -184,6 +193,7 @@ const showLogs = ref(false)
 const showAbout = ref(false)
 const showSettings = ref(false)
 const showAdvancedSettings = ref(false)
+const showImportExport = ref(false)
 const showEndpointDialog = ref(false)
 
 const localMaxConcurrency = ref<number | null>(null)
@@ -401,6 +411,84 @@ const resetGeminiModelPreset = () => {
 
 const useDefaultPrompt = () => {
   form.skillInjectionPrompt = lang.value === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
+}
+
+const handleConfigImported = async () => {
+  // 重新加载配置
+  const savedConfig = await loadConfig()
+  if (savedConfig) {
+    if (savedConfig.port) form.port = savedConfig.port
+    if (savedConfig.codexModel) {
+      form.codexModel = migrateCodexModel(savedConfig.codexModel)
+    }
+    if (savedConfig.endpointOptions && savedConfig.endpointOptions.length > 0) {
+      form.endpointOptions = savedConfig.endpointOptions.map((item) => ({
+        ...item,
+        codexModel: item.codexModel ? migrateCodexModel(item.codexModel) : item.codexModel,
+        codexModelMapping: item.codexModelMapping
+          ? migrateCodexModelMapping(item.codexModelMapping)
+          : item.codexModelMapping,
+      }))
+      if (savedConfig.selectedEndpointId) {
+        form.selectedEndpointId = savedConfig.selectedEndpointId
+      }
+      const hasSelected = form.endpointOptions.some((item) => item.id === form.selectedEndpointId)
+      if (!hasSelected) {
+        form.selectedEndpointId = form.endpointOptions[0].id
+      }
+    } else {
+      const legacyOption: EndpointOption = {
+        id: DEFAULT_ENDPOINT_OPTION.id,
+        alias: 'aicodemirror',
+        url: savedConfig.targetUrl || DEFAULT_ENDPOINT_OPTION.url,
+        apiKey: savedConfig.apiKey || '',
+      }
+      form.endpointOptions = [legacyOption]
+      form.selectedEndpointId = legacyOption.id
+    }
+    syncEndpointFromSelection()
+    if (savedConfig.skillInjectionPrompt) {
+      form.skillInjectionPrompt = savedConfig.skillInjectionPrompt
+    } else {
+      useDefaultPrompt()
+    }
+    if (savedConfig.lang && (savedConfig.lang === 'zh' || savedConfig.lang === 'en')) {
+      locale.value = savedConfig.lang
+    }
+    if (typeof savedConfig.maxConcurrency === 'number') {
+      form.maxConcurrency = savedConfig.maxConcurrency
+    }
+    if (savedConfig.codexModelMapping) {
+      form.codexModelMapping = migrateCodexModelMapping({
+        opus: savedConfig.codexModelMapping.opus || DEFAULT_CONFIG.codexModelMapping.opus,
+        sonnet: savedConfig.codexModelMapping.sonnet || DEFAULT_CONFIG.codexModelMapping.sonnet,
+        haiku: savedConfig.codexModelMapping.haiku || DEFAULT_CONFIG.codexModelMapping.haiku,
+      })
+    }
+    if (savedConfig.reasoningEffort) {
+      form.reasoningEffort = {
+        opus: savedConfig.reasoningEffort.opus || DEFAULT_CONFIG.reasoningEffort.opus,
+        sonnet: savedConfig.reasoningEffort.sonnet || DEFAULT_CONFIG.reasoningEffort.sonnet,
+        haiku: savedConfig.reasoningEffort.haiku || DEFAULT_CONFIG.reasoningEffort.haiku,
+      }
+    }
+    if (savedConfig.geminiReasoningEffort) {
+      form.geminiReasoningEffort = {
+        opus: savedConfig.geminiReasoningEffort.opus || DEFAULT_CONFIG.geminiReasoningEffort.opus,
+        sonnet: savedConfig.geminiReasoningEffort.sonnet || DEFAULT_CONFIG.geminiReasoningEffort.sonnet,
+        haiku: savedConfig.geminiReasoningEffort.haiku || DEFAULT_CONFIG.geminiReasoningEffort.haiku,
+      }
+    }
+    if (savedConfig.geminiModelPreset && Array.isArray(savedConfig.geminiModelPreset)) {
+      form.geminiModelPreset = savedConfig.geminiModelPreset
+    }
+    if (typeof savedConfig.ignoreProbeRequests === 'boolean') {
+      form.ignoreProbeRequests = savedConfig.ignoreProbeRequests
+    }
+    if (typeof savedConfig.allowCountTokensFallbackEstimate === 'boolean') {
+      form.allowCountTokensFallbackEstimate = savedConfig.allowCountTokensFallbackEstimate
+    }
+  }
 }
 
 const isSyncing = ref(false)

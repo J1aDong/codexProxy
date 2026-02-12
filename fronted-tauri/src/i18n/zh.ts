@@ -54,6 +54,7 @@ export default {
     menuAdvancedSettings: '高级设置',
     menuAbout: '关于',
     menuLogs: '日志',
+    menuImportExport: '导入/导出',
 
     // Advanced Settings
     advancedSettingsTitle: '高级设置',
@@ -90,6 +91,19 @@ export default {
     skillInjectionTip: '当使用 Skill 时，将此提示词注入到 User Message 中。留空则不注入。',
     skillInjectionPlaceholder: '例如：如果依赖缺失，请自动安装...',
     useDefaultPrompt: '使用默认提示词',
+
+    // Import/Export
+    importExportTitle: '配置导入/导出',
+    exportConfig: '导出配置',
+    importConfig: '导入配置',
+    exportDescription: '当前配置已导出为 JSON 格式，您可以复制到剪贴板或保存为文件。',
+    importDescription: '粘贴或加载配置 JSON 来导入设置。导入将覆盖当前配置。',
+    importPlaceholder: '在此粘贴配置 JSON...',
+    copyToClipboard: '复制到剪贴板',
+    saveToFile: '保存为文件',
+    loadFromFile: '从文件加载',
+    import: '导入',
+    importSuccess: '配置导入成功！',
 
     // Common
     cancel: '取消',

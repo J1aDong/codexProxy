@@ -48,6 +48,12 @@
               </svg>
               <span>{{ t('menuAdvancedSettings') }}</span>
             </div>
+            <div class="header-dropdown-item" @click="handleMenuItem('importExport')">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+              </svg>
+              <span>{{ t('menuImportExport') }}</span>
+            </div>
             <div class="header-dropdown-divider"></div>
             <div class="header-dropdown-item" @click="handleMenuItem('about')">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -90,7 +96,7 @@ defineProps({
   },
 })
 
-const emit = defineEmits(['toggleLang', 'showAbout', 'showSettings', 'showAdvancedSettings', 'showLogs'])
+const emit = defineEmits(['toggleLang', 'showAbout', 'showSettings', 'showAdvancedSettings', 'showImportExport', 'showLogs'])
 
 const menuVisible = ref(false)
 const menuRef = ref<HTMLElement | null>(null)
@@ -114,6 +120,9 @@ const handleMenuItem = (action: string) => {
       break
     case 'advancedSettings':
       emit('showAdvancedSettings')
+      break
+    case 'importExport':
+      emit('showImportExport')
       break
     case 'about':
       emit('showAbout')

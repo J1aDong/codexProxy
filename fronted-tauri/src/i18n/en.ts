@@ -54,6 +54,7 @@ export default {
     menuAdvancedSettings: 'Advanced Settings',
     menuAbout: 'About',
     menuLogs: 'Logs',
+    menuImportExport: 'Import/Export',
 
     // Advanced Settings
     advancedSettingsTitle: 'Advanced Settings',
@@ -90,6 +91,19 @@ export default {
     skillInjectionTip: 'Inject this prompt into User Message when Skills are used. Leave empty to disable.',
     skillInjectionPlaceholder: 'E.g. Auto-install dependencies if missing...',
     useDefaultPrompt: 'Use Default Prompt',
+
+    // Import/Export
+    importExportTitle: 'Configuration Import/Export',
+    exportConfig: 'Export Config',
+    importConfig: 'Import Config',
+    exportDescription: 'Current configuration exported as JSON. You can copy to clipboard or save as file.',
+    importDescription: 'Paste or load configuration JSON to import settings. Import will overwrite current configuration.',
+    importPlaceholder: 'Paste configuration JSON here...',
+    copyToClipboard: 'Copy to Clipboard',
+    saveToFile: 'Save to File',
+    loadFromFile: 'Load from File',
+    import: 'Import',
+    importSuccess: 'Configuration imported successfully!',
 
     // Common
     cancel: 'Cancel',

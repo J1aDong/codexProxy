@@ -414,3 +414,38 @@ pub async fn stop_proxy(app: AppHandle) -> Result<(), String> {
 
     Ok(())
 }
+
+#[tauri::command]
+pub fn export_config() -> Result<String, String> {
+    let path = get_config_path()?;
+    if path.exists() {
+        let content = fs::read_to_string(&path).map_err(|e| format!("读取配置文件失败: {}", e))?;
+        let config: ProxyConfig = serde_json::from_str(&content)
+            .map_err(|e| format!("解析配置文件失败: {}", e))?;
+        serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("序列化配置失败: {}", e))
+    } else {
+        let default_config = ProxyConfig::default();
+        serde_json::to_string_pretty(&default_config)
+            .map_err(|e| format!("序列化默认配置失败: {}", e))
+    }
+}
+
+#[tauri::command]
+pub fn import_config(config_json: String) -> Result<(), String> {
+    let config: ProxyConfig = serde_json::from_str(&config_json)
+        .map_err(|e| format!("JSON 格式无效: {}", e))?;
+
+    if config.endpoint_options.is_empty() {
+        return Err("配置无效: endpoint_options 不能为空".to_string());
+    }
+
+    let path = get_config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    }
+
+    let content = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("序列化配置失败: {}", e))?;
+    fs::write(&path, content).map_err(|e| format!("写入配置文件失败: {}", e))
+}

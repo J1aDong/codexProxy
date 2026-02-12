@@ -15,3 +15,9 @@ export const stopProxy = (): Promise<void> =>
 
 export const saveLang = (lang: string): Promise<void> =>
     invoke('save_lang', { lang })
+
+export const exportConfig = (): Promise<string> =>
+    invoke<string>('export_config')
+
+export const importConfig = (configJson: string): Promise<void> =>
+    invoke('import_config', { configJson })
