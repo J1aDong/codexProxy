@@ -47,9 +47,16 @@
           {{ t('noLogs') }}
         </div>
         <div v-else>
-          <div v-for="(log, index) in logs" :key="index" class="mb-2 flex gap-2">
+          <div v-for="(log, index) in logs" :key="index" class="mb-2 flex gap-2 items-start">
             <span class="text-xs text-apple-text-secondary">{{ log.time }}</span>
-            <span class="text-xs text-apple-text-primary break-all">{{ log.content }}</span>
+            <span
+              v-if="extractLogTag(log.content)"
+              class="text-[10px] px-1.5 py-0.5 rounded border shrink-0"
+              :class="getLogTagClass(extractLogTag(log.content))"
+            >
+              [{{ extractLogTag(log.content) }}]
+            </span>
+            <span class="text-xs text-apple-text-primary break-all">{{ extractLogBody(log.content) }}</span>
           </div>
         </div>
       </div>
@@ -114,6 +121,32 @@ const handleClose = () => {
 
 const handleClear = () => {
   emit('clear')
+}
+
+const parseLog = (content: string) => {
+  const match = content.match(/^\[([^\]]+)\]\s*(.*)$/)
+  if (!match) {
+    return { tag: '', body: content }
+  }
+  return {
+    tag: match[1],
+    body: match[2] || '',
+  }
+}
+
+const extractLogTag = (content: string) => parseLog(content).tag
+
+const extractLogBody = (content: string) => parseLog(content).body
+
+const getLogTagClass = (tag: string) => {
+  const normalized = tag.toLowerCase()
+  if (normalized === 'req') return 'bg-green-50 text-green-700 border-green-200'
+  if (normalized === 'warn' || normalized === 'warning' || normalized === 'error') {
+    return 'bg-red-50 text-red-700 border-red-200'
+  }
+  if (normalized === 'route') return 'bg-blue-50 text-blue-700 border-blue-200'
+  if (normalized === 'tokens' || normalized === 'ratelimit') return 'bg-amber-50 text-amber-700 border-amber-200'
+  return 'bg-gray-100 text-gray-700 border-gray-200'
 }
 </script>
 

@@ -1,6 +1,7 @@
+use crate::load_balancer::{EndpointPermit, LoadBalancerRuntime, ModelSlot, ResolvedEndpoint};
 use crate::logger::AppLogger;
-use crate::models::{AnthropicRequest, CodexModelMapping, ContentBlock, GeminiReasoningEffortMapping, Message, MessageContent, ReasoningEffort, ReasoningEffortMapping};
-use crate::transform::{CodexBackend, GeminiBackend, TransformBackend, TransformContext};
+use crate::models::{AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock, GeminiReasoningEffortMapping, Message, MessageContent, ReasoningEffort, ReasoningEffortMapping};
+use crate::transform::{AnthropicBackend, CodexBackend, GeminiBackend, TransformBackend, TransformContext};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -13,7 +14,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
@@ -28,10 +29,72 @@ pub struct ProxyServer {
     converter: String,
     codex_model: String,
     codex_model_mapping: CodexModelMapping,
+    anthropic_model_mapping: AnthropicModelMapping,
     gemini_reasoning_effort: GeminiReasoningEffortMapping,
     max_concurrency: u32,
     ignore_probe_requests: bool,
     allow_count_tokens_fallback_estimate: bool,
+    load_balancer_runtime: Option<LoadBalancerRuntime>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeConfigUpdate {
+    pub target_url: String,
+    pub api_key: Option<String>,
+    pub ctx: TransformContext,
+    pub ignore_probe_requests: bool,
+    pub allow_count_tokens_fallback_estimate: bool,
+    pub load_balancer_runtime: Option<LoadBalancerRuntime>,
+}
+
+#[derive(Clone)]
+struct RuntimeConfigState {
+    target_url: String,
+    api_key: Option<String>,
+    ctx: TransformContext,
+    ignore_probe_requests: bool,
+    allow_count_tokens_fallback_estimate: bool,
+    load_balancer_runtime: Option<LoadBalancerRuntime>,
+}
+
+impl From<RuntimeConfigUpdate> for RuntimeConfigState {
+    fn from(value: RuntimeConfigUpdate) -> Self {
+        Self {
+            target_url: value.target_url,
+            api_key: value.api_key,
+            ctx: value.ctx,
+            ignore_probe_requests: value.ignore_probe_requests,
+            allow_count_tokens_fallback_estimate: value.allow_count_tokens_fallback_estimate,
+            load_balancer_runtime: value.load_balancer_runtime,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ProxyRuntimeHandle {
+    state: Arc<RwLock<RuntimeConfigState>>,
+}
+
+impl ProxyRuntimeHandle {
+    pub fn apply_update(&self, update: RuntimeConfigUpdate) {
+        let next = RuntimeConfigState::from(update);
+        match self.state.write() {
+            Ok(mut guard) => {
+                *guard = next;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = next;
+            }
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeConfigState {
+        match self.state.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
 }
 
 fn detect_model_family(model: &str) -> Option<&'static str> {
@@ -45,6 +108,108 @@ fn detect_model_family(model: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn build_backend_by_converter(converter: &str) -> Arc<dyn TransformBackend> {
+    if converter.eq_ignore_ascii_case("gemini") {
+        Arc::new(GeminiBackend)
+    } else if converter.eq_ignore_ascii_case("anthropic") {
+        Arc::new(AnthropicBackend)
+    } else {
+        Arc::new(CodexBackend)
+    }
+}
+
+fn backend_label_by_converter(converter: &str) -> &'static str {
+    if converter.eq_ignore_ascii_case("gemini") {
+        "Gemini API"
+    } else if converter.eq_ignore_ascii_case("anthropic") {
+        "Anthropic API"
+    } else {
+        "Codex API"
+    }
+}
+
+fn resolve_model_for_converter(
+    converter: &str,
+    input_model: &str,
+    reasoning_mapping: &ReasoningEffortMapping,
+    codex_model_mapping: &CodexModelMapping,
+    anthropic_model_mapping: &AnthropicModelMapping,
+    gemini_reasoning_effort: &GeminiReasoningEffortMapping,
+) -> String {
+    if converter.eq_ignore_ascii_case("anthropic") {
+        if let Some(family) = detect_model_family(input_model) {
+            let model = match family {
+                "opus" => anthropic_model_mapping.opus.trim(),
+                "sonnet" => anthropic_model_mapping.sonnet.trim(),
+                "haiku" => anthropic_model_mapping.haiku.trim(),
+                _ => "",
+            };
+            if !model.is_empty() {
+                return model.to_string();
+            }
+        } else {
+            let effort = crate::models::get_reasoning_effort(input_model, reasoning_mapping);
+            let model = match effort {
+                ReasoningEffort::Xhigh => anthropic_model_mapping.opus.trim(),
+                ReasoningEffort::High | ReasoningEffort::Medium => anthropic_model_mapping.sonnet.trim(),
+                ReasoningEffort::Low => anthropic_model_mapping.haiku.trim(),
+            };
+            if !model.is_empty() {
+                return model.to_string();
+            }
+        }
+        return input_model.to_string();
+    }
+
+    let effort = crate::models::get_reasoning_effort(input_model, reasoning_mapping);
+    if converter.eq_ignore_ascii_case("gemini") {
+        return match effort {
+            ReasoningEffort::Xhigh => gemini_reasoning_effort.opus.clone(),
+            ReasoningEffort::High | ReasoningEffort::Medium => gemini_reasoning_effort.sonnet.clone(),
+            ReasoningEffort::Low => gemini_reasoning_effort.haiku.clone(),
+        };
+    }
+
+    match effort {
+        ReasoningEffort::Xhigh => codex_model_mapping.opus.clone(),
+        ReasoningEffort::High | ReasoningEffort::Medium => codex_model_mapping.sonnet.clone(),
+        ReasoningEffort::Low => codex_model_mapping.haiku.clone(),
+    }
+}
+
+fn transform_request_with_optional_codex_effort_override(
+    converter: &str,
+    request_backend: &Arc<dyn TransformBackend>,
+    anthropic_body: &AnthropicRequest,
+    log_tx: &broadcast::Sender<String>,
+    ctx: &TransformContext,
+    model_name: &str,
+    reasoning_effort_override: Option<ReasoningEffort>,
+) -> (Value, String) {
+    if converter.eq_ignore_ascii_case("codex") {
+        if let Some(override_effort) = reasoning_effort_override {
+            let override_mapping = ReasoningEffortMapping::new()
+                .with_opus(override_effort)
+                .with_sonnet(override_effort)
+                .with_haiku(override_effort);
+            return crate::transform::codex::TransformRequest::transform(
+                anthropic_body,
+                Some(log_tx),
+                &override_mapping,
+                &ctx.skill_injection_prompt,
+                model_name,
+            );
+        }
+    }
+
+    request_backend.transform_request(
+        anthropic_body,
+        Some(log_tx),
+        ctx,
+        Some(model_name.to_string()),
+    )
 }
 
 fn normalize_log_text(text: &str) -> String {
@@ -465,6 +630,7 @@ fn extract_cooldown_info(status: u16, error_text: &str, retry_after_header: &str
     }
 
     let retry_after_secs = parse_seconds_str(retry_after_header);
+    let lower = error_text.to_ascii_lowercase();
     let parsed = serde_json::from_str::<Value>(error_text).ok();
     let error_obj = parsed
         .as_ref()
@@ -475,6 +641,25 @@ fn extract_cooldown_info(status: u16, error_text: &str, retry_after_header: &str
         .and_then(|value| value.get("code"))
         .and_then(|value| value.as_str())
         .map(|value| value.to_string());
+    let normalized_code = code
+        .as_ref()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let quota_signal = normalized_code.contains("quota")
+        || normalized_code.contains("insufficient")
+        || lower.contains("insufficient_quota")
+        || lower.contains("quota exceeded")
+        || lower.contains("out of credits")
+        || lower.contains("insufficient balance")
+        || lower.contains("billing")
+        || lower.contains("额度")
+        || lower.contains("余额")
+        || lower.contains("欠费");
+
+    if !quota_signal {
+        return None;
+    }
 
     let model = error_obj
         .and_then(|value| value.get("model"))
@@ -566,6 +751,62 @@ fn build_codex_input_tokens_endpoint(target_url: &str) -> String {
     format!("{}/responses/input_tokens", base)
 }
 
+fn build_anthropic_messages_endpoint(target_url: &str) -> String {
+    let clean = strip_query(target_url.to_string());
+
+    if clean.contains("/messages/count_tokens") {
+        if let Some(idx) = clean.rfind("/messages/count_tokens") {
+            let mut endpoint = clean;
+            endpoint.replace_range(
+                idx..idx + "/messages/count_tokens".len(),
+                "/messages",
+            );
+            return endpoint;
+        }
+    }
+
+    if clean.contains("/messages") {
+        return clean;
+    }
+
+    if let Some(idx) = clean.rfind("/responses/input_tokens") {
+        let mut endpoint = clean;
+        endpoint.replace_range(
+            idx..idx + "/responses/input_tokens".len(),
+            "/messages",
+        );
+        return endpoint;
+    }
+
+    if let Some(idx) = clean.rfind("/responses") {
+        let mut endpoint = clean;
+        endpoint.replace_range(idx..idx + "/responses".len(), "/messages");
+        return endpoint;
+    }
+
+    let base = clean.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{}/messages", base)
+    } else {
+        format!("{}/v1/messages", base)
+    }
+}
+
+fn build_anthropic_count_tokens_endpoint(target_url: &str) -> String {
+    let messages_endpoint = build_anthropic_messages_endpoint(target_url);
+    if let Some(idx) = messages_endpoint.rfind("/messages") {
+        let mut endpoint = messages_endpoint;
+        endpoint.replace_range(
+            idx..idx + "/messages".len(),
+            "/messages/count_tokens",
+        );
+        return endpoint;
+    }
+
+    let base = messages_endpoint.trim_end_matches('/');
+    format!("{}/messages/count_tokens", base)
+}
+
 fn parse_input_tokens(value: &Value) -> Option<u64> {
     value
         .get("input_tokens")
@@ -641,10 +882,12 @@ impl ProxyServer {
             converter: "codex".to_string(),
             codex_model: "gpt-5.3-codex".to_string(),
             codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
             gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
             max_concurrency: 0,
             ignore_probe_requests: false,
             allow_count_tokens_fallback_estimate: true,
+            load_balancer_runtime: None,
         }
     }
 
@@ -673,6 +916,11 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_anthropic_model_mapping(mut self, mapping: AnthropicModelMapping) -> Self {
+        self.anthropic_model_mapping = mapping;
+        self
+    }
+
 
 
     pub fn with_gemini_reasoning_effort(mut self, effort: GeminiReasoningEffortMapping) -> Self {
@@ -695,12 +943,36 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_load_balancer_runtime(mut self, runtime: LoadBalancerRuntime) -> Self {
+        self.load_balancer_runtime = Some(runtime);
+        self
+    }
+
+    fn runtime_update(&self) -> RuntimeConfigUpdate {
+        RuntimeConfigUpdate {
+            target_url: self.target_url.clone(),
+            api_key: self.api_key.clone(),
+            ctx: TransformContext {
+                reasoning_mapping: self.reasoning_mapping.clone(),
+                codex_model_mapping: self.codex_model_mapping.clone(),
+                anthropic_model_mapping: self.anthropic_model_mapping.clone(),
+                skill_injection_prompt: self.skill_injection_prompt.clone(),
+                converter: self.converter.clone(),
+                codex_model: self.codex_model.clone(),
+                gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),
+            },
+            ignore_probe_requests: self.ignore_probe_requests,
+            allow_count_tokens_fallback_estimate: self.allow_count_tokens_fallback_estimate,
+            load_balancer_runtime: self.load_balancer_runtime.clone(),
+        }
+    }
+
     /// Start the proxy server and return a shutdown sender + JoinHandle
     /// Send () to the returned sender to stop the server
     pub async fn start(
         &self,
         log_tx: broadcast::Sender<String>,
-    ) -> Result<(broadcast::Sender<()>, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(broadcast::Sender<()>, tokio::task::JoinHandle<()>, ProxyRuntimeHandle), Box<dyn std::error::Error + Send + Sync>> {
         // 初始化全局日志记录器
         let logger = AppLogger::init(Some("logs"));
         logger.log("=== Codex Proxy Started ===");
@@ -711,28 +983,11 @@ impl ProxyServer {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let shutdown_tx_clone = shutdown_tx.clone();
 
-        let target_url = Arc::new(self.target_url.clone());
-        let api_key = Arc::new(self.api_key.clone());
-        let ignore_probe_requests = self.ignore_probe_requests;
-        let allow_count_tokens_fallback_estimate = self.allow_count_tokens_fallback_estimate;
         let model_cooldowns: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
-
-        // 构建共享的 TransformContext
-        let ctx = Arc::new(TransformContext {
-            reasoning_mapping: self.reasoning_mapping.clone(),
-            codex_model_mapping: self.codex_model_mapping.clone(),
-            skill_injection_prompt: self.skill_injection_prompt.clone(),
-            converter: self.converter.clone(),
-            codex_model: self.codex_model.clone(),
-            gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),
-        });
-
-        // 按 converter 选择后端，默认走 Codex
-        let backend: Arc<dyn TransformBackend> = if self.converter.eq_ignore_ascii_case("gemini") {
-            Arc::new(GeminiBackend)
-        } else {
-            Arc::new(CodexBackend)
+        let runtime_handle = ProxyRuntimeHandle {
+            state: Arc::new(RwLock::new(RuntimeConfigState::from(self.runtime_update()))),
         };
+        let runtime_handle_for_server = runtime_handle.clone();
 
         // 并发控制：0 = 不限制
         let semaphore: Option<Arc<Semaphore>> = if self.max_concurrency > 0 {
@@ -770,29 +1025,19 @@ impl ProxyServer {
                         match result {
                             Ok((stream, _)) => {
                                 let io = TokioIo::new(stream);
-                                let target_url = Arc::clone(&target_url);
-                                let api_key = Arc::clone(&api_key);
-                                let ctx = Arc::clone(&ctx);
-                                let backend = Arc::clone(&backend);
                                 let http_client = Arc::clone(&http_client);
                                 let semaphore = semaphore.clone();
-                                let ignore_probe_requests = ignore_probe_requests;
-                                let allow_count_tokens_fallback_estimate = allow_count_tokens_fallback_estimate;
                                 let model_cooldowns = Arc::clone(&model_cooldowns);
+                                let runtime_handle = runtime_handle_for_server.clone();
                                 let log_tx = log_tx.clone();
 
                                 conn_tasks.spawn(async move {
                                     let service = service_fn(move |req| {
                                         handle_request(
                                             req,
-                                            Arc::clone(&target_url),
-                                            Arc::clone(&api_key),
-                                            Arc::clone(&ctx),
-                                            Arc::clone(&backend),
+                                            runtime_handle.clone(),
                                             Arc::clone(&http_client),
                                             semaphore.clone(),
-                                            ignore_probe_requests,
-                                            allow_count_tokens_fallback_estimate,
                                             Arc::clone(&model_cooldowns),
                                             log_tx.clone(),
                                         )
@@ -820,20 +1065,15 @@ impl ProxyServer {
             }
         });
 
-        Ok((shutdown_tx, handle))
+        Ok((shutdown_tx, handle, runtime_handle))
     }
 }
 
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
-    target_url: Arc<String>,
-    api_key: Arc<Option<String>>,
-    ctx: Arc<TransformContext>,
-    backend: Arc<dyn TransformBackend>,
+    runtime_handle: ProxyRuntimeHandle,
     http_client: Arc<reqwest::Client>,
     semaphore: Option<Arc<Semaphore>>,
-    ignore_probe_requests: bool,
-    allow_count_tokens_fallback_estimate: bool,
     model_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
@@ -847,6 +1087,13 @@ async fn handle_request(
         .chars()
         .take(8)
         .collect();
+    let runtime_state = runtime_handle.snapshot();
+    let target_url = runtime_state.target_url;
+    let api_key = runtime_state.api_key;
+    let ctx = runtime_state.ctx;
+    let ignore_probe_requests = runtime_state.ignore_probe_requests;
+    let allow_count_tokens_fallback_estimate = runtime_state.allow_count_tokens_fallback_estimate;
+    let load_balancer_runtime = runtime_state.load_balancer_runtime;
 
     // 只处理 POST /messages、/v1/messages、/messages/count_tokens、/v1/messages/count_tokens
     if req.method() != Method::POST || (!is_messages && !is_count_tokens) {
@@ -902,9 +1149,9 @@ async fn handle_request(
         .map(|value| value.to_string());
 
     // 确定最终使用的 API key
-    let final_api_key = if let Some(ref key) = *api_key {
+    let final_api_key = if let Some(key) = api_key.clone() {
         // 环境变量配置的 key 优先
-        Some(key.clone())
+        Some(key)
     } else {
         x_api_key.clone().or_else(|| {
             auth_header.as_ref().and_then(|h| {
@@ -939,8 +1186,22 @@ async fn handle_request(
         }
     };
 
-    // 解析 Anthropic 请求
-    let anthropic_body: AnthropicRequest = match serde_json::from_slice(&body_bytes) {
+    // 先保留原始 JSON（anthropic 透传时直接转发，避免结构体二次序列化改变字段形态）
+    let raw_request_body: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(body) => body,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(full_body(
+                    json!({"error": {"message": format!("Invalid JSON: {}", e)}}).to_string(),
+                ))
+                .unwrap());
+        }
+    };
+
+    // 再解析为结构体用于日志统计、模型路由等逻辑
+    let anthropic_body: AnthropicRequest = match serde_json::from_value(raw_request_body.clone()) {
         Ok(body) => body,
         Err(e) => {
             return Ok(Response::builder()
@@ -985,49 +1246,80 @@ async fn handle_request(
         }
     }
 
-    let model_name = if ctx.converter.eq_ignore_ascii_case("gemini") {
-        // Map Anthropic model to Gemini model using reasoning effort configuration
-        let input_model = anthropic_body.model.as_deref().unwrap_or("claude-3-5-sonnet-20240620");
-        let effort = crate::models::get_reasoning_effort(
-            input_model,
-            &ctx.reasoning_mapping
-        );
-
-        if let Some(ref l) = AppLogger::get() {
-            l.log(&format!("[Debug] Mapping Gemini - Input: {}, Effort: {:?}", input_model, effort));
-            l.log(&format!("[Debug] Current Gemini Config: {:?}", ctx.gemini_reasoning_effort));
-        }
-
-        match effort {
-            ReasoningEffort::Xhigh => {
-                let msg = format!("[Debug] Mapping to Opus (Xhigh) -> {}", ctx.gemini_reasoning_effort.opus);
-                let _ = log_tx.send(msg.clone());
-                if let Some(ref l) = AppLogger::get() { l.log(&msg); }
-                ctx.gemini_reasoning_effort.opus.clone()
-            },
-            ReasoningEffort::High | ReasoningEffort::Medium => {
-                let msg = format!("[Debug] Mapping to Sonnet (High/Medium) -> {}", ctx.gemini_reasoning_effort.sonnet);
-                let _ = log_tx.send(msg.clone());
-                if let Some(ref l) = AppLogger::get() { l.log(&msg); }
-                ctx.gemini_reasoning_effort.sonnet.clone()
-            },
-            ReasoningEffort::Low => {
-                let msg = format!("[Debug] Mapping to Haiku (Low) -> {}", ctx.gemini_reasoning_effort.haiku);
-                let _ = log_tx.send(msg.clone());
-                if let Some(ref l) = AppLogger::get() { l.log(&msg); }
-                ctx.gemini_reasoning_effort.haiku.clone()
-            },
-        }
-    } else {
-        let input_model = anthropic_body.model.as_deref().unwrap_or("claude-3-5-sonnet-20240620");
-        let effort = crate::models::get_reasoning_effort(input_model, &ctx.reasoning_mapping);
-        match effort {
-            ReasoningEffort::Xhigh => ctx.codex_model_mapping.opus.clone(),
-            ReasoningEffort::High | ReasoningEffort::Medium => ctx.codex_model_mapping.sonnet.clone(),
-            ReasoningEffort::Low => ctx.codex_model_mapping.haiku.clone(),
-        }
-    };
     let input_model = anthropic_body.model.as_deref().unwrap_or("claude-3-5-sonnet-20240620");
+    let input_slot = ModelSlot::from_model_name(input_model);
+    let mut resolved_target_url = target_url.clone();
+    let mut resolved_api_key = final_api_key.clone();
+    let mut request_converter = ctx.converter.clone();
+    let mut selected_lb_route: Option<ResolvedEndpoint> = None;
+    let mut _lb_permit: Option<EndpointPermit> = None;
+    let mut request_reasoning_effort_override: Option<ReasoningEffort> = None;
+
+    let mut model_name = resolve_model_for_converter(
+        &request_converter,
+        input_model,
+        &ctx.reasoning_mapping,
+        &ctx.codex_model_mapping,
+        &ctx.anthropic_model_mapping,
+        &ctx.gemini_reasoning_effort,
+    );
+
+    if let Some(runtime) = load_balancer_runtime.as_ref() {
+        if let Some((resolved, permit)) = runtime.resolve_and_acquire(input_model) {
+            selected_lb_route = Some(resolved.clone());
+            resolved_target_url = resolved.target_url;
+            if let Some(key) = resolved.api_key {
+                resolved_api_key = key;
+            }
+            request_converter = resolved.converter;
+            if let Some(overridden_model) = resolved.model {
+                model_name = overridden_model;
+            } else {
+                model_name = resolve_model_for_converter(
+                    &request_converter,
+                    input_model,
+                    &ctx.reasoning_mapping,
+                    &ctx.codex_model_mapping,
+                    &ctx.anthropic_model_mapping,
+                    &ctx.gemini_reasoning_effort,
+                );
+            }
+            if let Some(custom_effort) = resolved.reasoning_effort {
+                request_reasoning_effort_override = Some(ReasoningEffort::from_str(&custom_effort));
+            }
+            _lb_permit = Some(permit);
+        } else {
+            let _ = log_tx.send(format!(
+                "[Warn] #{} lb_unavailable slot={} model={} reason=no_available_candidate",
+                request_id,
+                input_slot.as_str(),
+                input_model,
+            ));
+
+            return Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Content-Type", "application/json")
+                .body(full_body(
+                    json!({
+                        "error": {
+                            "type": "service_unavailable",
+                            "message": format!(
+                                "No available upstream route in slot '{}' for model '{}'",
+                                input_slot.as_str(),
+                                input_model
+                            )
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap());
+        }
+    }
+
+    if request_converter.eq_ignore_ascii_case("anthropic") {
+        resolved_target_url = build_anthropic_messages_endpoint(&resolved_target_url);
+    }
+
     if let Some(family) = detect_model_family(input_model) {
         let _ = log_tx.send(format!("[Stat] model_request:{}", family));
     }
@@ -1052,21 +1344,56 @@ async fn handle_request(
         display_summary,
     ));
 
+    let route_mode = if selected_lb_route.is_some() { "lb" } else { "single" };
+    let route_slot = selected_lb_route
+        .as_ref()
+        .map(|route| route.slot.as_str())
+        .unwrap_or(input_slot.as_str());
+    let route_endpoint = selected_lb_route
+        .as_ref()
+        .map(|route| route.endpoint_id.as_str())
+        .unwrap_or("single");
+    let route_effort = if request_converter.eq_ignore_ascii_case("codex") {
+        request_reasoning_effort_override
+            .map(|effort| effort.as_str().to_string())
+            .unwrap_or_else(|| {
+                crate::models::get_reasoning_effort(input_model, &ctx.reasoning_mapping)
+                    .as_str()
+                    .to_string()
+            })
+    } else {
+        "-".to_string()
+    };
+
+    let _ = log_tx.send(format!(
+        "[Route] #{} mode={} slot={} endpoint={} base={} converter={} model={} effort={}",
+        request_id,
+        route_mode,
+        route_slot,
+        route_endpoint,
+        resolved_target_url,
+        request_converter,
+        model_name,
+        route_effort,
+    ));
+
     if is_count_tokens {
         let _ = log_tx.send(format!(
             "[Req] #{} mode=count_tokens converter={} in={} out={}",
             request_id,
-            ctx.converter,
+            request_converter,
             input_model,
             model_name,
         ));
+
+        let request_backend = build_backend_by_converter(&request_converter);
 
         let mut token_count: Option<u64> = None;
         let mut upstream_status: Option<u16> = None;
         let mut source = "estimate".to_string();
 
-        if ctx.converter.eq_ignore_ascii_case("gemini") {
-            let endpoint = build_gemini_count_tokens_endpoint(&target_url, &model_name);
+        if request_converter.eq_ignore_ascii_case("gemini") {
+            let endpoint = build_gemini_count_tokens_endpoint(&resolved_target_url, &model_name);
             let (messages, _) = crate::transform::MessageProcessor::transform_messages(&anthropic_body.messages, Some(&log_tx));
             let contents = GeminiBackend::build_contents_for_count(&messages);
             let body = json!({ "contents": contents });
@@ -1074,8 +1401,8 @@ async fn handle_request(
             let response = http_client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
-                .header("x-goog-api-key", &final_api_key)
-                .header("Authorization", format!("Bearer {}", &final_api_key))
+                .header("x-goog-api-key", &resolved_api_key)
+                .header("Authorization", format!("Bearer {}", &resolved_api_key))
                 .body(body.to_string())
                 .send()
                 .await;
@@ -1096,20 +1423,58 @@ async fn handle_request(
                     }
                 }
             }
+        } else if request_converter.eq_ignore_ascii_case("anthropic") {
+            let endpoint = build_anthropic_count_tokens_endpoint(&resolved_target_url);
+            let mut request_body = raw_request_body.clone();
+            if let Some(obj) = request_body.as_object_mut() {
+                obj.remove("stream");
+                obj.insert("model".to_string(), json!(model_name.clone()));
+            }
+
+            let response = http_client
+                .post(endpoint)
+                .header("Content-Type", "application/json")
+                .header("x-api-key", &resolved_api_key)
+                .header("Authorization", format!("Bearer {}", &resolved_api_key))
+                .header("x-anthropic-version", &anthropic_version)
+                .body(request_body.to_string());
+
+            let response = if let Some(beta) = &anthropic_beta {
+                response.header("anthropic-beta", beta).send().await
+            } else {
+                response.send().await
+            };
+
+            if let Ok(resp) = response {
+                upstream_status = Some(resp.status().as_u16());
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            token_count = parse_input_tokens(&value);
+                            if token_count.is_some() {
+                                source = "anthropic_count_tokens".to_string();
+                            }
+                        }
+                    }
+                }
+            }
         } else {
-            let endpoint = build_codex_input_tokens_endpoint(&target_url);
-            let (codex_body, _) = backend.transform_request(
+            let endpoint = build_codex_input_tokens_endpoint(&resolved_target_url);
+            let (codex_body, _) = transform_request_with_optional_codex_effort_override(
+                &request_converter,
+                &request_backend,
                 &anthropic_body,
-                Some(&log_tx),
+                &log_tx,
                 &ctx,
-                Some(model_name.clone()),
+                &model_name,
+                request_reasoning_effort_override,
             );
 
             let response = http_client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", &final_api_key))
-                .header("x-api-key", &final_api_key)
+                .header("Authorization", format!("Bearer {}", &resolved_api_key))
+                .header("x-api-key", &resolved_api_key)
                 .header("x-anthropic-version", &anthropic_version)
                 .header("originator", "codex_cli_rs")
                 .body(codex_body.to_string());
@@ -1213,17 +1578,30 @@ async fn handle_request(
             .unwrap());
     }
 
-    // 通过 trait 转换请求
-    let (codex_body, session_id) = backend.transform_request(
-        &anthropic_body,
-        Some(&log_tx),
-        &ctx,
-        Some(model_name.clone()),
-    );
+    let request_backend = build_backend_by_converter(&request_converter);
 
-    if let Some(input_summary) = summarize_codex_payload(&codex_body) {
-        let top_keys = sorted_object_keys(&codex_body).join(",");
-        let input_items = codex_body
+    // anthropic 透传保留原始 JSON，仅按映射覆盖 model；其余 converter 走既有转换器。
+    let (upstream_body, session_id) = if request_converter.eq_ignore_ascii_case("anthropic") {
+        let mut request_body = raw_request_body.clone();
+        if let Some(obj) = request_body.as_object_mut() {
+            obj.insert("model".to_string(), json!(model_name.clone()));
+        }
+        (request_body, Uuid::new_v4().to_string())
+    } else {
+        transform_request_with_optional_codex_effort_override(
+            &request_converter,
+            &request_backend,
+            &anthropic_body,
+            &log_tx,
+            &ctx,
+            &model_name,
+            request_reasoning_effort_override,
+        )
+    };
+
+    if let Some(input_summary) = summarize_codex_payload(&upstream_body) {
+        let top_keys = sorted_object_keys(&upstream_body).join(",");
+        let input_items = upstream_body
             .get("input")
             .and_then(|v| v.as_array())
             .map(|arr| arr.len())
@@ -1246,7 +1624,7 @@ async fn handle_request(
         l.log_anthropic_request(&body_bytes);
     }
 
-    // 记录转换后的 Codex 请求（curl 格式）
+    // 记录上游请求（curl 格式）
     if let Some(ref l) = logger {
         let headers = vec![
             ("Content-Type", "application/json"),
@@ -1256,15 +1634,21 @@ async fn handle_request(
             ("Accept", "text/event-stream"),
             ("session_id", &session_id),
         ];
-        l.log_curl_request("POST", &target_url, &headers, &codex_body);
+        l.log_curl_request(
+            "POST",
+            &resolved_target_url,
+            &headers,
+            &upstream_body,
+            backend_label_by_converter(&request_converter),
+        );
     }
 
     // 通过 trait 构建上游请求
-    let upstream_req = backend.build_upstream_request(
+    let upstream_req = request_backend.build_upstream_request(
         &http_client,
-        &target_url,
-        &final_api_key,
-        &codex_body,
+        &resolved_target_url,
+        &resolved_api_key,
+        &upstream_body,
         &session_id,
         &anthropic_version,
     );
@@ -1279,6 +1663,9 @@ async fn handle_request(
     let response = match upstream_req.send().await {
         Ok(resp) => resp,
         Err(e) => {
+            if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), selected_lb_route.as_ref()) {
+                runtime.handle_upstream_outcome(route, None, true, None);
+            }
             let _ = log_tx.send(format!("[Error] Request failed: {}", e));
             return Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -1299,6 +1686,10 @@ async fn handle_request(
             .to_string();
         let status = response.status().as_u16();
         let error_text = response.text().await.unwrap_or_default();
+
+        if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), selected_lb_route.as_ref()) {
+            runtime.handle_upstream_outcome(route, Some(status), false, Some(&error_text));
+        }
 
         if let Some((cooldown_model, cooldown_secs, reason)) = extract_cooldown_info(status, &error_text, &retry_after, &model) {
             set_model_cooldown(&model_cooldowns, &cooldown_model, cooldown_secs);
@@ -1330,17 +1721,44 @@ async fn handle_request(
     }
 
     let _ = log_tx.send(format!(
-        "[System] #{} Request transformed and forwarding to Codex Responses API",
-        request_id
+        "[System] #{} Request transformed and forwarding to upstream API",
+        request_id,
     ));
 
     let upstream_status = response.status().as_u16();
+    if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), selected_lb_route.as_ref()) {
+        runtime.handle_upstream_outcome(route, Some(upstream_status), false, None);
+    }
+
+    if request_converter.eq_ignore_ascii_case("anthropic") && !anthropic_body.stream {
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(ref l) = AppLogger::get() {
+            l.log_upstream_response(upstream_status, &body_text);
+            l.log("════════════════════════════════════════════════════════════════");
+            l.log("✅ Request completed");
+            l.log("════════════════════════════════════════════════════════════════");
+        }
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", content_type)
+            .header("Access-Control-Allow-Origin", "*")
+            .body(full_body(body_text))
+            .unwrap());
+    }
 
     // 非流式：把上游 SSE 聚合成 Anthropic JSON
     if !anthropic_body.stream {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
-        let mut transformer = backend.create_response_transformer(&model);
+        let mut transformer = request_backend.create_response_transformer(&model);
 
         let mut message_state: Option<Value> = None;
         let mut blocks: BTreeMap<usize, Value> = BTreeMap::new();
@@ -1492,7 +1910,7 @@ async fn handle_request(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(256);
 
     // 通过 trait 创建响应转换器
-    let mut transformer = backend.create_response_transformer(&model);
+    let mut transformer = request_backend.create_response_transformer(&model);
 
     let log_tx_clone = log_tx.clone();
     let request_id_for_stream = request_id.clone();

@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 /// Anthropic 请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicRequest {
     pub model: Option<String>,
     pub messages: Vec<Message>,
@@ -22,7 +22,7 @@ fn default_stream() -> bool {
 }
 
 /// system 字段可以是字符串或数组
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum SystemContent {
     Text(String),
@@ -52,7 +52,7 @@ impl SystemContent {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum SystemBlock {
     PlainString(String),

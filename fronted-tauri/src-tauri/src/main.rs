@@ -29,6 +29,8 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             proxy::start_proxy,
+            proxy::apply_proxy_config,
+            proxy::restart_proxy,
             proxy::stop_proxy,
             proxy::load_config,
             proxy::save_config,

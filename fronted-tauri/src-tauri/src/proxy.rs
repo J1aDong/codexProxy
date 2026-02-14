@@ -1,5 +1,25 @@
-use codex_proxy_core::{ProxyServer, ReasoningEffort, ReasoningEffortMapping, GeminiReasoningEffortMapping, CodexModelMapping};
+use codex_proxy_core::{
+    AnthropicModelMapping,
+    CodexModelMapping,
+    GeminiReasoningEffortMapping,
+    ProxyRuntimeHandle,
+    ProxyServer,
+    ReasoningEffort,
+    ReasoningEffortMapping,
+    RuntimeConfigUpdate,
+    TransformContext,
+};
+use codex_proxy_core::load_balancer::{
+    EndpointPolicy as CoreEndpointPolicy,
+    LoadBalancerConfig as CoreLoadBalancerConfig,
+    LoadBalancerEndpoint as CoreLoadBalancerEndpoint,
+    LoadBalancerProfile as CoreLoadBalancerProfile,
+    LoadBalancerRuntime,
+    SlotEndpointRef as CoreSlotEndpointRef,
+    SlotMapping as CoreSlotMapping,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::net::TcpListener;
 use std::process::Command;
@@ -15,6 +35,13 @@ pub struct ReasoningEffortConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CodexModelMappingConfig {
+    pub opus: String,
+    pub sonnet: String,
+    pub haiku: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AnthropicModelMappingConfig {
     pub opus: String,
     pub sonnet: String,
     pub haiku: String,
@@ -57,6 +84,71 @@ impl ReasoningEffortConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LbSlotEndpointRef {
+    pub endpoint_id: String,
+    pub custom_model_name: Option<String>,
+    pub custom_reasoning_effort: Option<String>,
+    pub converter_override: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSlotMapping {
+    pub opus: Vec<LbSlotEndpointRef>,
+    pub sonnet: Vec<LbSlotEndpointRef>,
+    pub haiku: Vec<LbSlotEndpointRef>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LbFailoverStrategy {
+    pub error_threshold: u32,
+    pub error_window_seconds: u32,
+    pub cooldown_seconds: u32,
+    pub degraded_concurrency: u32,
+}
+
+impl Default for LbFailoverStrategy {
+    fn default() -> Self {
+        Self {
+            error_threshold: 5,
+            error_window_seconds: 60,
+            cooldown_seconds: 3600,
+            degraded_concurrency: 4,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadBalancerProfile {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub model_mapping: ModelSlotMapping,
+    pub strategy: LbFailoverStrategy,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LbEndpointConfig {
+    pub endpoint_id: String,
+    pub enabled: bool,
+    pub max_concurrency: u32,
+    pub priority: u32,
+    pub weight: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadBalancerConfig {
+    pub lb_profiles: Vec<LoadBalancerProfile>,
+    pub selected_lb_profile_id: Option<String>,
+    pub lb_endpoint_configs: std::collections::HashMap<String, LbEndpointConfig>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EndpointOption {
     pub id: String,
@@ -77,6 +169,9 @@ pub struct EndpointOption {
     #[serde(rename = "geminiModelPreset", default)]
     pub gemini_model_preset: Option<Vec<String>>,
 
+    #[serde(rename = "anthropicModelMapping", default)]
+    pub anthropic_model_mapping: Option<AnthropicModelMappingConfig>,
+
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: Option<ReasoningEffortConfig>,
 
@@ -94,6 +189,7 @@ fn default_endpoint_options() -> Vec<EndpointOption> {
         codex_model: None,
         codex_model_mapping: None,
         gemini_model_preset: None,
+        anthropic_model_mapping: None,
         reasoning_effort: None,
         gemini_reasoning_effort: None,
     }]
@@ -101,6 +197,26 @@ fn default_endpoint_options() -> Vec<EndpointOption> {
 
 fn default_selected_endpoint_id() -> String {
     "aicodemirror-default".to_string()
+}
+
+fn default_proxy_mode() -> String {
+    "single".to_string()
+}
+
+fn default_load_balancer() -> LoadBalancerConfig {
+    LoadBalancerConfig::default()
+}
+
+fn default_lb_model_cooldown_seconds() -> u32 {
+    3600
+}
+
+fn default_lb_transient_backoff_seconds() -> u32 {
+    6
+}
+
+fn default_anthropic_model_mapping() -> AnthropicModelMappingConfig {
+    AnthropicModelMappingConfig::default()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -120,6 +236,8 @@ pub struct ProxyConfig {
     pub codex_model: String,
     #[serde(rename = "codexModelMapping", default)]
     pub codex_model_mapping: CodexModelMappingConfig,
+    #[serde(rename = "anthropicModelMapping", default = "default_anthropic_model_mapping")]
+    pub anthropic_model_mapping: AnthropicModelMappingConfig,
 
     #[serde(rename = "geminiModelPreset", default = "default_gemini_model_preset")]
     pub gemini_model_preset: Vec<String>,
@@ -132,6 +250,14 @@ pub struct ProxyConfig {
     pub allow_count_tokens_fallback_estimate: bool,
     #[serde(default)]
     pub force: bool,
+    #[serde(rename = "proxyMode", default = "default_proxy_mode")]
+    pub proxy_mode: String,
+    #[serde(rename = "loadBalancer", default = "default_load_balancer")]
+    pub load_balancer: LoadBalancerConfig,
+    #[serde(rename = "lbModelCooldownSeconds", default = "default_lb_model_cooldown_seconds")]
+    pub lb_model_cooldown_seconds: u32,
+    #[serde(rename = "lbTransientBackoffSeconds", default = "default_lb_transient_backoff_seconds")]
+    pub lb_transient_backoff_seconds: u32,
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: ReasoningEffortConfig,
     #[serde(rename = "geminiReasoningEffort", default)]
@@ -169,6 +295,202 @@ fn default_gemini_model_preset() -> Vec<String> {
     ]
 }
 
+fn build_lb_runtime(config: &ProxyConfig, log_tx: Option<broadcast::Sender<String>>) -> Option<LoadBalancerRuntime> {
+    let selected_profile_id = config.load_balancer.selected_lb_profile_id.clone();
+    let selected_profile_strategy = selected_profile_id
+        .as_ref()
+        .and_then(|profile_id| config.load_balancer.lb_profiles.iter().find(|p| &p.id == profile_id))
+        .map(|p| p.strategy.clone())
+        .unwrap_or_default();
+
+    let error_threshold = selected_profile_strategy.error_threshold.max(1);
+    let error_window_seconds = selected_profile_strategy.error_window_seconds.max(1);
+    let degraded_concurrency = selected_profile_strategy.degraded_concurrency.max(1);
+    let cooldown_seconds = if config.lb_model_cooldown_seconds == 0 {
+        default_lb_model_cooldown_seconds()
+    } else {
+        config.lb_model_cooldown_seconds
+    };
+    let transient_backoff_seconds = if config.lb_transient_backoff_seconds == 0 {
+        default_lb_transient_backoff_seconds()
+    } else {
+        config.lb_transient_backoff_seconds
+    };
+
+    let profiles: Vec<CoreLoadBalancerProfile> = config
+        .load_balancer
+        .lb_profiles
+        .iter()
+        .map(|profile| CoreLoadBalancerProfile {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            model_mapping: CoreSlotMapping {
+                opus: profile
+                    .model_mapping
+                    .opus
+                    .iter()
+                    .map(|item| CoreSlotEndpointRef {
+                        endpoint_id: item.endpoint_id.clone(),
+                        custom_model_name: item.custom_model_name.clone(),
+                        custom_reasoning_effort: item.custom_reasoning_effort.clone(),
+                        converter_override: item.converter_override.clone(),
+                    })
+                    .collect(),
+                sonnet: profile
+                    .model_mapping
+                    .sonnet
+                    .iter()
+                    .map(|item| CoreSlotEndpointRef {
+                        endpoint_id: item.endpoint_id.clone(),
+                        custom_model_name: item.custom_model_name.clone(),
+                        custom_reasoning_effort: item.custom_reasoning_effort.clone(),
+                        converter_override: item.converter_override.clone(),
+                    })
+                    .collect(),
+                haiku: profile
+                    .model_mapping
+                    .haiku
+                    .iter()
+                    .map(|item| CoreSlotEndpointRef {
+                        endpoint_id: item.endpoint_id.clone(),
+                        custom_model_name: item.custom_model_name.clone(),
+                        custom_reasoning_effort: item.custom_reasoning_effort.clone(),
+                        converter_override: item.converter_override.clone(),
+                    })
+                    .collect(),
+            },
+        })
+        .collect();
+
+    if profiles.is_empty() || selected_profile_id.is_none() {
+        return None;
+    }
+
+    let endpoint_directory: HashMap<String, CoreLoadBalancerEndpoint> = config
+        .endpoint_options
+        .iter()
+        .map(|item| {
+            let converter = item
+                .converter
+                .clone()
+                .unwrap_or_else(|| config.converter.clone());
+            let api_key = if item.api_key.is_empty() {
+                if config.api_key.is_empty() {
+                    None
+                } else {
+                    Some(config.api_key.clone())
+                }
+            } else {
+                Some(item.api_key.clone())
+            };
+
+            (
+                item.id.clone(),
+                CoreLoadBalancerEndpoint {
+                    id: item.id.clone(),
+                    target_url: item.url.clone(),
+                    api_key,
+                    converter,
+                },
+            )
+        })
+        .collect();
+
+    let endpoint_policies: HashMap<String, CoreEndpointPolicy> = config
+        .endpoint_options
+        .iter()
+        .map(|endpoint| {
+            let endpoint_cfg = config.load_balancer.lb_endpoint_configs.get(&endpoint.id);
+            let enabled = endpoint_cfg.map(|cfg| cfg.enabled).unwrap_or(true);
+            let max_concurrency = endpoint_cfg
+                .map(|cfg| cfg.max_concurrency)
+                .unwrap_or(16);
+
+            (
+                endpoint.id.clone(),
+                CoreEndpointPolicy {
+                    enabled,
+                    max_concurrency: if max_concurrency == 0 { 1 } else { max_concurrency },
+                    error_threshold,
+                    error_window_seconds,
+                    cooldown_seconds,
+                    degraded_concurrency,
+                    transient_backoff_seconds,
+                },
+            )
+        })
+        .collect();
+
+    Some(LoadBalancerRuntime::new(
+        CoreLoadBalancerConfig {
+            selected_profile_id,
+            profiles,
+            endpoint_policies,
+        },
+        endpoint_directory,
+        log_tx,
+    ))
+}
+
+fn selected_endpoint<'a>(config: &'a ProxyConfig) -> Option<&'a EndpointOption> {
+    config
+        .endpoint_options
+        .iter()
+        .find(|item| item.id == config.selected_endpoint_id)
+}
+
+fn resolve_target_and_api_key(config: &ProxyConfig) -> (String, Option<String>) {
+    let selected = selected_endpoint(config);
+    let target_url = selected
+        .map(|item| item.url.clone())
+        .unwrap_or_else(|| config.target_url.clone());
+    let resolved_api_key = selected
+        .map(|item| item.api_key.clone())
+        .unwrap_or_else(|| config.api_key.clone());
+    let api_key = if resolved_api_key.is_empty() {
+        None
+    } else {
+        Some(resolved_api_key)
+    };
+    (target_url, api_key)
+}
+
+fn build_runtime_update(
+    config: &ProxyConfig,
+    log_tx: Option<broadcast::Sender<String>>,
+) -> RuntimeConfigUpdate {
+    let (target_url, api_key) = resolve_target_and_api_key(config);
+    let load_balancer_runtime = if config.proxy_mode.eq_ignore_ascii_case("load_balancer") {
+        build_lb_runtime(config, log_tx)
+    } else {
+        None
+    };
+
+    RuntimeConfigUpdate {
+        target_url,
+        api_key,
+        ctx: TransformContext {
+            reasoning_mapping: config.reasoning_effort.to_mapping(),
+            codex_model_mapping: CodexModelMapping {
+                opus: config.codex_model_mapping.opus.clone(),
+                sonnet: config.codex_model_mapping.sonnet.clone(),
+                haiku: config.codex_model_mapping.haiku.clone(),
+            },
+            anthropic_model_mapping: AnthropicModelMapping {
+                opus: config.anthropic_model_mapping.opus.clone(),
+                sonnet: config.anthropic_model_mapping.sonnet.clone(),
+                haiku: config.anthropic_model_mapping.haiku.clone(),
+            },
+            skill_injection_prompt: config.skill_injection_prompt.clone(),
+            converter: config.converter.clone(),
+            codex_model: config.codex_model.clone(),
+            gemini_reasoning_effort: config.gemini_reasoning_effort.to_gemini_mapping(),
+        },
+        ignore_probe_requests: config.ignore_probe_requests,
+        allow_count_tokens_fallback_estimate: config.allow_count_tokens_fallback_estimate,
+        load_balancer_runtime,
+    }
+}
 
 
 
@@ -178,6 +500,8 @@ pub struct ProxyManager {
     shutdown_tx: Option<broadcast::Sender<()>>,
     log_tx: Option<broadcast::Sender<String>>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
+    runtime_handle: Option<ProxyRuntimeHandle>,
+    current_port: Option<u16>,
 }
 
 impl Default for ProxyManager {
@@ -187,6 +511,8 @@ impl Default for ProxyManager {
             shutdown_tx: None,
             log_tx: None,
             server_handle: None,
+            runtime_handle: None,
+            current_port: None,
         }
     }
 }
@@ -204,6 +530,22 @@ impl ProxyManager {
         self.shutdown_tx = Some(tx);
     }
 
+    pub fn set_runtime_handle(&mut self, handle: ProxyRuntimeHandle) {
+        self.runtime_handle = Some(handle);
+    }
+
+    pub fn runtime_handle(&self) -> Option<ProxyRuntimeHandle> {
+        self.runtime_handle.clone()
+    }
+
+    pub fn current_port(&self) -> Option<u16> {
+        self.current_port
+    }
+
+    pub fn set_current_port(&mut self, port: u16) {
+        self.current_port = Some(port);
+    }
+
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -213,6 +555,8 @@ impl ProxyManager {
         }
         self.running = false;
         self.log_tx = None;
+        self.runtime_handle = None;
+        self.current_port = None;
     }
 }
 
@@ -317,19 +661,20 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
         return Err("Proxy is already running".to_string());
     }
 
+    start_proxy_with_manager(&app, config, &mut manager).await
+}
+
+async fn start_proxy_with_manager(
+    app: &AppHandle,
+    config: ProxyConfig,
+    manager: &mut ProxyManager,
+) -> Result<(), String> {
     app.emit(
         "proxy-log",
         format!("[System] Starting proxy on port {}...", config.port),
     )
     .map_err(|e| e.to_string())?;
-    let selected_endpoint = config
-        .endpoint_options
-        .iter()
-        .find(|item| item.id == config.selected_endpoint_id);
-
-    let resolved_target_url = selected_endpoint
-        .map(|item| item.url.clone())
-        .unwrap_or_else(|| config.target_url.clone());
+    let (resolved_target_url, api_key) = resolve_target_and_api_key(&config);
 
     app.emit("proxy-log", format!("[System] Target: {}", resolved_target_url))
         .map_err(|e| e.to_string())?;
@@ -337,16 +682,6 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
     // 创建日志通道（容量 2048 减少高频场景下的 lag）
     let (log_tx, mut log_rx) = broadcast::channel::<String>(2048);
     manager.log_tx = Some(log_tx.clone());
-
-    let resolved_api_key = selected_endpoint
-        .map(|item| item.api_key.clone())
-        .unwrap_or_else(|| config.api_key.clone());
-
-    let api_key = if resolved_api_key.is_empty() {
-        None
-    } else {
-        Some(resolved_api_key)
-    };
 
     let server = ProxyServer::new(config.port, resolved_target_url.clone(), api_key)
         .with_reasoning_mapping(config.reasoning_effort.to_mapping())
@@ -358,10 +693,32 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
             sonnet: config.codex_model_mapping.sonnet.clone(),
             haiku: config.codex_model_mapping.haiku.clone(),
         })
+        .with_anthropic_model_mapping(AnthropicModelMapping {
+            opus: config.anthropic_model_mapping.opus.clone(),
+            sonnet: config.anthropic_model_mapping.sonnet.clone(),
+            haiku: config.anthropic_model_mapping.haiku.clone(),
+        })
         .with_gemini_reasoning_effort(config.gemini_reasoning_effort.to_gemini_mapping())
         .with_ignore_probe_requests(config.ignore_probe_requests)
         .with_allow_count_tokens_fallback_estimate(config.allow_count_tokens_fallback_estimate)
         .with_max_concurrency(config.max_concurrency);
+
+    let server = if config.proxy_mode.eq_ignore_ascii_case("load_balancer") {
+        if let Some(runtime) = build_lb_runtime(&config, Some(log_tx.clone())) {
+            app.emit("proxy-log", "[System] Load balancer mode enabled")
+                .map_err(|e| e.to_string())?;
+            server.with_load_balancer_runtime(runtime)
+        } else {
+            app.emit(
+                "proxy-log",
+                "[Warning] Load balancer config incomplete, fallback to single mode",
+            )
+            .map_err(|e| e.to_string())?;
+            server
+        }
+    } else {
+        server
+    };
 
     // 启动日志转发（Lagged 时跳过丢失的消息继续接收，不退出）
     let app_clone = app.clone();
@@ -383,14 +740,17 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
     // 启动代理服务器
     let app_clone = app.clone();
     match server.start(log_tx).await {
-        Ok((shutdown_tx, server_handle)) => {
+        Ok((shutdown_tx, server_handle, runtime_handle)) => {
             manager.set_shutdown_tx(shutdown_tx);
             manager.server_handle = Some(server_handle);
+            manager.set_runtime_handle(runtime_handle);
+            manager.set_current_port(config.port);
             manager.set_running(true);
             app.emit("proxy-status", "running")
                 .map_err(|e| e.to_string())?;
         }
         Err(e) => {
+            manager.set_running(false);
             let _ = app_clone.emit("proxy-log", format!("[Error] Server error: {}", e));
             let _ = app_clone.emit("proxy-status", "stopped");
             return Err(e.to_string());
@@ -398,6 +758,83 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn apply_proxy_config(app: AppHandle, config: ProxyConfig) -> Result<(), String> {
+    save_config(config.clone())?;
+
+    let state = app.state::<crate::AppState>();
+    let manager = state.proxy_manager.lock().await;
+
+    if !manager.is_running() {
+        app.emit("proxy-log", "[System] Proxy not running, config saved only")
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    if manager.current_port() != Some(config.port) {
+        app.emit(
+            "proxy-log",
+            format!(
+                "[Warning] Port change {} -> {} requires restart, hot apply skipped",
+                manager.current_port().unwrap_or(config.port),
+                config.port
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let Some(runtime_handle) = manager.runtime_handle() else {
+        return Err("Proxy runtime handle missing".to_string());
+    };
+    let update = build_runtime_update(&config, manager.log_tx.clone());
+    if config.proxy_mode.eq_ignore_ascii_case("load_balancer") && update.load_balancer_runtime.is_none() {
+        app.emit(
+            "proxy-log",
+            "[Warning] Load balancer config incomplete, hot fallback to single mode",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    runtime_handle.apply_update(update);
+
+    app.emit("proxy-log", "[System] Runtime config hot-updated (no restart)")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn restart_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), String> {
+    save_config(config.clone())?;
+
+    let state = app.state::<crate::AppState>();
+    let mut manager = state.proxy_manager.lock().await;
+
+    if manager.is_running() {
+        app.emit("proxy-log", "[System] Applying config changes and restarting proxy...")
+            .map_err(|e| e.to_string())?;
+        manager.stop();
+    }
+
+    if !config.force && check_port(config.port) {
+        app.emit("port-in-use", config.port)
+            .map_err(|e| e.to_string())?;
+        app.emit("proxy-status", "stopped")
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    if config.force {
+        app.emit(
+            "proxy-log",
+            format!("[System] Stopping process on port {}...", config.port),
+        )
+        .map_err(|e| e.to_string())?;
+        kill_port(config.port).await?;
+    }
+
+    start_proxy_with_manager(&app, config, &mut manager).await
 }
 
 #[tauri::command]

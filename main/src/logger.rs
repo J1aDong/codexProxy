@@ -125,7 +125,14 @@ impl AppLogger {
     }
 
     /// 记录 curl 格式的请求
-    pub fn log_curl_request(&self, method: &str, url: &str, headers: &[(&str, &str)], body: &Value) {
+    pub fn log_curl_request(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        backend_label: &str,
+    ) {
         if !is_debug_log_enabled() {
             return;
         }
@@ -142,14 +149,14 @@ impl AppLogger {
 
         let log_content = format!(
             "\n[{}] ════════════════════════════════════════════════════════════════\n\
-             [{}] 📤 OUTGOING REQUEST (Codex API)\n\
+             [{}] 📤 OUTGOING REQUEST ({})\n\
              [{}] ════════════════════════════════════════════════════════════════\n\
              {}\n\
              \n\
              Request Body:\n\
              {}\n\
              ════════════════════════════════════════════════════════════════════════\n",
-            timestamp, timestamp, timestamp, curl_cmd, pretty_body
+            timestamp, timestamp, backend_label, timestamp, curl_cmd, pretty_body
         );
 
         if let Ok(mut file) = OpenOptions::new()

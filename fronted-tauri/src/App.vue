@@ -16,6 +16,7 @@
       <ConfigCard
         :form="form"
         :isRunning="isRunning"
+        :lbAvailabilityMap="lbAvailabilityMap"
         @update:form="updateForm"
         @reset="resetDefaults"
         @toggle="toggleProxy"
@@ -92,6 +93,32 @@
             :placeholder="t('advancedMaxConcurrencyPlaceholder')"
           />
           <div class="text-apple-text-secondary text-xs">{{ t('advancedMaxConcurrencyTip') }}</div>
+        </div>
+
+        <div class="space-y-2">
+          <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedLbModelCooldownLabel') }}</label>
+          <input
+            type="number"
+            v-model.number="localLbModelCooldownSeconds"
+            min="1"
+            max="86400"
+            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
+            :placeholder="t('advancedLbModelCooldownPlaceholder')"
+          />
+          <div class="text-apple-text-secondary text-xs">{{ t('advancedLbModelCooldownTip') }}</div>
+        </div>
+
+        <div class="space-y-2">
+          <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedLbTransientBackoffLabel') }}</label>
+          <input
+            type="number"
+            v-model.number="localLbTransientBackoffSeconds"
+            min="1"
+            max="120"
+            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
+            :placeholder="t('advancedLbTransientBackoffPlaceholder')"
+          />
+          <div class="text-apple-text-secondary text-xs">{{ t('advancedLbTransientBackoffTip') }}</div>
         </div>
 
         <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
@@ -173,8 +200,9 @@ import { useI18n } from 'vue-i18n'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
-import { loadConfig, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
-import type { CodexEffortCapabilityMap, EndpointOption, GeminiModelPreset, ProxyConfig } from './types/configTypes'
+import { applyProxyConfig, loadConfig, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
+import type { AnthropicModelMapping, CodexEffortCapabilityMap, ConverterType, EndpointOption, GeminiModelPreset, ProxyConfigV2 } from './types/configTypes'
+import { DEFAULT_PROXY_CONFIG_V2 } from './types/configTypes'
 
 import Header from './components/features/Header.vue'
 import ConfigCard from './components/features/ConfigCard.vue'
@@ -197,6 +225,8 @@ const showImportExport = ref(false)
 const showEndpointDialog = ref(false)
 
 const localMaxConcurrency = ref<number | null>(null)
+const localLbModelCooldownSeconds = ref<number | null>(3600)
+const localLbTransientBackoffSeconds = ref<number | null>(6)
 const localIgnoreProbeRequests = ref(false)
 const localAllowCountTokensFallbackEstimate = ref(true)
 const localCodexCapabilityJson = ref('')
@@ -212,6 +242,7 @@ type LogItem = {
 }
 
 const logs = ref<LogItem[]>([])
+const lbAvailabilityMap = ref<Record<string, boolean>>({})
 const modelRequestStats = reactive({
   opus: 0,
   sonnet: 0,
@@ -228,6 +259,8 @@ const RELEASES_URL = 'https://github.com/J1aDong/codexProxy/releases'
 
 // Event listeners
 const unlisteners: UnlistenFn[] = []
+let restartApplyTimer: ReturnType<typeof setTimeout> | null = null
+let lastAppliedConfigHash = ''
 
 // Language Support
 const lang = computed(() => locale.value as 'zh' | 'en')
@@ -254,13 +287,18 @@ const DEFAULT_CONFIG = {
   apiKey: '',
   endpointOptions: [DEFAULT_ENDPOINT_OPTION],
   selectedEndpointId: DEFAULT_ENDPOINT_OPTION.id,
-  converter: 'codex' as 'codex' | 'gemini',
+  converter: 'codex' as ConverterType,
   codexModel: 'gpt-5.3-codex',
   codexModelMapping: {
     opus: 'gpt-5.3-codex',
     sonnet: 'gpt-5.2-codex',
     haiku: 'gpt-5.1-codex-mini',
   },
+  anthropicModelMapping: {
+    opus: '',
+    sonnet: '',
+    haiku: '',
+  } as AnthropicModelMapping,
   codexEffortCapabilityMap: {
     'gpt-5.3-codex': ['low', 'medium', 'high', 'xhigh'],
     'gpt-5.2-codex': ['low', 'medium', 'high', 'xhigh'],
@@ -278,6 +316,8 @@ const DEFAULT_CONFIG = {
     'gemini-2.5-pro',
   ] as GeminiModelPreset,
   maxConcurrency: 0,
+  lbModelCooldownSeconds: 3600,
+  lbTransientBackoffSeconds: 6,
   ignoreProbeRequests: false,
   allowCountTokensFallbackEstimate: true,
   reasoningEffort: {
@@ -298,19 +338,29 @@ const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. D
 
 const form = reactive({
   ...DEFAULT_CONFIG,
+  ...DEFAULT_PROXY_CONFIG_V2,
   endpointOptions: [...DEFAULT_CONFIG.endpointOptions],
   selectedEndpointId: DEFAULT_CONFIG.selectedEndpointId,
   maxConcurrency: DEFAULT_CONFIG.maxConcurrency,
+  lbModelCooldownSeconds: DEFAULT_CONFIG.lbModelCooldownSeconds,
+  lbTransientBackoffSeconds: DEFAULT_CONFIG.lbTransientBackoffSeconds,
   ignoreProbeRequests: DEFAULT_CONFIG.ignoreProbeRequests,
   allowCountTokensFallbackEstimate: DEFAULT_CONFIG.allowCountTokensFallbackEstimate,
   reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort },
   converter: DEFAULT_CONFIG.converter,
   codexModel: DEFAULT_CONFIG.codexModel,
   codexModelMapping: { ...DEFAULT_CONFIG.codexModelMapping },
+  anthropicModelMapping: { ...DEFAULT_CONFIG.anthropicModelMapping },
   codexEffortCapabilityMap: JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap)),
   geminiModelPreset: [...DEFAULT_CONFIG.geminiModelPreset],
   geminiReasoningEffort: { ...DEFAULT_CONFIG.geminiReasoningEffort },
+  loadBalancer: {
+    ...DEFAULT_PROXY_CONFIG_V2.loadBalancer,
+    lbProfiles: [...DEFAULT_PROXY_CONFIG_V2.loadBalancer.lbProfiles],
+    lbEndpointConfigs: { ...DEFAULT_PROXY_CONFIG_V2.loadBalancer.lbEndpointConfigs },
+  },
 })
+
 
 const migrateCodexModel = (model: string): string => {
   return model === 'codex-mini-latest' ? 'gpt-5.1-codex-mini' : model
@@ -359,13 +409,89 @@ const normalizeGeminiModelPreset = (input: unknown): GeminiModelPreset => {
   return result.length > 0 ? result : fallback
 }
 
+const normalizeAnthropicModelMapping = (input: unknown): AnthropicModelMapping => {
+  const fallback = { ...DEFAULT_CONFIG.anthropicModelMapping }
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return fallback
+  }
+
+  const source = input as Record<string, unknown>
+  const normalizeItem = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
+
+  return {
+    opus: normalizeItem(source.opus),
+    sonnet: normalizeItem(source.sonnet),
+    haiku: normalizeItem(source.haiku),
+  }
+}
+
+const normalizeConverter = (value: unknown, fallback: ConverterType): ConverterType => {
+  if (value === 'codex' || value === 'gemini' || value === 'anthropic') {
+    return value
+  }
+  return fallback
+}
+
+const resolveSavedDefaultConverter = (savedConfig: ProxyConfigV2): ConverterType => {
+  const configConverter = normalizeConverter(savedConfig.converter, DEFAULT_CONFIG.converter)
+  const endpointConverter = savedConfig.endpointOptions
+    ?.find((item) => item.id === savedConfig.selectedEndpointId)
+    ?.converter
+  return normalizeConverter(endpointConverter, configConverter)
+}
+
+const normalizeLoadBalancerConfig = (
+  input: ProxyConfigV2['loadBalancer'],
+  fallbackConverter: ConverterType = DEFAULT_CONFIG.converter,
+) => {
+  const fallback = DEFAULT_PROXY_CONFIG_V2.loadBalancer
+  const normalizedConverter = normalizeConverter(fallbackConverter, DEFAULT_CONFIG.converter)
+  const rawProfiles = Array.isArray(input?.lbProfiles) ? input.lbProfiles : [...fallback.lbProfiles]
+  const lbProfiles = rawProfiles.map((profile) => {
+    const normalizeSlot = (items: any[] | undefined) => (
+      Array.isArray(items)
+        ? items.map((candidate) => ({
+          ...candidate,
+          converterOverride: normalizeConverter(candidate?.converterOverride, normalizedConverter),
+        }))
+        : []
+    )
+
+    return {
+      ...profile,
+      modelMapping: {
+        opus: normalizeSlot((profile as any)?.modelMapping?.opus),
+        sonnet: normalizeSlot((profile as any)?.modelMapping?.sonnet),
+        haiku: normalizeSlot((profile as any)?.modelMapping?.haiku),
+      },
+    }
+  })
+  const lbEndpointConfigs = input?.lbEndpointConfigs && typeof input.lbEndpointConfigs === 'object'
+    ? input.lbEndpointConfigs
+    : { ...fallback.lbEndpointConfigs }
+  const selectedLbProfileId = input?.selectedLbProfileId
+    && lbProfiles.some((item) => item.id === input.selectedLbProfileId)
+    ? input.selectedLbProfileId
+    : lbProfiles[0]?.id
+
+  return {
+    ...fallback,
+    ...input,
+    lbProfiles,
+    lbEndpointConfigs,
+    selectedLbProfileId,
+  }
+}
+
 const updateSkillInjectionPrompt = (prompt: string) => {
   form.skillInjectionPrompt = prompt
-  saveConfig(buildProxyConfig()).catch(console.error)
+  persistConfig(buildProxyConfig())
 }
 
 const openAdvancedSettings = () => {
   localMaxConcurrency.value = form.maxConcurrency
+  localLbModelCooldownSeconds.value = form.lbModelCooldownSeconds
+  localLbTransientBackoffSeconds.value = form.lbTransientBackoffSeconds
   localIgnoreProbeRequests.value = form.ignoreProbeRequests
   localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
   localCodexCapabilityJson.value = JSON.stringify(form.codexEffortCapabilityMap, null, 2)
@@ -395,10 +521,12 @@ const saveAdvancedSettings = () => {
   }
 
   form.maxConcurrency = localMaxConcurrency.value ?? 0
+  form.lbModelCooldownSeconds = Math.max(1, Math.floor(localLbModelCooldownSeconds.value ?? DEFAULT_CONFIG.lbModelCooldownSeconds))
+  form.lbTransientBackoffSeconds = Math.max(1, Math.floor(localLbTransientBackoffSeconds.value ?? DEFAULT_CONFIG.lbTransientBackoffSeconds))
   form.ignoreProbeRequests = localIgnoreProbeRequests.value
   form.allowCountTokensFallbackEstimate = localAllowCountTokensFallbackEstimate.value
   showAdvancedSettings.value = false
-  saveConfig(buildProxyConfig()).catch(console.error)
+  persistConfig(buildProxyConfig())
 }
 
 const resetCodexCapabilityPreset = () => {
@@ -417,6 +545,13 @@ const handleConfigImported = async () => {
   // 重新加载配置
   const savedConfig = await loadConfig()
   if (savedConfig) {
+    const savedDefaultConverter = resolveSavedDefaultConverter(savedConfig as ProxyConfigV2)
+    // V2 defaults (non-breaking for old configs)
+    form.proxyMode = (savedConfig as ProxyConfigV2).proxyMode || DEFAULT_PROXY_CONFIG_V2.proxyMode
+    form.loadBalancer = normalizeLoadBalancerConfig(
+      (savedConfig as ProxyConfigV2).loadBalancer,
+      savedDefaultConverter,
+    )
     if (savedConfig.port) form.port = savedConfig.port
     if (savedConfig.codexModel) {
       form.codexModel = migrateCodexModel(savedConfig.codexModel)
@@ -428,6 +563,9 @@ const handleConfigImported = async () => {
         codexModelMapping: item.codexModelMapping
           ? migrateCodexModelMapping(item.codexModelMapping)
           : item.codexModelMapping,
+        anthropicModelMapping: item.anthropicModelMapping
+          ? normalizeAnthropicModelMapping(item.anthropicModelMapping)
+          : item.anthropicModelMapping,
       }))
       if (savedConfig.selectedEndpointId) {
         form.selectedEndpointId = savedConfig.selectedEndpointId
@@ -458,6 +596,12 @@ const handleConfigImported = async () => {
     if (typeof savedConfig.maxConcurrency === 'number') {
       form.maxConcurrency = savedConfig.maxConcurrency
     }
+    if (typeof savedConfig.lbModelCooldownSeconds === 'number') {
+      form.lbModelCooldownSeconds = Math.max(1, Math.floor(savedConfig.lbModelCooldownSeconds))
+    }
+    if (typeof savedConfig.lbTransientBackoffSeconds === 'number') {
+      form.lbTransientBackoffSeconds = Math.max(1, Math.floor(savedConfig.lbTransientBackoffSeconds))
+    }
     if (savedConfig.codexModelMapping) {
       form.codexModelMapping = migrateCodexModelMapping({
         opus: savedConfig.codexModelMapping.opus || DEFAULT_CONFIG.codexModelMapping.opus,
@@ -472,6 +616,9 @@ const handleConfigImported = async () => {
         haiku: savedConfig.reasoningEffort.haiku || DEFAULT_CONFIG.reasoningEffort.haiku,
       }
     }
+    form.anthropicModelMapping = savedConfig.anthropicModelMapping
+      ? normalizeAnthropicModelMapping(savedConfig.anthropicModelMapping)
+      : { ...DEFAULT_CONFIG.anthropicModelMapping }
     if (savedConfig.geminiReasoningEffort) {
       form.geminiReasoningEffort = {
         opus: savedConfig.geminiReasoningEffort.opus || DEFAULT_CONFIG.geminiReasoningEffort.opus,
@@ -505,6 +652,9 @@ const syncEndpointFromSelection = () => {
   if (endpoint.converter) form.converter = endpoint.converter
   if (endpoint.codexModel) form.codexModel = migrateCodexModel(endpoint.codexModel)
   if (endpoint.codexModelMapping) form.codexModelMapping = migrateCodexModelMapping(endpoint.codexModelMapping)
+  form.anthropicModelMapping = endpoint.anthropicModelMapping
+    ? normalizeAnthropicModelMapping(endpoint.anthropicModelMapping)
+    : { ...DEFAULT_CONFIG.anthropicModelMapping }
   if (endpoint.codexEffortCapabilityMap) {
     form.codexEffortCapabilityMap = normalizeCapabilityMap(endpoint.codexEffortCapabilityMap)
   }
@@ -533,6 +683,7 @@ const updateSelectedEndpointConfig = () => {
       converter: form.converter,
       codexModel: form.codexModel,
       codexModelMapping: { ...form.codexModelMapping },
+      anthropicModelMapping: { ...form.anthropicModelMapping },
       codexEffortCapabilityMap: JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
       geminiModelPreset: [...form.geminiModelPreset],
       reasoningEffort: { ...form.reasoningEffort },
@@ -549,6 +700,7 @@ watch(
     () => form.converter,
     () => form.codexModel,
     () => form.codexModelMapping,
+    () => form.anthropicModelMapping,
     () => form.codexEffortCapabilityMap,
     () => form.geminiModelPreset,
     () => form.reasoningEffort,
@@ -557,7 +709,7 @@ watch(
   () => {
     if (isSyncing.value) return
     updateSelectedEndpointConfig()
-    saveConfig(buildProxyConfig()).catch(console.error)
+    persistConfig(buildProxyConfig())
   },
   { deep: true }
 )
@@ -610,6 +762,7 @@ const handleEndpointSubmit = (endpointData: any) => {
       converter: endpointData.converter || form.converter,
       codexModel: endpointData.codexModel || form.codexModel,
       codexModelMapping: endpointData.codexModelMapping || { ...form.codexModelMapping },
+      anthropicModelMapping: endpointData.anthropicModelMapping || { ...form.anthropicModelMapping },
       codexEffortCapabilityMap: endpointData.codexEffortCapabilityMap || JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
       geminiModelPreset: endpointData.geminiModelPreset || [...form.geminiModelPreset],
       reasoningEffort: endpointData.reasoningEffort || { ...form.reasoningEffort },
@@ -636,7 +789,7 @@ const handleDeleteEndpoint = (id: string) => {
       form.selectedEndpointId = form.endpointOptions[0].id
       syncEndpointFromSelection()
     }
-    saveConfig(buildProxyConfig()).catch(console.error)
+    persistConfig(buildProxyConfig())
   }
   closeEndpointDialog()
 }
@@ -644,7 +797,11 @@ const handleDeleteEndpoint = (id: string) => {
 const shouldShowLog = (message: string) => {
   if (message.startsWith('[Stat]')) return false
   if (message.includes('[Error]')) return true
+  if (message.includes('[Warn]') || message.includes('[Warning]')) return true
   if (message.startsWith('[Req]')) return true
+  if (message.startsWith('[Route]')) return true
+  if (message.startsWith('[LBStatus]')) return true
+  if (message.startsWith('[LB]')) return true
   if (message.startsWith('[ReqPayload]')) return true
   if (message.startsWith('[RateLimit]')) return true
   if (message.startsWith('[Tokens]')) return true
@@ -659,7 +816,7 @@ const pushLog = (message: string) => {
     time: new Date().toLocaleTimeString(),
     content: message,
   }
-  logs.value = [...logs.value, nextLog].slice(-20)
+  logs.value = [...logs.value, nextLog].slice(-50)
 }
 
 const tryCountModelStat = (message: string) => {
@@ -670,6 +827,32 @@ const tryCountModelStat = (message: string) => {
   if (family === 'haiku') modelRequestStats.haiku += 1
 }
 
+const tryUpdateLbAvailability = (message: string) => {
+  if (!message.startsWith('[LBStatus]')) return
+
+  const payload = message.replace('[LBStatus]', '').trim()
+  if (!payload) return
+
+  const kv: Record<string, string> = {}
+  payload.split(/\s+/).forEach((token) => {
+    const index = token.indexOf('=')
+    if (index <= 0) return
+    const key = token.slice(0, index)
+    const value = token.slice(index + 1)
+    if (key) kv[key] = value
+  })
+
+  const routeKey = kv.key
+  const state = (kv.state || '').toLowerCase()
+  if (!routeKey || !state) return
+
+  const nextAvailability = state !== 'unavailable'
+  lbAvailabilityMap.value = {
+    ...lbAvailabilityMap.value,
+    [routeKey]: nextAvailability,
+  }
+}
+
 const resetDefaults = () => {
   form.port = DEFAULT_CONFIG.port
   form.endpointOptions = [...DEFAULT_CONFIG.endpointOptions]
@@ -678,17 +861,26 @@ const resetDefaults = () => {
   form.converter = DEFAULT_CONFIG.converter
   form.codexModel = DEFAULT_CONFIG.codexModel
   form.codexModelMapping = { ...DEFAULT_CONFIG.codexModelMapping }
+  form.anthropicModelMapping = { ...DEFAULT_CONFIG.anthropicModelMapping }
   form.codexEffortCapabilityMap = JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap))
   form.geminiModelPreset = [...DEFAULT_CONFIG.geminiModelPreset]
   form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
   form.geminiReasoningEffort = { ...DEFAULT_CONFIG.geminiReasoningEffort }
   form.maxConcurrency = DEFAULT_CONFIG.maxConcurrency
+  form.lbModelCooldownSeconds = DEFAULT_CONFIG.lbModelCooldownSeconds
+  form.lbTransientBackoffSeconds = DEFAULT_CONFIG.lbTransientBackoffSeconds
   form.ignoreProbeRequests = DEFAULT_CONFIG.ignoreProbeRequests
   form.allowCountTokensFallbackEstimate = DEFAULT_CONFIG.allowCountTokensFallbackEstimate
+  form.proxyMode = DEFAULT_PROXY_CONFIG_V2.proxyMode
+  form.loadBalancer = {
+    ...DEFAULT_PROXY_CONFIG_V2.loadBalancer,
+    lbProfiles: [...DEFAULT_PROXY_CONFIG_V2.loadBalancer.lbProfiles],
+    lbEndpointConfigs: { ...DEFAULT_PROXY_CONFIG_V2.loadBalancer.lbEndpointConfigs },
+  }
   useDefaultPrompt()
 }
 
-const buildProxyConfig = (force = false): ProxyConfig => ({
+const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   port: form.port,
   targetUrl: form.targetUrl,
   apiKey: form.apiKey,
@@ -697,9 +889,12 @@ const buildProxyConfig = (force = false): ProxyConfig => ({
   converter: form.converter,
   codexModel: form.codexModel,
   codexModelMapping: form.codexModelMapping,
+  anthropicModelMapping: form.anthropicModelMapping,
   codexEffortCapabilityMap: form.codexEffortCapabilityMap,
   geminiModelPreset: form.geminiModelPreset,
   maxConcurrency: form.maxConcurrency,
+  lbModelCooldownSeconds: form.lbModelCooldownSeconds,
+  lbTransientBackoffSeconds: form.lbTransientBackoffSeconds,
   ignoreProbeRequests: form.ignoreProbeRequests,
   allowCountTokensFallbackEstimate: form.allowCountTokensFallbackEstimate,
   reasoningEffort: form.reasoningEffort,
@@ -707,13 +902,53 @@ const buildProxyConfig = (force = false): ProxyConfig => ({
   skillInjectionPrompt: form.skillInjectionPrompt,
   lang: locale.value,
   force,
+  proxyMode: form.proxyMode,
+  loadBalancer: form.loadBalancer,
 })
+
+const configRuntimeHash = (config: ProxyConfigV2) => JSON.stringify(config)
+
+const scheduleApplyRunningConfig = (config: ProxyConfigV2) => {
+  if (!isRunning.value) return
+
+  const nextConfig = { ...config, force: false }
+  const nextHash = configRuntimeHash(nextConfig)
+  if (nextHash === lastAppliedConfigHash) return
+
+  if (restartApplyTimer) {
+    clearTimeout(restartApplyTimer)
+  }
+
+  restartApplyTimer = setTimeout(() => {
+    if (!isRunning.value) return
+    applyProxyConfig(nextConfig)
+      .then(() => {
+        lastAppliedConfigHash = nextHash
+      })
+      .catch(console.error)
+  }, 350)
+}
+
+const persistConfig = (config: ProxyConfigV2 = buildProxyConfig()) => {
+  saveConfig(config).catch(console.error)
+  scheduleApplyRunningConfig(config)
+}
 
 const toggleProxy = () => {
   if (isRunning.value) {
+    if (restartApplyTimer) {
+      clearTimeout(restartApplyTimer)
+      restartApplyTimer = null
+    }
+    lastAppliedConfigHash = ''
     stopProxy().catch(console.error)
   } else {
-    startProxy(buildProxyConfig(false)).catch(console.error)
+    const config = buildProxyConfig(false)
+    startProxy(config)
+      .then(() => {
+        lastAppliedConfigHash = configRuntimeHash(config)
+      })
+      .catch(console.error)
   }
 }
 
@@ -835,10 +1070,18 @@ onMounted(() => {
   loadConfig()
     .then((savedConfig) => {
       if (savedConfig) {
+        const savedDefaultConverter = resolveSavedDefaultConverter(savedConfig as ProxyConfigV2)
         if (savedConfig.port) form.port = savedConfig.port
         if (savedConfig.codexModel) {
           form.codexModel = migrateCodexModel(savedConfig.codexModel)
         }
+        if (savedConfig.proxyMode) {
+          form.proxyMode = savedConfig.proxyMode
+        }
+        form.loadBalancer = normalizeLoadBalancerConfig(
+          savedConfig.loadBalancer,
+          savedDefaultConverter,
+        )
         if (savedConfig.endpointOptions && savedConfig.endpointOptions.length > 0) {
           form.endpointOptions = savedConfig.endpointOptions.map((item) => ({
             ...item,
@@ -846,6 +1089,9 @@ onMounted(() => {
             codexModelMapping: item.codexModelMapping
               ? migrateCodexModelMapping(item.codexModelMapping)
               : item.codexModelMapping,
+            anthropicModelMapping: item.anthropicModelMapping
+              ? normalizeAnthropicModelMapping(item.anthropicModelMapping)
+              : item.anthropicModelMapping,
           }))
           if (savedConfig.selectedEndpointId) {
             form.selectedEndpointId = savedConfig.selectedEndpointId
@@ -876,6 +1122,12 @@ onMounted(() => {
         if (typeof savedConfig.maxConcurrency === 'number') {
           form.maxConcurrency = savedConfig.maxConcurrency
         }
+        if (typeof savedConfig.lbModelCooldownSeconds === 'number') {
+          form.lbModelCooldownSeconds = Math.max(1, Math.floor(savedConfig.lbModelCooldownSeconds))
+        }
+        if (typeof savedConfig.lbTransientBackoffSeconds === 'number') {
+          form.lbTransientBackoffSeconds = Math.max(1, Math.floor(savedConfig.lbTransientBackoffSeconds))
+        }
         if (savedConfig.codexModelMapping) {
           form.codexModelMapping = migrateCodexModelMapping({
             opus: savedConfig.codexModelMapping.opus || DEFAULT_CONFIG.codexModelMapping.opus,
@@ -883,6 +1135,9 @@ onMounted(() => {
             haiku: savedConfig.codexModelMapping.haiku || DEFAULT_CONFIG.codexModelMapping.haiku,
           })
         }
+        form.anthropicModelMapping = savedConfig.anthropicModelMapping
+          ? normalizeAnthropicModelMapping(savedConfig.anthropicModelMapping)
+          : { ...DEFAULT_CONFIG.anthropicModelMapping }
         if (savedConfig.codexEffortCapabilityMap) {
           form.codexEffortCapabilityMap = normalizeCapabilityMap(savedConfig.codexEffortCapabilityMap)
         }
@@ -896,12 +1151,14 @@ onMounted(() => {
           form.allowCountTokensFallbackEstimate = savedConfig.allowCountTokensFallbackEstimate
         }
         localMaxConcurrency.value = form.maxConcurrency
+        localLbModelCooldownSeconds.value = form.lbModelCooldownSeconds
+        localLbTransientBackoffSeconds.value = form.lbTransientBackoffSeconds
         localIgnoreProbeRequests.value = form.ignoreProbeRequests
         localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
       } else {
         syncEndpointFromSelection()
         useDefaultPrompt()
-        saveConfig(buildProxyConfig()).catch(console.error)
+        persistConfig(buildProxyConfig())
       }
     })
     .catch(console.error)
@@ -909,12 +1166,22 @@ onMounted(() => {
   // Listen for proxy status
   listen<string>('proxy-status', (event) => {
     isRunning.value = event.payload === 'running'
+    if (!isRunning.value) {
+      lastAppliedConfigHash = ''
+      if (restartApplyTimer) {
+        clearTimeout(restartApplyTimer)
+        restartApplyTimer = null
+      }
+    } else if (!lastAppliedConfigHash) {
+      lastAppliedConfigHash = configRuntimeHash(buildProxyConfig(false))
+    }
   }).then(unlisten => unlisteners.push(unlisten))
 
   // Listen for proxy logs
   listen<string>('proxy-log', (event) => {
     const message = event.payload
     tryCountModelStat(message)
+    tryUpdateLbAvailability(message)
     pushLog(message)
   }).then(unlisten => unlisteners.push(unlisten))
 
@@ -925,7 +1192,12 @@ onMounted(() => {
       t('portInUse', { port })
     )
     if (confirmed) {
-      startProxy(buildProxyConfig(true)).catch(console.error)
+      const config = buildProxyConfig(true)
+      startProxy(config)
+        .then(() => {
+          lastAppliedConfigHash = configRuntimeHash({ ...config, force: false })
+        })
+        .catch(console.error)
     } else {
       isRunning.value = false
     }
@@ -933,20 +1205,29 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  if (restartApplyTimer) {
+    clearTimeout(restartApplyTimer)
+    restartApplyTimer = null
+  }
   unlisteners.forEach(unlisten => unlisten())
 })
 
 watch(
   [
     () => form.maxConcurrency,
+    () => form.lbModelCooldownSeconds,
+    () => form.lbTransientBackoffSeconds,
     () => form.ignoreProbeRequests,
     () => form.allowCountTokensFallbackEstimate,
+    () => form.proxyMode,
+    () => form.loadBalancer,
   ],
   () => {
     if (!isSyncing.value) {
-      saveConfig(buildProxyConfig()).catch(console.error)
+      persistConfig(buildProxyConfig())
     }
-  }
+  },
+  { deep: true }
 )
 </script>
 

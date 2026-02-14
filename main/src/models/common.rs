@@ -140,3 +140,13 @@ impl Default for CodexModelMapping {
         }
     }
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AnthropicModelMapping {
+    #[serde(default)]
+    pub opus: String,
+    #[serde(default)]
+    pub sonnet: String,
+    #[serde(default)]
+    pub haiku: String,
+}

@@ -1,14 +1,20 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { ProxyConfig } from '../types/configTypes'
+import type { ProxyConfigV2 } from '../types/configTypes'
 
-export const loadConfig = (): Promise<ProxyConfig | null> =>
-    invoke<ProxyConfig | null>('load_config')
+export const loadConfig = (): Promise<ProxyConfigV2 | null> =>
+    invoke<ProxyConfigV2 | null>('load_config')
 
-export const saveConfig = (config: ProxyConfig): Promise<void> =>
+export const saveConfig = (config: ProxyConfigV2): Promise<void> =>
     invoke('save_config', { config })
 
-export const startProxy = (config: ProxyConfig): Promise<void> =>
+export const startProxy = (config: ProxyConfigV2): Promise<void> =>
     invoke('start_proxy', { config })
+
+export const applyProxyConfig = (config: ProxyConfigV2): Promise<void> =>
+    invoke('apply_proxy_config', { config })
+
+export const restartProxy = (config: ProxyConfigV2): Promise<void> =>
+    invoke('restart_proxy', { config })
 
 export const stopProxy = (): Promise<void> =>
     invoke('stop_proxy')
