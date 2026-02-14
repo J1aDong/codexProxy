@@ -5,13 +5,13 @@
     @close="handleClose"
   >
     <div class="text-center">
-      <div class="text-lg font-semibold text-apple-text-primary mb-2">{{ t('appName') }}</div>
-      <div class="text-sm text-apple-text-secondary mb-4">
+      <div class="text-lg font-semibold text-apple-text-primary dark:text-dark-text-primary mb-2">{{ t('appName') }}</div>
+      <div class="text-sm text-apple-text-secondary dark:text-dark-text-secondary mb-4">
         {{ t('versionLabel') }} v{{ appVersion }}
       </div>
 
       <div class="mb-4">
-        <div class="text-xs text-apple-text-secondary mb-2">{{ updateStatusText }}</div>
+        <div class="text-xs text-apple-text-secondary dark:text-dark-text-secondary mb-2">{{ updateStatusText }}</div>
         <Button
           type="primary"
           size="small"

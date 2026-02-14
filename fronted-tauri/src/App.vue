@@ -1,10 +1,12 @@
 <template>
-  <div class="app-container">
+  <div class="app-container" :class="{ 'dark': isDarkMode }">
     <div class="main-content max-w-3xl mx-auto px-5 py-10">
       <!-- Header -->
       <Header
         :isRunning="isRunning"
+        :isDarkMode="isDarkMode"
         @toggleLang="toggleLang"
+        @toggleDarkMode="toggleDarkMode"
         @showAbout="showAbout = true"
         @showSettings="showSettings = true"
         @showAdvancedSettings="openAdvancedSettings"
@@ -17,6 +19,7 @@
         :form="form"
         :isRunning="isRunning"
         :lbAvailabilityMap="lbAvailabilityMap"
+        :isDarkMode="isDarkMode"
         @update:form="updateForm"
         @reset="resetDefaults"
         @toggle="toggleProxy"
@@ -27,6 +30,7 @@
       <!-- Guide Section -->
       <GuideSection
         :port="form.port"
+        :isDarkMode="isDarkMode"
       />
     </div>
 
@@ -83,65 +87,71 @@
     >
       <div class="space-y-4">
         <div class="space-y-2">
-          <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedMaxConcurrencyLabel') }}</label>
+          <label class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedMaxConcurrencyLabel') }}</label>
           <input
             type="number"
             v-model.number="localMaxConcurrency"
             min="0"
             max="100"
-            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
+            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 dark:bg-dark-tertiary dark:border-dark-border dark:text-dark-text-primary border border-transparent focus:bg-white dark:focus:bg-dark-tertiary focus:border-apple-blue dark:focus:border-accent-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
             :placeholder="t('advancedMaxConcurrencyPlaceholder')"
           />
-          <div class="text-apple-text-secondary text-xs">{{ t('advancedMaxConcurrencyTip') }}</div>
+          <div class="text-apple-text-secondary dark:text-dark-text-secondary text-xs">{{ t('advancedMaxConcurrencyTip') }}</div>
         </div>
 
         <div class="space-y-2">
-          <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedLbModelCooldownLabel') }}</label>
+          <label class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedLbModelCooldownLabel') }}</label>
           <input
             type="number"
             v-model.number="localLbModelCooldownSeconds"
             min="1"
             max="86400"
-            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
+            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 dark:bg-dark-tertiary dark:border-dark-border dark:text-dark-text-primary border border-transparent focus:bg-white dark:focus:bg-dark-tertiary focus:border-apple-blue dark:focus:border-accent-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
             :placeholder="t('advancedLbModelCooldownPlaceholder')"
           />
-          <div class="text-apple-text-secondary text-xs">{{ t('advancedLbModelCooldownTip') }}</div>
+          <div class="text-apple-text-secondary dark:text-dark-text-secondary text-xs">{{ t('advancedLbModelCooldownTip') }}</div>
         </div>
 
         <div class="space-y-2">
-          <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedLbTransientBackoffLabel') }}</label>
+          <label class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedLbTransientBackoffLabel') }}</label>
           <input
             type="number"
             v-model.number="localLbTransientBackoffSeconds"
             min="1"
             max="120"
-            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
+            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 dark:bg-dark-tertiary dark:border-dark-border dark:text-dark-text-primary border border-transparent focus:bg-white dark:focus:bg-dark-tertiary focus:border-apple-blue dark:focus:border-accent-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
             :placeholder="t('advancedLbTransientBackoffPlaceholder')"
           />
-          <div class="text-apple-text-secondary text-xs">{{ t('advancedLbTransientBackoffTip') }}</div>
+          <div class="text-apple-text-secondary dark:text-dark-text-secondary text-xs">{{ t('advancedLbTransientBackoffTip') }}</div>
         </div>
 
-        <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
+        <label
+          class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer dark:border-dark-border"
+          :class="form.proxyMode === 'load_balancer' ? 'border-dark-border' : 'border-gray-200'"
+        >
           <input v-model="localIgnoreProbeRequests" type="checkbox" class="mt-1" />
           <div class="flex-1">
-            <div class="text-sm font-medium text-apple-text-primary">{{ t('advancedIgnoreProbeLabel') }}</div>
-            <div class="text-xs text-apple-text-secondary mt-1">{{ t('advancedIgnoreProbeTip') }}</div>
+            <div class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedIgnoreProbeLabel') }}</div>
+            <div class="text-xs text-apple-text-secondary dark:text-dark-text-secondary mt-1">{{ t('advancedIgnoreProbeTip') }}</div>
           </div>
         </label>
 
-        <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer">
+        <label
+          class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer dark:border-dark-border"
+          :class="form.proxyMode === 'load_balancer' ? 'border-dark-border' : 'border-gray-200'"
+        >
           <input v-model="localAllowCountTokensFallbackEstimate" type="checkbox" class="mt-1" />
           <div class="flex-1">
-            <div class="text-sm font-medium text-apple-text-primary">{{ t('advancedCountTokensFallbackLabel') }}</div>
-            <div class="text-xs text-apple-text-secondary mt-1">{{ t('advancedCountTokensFallbackTip') }}</div>
+            <div class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedCountTokensFallbackLabel') }}</div>
+            <div class="text-xs text-apple-text-secondary dark:text-dark-text-secondary mt-1">{{ t('advancedCountTokensFallbackTip') }}</div>
           </div>
         </label>
 
         <div class="space-y-2">
           <div class="flex items-center justify-between">
-            <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedCodexCapabilityPresetLabel') }}</label>
+            <label class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedCodexCapabilityPresetLabel') }}</label>
             <button
-              class="text-xs text-apple-blue hover:text-blue-700 transition-colors"
+              class="text-xs text-apple-blue dark:text-accent-blue hover:text-blue-700 dark:hover:text-blue-400 transition-colors"
               @click="resetCodexCapabilityPreset"
             >
               {{ t('restoreDefaults') }}
@@ -150,17 +160,17 @@
           <textarea
             v-model="localCodexCapabilityJson"
             rows="8"
-            class="w-full px-3 py-2 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-dark-tertiary dark:border-dark-border dark:text-dark-text-primary border border-transparent focus:bg-white dark:focus:bg-dark-tertiary focus:border-apple-blue dark:focus:border-accent-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
           />
-          <div class="text-xs text-apple-text-secondary">{{ t('advancedCodexCapabilityPresetTip') }}</div>
+          <div class="text-xs text-apple-text-secondary dark:text-dark-text-secondary">{{ t('advancedCodexCapabilityPresetTip') }}</div>
           <div v-if="advancedSettingsError" class="text-xs text-red-500">{{ advancedSettingsError }}</div>
         </div>
 
         <div class="space-y-2">
           <div class="flex items-center justify-between">
-            <label class="text-sm font-medium text-apple-text-primary">{{ t('advancedGeminiModelPresetLabel') }}</label>
+            <label class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedGeminiModelPresetLabel') }}</label>
             <button
-              class="text-xs text-apple-blue hover:text-blue-700 transition-colors"
+              class="text-xs text-apple-blue dark:text-accent-blue hover:text-blue-700 dark:hover:text-blue-400 transition-colors"
               @click="resetGeminiModelPreset"
             >
               {{ t('restoreDefaults') }}
@@ -169,13 +179,13 @@
           <textarea
             v-model="localGeminiModelPresetJson"
             rows="5"
-            class="w-full px-3 py-2 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-dark-tertiary dark:border-dark-border dark:text-dark-text-primary border border-transparent focus:bg-white dark:focus:bg-dark-tertiary focus:border-apple-blue dark:focus:border-accent-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none font-mono text-xs"
           />
-          <div class="text-xs text-apple-text-secondary">{{ t('advancedGeminiModelPresetTip') }}</div>
+          <div class="text-xs text-apple-text-secondary dark:text-dark-text-secondary">{{ t('advancedGeminiModelPresetTip') }}</div>
           <div v-if="advancedGeminiPresetError" class="text-xs text-red-500">{{ advancedGeminiPresetError }}</div>
         </div>
 
-        <div class="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+        <div class="text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg px-3 py-2">
           {{ t('advancedSettingsRiskTip') }}
         </div>
       </div>
@@ -215,6 +225,33 @@ import ImportExportDialog from './components/features/ImportExportDialog.vue'
 import Dialog from './components/base/Dialog.vue'
 
 const { t, locale } = useI18n()
+
+// 暗黑模式状态管理
+const isDarkMode = ref(false)
+
+// 初始化暗黑模式
+onMounted(() => {
+  // 从 localStorage 读取用户偏好
+  const savedTheme = localStorage.getItem('theme')
+  if (savedTheme === 'dark') {
+    isDarkMode.value = true
+  } else if (savedTheme === 'light') {
+    isDarkMode.value = false
+  } else {
+    // 如果没有保存的偏好，使用系统偏好
+    isDarkMode.value = window.matchMedia('(prefers-color-scheme: dark)').matches
+  }
+})
+
+// 监听暗黑模式变化，保存到 localStorage
+watch(isDarkMode, (newValue) => {
+  localStorage.setItem('theme', newValue ? 'dark' : 'light')
+})
+
+// 切换暗黑模式的方法
+const toggleDarkMode = () => {
+  isDarkMode.value = !isDarkMode.value
+}
 
 const isRunning = ref(false)
 const showLogs = ref(false)
@@ -1238,6 +1275,10 @@ watch(
   min-height: 100vh;
   background-color: #f5f5f7;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+}
+
+.app-container.dark {
+  background-color: #0a0a0f;
 }
 
 .main-content {

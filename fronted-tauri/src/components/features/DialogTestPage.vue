@@ -1,6 +1,6 @@
 <template>
   <div class="p-8 space-y-4">
-    <h1 class="text-2xl font-bold mb-6">Dialog 组件测试</h1>
+    <h1 class="text-2xl font-bold mb-6 text-apple-text-primary dark:text-dark-text-primary">Dialog 组件测试</h1>
 
     <div class="space-y-4">
       <Button @click="showShortDialog = true">显示短内容 Dialog</Button>
@@ -15,8 +15,8 @@
       @close="showShortDialog = false"
     >
       <div class="space-y-4">
-        <p>这是一个短内容的 Dialog，应该显示为内容的自然高度。</p>
-        <p>内容不多，不会触发滚动。</p>
+        <p class="text-apple-text-primary dark:text-dark-text-primary">这是一个短内容的 Dialog，应该显示为内容的自然高度。</p>
+        <p class="text-apple-text-primary dark:text-dark-text-primary">内容不多，不会触发滚动。</p>
       </div>
 
       <template #footer>
@@ -33,10 +33,10 @@
       @close="showLongDialog = false"
     >
       <div class="space-y-4">
-        <p>这是一个长内容的 Dialog 测试。</p>
-        <div v-for="i in 15" :key="i" class="p-4 bg-gray-100 rounded">
-          <h3 class="font-semibold">段落 {{ i }}</h3>
-          <p>这是第 {{ i }} 个段落的内容。当内容超过视口高度的 75% 时，Dialog 会自动启用滚动功能，确保用户可以查看所有内容而不会超出屏幕范围。</p>
+        <p class="text-apple-text-primary dark:text-dark-text-primary">这是一个长内容的 Dialog 测试。</p>
+        <div v-for="i in 15" :key="i" class="p-4 bg-gray-100 dark:bg-dark-secondary rounded">
+          <h3 class="font-semibold text-apple-text-primary dark:text-dark-text-primary">段落 {{ i }}</h3>
+          <p class="text-apple-text-primary dark:text-dark-text-primary">这是第 {{ i }} 个段落的内容。当内容超过视口高度的 75% 时，Dialog 会自动启用滚动功能，确保用户可以查看所有内容而不会超出屏幕范围。</p>
         </div>
       </div>
 
@@ -54,11 +54,11 @@
       @close="showVeryLongDialog = false"
     >
       <div class="space-y-4">
-        <p>这是一个超长内容的 Dialog 测试，用于验证滚动功能。</p>
-        <div v-for="i in 30" :key="i" class="p-4 bg-gray-100 rounded">
-          <h3 class="font-semibold">段落 {{ i }}</h3>
-          <p>这是第 {{ i }} 个段落的内容。这个 Dialog 包含大量内容，肯定会超过视口高度的 75%，因此会启用滚动功能。用户可以通过滚动来查看所有内容。</p>
-          <ul class="mt-2 space-y-1">
+        <p class="text-apple-text-primary dark:text-dark-text-primary">这是一个超长内容的 Dialog 测试，用于验证滚动功能。</p>
+        <div v-for="i in 30" :key="i" class="p-4 bg-gray-100 dark:bg-dark-secondary rounded">
+          <h3 class="font-semibold text-apple-text-primary dark:text-dark-text-primary">段落 {{ i }}</h3>
+          <p class="text-apple-text-primary dark:text-dark-text-primary">这是第 {{ i }} 个段落的内容。这个 Dialog 包含大量内容，肯定会超过视口高度的 75%，因此会启用滚动功能。用户可以通过滚动来查看所有内容。</p>
+          <ul class="mt-2 space-y-1 text-apple-text-primary dark:text-dark-text-primary">
             <li>• 列表项 1</li>
             <li>• 列表项 2</li>
             <li>• 列表项 3</li>

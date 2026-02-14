@@ -2,8 +2,8 @@
   <div
     class="flex items-center px-3 py-1.5 rounded-full text-xs font-medium transition-all duration-300 relative overflow-hidden"
     :class="{
-      'bg-gray-200 text-apple-text-secondary': !isRunning,
-      'bg-green-100/80 text-green-700': isRunning,
+      'bg-gray-200 dark:bg-dark-tertiary text-apple-text-secondary dark:text-dark-text-secondary': !isRunning,
+      'bg-green-100/80 dark:bg-green-900/30 text-green-700 dark:text-green-400': isRunning,
     }"
   >
     <!-- Dot and Ripple -->

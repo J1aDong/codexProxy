@@ -1,8 +1,8 @@
 <template>
-  <div v-if="visible" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+  <div v-if="visible" class="fixed inset-0 bg-black bg-opacity-50 dark:bg-black dark:bg-opacity-70 flex items-center justify-center z-50 p-4">
     <div
       ref="dialogRef"
-      class="bg-white rounded-xl w-full mx-4 flex flex-col"
+      class="bg-white dark:bg-dark-secondary rounded-xl w-full mx-4 flex flex-col"
       :class="[
         maxWidth,
         { 'max-h-[75vh]': shouldUseMaxHeight }
@@ -10,8 +10,8 @@
       :style="dynamicStyles"
     >
       <!-- Header -->
-      <div class="flex items-center justify-between p-4 border-b border-gray-200 flex-shrink-0">
-        <h2 class="text-lg font-semibold text-apple-text-primary">{{ title }}</h2>
+      <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-dark-border flex-shrink-0">
+        <h2 class="text-lg font-semibold text-apple-text-primary dark:text-dark-text-primary">{{ title }}</h2>
         <Button
           v-if="showClose"
           type="text"
@@ -38,7 +38,7 @@
       </div>
 
       <!-- Footer -->
-      <div v-if="$slots.footer" class="border-t border-gray-200 flex-shrink-0">
+      <div v-if="$slots.footer" class="border-t border-gray-200 dark:border-dark-border flex-shrink-0">
         <slot name="footer" />
       </div>
     </div>

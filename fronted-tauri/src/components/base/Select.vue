@@ -1,12 +1,12 @@
 <template>
   <div class="relative">
-    <label v-if="label" class="block text-sm font-medium text-apple-text-primary mb-1">
+    <label v-if="label" class="block text-sm font-medium text-apple-text-primary dark:text-dark-text-primary mb-1">
       {{ label }}
     </label>
     <div class="relative">
       <button
         :class="[
-          'w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none text-left flex justify-between items-center',
+          'w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none text-left flex justify-between items-center dark:bg-dark-tertiary dark:border-dark-border dark:text-dark-text-primary dark:focus:bg-dark-tertiary dark:focus:border-accent-blue',
           { 'opacity-50 cursor-not-allowed': disabled },
         ]"
         :disabled="disabled"
@@ -21,7 +21,7 @@
           </span>
         </span>
         <svg
-          class="w-4 h-4 text-apple-text-secondary transition-transform duration-200 shrink-0"
+          class="w-4 h-4 text-apple-text-secondary dark:text-dark-text-secondary transition-transform duration-200 shrink-0"
           :class="{ 'transform rotate-180': isOpen }"
           fill="none"
           stroke="currentColor"
@@ -32,14 +32,14 @@
       </button>
       <div
         v-if="isOpen"
-        class="absolute z-50 w-full mt-1 bg-white rounded-lg shadow-lg border border-gray-200 max-h-60 overflow-y-auto"
+        class="absolute z-50 w-full mt-1 bg-white dark:bg-dark-secondary rounded-lg shadow-lg border border-gray-200 dark:border-dark-border max-h-60 overflow-y-auto"
         @click.outside="closeDropdown"
       >
         <div
           v-for="option in options"
           :key="option.value"
-          class="px-3 py-2.5 cursor-pointer hover:bg-gray-50 text-sm transition-colors duration-150 flex items-center justify-between group"
-          :class="{ 'text-apple-blue bg-blue-50': selectedOption?.value === option.value }"
+          class="px-3 py-2.5 cursor-pointer hover:bg-gray-50 dark:hover:bg-dark-tertiary text-sm transition-colors duration-150 flex items-center justify-between group text-apple-text-primary dark:text-dark-text-primary"
+          :class="{ 'text-apple-blue bg-blue-50 dark:text-accent-blue dark:bg-accent-blue/10': selectedOption?.value === option.value }"
           @click="selectOption(option)"
         >
           <slot name="option" :option="option">
@@ -48,7 +48,7 @@
         </div>
       </div>
     </div>
-    <div v-if="tip" class="text-apple-text-secondary text-xs mt-1">
+    <div v-if="tip" class="text-apple-text-secondary dark:text-dark-text-secondary text-xs mt-1">
       {{ tip }}
     </div>
   </div>

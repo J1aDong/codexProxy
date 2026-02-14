@@ -1,9 +1,15 @@
 <template>
-  <div class="bg-white rounded-xl shadow-sm p-6 mb-8">
+  <div
+    class="rounded-xl shadow-sm p-6 mb-8 transition-colors duration-300"
+    :class="isDarkMode ? 'bg-dark-secondary border border-dark-border' : 'bg-white'"
+  >
     <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
       <div>
         <div class="flex items-center h-8 mb-1">
-          <label class="block text-sm font-medium text-apple-text-primary">{{ t('port') }}</label>
+          <label
+            class="block text-sm font-medium"
+            :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+          >{{ t('port') }}</label>
         </div>
         <Input
           v-model="localPort"
@@ -14,7 +20,10 @@
       </div>
       <div>
         <div class="flex items-center h-8 mb-1">
-          <label class="block text-sm font-medium text-apple-text-primary">{{ t('proxyModeLabel') }}</label>
+          <label
+            class="block text-sm font-medium"
+            :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+          >{{ t('proxyModeLabel') }}</label>
         </div>
         <Select
           :model-value="form.proxyMode"
@@ -28,10 +37,13 @@
       <transition name="proxy-mode-fade" mode="out-in">
         <div :key="form.proxyMode">
           <div v-if="form.proxyMode === 'single'">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div class="space-y-4">
               <div>
                 <div class="flex items-center justify-between h-8 mb-1">
-                  <label class="block text-sm font-medium text-apple-text-primary">{{ t('targetUrl') }}</label>
+                  <label
+                    class="block text-sm font-medium"
+                    :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+                  >{{ t('targetUrl') }}</label>
                   <Button
                     type="primary"
                     size="small"
@@ -50,7 +62,7 @@
                   <template #option="{ option }">
                     <span>{{ option.label }}</span>
                     <button
-                      class="text-gray-400 hover:text-apple-blue opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-blue-50 focus:outline-none"
+                      class="text-gray-400 hover:text-apple-blue opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-blue-50 focus:outline-none dark:text-dark-text-tertiary dark:hover:text-blue-400 dark:hover:bg-blue-500/20"
                       @click.stop="handleEditEndpoint(option.value)"
                       :title="t('edit')"
                     >
@@ -61,9 +73,13 @@
                   </template>
                 </Select>
               </div>
+
               <div>
                 <div class="flex items-center h-8 mb-1">
-                  <label class="block text-sm font-medium text-apple-text-primary">{{ t('apiKey') }}</label>
+                  <label
+                    class="block text-sm font-medium"
+                    :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+                  >{{ t('apiKey') }}</label>
                 </div>
                 <Input
                   v-model="localApiKey"
@@ -84,8 +100,11 @@
               />
             </div>
 
-            <div v-if="form.converter !== 'anthropic'" class="mt-5 pt-4 border-t border-gray-200">
-              <h3 class="text-sm font-semibold text-apple-text-primary mb-3">{{ t('reasoningEffort') }}</h3>
+            <div v-if="form.converter !== 'anthropic'" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+              <h3
+                class="text-sm font-semibold mb-3"
+                :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+              >{{ t('reasoningEffort') }}</h3>
               <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
                 <div>
                   <Select
@@ -156,8 +175,11 @@
               </div>
             </div>
 
-            <div v-else class="mt-5 pt-4 border-t border-gray-200">
-              <h3 class="text-sm font-semibold text-apple-text-primary mb-3">{{ t('anthropicModelMappingTitle') }}</h3>
+            <div v-else class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+              <h3
+                class="text-sm font-semibold mb-3"
+                :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+              >{{ t('anthropicModelMappingTitle') }}</h3>
               <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
                 <Input
                   v-model="form.anthropicModelMapping.opus"
@@ -186,37 +208,56 @@
 
           <div v-else class="space-y-4">
             <div class="flex items-center justify-between gap-2 mb-3">
-              <div class="text-sm font-semibold text-apple-text-primary">{{ t('lbProfile') }}</div>
-              <div class="flex items-center gap-2">
-                <Button type="primary" size="small" @click="handleAddLbProfile">+</Button>
-                <Button size="small" @click="handleRenameLbProfile">{{ t('rename') }}</Button>
-                <Button size="small" type="danger" @click="handleDeleteLbProfile">{{ t('delete') }}</Button>
-              </div>
+              <div
+                class="text-sm font-semibold"
+                :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+              >{{ t('lbProfile') }}</div>
+              <Button type="primary" size="small" circle @click="handleAddLbProfile">+</Button>
             </div>
 
             <Select
               v-model="selectedLbProfileId"
               :options="lbProfileOptions"
               :placeholder="t('lbProfileSelect')"
-            />
+            >
+              <template #option="{ option }">
+                <span>{{ option.label }}</span>
+                <button
+                  class="text-gray-400 hover:text-apple-blue opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-blue-50 focus:outline-none dark:text-dark-text-tertiary dark:hover:text-blue-400 dark:hover:bg-blue-500/20"
+                  @click.stop="handleEditLbProfile(option.value)"
+                  :title="t('edit')"
+                >
+                  <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                  </svg>
+                </button>
+              </template>
+            </Select>
 
             <div
               v-if="currentLbProfile"
               class="space-y-4"
             >
-              <div class="text-sm font-semibold text-apple-text-primary">{{ t('lbModelMapping') }}</div>
+              <div
+                class="text-sm font-semibold"
+                :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+              >{{ t('lbModelMapping') }}</div>
 
               <div
                 v-for="slot in lbModelSlots"
                 :key="slot"
                 class="space-y-2"
               >
-                <div class="text-xs text-apple-text-secondary mb-2 uppercase">{{ slot }}</div>
+                <div
+                  class="text-xs mb-2 uppercase"
+                  :class="isDarkMode ? 'text-dark-text-secondary' : 'text-apple-text-secondary'"
+                >{{ slot }}</div>
 
                 <div
                   v-for="(candidate, idx) in getSlotCandidates(slot)"
                   :key="`${slot}-${idx}-${candidate.endpointId}`"
-                  class="p-2 rounded-lg border border-gray-200 bg-gray-50"
+                  class="p-2 rounded-lg border"
+                  :class="isDarkMode ? 'border-dark-border bg-dark-tertiary' : 'border-gray-200 bg-gray-50'"
                 >
                   <div class="flex items-center gap-2">
                     <span
@@ -242,13 +283,17 @@
                     <Button size="small" type="danger" @click="handleDeleteSlotCandidate(slot, idx)">-</Button>
                   </div>
 
-                  <div class="mt-2 text-xs text-apple-text-secondary">
+                  <div
+                    class="mt-2 text-xs"
+                    :class="isDarkMode ? 'text-dark-text-secondary' : 'text-apple-text-secondary'"
+                  >
                     {{ getSlotCandidateSummary(slot, candidate) }}
                   </div>
 
                   <div
                     v-if="isSlotCandidateExpanded(slot, idx, candidate)"
-                    class="mt-2 pt-2 border-t border-gray-200"
+                    class="mt-2 pt-2 border-t"
+                    :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'"
                   >
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
                       <Select
@@ -296,7 +341,8 @@
 
                     <div
                       v-if="getEffectiveSlotCandidateConverter(candidate) === 'anthropic'"
-                      class="text-xs text-apple-text-secondary mt-2"
+                      class="text-xs mt-2"
+                      :class="isDarkMode ? 'text-dark-text-secondary' : 'text-apple-text-secondary'"
                     >
                       {{ t('lbAnthropicModelTip') }}
                     </div>
@@ -318,7 +364,10 @@
       </transition>
     </div>
 
-    <div class="mt-6 pt-4 border-t border-gray-200 flex justify-between items-center">
+    <div
+      class="mt-6 pt-4 border-t flex justify-between items-center"
+      :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'"
+    >
       <Button @click="handleReset">{{ t('restoreDefaults') }}</Button>
       <Button
         :type="isRunning ? 'danger' : 'primary'"
@@ -339,9 +388,16 @@
       />
 
       <template #footer>
-        <div class="p-4 flex justify-end gap-2">
-          <Button @click="handleCancelRenameLbProfile">{{ t('cancel') }}</Button>
-          <Button type="primary" @click="handleConfirmRenameLbProfile">{{ t('save') }}</Button>
+        <div class="p-4 flex justify-between items-center">
+          <Button
+            type="danger"
+            @click="handleDeleteLbProfileFromDialog"
+            :disabled="props.form.loadBalancer.lbProfiles.length <= 1"
+          >{{ t('delete') }}</Button>
+          <div class="flex gap-2">
+            <Button @click="handleCancelRenameLbProfile">{{ t('cancel') }}</Button>
+            <Button type="primary" @click="handleConfirmRenameLbProfile">{{ t('save') }}</Button>
+          </div>
         </div>
       </template>
     </Dialog>
@@ -423,6 +479,10 @@ const props = defineProps({
     required: true,
   },
   isRunning: {
+    type: Boolean,
+    required: true,
+  },
+  isDarkMode: {
     type: Boolean,
     required: true,
   },
@@ -598,6 +658,25 @@ const handleAddLbProfile = () => {
   })
 }
 
+const handleEditLbProfile = (profileId: string) => {
+  // 先选中该配置
+  emit('update:form', {
+    ...props.form,
+    loadBalancer: {
+      ...props.form.loadBalancer,
+      selectedLbProfileId: profileId,
+    },
+  })
+  // 打开编辑菜单（这里先打开重命名对话框，后续可以改为菜单）
+  const current = props.form.loadBalancer.lbProfiles.find((item) => item.id === profileId)
+  if (!current) return
+
+  isRenamingLbProfile.value = true
+  lbProfileRenameDraft.value = current.name === 'Default LB Profile'
+    ? t('defaultLbProfileName')
+    : current.name
+}
+
 const handleRenameLbProfile = () => {
   const selectedId = props.form.loadBalancer.selectedLbProfileId
   if (!selectedId) return
@@ -636,6 +715,25 @@ const handleConfirmRenameLbProfile = () => {
 }
 
 const handleCancelRenameLbProfile = () => {
+  isRenamingLbProfile.value = false
+  lbProfileRenameDraft.value = ''
+}
+
+const handleDeleteLbProfileFromDialog = () => {
+  const selectedId = props.form.loadBalancer.selectedLbProfileId
+  if (!selectedId) return
+  if (props.form.loadBalancer.lbProfiles.length <= 1) return
+
+  const nextProfiles = props.form.loadBalancer.lbProfiles.filter((item) => item.id !== selectedId)
+  emit('update:form', {
+    ...props.form,
+    loadBalancer: {
+      ...props.form.loadBalancer,
+      lbProfiles: nextProfiles,
+      selectedLbProfileId: nextProfiles[0]?.id,
+    },
+  })
+
   isRenamingLbProfile.value = false
   lbProfileRenameDraft.value = ''
 }

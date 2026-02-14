@@ -6,17 +6,17 @@
   >
     <div class="space-y-4">
       <div>
-        <label class="block text-sm font-medium text-apple-text-primary mb-1">
+        <label class="block text-sm font-medium text-apple-text-primary dark:text-dark-text-primary mb-1">
           {{ t('skillInjection') }}
         </label>
         <textarea
           v-model="localPrompt"
           rows="4"
-          class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none resize-none"
+          class="w-full px-3 py-2.5 rounded-lg bg-gray-100 dark:bg-dark-secondary border border-transparent focus:bg-white dark:focus:bg-dark-primary focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none resize-none text-apple-text-primary dark:text-dark-text-primary"
           :placeholder="t('skillInjectionPlaceholder')"
           maxlength="500"
         />
-        <div class="text-apple-text-secondary text-xs mt-1">
+        <div class="text-apple-text-secondary dark:text-dark-text-secondary text-xs mt-1">
           {{ t('skillInjectionTip') }}
         </div>
         <Button

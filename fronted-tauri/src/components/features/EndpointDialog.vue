@@ -26,14 +26,14 @@
 
     <!-- Delete Confirmation UI -->
     <div v-else class="text-center space-y-4 py-2">
-      <div class="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto text-red-500">
+      <div class="w-12 h-12 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center mx-auto text-red-500 dark:text-red-400">
         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
       </div>
       <div class="space-y-2">
-        <h3 class="text-lg font-medium text-gray-900">
+        <h3 class="text-lg font-medium text-gray-900 dark:text-dark-text-primary">
           {{ deleteStep === 1 ? t('confirmDeleteEndpoint', { name: endpointDraft.alias || endpointDraft.url }) : t('confirmDeleteEndpointFinal') }}
         </h3>
-        <p class="text-sm text-gray-500" v-if="deleteStep === 2">
+        <p class="text-sm text-gray-500 dark:text-dark-text-secondary" v-if="deleteStep === 2">
           This action cannot be undone.
         </p>
       </div>

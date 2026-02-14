@@ -9,10 +9,10 @@
       ></div>
     </Transition>
 
-    <div class="fixed inset-y-0 right-0 w-96 bg-white shadow-2xl z-50 flex flex-col transform transition-transform duration-300 ease-in-out"
+    <div class="fixed inset-y-0 right-0 w-96 bg-white dark:bg-dark-secondary shadow-2xl z-50 flex flex-col transform transition-transform duration-300 ease-in-out"
          :class="{ 'translate-x-full': !visible, 'translate-x-0': visible }">
-      <div class="flex items-center justify-between p-4 border-b border-gray-200">
-        <h2 class="text-lg font-semibold text-apple-text-primary">{{ t('logsTitle') }}</h2>
+      <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-dark-border">
+        <h2 class="text-lg font-semibold text-apple-text-primary dark:text-dark-text-primary">{{ t('logsTitle') }}</h2>
         <Button
           type="text"
           size="small"
@@ -25,31 +25,31 @@
         </Button>
       </div>
 
-      <div class="p-4 border-b border-gray-200">
+      <div class="p-4 border-b border-gray-200 dark:border-dark-border">
         <div class="flex items-center gap-3 text-sm">
           <span class="flex items-center gap-1.5">
             <span class="bg-red-500 text-white text-xs font-medium px-2 py-0.5 rounded-md">Opus</span>
-            <span class="text-apple-text-primary font-medium">{{ modelRequestStats.opus }}</span>
+            <span class="text-apple-text-primary dark:text-dark-text-primary font-medium">{{ modelRequestStats.opus }}</span>
           </span>
           <span class="flex items-center gap-1.5">
             <span class="bg-green-500 text-white text-xs font-medium px-2 py-0.5 rounded-md">Sonnet</span>
-            <span class="text-apple-text-primary font-medium">{{ modelRequestStats.sonnet }}</span>
+            <span class="text-apple-text-primary dark:text-dark-text-primary font-medium">{{ modelRequestStats.sonnet }}</span>
           </span>
           <span class="flex items-center gap-1.5">
             <span class="bg-gray-800 text-white text-xs font-medium px-2 py-0.5 rounded-md">Haiku</span>
-            <span class="text-apple-text-primary font-medium">{{ modelRequestStats.haiku }}</span>
+            <span class="text-apple-text-primary dark:text-dark-text-primary font-medium">{{ modelRequestStats.haiku }}</span>
           </span>
         </div>
       </div>
 
       <div class="flex-1 overflow-y-auto p-4 overscroll-contain flex flex-col" ref="logsContainer">
-        <div v-if="logs.length === 0" class="flex-1 flex items-center justify-center text-apple-text-secondary min-h-[50px]">
+        <div v-if="logs.length === 0" class="flex-1 flex items-center justify-center text-apple-text-secondary dark:text-dark-text-secondary min-h-[50px]">
           {{ t('noLogs') }}
         </div>
         <div v-else>
           <div v-for="(log, index) in logs" :key="index" class="mb-2">
             <div class="flex gap-2 items-center">
-              <span class="w-[64px] shrink-0 text-xs text-apple-text-secondary tabular-nums">{{ log.time }}</span>
+              <span class="w-[64px] shrink-0 text-xs text-apple-text-secondary dark:text-dark-text-secondary tabular-nums">{{ log.time }}</span>
               <span
                 v-if="extractLogTag(log.content)"
                 class="text-[10px] px-1.5 py-0.5 rounded border shrink-0"
@@ -58,14 +58,14 @@
                 [{{ extractLogTag(log.content) }}]
               </span>
             </div>
-            <div class="mt-1 ml-[72px] text-xs text-apple-text-primary break-all leading-5">
+            <div class="mt-1 ml-[72px] text-xs text-apple-text-primary dark:text-dark-text-primary break-all leading-5">
               {{ extractLogBody(log.content) }}
             </div>
           </div>
         </div>
       </div>
 
-      <div class="p-4 border-t border-gray-200 flex justify-end">
+      <div class="p-4 border-t border-gray-200 dark:border-dark-border flex justify-end">
         <Button @click="handleClear">{{ t('clearLogs') }}</Button>
       </div>
     </div>
@@ -144,13 +144,13 @@ const extractLogBody = (content: string) => parseLog(content).body
 
 const getLogTagClass = (tag: string) => {
   const normalized = tag.toLowerCase()
-  if (normalized === 'req') return 'bg-green-50 text-green-700 border-green-200'
+  if (normalized === 'req') return 'bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-400 border-green-200 dark:border-green-700'
   if (normalized === 'warn' || normalized === 'warning' || normalized === 'error') {
-    return 'bg-red-50 text-red-700 border-red-200'
+    return 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-400 border-red-200 dark:border-red-700'
   }
-  if (normalized === 'route') return 'bg-blue-50 text-blue-700 border-blue-200'
-  if (normalized === 'tokens' || normalized === 'ratelimit') return 'bg-amber-50 text-amber-700 border-amber-200'
-  return 'bg-gray-100 text-gray-700 border-gray-200'
+  if (normalized === 'route') return 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-700'
+  if (normalized === 'tokens' || normalized === 'ratelimit') return 'bg-amber-50 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-700'
+  return 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-gray-600'
 }
 </script>
 

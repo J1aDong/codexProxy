@@ -6,7 +6,7 @@
         :text="isRunning ? t('statusRunning') : t('statusStopped')"
       />
     </div>
-    <h1 class="text-2xl font-semibold text-apple-text-primary font-pixel">
+    <h1 class="text-2xl font-semibold text-apple-text-primary dark:text-dark-text-primary font-pixel">
       {{ t('title') }}
     </h1>
     <div class="flex items-center gap-2">
@@ -28,7 +28,7 @@
 
         <!-- Dropdown Menu -->
         <Transition name="menu-fade">
-          <div v-if="menuVisible" class="header-dropdown">
+          <div v-if="menuVisible" class="header-dropdown" :class="isDarkMode ? 'dark-dropdown' : ''">
             <div class="header-dropdown-item" @click="handleMenuItem('settings')">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -41,6 +41,13 @@
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" />
               </svg>
               <span>{{ locale === 'zh' ? 'English' : '中文' }}</span>
+            </div>
+            <div class="header-dropdown-item" @click="handleMenuItem('darkMode')">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path v-if="!isDarkMode" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+                <path v-else stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+              </svg>
+              <span>{{ isDarkMode ? '浅色模式' : '深色模式' }}</span>
             </div>
             <div class="header-dropdown-item" @click="handleMenuItem('advancedSettings')">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -94,9 +101,13 @@ defineProps({
     type: Boolean,
     required: true,
   },
+  isDarkMode: {
+    type: Boolean,
+    required: true,
+  },
 })
 
-const emit = defineEmits(['toggleLang', 'showAbout', 'showSettings', 'showAdvancedSettings', 'showImportExport', 'showLogs'])
+const emit = defineEmits(['toggleLang', 'toggleDarkMode', 'showAbout', 'showSettings', 'showAdvancedSettings', 'showImportExport', 'showLogs'])
 
 const menuVisible = ref(false)
 const menuRef = ref<HTMLElement | null>(null)
@@ -117,6 +128,9 @@ const handleMenuItem = (action: string) => {
       break
     case 'lang':
       emit('toggleLang')
+      break
+    case 'darkMode':
+      emit('toggleDarkMode')
       break
     case 'advancedSettings':
       emit('showAdvancedSettings')
@@ -173,6 +187,11 @@ onUnmounted(() => {
   z-index: 100;
 }
 
+.header-dropdown.dark-dropdown {
+  background: #14141a;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
 .header-dropdown-item {
   display: flex;
   align-items: center;
@@ -182,22 +201,38 @@ onUnmounted(() => {
   font-size: 13px;
   color: #1d1d1f;
   cursor: pointer;
-  transition: background-color 0.15s ease;
+  transition: background-color 0.15s ease, color 0.15s ease;
   user-select: none;
+}
+
+.dark-dropdown .header-dropdown-item {
+  color: #f0f0f5;
 }
 
 .header-dropdown-item:hover {
   background-color: #f0f0f5;
 }
 
+.dark-dropdown .header-dropdown-item:hover {
+  background-color: #1c1c24;
+}
+
 .header-dropdown-item:active {
   background-color: #e5e5ea;
+}
+
+.dark-dropdown .header-dropdown-item:active {
+  background-color: #25252d;
 }
 
 .header-dropdown-divider {
   height: 1px;
   background-color: #e5e5ea;
   margin: 4px 8px;
+}
+
+.dark-dropdown .header-dropdown-divider {
+  background-color: #25252d;
 }
 
 .menu-fade-enter-active,

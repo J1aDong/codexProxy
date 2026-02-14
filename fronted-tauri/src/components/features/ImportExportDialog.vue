@@ -6,15 +6,15 @@
   >
     <div class="space-y-4">
       <!-- Tab Switch -->
-      <div class="flex gap-2 p-1 bg-gray-100 rounded-lg">
+      <div class="flex gap-2 p-1 bg-gray-100 dark:bg-dark-secondary rounded-lg">
         <button
-          :class="['flex-1 py-2 px-4 rounded-md text-sm font-medium transition-all', activeTab === 'export' ? 'bg-white shadow-sm text-apple-blue' : 'text-gray-600 hover:text-gray-900']"
+          :class="['flex-1 py-2 px-4 rounded-md text-sm font-medium transition-all', activeTab === 'export' ? 'bg-white dark:bg-dark-primary shadow-sm text-apple-blue dark:text-blue-400' : 'text-gray-600 dark:text-dark-text-secondary hover:text-gray-900 dark:hover:text-dark-text-primary']"
           @click="activeTab = 'export'"
         >
           {{ t('exportConfig') }}
         </button>
         <button
-          :class="['flex-1 py-2 px-4 rounded-md text-sm font-medium transition-all', activeTab === 'import' ? 'bg-white shadow-sm text-apple-blue' : 'text-gray-600 hover:text-gray-900']"
+          :class="['flex-1 py-2 px-4 rounded-md text-sm font-medium transition-all', activeTab === 'import' ? 'bg-white dark:bg-dark-primary shadow-sm text-apple-blue dark:text-blue-400' : 'text-gray-600 dark:text-dark-text-secondary hover:text-gray-900 dark:hover:text-dark-text-primary']"
           @click="activeTab = 'import'"
         >
           {{ t('importConfig') }}
@@ -23,14 +23,14 @@
 
       <!-- Export Tab -->
       <div v-if="activeTab === 'export'" class="space-y-4">
-        <div class="text-sm text-apple-text-secondary">
+        <div class="text-sm text-apple-text-secondary dark:text-dark-text-secondary">
           {{ t('exportDescription') }}
         </div>
         <textarea
           v-model="exportJson"
           rows="12"
           readonly
-          class="w-full px-3 py-2.5 rounded-lg bg-gray-50 border border-gray-200 text-xs font-mono resize-none focus:outline-none"
+          class="w-full px-3 py-2.5 rounded-lg bg-gray-50 dark:bg-dark-secondary border border-gray-200 dark:border-dark-border text-xs font-mono resize-none focus:outline-none text-apple-text-primary dark:text-dark-text-primary"
         />
         <div class="flex gap-3">
           <Button type="primary" class="flex-1" @click="handleCopyToClipboard">
@@ -44,14 +44,14 @@
 
       <!-- Import Tab -->
       <div v-if="activeTab === 'import'" class="space-y-4">
-        <div class="text-sm text-apple-text-secondary">
+        <div class="text-sm text-apple-text-secondary dark:text-dark-text-secondary">
           {{ t('importDescription') }}
         </div>
         <textarea
           v-model="importJson"
           rows="10"
           :placeholder="t('importPlaceholder')"
-          class="w-full px-3 py-2.5 rounded-lg bg-gray-100 border border-transparent focus:bg-white focus:border-apple-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none resize-none text-xs font-mono"
+          class="w-full px-3 py-2.5 rounded-lg bg-gray-100 dark:bg-dark-secondary border border-transparent dark:border-dark-border focus:bg-white dark:focus:bg-dark-primary focus:border-apple-blue dark:focus:border-blue-400 focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 dark:focus:ring-blue-400 dark:focus:ring-opacity-20 transition-all duration-200 outline-none resize-none text-xs font-mono text-apple-text-primary dark:text-dark-text-primary placeholder-gray-500 dark:placeholder-dark-text-secondary"
         />
         <div class="flex gap-3">
           <Button type="secondary" class="flex-1" @click="handleLoadFromFile">
@@ -61,10 +61,10 @@
             {{ t('import') }}
           </Button>
         </div>
-        <div v-if="importError" class="text-sm text-red-500">
+        <div v-if="importError" class="text-sm text-red-500 dark:text-red-400">
           {{ importError }}
         </div>
-        <div v-if="importSuccess" class="text-sm text-green-600">
+        <div v-if="importSuccess" class="text-sm text-green-600 dark:text-green-400">
           {{ t('importSuccess') }}
         </div>
       </div>
