@@ -671,6 +671,7 @@ watch(() => form.selectedEndpointId, async () => {
   syncEndpointFromSelection()
   await nextTick()
   isSyncing.value = false
+  persistConfig(buildProxyConfig())
 })
 
 const updateSelectedEndpointConfig = () => {
@@ -806,6 +807,7 @@ const shouldShowLog = (message: string) => {
   if (message.startsWith('[RateLimit]')) return true
   if (message.startsWith('[Tokens]')) return true
   if (message.includes('[System] Init success')) return true
+  if (message.includes('Runtime config hot-updated')) return true
   if (message.includes('[Request] Sending request')) return true
   return false
 }

@@ -193,3 +193,109 @@ fn test_transient_overload_uses_short_backoff_without_marking_unavailable() {
     let after = runtime.resolve_and_acquire("claude-opus");
     assert!(after.is_some(), "endpoint should recover after transient backoff");
 }
+
+#[test]
+fn test_model_unavailable_signal_immediately_fallbacks_to_next_route_in_same_slot() {
+    let endpoint_directory: HashMap<String, LoadBalancerEndpoint> = [
+        (
+            "ep-bad".to_string(),
+            LoadBalancerEndpoint {
+                id: "ep-bad".to_string(),
+                target_url: "http://bad.example.com".to_string(),
+                api_key: Some("bad".to_string()),
+                converter: "anthropic".to_string(),
+            },
+        ),
+        (
+            "ep-good".to_string(),
+            LoadBalancerEndpoint {
+                id: "ep-good".to_string(),
+                target_url: "https://good.example.com".to_string(),
+                api_key: Some("good".to_string()),
+                converter: "codex".to_string(),
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let profiles = vec![LoadBalancerProfile {
+        id: "profile-1".to_string(),
+        name: "Test Profile".to_string(),
+        model_mapping: SlotMapping {
+            opus: vec![
+                SlotEndpointRef {
+                    endpoint_id: "ep-bad".to_string(),
+                    custom_model_name: None,
+                    custom_reasoning_effort: None,
+                    converter_override: None,
+                },
+                SlotEndpointRef {
+                    endpoint_id: "ep-good".to_string(),
+                    custom_model_name: None,
+                    custom_reasoning_effort: None,
+                    converter_override: None,
+                },
+            ],
+            sonnet: vec![],
+            haiku: vec![],
+        },
+    }];
+
+    let endpoint_policies: HashMap<String, EndpointPolicy> = [
+        (
+            "ep-bad".to_string(),
+            EndpointPolicy {
+                enabled: true,
+                max_concurrency: 4,
+                error_threshold: 5,
+                error_window_seconds: 60,
+                cooldown_seconds: 300,
+                degraded_concurrency: 2,
+                transient_backoff_seconds: 1,
+            },
+        ),
+        (
+            "ep-good".to_string(),
+            EndpointPolicy {
+                enabled: true,
+                max_concurrency: 4,
+                error_threshold: 5,
+                error_window_seconds: 60,
+                cooldown_seconds: 300,
+                degraded_concurrency: 2,
+                transient_backoff_seconds: 1,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let runtime = LoadBalancerRuntime::new(
+        LoadBalancerConfig {
+            selected_profile_id: Some("profile-1".to_string()),
+            profiles,
+            endpoint_policies,
+        },
+        endpoint_directory,
+        None,
+    );
+
+    let first = runtime.resolve_and_acquire("claude-opus-4-6");
+    assert!(first.is_some());
+    let (first_resolved, first_permit) = first.unwrap();
+    assert_eq!(first_resolved.endpoint_id, "ep-bad");
+    drop(first_permit);
+
+    runtime.handle_upstream_outcome(
+        &first_resolved,
+        Some(502),
+        false,
+        Some("unknown provider for model claude-opus-4-6"),
+    );
+
+    let second = runtime.resolve_and_acquire("claude-opus-4-6");
+    assert!(second.is_some(), "should fallback to next route in opus slot");
+    let (second_resolved, _second_permit) = second.unwrap();
+    assert_eq!(second_resolved.endpoint_id, "ep-good");
+}

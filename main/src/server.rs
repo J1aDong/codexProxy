@@ -1077,7 +1077,7 @@ async fn handle_request(
     model_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
     let normalized_path = path.trim_end_matches('/');
     let is_messages = normalized_path == "/messages" || normalized_path == "/v1/messages";
     let is_count_tokens = normalized_path == "/messages/count_tokens" || normalized_path == "/v1/messages/count_tokens";
@@ -1353,6 +1353,10 @@ async fn handle_request(
         .as_ref()
         .map(|route| route.endpoint_id.as_str())
         .unwrap_or("single");
+    let route_key = selected_lb_route
+        .as_ref()
+        .map(|route| route.route_key.as_str())
+        .unwrap_or("-");
     let route_effort = if request_converter.eq_ignore_ascii_case("codex") {
         request_reasoning_effort_override
             .map(|effort| effort.as_str().to_string())
@@ -1666,6 +1670,21 @@ async fn handle_request(
             if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), selected_lb_route.as_ref()) {
                 runtime.handle_upstream_outcome(route, None, true, None);
             }
+            let _ = log_tx.send(format!(
+                "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={}",
+                request_id,
+                path,
+                target_url,
+                resolved_target_url,
+                route_mode,
+                route_slot,
+                route_endpoint,
+                route_key,
+                request_converter,
+                input_model,
+                model,
+                route_effort,
+            ));
             let _ = log_tx.send(format!("[Error] Request failed: {}", e));
             return Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -1690,6 +1709,23 @@ async fn handle_request(
         if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), selected_lb_route.as_ref()) {
             runtime.handle_upstream_outcome(route, Some(status), false, Some(&error_text));
         }
+        let _ = log_tx.send(format!(
+            "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={} status={} retry_after={}",
+            request_id,
+            path,
+            target_url,
+            resolved_target_url,
+            route_mode,
+            route_slot,
+            route_endpoint,
+            route_key,
+            request_converter,
+            input_model,
+            model,
+            route_effort,
+            status,
+            retry_after,
+        ));
 
         if let Some((cooldown_model, cooldown_secs, reason)) = extract_cooldown_info(status, &error_text, &retry_after, &model) {
             set_model_cooldown(&model_cooldowns, &cooldown_model, cooldown_secs);

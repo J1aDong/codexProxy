@@ -47,16 +47,20 @@
           {{ t('noLogs') }}
         </div>
         <div v-else>
-          <div v-for="(log, index) in logs" :key="index" class="mb-2 flex gap-2 items-start">
-            <span class="text-xs text-apple-text-secondary">{{ log.time }}</span>
-            <span
-              v-if="extractLogTag(log.content)"
-              class="text-[10px] px-1.5 py-0.5 rounded border shrink-0"
-              :class="getLogTagClass(extractLogTag(log.content))"
-            >
-              [{{ extractLogTag(log.content) }}]
-            </span>
-            <span class="text-xs text-apple-text-primary break-all">{{ extractLogBody(log.content) }}</span>
+          <div v-for="(log, index) in logs" :key="index" class="mb-2">
+            <div class="flex gap-2 items-center">
+              <span class="w-[64px] shrink-0 text-xs text-apple-text-secondary tabular-nums">{{ log.time }}</span>
+              <span
+                v-if="extractLogTag(log.content)"
+                class="text-[10px] px-1.5 py-0.5 rounded border shrink-0"
+                :class="getLogTagClass(extractLogTag(log.content))"
+              >
+                [{{ extractLogTag(log.content) }}]
+              </span>
+            </div>
+            <div class="mt-1 ml-[72px] text-xs text-apple-text-primary break-all leading-5">
+              {{ extractLogBody(log.content) }}
+            </div>
           </div>
         </div>
       </div>

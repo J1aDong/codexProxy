@@ -738,13 +738,18 @@ impl LoadBalancerRuntime {
 
         let has_model_signal = lower.contains("model_not_found")
             || lower.contains("unknown model")
+            || lower.contains("unknown provider for model")
             || lower.contains("invalid model")
             || lower.contains("model does not exist")
             || lower.contains("unsupported model")
             || lower.contains("模型不存在")
             || lower.contains("模型不可用");
 
-        if (status == 400 || status == 404) && has_model_signal {
+        let model_unavailable_status = status == 400
+            || status == 404
+            || status == 422
+            || (500..=599).contains(&status);
+        if model_unavailable_status && has_model_signal {
             return Some("model_unavailable");
         }
 
