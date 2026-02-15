@@ -1,63 +1,71 @@
-# Codex Proxy - Claude Code 中转代理
+# Codex Proxy
 
-本项目专为 **Claude Code** 设计，将 Codex Responses API 格式转换为 Anthropic Messages API 格式，使 Claude Code 能够使用 aicodemirror 的 Codex API。
+Codex Proxy 是一个本地网关：以 **Anthropic Messages** 作为统一入口，兼容 **Claude Code** 使用习惯，并将请求稳定路由到 **Codex / Gemini / Anthropic（透传）** 等上游。
 
-**当前版本：** Tauri 重写版本，支持 `gpt-5.3-codex` 和 `gpt-5.2-codex` 模型
+运行拓扑：
 
-![应用截图](imgs/img1.png)
+`Claude Code -> http://localhost:8889/v1/messages -> Codex Proxy -> (Codex/Gemini/Anthropic Upstream)`
 
-## 功能特性
+## 核心能力
 
-✅ **完整功能支持**
-- 文本对话流式响应
-- 工具调用（以 Claude Code 传入的 tools 为准）
-- 图片支持
-- 推理强度配置（reasoning_effort）
-- 工具结果反馈循环
-- **模型选择**：支持 `gpt-5.3-codex`（默认）和 `gpt-5.2-codex`
-- 桌面端安装包仅提供 macOS/Windows，Linux 请使用命令行启动
+- 协议转换：`/v1/messages` 与 `/v1/messages/count_tokens`
+- 流式转换：上游 SSE 统一回传为 Anthropic 事件格式
+- 多上游支持：Codex、Gemini、Anthropic 透传
+- 模型映射：按 `opus / sonnet / haiku` slot 做模型和推理强度映射
+- 负载均衡：同 slot 多端点选择、健康状态管理、同请求内 failback
+- 稳定性：`count_tokens` 失败可回退估算（可配置）、本地冷却、短退避
+- 可运维性：配置热更新、请求/路由日志、配置导入导出、Tauri 可视化管理
+
+## 界面截图
+
+单模型模式：
+
+![单模型模式](imgs/single.png)
+
+多模型负载均衡模式：
+
+![多模型负载均衡模式](imgs/multi.png)
 
 ## 快速开始
 
-### 使用桌面应用（推荐）
+### 1. 桌面应用（推荐）
 
-从 [Releases](https://github.com/J1aDong/codexProxy/releases) 下载对应平台的安装包。
+从 [Releases](https://github.com/J1aDong/codexProxy/releases) 下载安装包。
 
-**新功能：** 应用内置模型选择功能，支持：
-- `gpt-5.3-codex` - 默认推荐模型
-- `gpt-5.2-codex` - 兼容性支持
+- 当前提供 macOS / Windows 安装包
+- Linux 请使用命令行方式启动
 
-说明：Release 资产文件名可能不带版本号，请以 Release 标题/发布时间为准选择最新版本。
-
-当前仅提供 macOS/Windows 安装包；Linux 暂无安装包，请使用命令行方式启动。
-
-> **macOS 用户注意**：如果打开应用时提示"已损坏"，请在终端执行：
-> ```bash
-> xattr -cr /Applications/Codex\ Proxy.app
-> ```
-
-### 开发模式启动
+macOS 如提示“应用已损坏”，执行：
 
 ```bash
-# 克隆项目
-git clone https://github.com/J1aDong/codexProxy.git
-cd codexProxy
+xattr -cr /Applications/Codex\ Proxy.app
+```
 
-# 启动 Tauri 开发服务器
-cd fronted-tauri
+### 2. 开发模式启动（Tauri）
+
+```bash
+git clone https://github.com/J1aDong/codexProxy.git
+cd codexProxy/fronted-tauri
 npm install
 npm run tauri dev
 ```
 
-### 配置 Claude Code
+### 3. 仅启动核心服务（Rust）
 
-Claude Code 配置文件路径：`~/.claude/settings.json`
+```bash
+cd main
+cargo run --bin codex-proxy-server
+```
+
+## Claude Code 接入配置
+
+Claude Code 配置文件：`~/.claude/settings.json`
 
 ```json
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:8889",
-    "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-你的API密钥"
+    "ANTHROPIC_AUTH_TOKEN": "你的上游API密钥"
   },
   "forceLoginMethod": "claudeai",
   "permissions": {
@@ -67,85 +75,82 @@ Claude Code 配置文件路径：`~/.claude/settings.json`
 }
 ```
 
-代理服务器默认监听 `http://localhost:8889`
+本地代理默认监听 `http://localhost:8889`，常用入口：
 
-## API 格式转换
+- `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 
-### Anthropic Messages → Codex
+## 代理工作流
 
-| Anthropic 参数 | Codex 参数 | 说明 |
-|---------------|-----------|------|
-| `messages` | `input` | 消息内容 |
-| `system` | `instructions` | 系统提示 |
-| `tools` | `tools` | 工具定义 |
+1. 接收 `messages` 或 `count_tokens` 请求
+2. 识别输入模型归属 slot（`opus / sonnet / haiku`）
+3. 若启用负载均衡，在当前 slot 候选内选择端点
+4. 按 `converter + operation` 解析上游 URL
+5. 执行请求转换（tools、image、reasoning、model mapping）
+6. 调用上游并将流式响应转换回 Anthropic SSE
+7. 按返回状态更新端点健康（Healthy / Constrained / Cooldown）
+8. 遇到可重试错误时，同请求内切换同 slot 下一个候选（failback）
 
-### 响应格式
+## 配置与运行模式
 
-```json
-{
-  "type": "content_block_delta",
-  "delta": { "type": "text_delta", "text": "Hello!" },
-  "index": 0
-}
-```
+### `single`（单模型代理）
 
-工具调用：
-```json
-{
-  "type": "content_block_start",
-  "content_block": {
-    "type": "tool_use",
-    "id": "tool_123",
-    "name": "shell_command",
-    "input": {}
-  }
-}
-```
+- 使用当前选中的单个端点转发请求
+- 适合单上游、低复杂度场景
 
-## 支持的工具
+### `load_balancer`（多模型负载均衡）
 
-工具清单以 Claude Code 请求中的 `tools` 为准，代理不再自动注入 Codex 模板工具。若未传入 `tools`，则不会触发工具调用。
+- 通过 profile 配置 `opus / sonnet / haiku` 到端点候选列表的映射
+- 支持每端点策略：
+  - `max_concurrency`
+  - `error_threshold`
+  - `cooldown_seconds`
+  - `transient_backoff_seconds`
 
-## 故障排除
+默认行为：负载切换 **不跨 slot**（例如 opus 不自动降到 sonnet/haiku）。
 
-### 问题：模型选择不生效
+## 项目结构与关键入口
 
-**原因**：使用了旧版本或配置未更新
+- `fronted-tauri/`：桌面前端（Vue）
+- `fronted-tauri/src-tauri/`：Tauri 命令层（启动/停止、热更新配置、导入导出）
+- `main/`：Rust 核心代理库与服务
+- `backup/`：历史 Node.js 版本（归档参考）
 
-**解决**：
-1. 确保使用最新的 Tauri 版本
-2. 在应用界面中选择 `gpt-5.3-codex` 或 `gpt-5.2-codex`
-3. 重启代理服务
+关键排查入口：
 
-### 问题：工具调用不触发
+- `main/src/server.rs`：HTTP 入口、请求生命周期、上游调用、SSE 回传
+- `main/src/load_balancer/mod.rs`：slot 选择、健康状态、故障切换
+- `main/src/transform/codex.rs`：Anthropic <-> Codex 转换
+- `main/src/transform/gemini.rs`：Anthropic <-> Gemini 转换
+- `main/src/transform/anthropic.rs`：Anthropic 透传
+- `fronted-tauri/src-tauri/src/proxy.rs`：配置装载、运行时热更新、模式组装
 
-**原因**：工具定义格式不完整或未传入 tools
+## 常见问题
 
-**解决**：确保 Claude Code 请求包含完整的 tools 定义
+### 1. 负载均衡模式没有生效
 
-### 问题：图片无法识别
+常见原因：`load_balancer` 配置不完整（如未选 profile 或 profile 无有效端点映射）。  
+结果：运行时会回退到单模型模式。
 
-**原因**：图片 URL 格式不支持
+### 2. `count_tokens` 上游失败
 
-**解决**：Claude Code 使用 `file://` 协议时，需要确保代理正确转换
+当开启 `allowCountTokensFallbackEstimate` 时，代理会回退到本地估算；关闭后会直接返回上游错误。
 
-### 问题：400 错误 "Instructions are not valid"
+### 3. 上游频繁报 401/403/429/404
 
-**原因**：instructions 格式不正确
+- 401/403：优先检查 API Key 与权限
+- 429：检查配额与限流，必要时增加端点并启用 LB
+- 404（路由不可用）：会被识别为路由不可用信号并触发同 slot 快速切换
 
-**解决**：代理会自动使用 Codex CLI 的完整 instructions 模板
+## 已知边界与约束
 
-## API 端点
-
-- **代理服务器**: `http://localhost:8889/v1/messages`
-- **Codex API**: `https://api.aicodemirror.com/api/codex/backend-api/codex/responses`
-
-## 许可证
-
-本项目仅供学习和研究使用。
+- 默认不跨 slot failover
+- `codex-request.json` 模板指令仍是 Codex 路径的重要约束
+- 主线实现是 Tauri + Rust，`backup/` 仅历史参考
 
 ## 参考
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-- [Codex CLI 源码](https://github.com/openai/codex)
-- [aicodemirror](https://aicodemirror.com)
+- [Claude Code 文档](https://docs.anthropic.com/en/docs/claude-code)
+- [Anthropic Messages API](https://platform.claude.com/docs/en/api/messages)
+- [OpenAI Codex 仓库](https://github.com/openai/codex)
+- [API 格式参考（本仓）](docs/API-FORMAT-REFERENCE.md)
