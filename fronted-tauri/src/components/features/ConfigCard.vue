@@ -224,7 +224,7 @@
                 <span>{{ option.label }}</span>
                 <button
                   class="text-gray-400 hover:text-apple-blue opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-blue-50 focus:outline-none dark:text-dark-text-tertiary dark:hover:text-blue-400 dark:hover:bg-blue-500/20"
-                  @click.stop="handleEditLbProfile(option.value)"
+                  @click.stop="handleEditLbProfile(String(option.value))"
                   :title="t('edit')"
                 >
                   <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -677,18 +677,6 @@ const handleEditLbProfile = (profileId: string) => {
     : current.name
 }
 
-const handleRenameLbProfile = () => {
-  const selectedId = props.form.loadBalancer.selectedLbProfileId
-  if (!selectedId) return
-  const current = props.form.loadBalancer.lbProfiles.find((item) => item.id === selectedId)
-  if (!current) return
-
-  isRenamingLbProfile.value = true
-  lbProfileRenameDraft.value = current.name === 'Default LB Profile'
-    ? t('defaultLbProfileName')
-    : current.name
-}
-
 const handleConfirmRenameLbProfile = () => {
   const selectedId = props.form.loadBalancer.selectedLbProfileId
   const draftName = lbProfileRenameDraft.value.trim()
@@ -736,22 +724,6 @@ const handleDeleteLbProfileFromDialog = () => {
 
   isRenamingLbProfile.value = false
   lbProfileRenameDraft.value = ''
-}
-
-const handleDeleteLbProfile = () => {
-  const selectedId = props.form.loadBalancer.selectedLbProfileId
-  if (!selectedId) return
-  if (props.form.loadBalancer.lbProfiles.length <= 1) return
-
-  const nextProfiles = props.form.loadBalancer.lbProfiles.filter((item) => item.id !== selectedId)
-  emit('update:form', {
-    ...props.form,
-    loadBalancer: {
-      ...props.form.loadBalancer,
-      lbProfiles: nextProfiles,
-      selectedLbProfileId: nextProfiles[0]?.id,
-    },
-  })
 }
 
 const endpointOptionsForSelect = computed(() => (
