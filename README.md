@@ -50,34 +50,6 @@ npm install
 npm run tauri dev
 ```
 
-### 3. 仅启动核心服务（Rust）
-
-```bash
-cd main
-cargo run --bin codex-proxy-server
-```
-
-### 4. Linux 本地打包（可选）
-
-在 Linux 主机上可直接打包 Tauri 安装包。以 Ubuntu 为例：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  libwebkit2gtk-4.1-dev \
-  libgtk-3-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev \
-  patchelf \
-  rpm
-```
-
-```bash
-cd fronted-tauri
-npm install
-npm run tauri build -- --bundles appimage,deb,rpm
-```
-
 ## Claude Code 接入配置
 
 Claude Code 配置文件：`~/.claude/settings.json`
