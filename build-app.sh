@@ -7,6 +7,7 @@ FRONTED_DIR="$BASE_DIR/fronted-tauri"
 PACKAGE_JSON="$FRONTED_DIR/package.json"
 TAURI_CONF="$FRONTED_DIR/src-tauri/tauri.conf.json"
 CARGO_TOML="$FRONTED_DIR/src-tauri/Cargo.toml"
+OS_NAME="$(uname -s)"
 
 echo "=========================================="
 echo "   🚀 Codex Proxy 构建与发布工具 (Tauri)  "
@@ -67,8 +68,9 @@ if [ "$NEW_VERSION" != "$CURRENT_VERSION" ]; then
     "
     echo "  ✅ tauri.conf.json"
 
-    # 更新 Cargo.toml
-    sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" "$CARGO_TOML"
+    # 更新 Cargo.toml (跨平台，兼容 macOS/Linux)
+    sed -i.bak "s/^version = \".*\"/version = \"$NEW_VERSION\"/" "$CARGO_TOML"
+    rm -f "${CARGO_TOML}.bak"
     echo "  ✅ Cargo.toml"
 
     echo "✅ 版本号已更新为 $NEW_VERSION"
@@ -126,23 +128,58 @@ fi
 
 echo "请选择目标平台:"
 echo "  1) 当前系统 (默认)"
-echo "  2) macOS (Universal: Intel + Apple Silicon)"
-echo "  3) macOS (仅 Apple Silicon)"
-echo "  4) macOS (仅 Intel)"
-read -p "选择 [1-4, 默认 1]: " PLATFORM_CHOICE
+if [ "$OS_NAME" = "Darwin" ]; then
+    echo "  2) macOS (Universal: Intel + Apple Silicon)"
+    echo "  3) macOS (仅 Apple Silicon)"
+    echo "  4) macOS (仅 Intel)"
+    echo "  5) Linux (AppImage + DEB + RPM) [需要 Linux 环境]"
+    read -p "选择 [1-5, 默认 1]: " PLATFORM_CHOICE
+elif [ "$OS_NAME" = "Linux" ]; then
+    echo "  2) Linux (AppImage + DEB + RPM)"
+    read -p "选择 [1-2, 默认 1]: " PLATFORM_CHOICE
+else
+    read -p "选择 [1, 默认 1]: " PLATFORM_CHOICE
+fi
 
 case $PLATFORM_CHOICE in
     2)
-        echo "🏗️  构建 macOS Universal..."
-        npm run tauri build -- --target universal-apple-darwin
+        if [ "$OS_NAME" = "Darwin" ]; then
+            echo "🏗️  构建 macOS Universal..."
+            npm run tauri build -- --target universal-apple-darwin
+        elif [ "$OS_NAME" = "Linux" ]; then
+            echo "🏗️  构建 Linux (AppImage + DEB + RPM)..."
+            npm run tauri build -- --bundles appimage,deb,rpm
+        else
+            echo "⚠️  当前系统不支持该选项，改为构建当前系统。"
+            npm run tauri build
+        fi
         ;;
     3)
-        echo "🏗️  构建 macOS Apple Silicon..."
-        npm run tauri build -- --target aarch64-apple-darwin
+        if [ "$OS_NAME" = "Darwin" ]; then
+            echo "🏗️  构建 macOS Apple Silicon..."
+            npm run tauri build -- --target aarch64-apple-darwin
+        else
+            echo "❌ 当前系统不支持该选项。"
+            exit 1
+        fi
         ;;
     4)
-        echo "🏗️  构建 macOS Intel..."
-        npm run tauri build -- --target x86_64-apple-darwin
+        if [ "$OS_NAME" = "Darwin" ]; then
+            echo "🏗️  构建 macOS Intel..."
+            npm run tauri build -- --target x86_64-apple-darwin
+        else
+            echo "❌ 当前系统不支持该选项。"
+            exit 1
+        fi
+        ;;
+    5)
+        if [ "$OS_NAME" = "Darwin" ]; then
+            echo "❌ 不建议在 macOS 上直接交叉打包 Linux。请在 Linux 主机或 GitHub Ubuntu Runner 上构建。"
+            exit 1
+        else
+            echo "❌ 当前系统不支持该选项。"
+            exit 1
+        fi
         ;;
     *)
         echo "🏗️  构建当前系统..."
