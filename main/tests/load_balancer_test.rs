@@ -299,3 +299,123 @@ fn test_model_unavailable_signal_immediately_fallbacks_to_next_route_in_same_slo
     let (second_resolved, _second_permit) = second.unwrap();
     assert_eq!(second_resolved.endpoint_id, "ep-good");
 }
+
+#[test]
+fn test_route_not_found_404_immediately_fallbacks_to_next_route_in_same_slot() {
+    let endpoint_directory: HashMap<String, LoadBalancerEndpoint> = [
+        (
+            "ep-bad".to_string(),
+            LoadBalancerEndpoint {
+                id: "ep-bad".to_string(),
+                target_url: "https://bad.example.com/openai".to_string(),
+                api_key: Some("bad".to_string()),
+                converter: "codex".to_string(),
+            },
+        ),
+        (
+            "ep-good".to_string(),
+            LoadBalancerEndpoint {
+                id: "ep-good".to_string(),
+                target_url: "https://good.example.com/openai/responses".to_string(),
+                api_key: Some("good".to_string()),
+                converter: "codex".to_string(),
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let profiles = vec![LoadBalancerProfile {
+        id: "profile-1".to_string(),
+        name: "Test Profile".to_string(),
+        model_mapping: SlotMapping {
+            opus: vec![
+                SlotEndpointRef {
+                    endpoint_id: "ep-bad".to_string(),
+                    custom_model_name: Some("gpt-5.3-codex".to_string()),
+                    custom_reasoning_effort: None,
+                    converter_override: None,
+                },
+                SlotEndpointRef {
+                    endpoint_id: "ep-good".to_string(),
+                    custom_model_name: Some("gpt-5.3-codex".to_string()),
+                    custom_reasoning_effort: None,
+                    converter_override: None,
+                },
+            ],
+            sonnet: vec![],
+            haiku: vec![],
+        },
+    }];
+
+    let endpoint_policies: HashMap<String, EndpointPolicy> = [
+        (
+            "ep-bad".to_string(),
+            EndpointPolicy {
+                enabled: true,
+                max_concurrency: 4,
+                error_threshold: 5,
+                error_window_seconds: 60,
+                cooldown_seconds: 300,
+                degraded_concurrency: 2,
+                transient_backoff_seconds: 1,
+            },
+        ),
+        (
+            "ep-good".to_string(),
+            EndpointPolicy {
+                enabled: true,
+                max_concurrency: 4,
+                error_threshold: 5,
+                error_window_seconds: 60,
+                cooldown_seconds: 300,
+                degraded_concurrency: 2,
+                transient_backoff_seconds: 1,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let runtime = LoadBalancerRuntime::new(
+        LoadBalancerConfig {
+            selected_profile_id: Some("profile-1".to_string()),
+            profiles,
+            endpoint_policies,
+        },
+        endpoint_directory,
+        None,
+    );
+
+    let first = runtime.resolve_and_acquire("claude-opus-4-6");
+    assert!(first.is_some());
+    let (first_resolved, first_permit) = first.unwrap();
+    drop(first_permit);
+
+    let action = runtime.handle_upstream_outcome(
+        &first_resolved,
+        Some(404),
+        false,
+        Some("Route /openai not found"),
+    );
+    assert_eq!(action, UpstreamOutcomeAction::RetryNextCandidate);
+
+    let second = runtime.resolve_and_acquire("claude-opus-4-6");
+    assert!(second.is_some(), "should fallback to next route in opus slot");
+    let (second_resolved, _second_permit) = second.unwrap();
+    assert_eq!(second_resolved.endpoint_id, "ep-good");
+}
+
+#[test]
+fn test_generic_5xx_is_retryable_for_same_request_failover() {
+    let runtime = create_test_runtime();
+    let resolved = resolve_opus_route(&runtime);
+
+    let action = runtime.handle_upstream_outcome(
+        &resolved,
+        Some(502),
+        false,
+        Some("upstream internal error"),
+    );
+    assert_eq!(action, UpstreamOutcomeAction::RetryNextCandidate);
+}

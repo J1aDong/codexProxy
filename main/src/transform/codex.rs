@@ -159,6 +159,11 @@ impl TransformRequest {
             }
 
             if item_type.as_deref() == Some("message") {
+                let role = obj
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("assistant")
+                    .to_string();
                 if let Some(content_blocks) = obj.get_mut("content").and_then(|v| v.as_array_mut()) {
                     for block in content_blocks.iter_mut() {
                         let Some(block_obj) = block.as_object_mut() else {
@@ -166,6 +171,21 @@ impl TransformRequest {
                         };
 
                         if block_obj.get("type").and_then(|v| v.as_str()) == Some("thinking") {
+                            // Codex upstream does not accept `thinking` blocks in message.content.
+                            // Normalize to regular text blocks by role.
+                            if !block_obj.contains_key("text") {
+                                if let Some(thinking_value) = block_obj.remove("thinking") {
+                                    block_obj.insert("text".to_string(), thinking_value);
+                                }
+                            } else {
+                                block_obj.remove("thinking");
+                            }
+                            let normalized_type = if role.eq_ignore_ascii_case("user") {
+                                "input_text"
+                            } else {
+                                "output_text"
+                            };
+                            block_obj.insert("type".to_string(), json!(normalized_type));
                             block_obj.remove("signature");
                         }
                     }
@@ -909,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_input_strips_signature_fields() {
+    fn test_codex_input_strips_signature_fields_and_normalizes_thinking_type() {
         let request = AnthropicRequest {
             model: Some("claude-sonnet-4-5-20250929".to_string()),
             messages: vec![
@@ -961,16 +981,103 @@ mod tests {
             "function_call signature should be stripped for codex"
         );
 
-        let thinking_block = input
+        let normalized_block = input
             .iter()
             .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
             .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
             .flat_map(|content| content.iter())
-            .find(|block| block.get("type").and_then(|v| v.as_str()) == Some("thinking"))
-            .expect("thinking block should exist");
+            .find(|block| block.get("type").and_then(|v| v.as_str()) == Some("output_text"))
+            .expect("thinking block should be normalized to output_text");
         assert!(
-            thinking_block.get("signature").is_none(),
-            "thinking signature should be stripped for codex"
+            normalized_block.get("signature").is_none(),
+            "normalized block signature should be stripped for codex"
+        );
+        assert_eq!(
+            normalized_block
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "internal",
+            "thinking text should be preserved after normalization"
+        );
+        assert!(
+            normalized_block.get("thinking").is_none(),
+            "legacy thinking field should be removed after normalization"
+        );
+
+        let has_thinking_type = input
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+            .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
+            .flat_map(|content| content.iter())
+            .any(|block| block.get("type").and_then(|v| v.as_str()) == Some("thinking"));
+        assert!(!has_thinking_type, "codex payload must not contain thinking type");
+
+        let has_summary_text_type = input
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+            .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
+            .flat_map(|content| content.iter())
+            .any(|block| block.get("type").and_then(|v| v.as_str()) == Some("summary_text"));
+        assert!(
+            !has_summary_text_type,
+            "codex message.content should not use summary_text type"
+        );
+    }
+
+    #[test]
+    fn test_codex_input_normalizes_multiple_thinking_blocks() {
+        let request = AnthropicRequest {
+            model: Some("claude-opus-4-6".to_string()),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    ContentBlock::Thinking {
+                        thinking: "first".to_string(),
+                        signature: Some("sig_1".to_string()),
+                    },
+                    ContentBlock::Text {
+                        text: "visible".to_string(),
+                    },
+                    ContentBlock::Thinking {
+                        thinking: "second".to_string(),
+                        signature: Some("sig_2".to_string()),
+                    },
+                ])),
+            }],
+            system: None,
+            stream: true,
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let input = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input should be an array");
+
+        let normalized_texts: Vec<String> = input
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+            .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
+            .flat_map(|content| content.iter())
+            .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("output_text"))
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+
+        assert!(
+            normalized_texts.contains(&"first".to_string()),
+            "first thinking block should be normalized to output_text"
+        );
+        assert!(
+            normalized_texts.contains(&"second".to_string()),
+            "second thinking block should be normalized to output_text"
         );
     }
 }

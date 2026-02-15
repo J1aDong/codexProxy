@@ -1,4 +1,6 @@
-use crate::load_balancer::{EndpointPermit, LoadBalancerRuntime, ModelSlot, ResolvedEndpoint};
+use crate::load_balancer::{
+    EndpointPermit, LoadBalancerRuntime, ModelSlot, ResolvedEndpoint, UpstreamOutcomeAction,
+};
 use crate::logger::AppLogger;
 use crate::models::{AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock, GeminiReasoningEffortMapping, Message, MessageContent, ReasoningEffort, ReasoningEffortMapping};
 use crate::transform::{AnthropicBackend, CodexBackend, GeminiBackend, TransformBackend, TransformContext};
@@ -713,6 +715,22 @@ fn strip_query(url: String) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamOperation {
+    Messages,
+    CountTokens,
+}
+
+struct RouteSelection {
+    target_url: String,
+    api_key: String,
+    converter: String,
+    model_name: String,
+    route: Option<ResolvedEndpoint>,
+    route_permit: Option<EndpointPermit>,
+    reasoning_effort_override: Option<ReasoningEffort>,
+}
+
 fn build_gemini_count_tokens_endpoint(target_url: &str, model: &str) -> String {
     if target_url.contains(":streamGenerateContent") || target_url.contains(":generateContent") {
         let endpoint = target_url
@@ -737,6 +755,48 @@ fn build_gemini_count_tokens_endpoint(target_url: &str, model: &str) -> String {
 
     let base = target_url.trim_end_matches('/');
     format!("{}/v1beta/models/{}:countTokens", base, model)
+}
+
+fn build_gemini_messages_endpoint(target_url: &str, model: &str) -> String {
+    if target_url.contains(":streamGenerateContent") {
+        return target_url.to_string();
+    }
+
+    if target_url.contains("{model}") {
+        let endpoint = target_url.replace("{model}", model);
+        if endpoint.contains(":streamGenerateContent") {
+            return endpoint;
+        }
+        if endpoint.contains(":generateContent") {
+            return endpoint.replace(":generateContent", ":streamGenerateContent");
+        }
+    }
+
+    if target_url.contains(":generateContent") {
+        return target_url.replace(":generateContent", ":streamGenerateContent");
+    }
+
+    let base = target_url.trim_end_matches('/');
+    format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, model)
+}
+
+fn build_codex_messages_endpoint(target_url: &str) -> String {
+    let clean = strip_query(target_url.to_string());
+    if let Some(idx) = clean.rfind("/responses/input_tokens") {
+        let mut endpoint = clean;
+        endpoint.replace_range(
+            idx..idx + "/responses/input_tokens".len(),
+            "/responses",
+        );
+        return endpoint;
+    }
+
+    if clean.contains("/responses") {
+        return clean;
+    }
+
+    let base = clean.trim_end_matches('/');
+    format!("{}/responses", base)
 }
 
 fn build_codex_input_tokens_endpoint(target_url: &str) -> String {
@@ -805,6 +865,124 @@ fn build_anthropic_count_tokens_endpoint(target_url: &str) -> String {
 
     let base = messages_endpoint.trim_end_matches('/');
     format!("{}/messages/count_tokens", base)
+}
+
+fn resolve_upstream_url(
+    converter: &str,
+    target_url: &str,
+    operation: UpstreamOperation,
+    model: &str,
+) -> String {
+    if converter.eq_ignore_ascii_case("anthropic") {
+        return match operation {
+            UpstreamOperation::Messages => build_anthropic_messages_endpoint(target_url),
+            UpstreamOperation::CountTokens => build_anthropic_count_tokens_endpoint(target_url),
+        };
+    }
+
+    if converter.eq_ignore_ascii_case("gemini") {
+        return match operation {
+            UpstreamOperation::Messages => build_gemini_messages_endpoint(target_url, model),
+            UpstreamOperation::CountTokens => build_gemini_count_tokens_endpoint(target_url, model),
+        };
+    }
+
+    match operation {
+        UpstreamOperation::Messages => build_codex_messages_endpoint(target_url),
+        UpstreamOperation::CountTokens => build_codex_input_tokens_endpoint(target_url),
+    }
+}
+
+fn resolve_route_selection(
+    request_id: &str,
+    input_model: &str,
+    input_slot: ModelSlot,
+    target_url: &str,
+    final_api_key: &str,
+    ctx: &TransformContext,
+    load_balancer_runtime: Option<&LoadBalancerRuntime>,
+    log_tx: &broadcast::Sender<String>,
+) -> Result<RouteSelection, Response<BoxBody<Bytes, Infallible>>> {
+    let mut resolved_target_url = target_url.to_string();
+    let mut resolved_api_key = final_api_key.to_string();
+    let mut request_converter = ctx.converter.clone();
+    let mut selected_lb_route: Option<ResolvedEndpoint> = None;
+    let mut lb_permit: Option<EndpointPermit> = None;
+    let mut request_reasoning_effort_override: Option<ReasoningEffort> = None;
+
+    let mut model_name = resolve_model_for_converter(
+        &request_converter,
+        input_model,
+        &ctx.reasoning_mapping,
+        &ctx.codex_model_mapping,
+        &ctx.anthropic_model_mapping,
+        &ctx.gemini_reasoning_effort,
+    );
+
+    if let Some(runtime) = load_balancer_runtime {
+        if let Some((resolved, permit)) = runtime.resolve_and_acquire(input_model) {
+            resolved_target_url = resolved.target_url.clone();
+            if let Some(key) = resolved.api_key.clone() {
+                resolved_api_key = key;
+            }
+
+            request_converter = resolved.converter.clone();
+            if let Some(overridden_model) = resolved.model.clone() {
+                model_name = overridden_model;
+            } else {
+                model_name = resolve_model_for_converter(
+                    &request_converter,
+                    input_model,
+                    &ctx.reasoning_mapping,
+                    &ctx.codex_model_mapping,
+                    &ctx.anthropic_model_mapping,
+                    &ctx.gemini_reasoning_effort,
+                );
+            }
+
+            if let Some(custom_effort) = resolved.reasoning_effort.clone() {
+                request_reasoning_effort_override = Some(ReasoningEffort::from_str(&custom_effort));
+            }
+
+            selected_lb_route = Some(resolved);
+            lb_permit = Some(permit);
+        } else {
+            let _ = log_tx.send(format!(
+                "[Warn] #{} lb_unavailable slot={} model={} reason=no_available_candidate",
+                request_id,
+                input_slot.as_str(),
+                input_model,
+            ));
+
+            return Err(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Content-Type", "application/json")
+                .body(full_body(
+                    json!({
+                        "error": {
+                            "type": "service_unavailable",
+                            "message": format!(
+                                "No available upstream route in slot '{}' for model '{}'",
+                                input_slot.as_str(),
+                                input_model
+                            )
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap());
+        }
+    }
+
+    Ok(RouteSelection {
+        target_url: resolved_target_url,
+        api_key: resolved_api_key,
+        converter: request_converter,
+        model_name,
+        route: selected_lb_route,
+        route_permit: lb_permit,
+        reasoning_effort_override: request_reasoning_effort_override,
+    })
 }
 
 fn parse_input_tokens(value: &Value) -> Option<u64> {
@@ -1246,82 +1424,17 @@ async fn handle_request(
         }
     }
 
-    let input_model = anthropic_body.model.as_deref().unwrap_or("claude-3-5-sonnet-20240620");
+    let input_model = anthropic_body
+        .model
+        .as_deref()
+        .unwrap_or("claude-3-5-sonnet-20240620");
     let input_slot = ModelSlot::from_model_name(input_model);
-    let mut resolved_target_url = target_url.clone();
-    let mut resolved_api_key = final_api_key.clone();
-    let mut request_converter = ctx.converter.clone();
-    let mut selected_lb_route: Option<ResolvedEndpoint> = None;
-    let mut _lb_permit: Option<EndpointPermit> = None;
-    let mut request_reasoning_effort_override: Option<ReasoningEffort> = None;
 
-    let mut model_name = resolve_model_for_converter(
-        &request_converter,
-        input_model,
-        &ctx.reasoning_mapping,
-        &ctx.codex_model_mapping,
-        &ctx.anthropic_model_mapping,
-        &ctx.gemini_reasoning_effort,
-    );
-
-    if let Some(runtime) = load_balancer_runtime.as_ref() {
-        if let Some((resolved, permit)) = runtime.resolve_and_acquire(input_model) {
-            selected_lb_route = Some(resolved.clone());
-            resolved_target_url = resolved.target_url;
-            if let Some(key) = resolved.api_key {
-                resolved_api_key = key;
-            }
-            request_converter = resolved.converter;
-            if let Some(overridden_model) = resolved.model {
-                model_name = overridden_model;
-            } else {
-                model_name = resolve_model_for_converter(
-                    &request_converter,
-                    input_model,
-                    &ctx.reasoning_mapping,
-                    &ctx.codex_model_mapping,
-                    &ctx.anthropic_model_mapping,
-                    &ctx.gemini_reasoning_effort,
-                );
-            }
-            if let Some(custom_effort) = resolved.reasoning_effort {
-                request_reasoning_effort_override = Some(ReasoningEffort::from_str(&custom_effort));
-            }
-            _lb_permit = Some(permit);
-        } else {
-            let _ = log_tx.send(format!(
-                "[Warn] #{} lb_unavailable slot={} model={} reason=no_available_candidate",
-                request_id,
-                input_slot.as_str(),
-                input_model,
-            ));
-
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Content-Type", "application/json")
-                .body(full_body(
-                    json!({
-                        "error": {
-                            "type": "service_unavailable",
-                            "message": format!(
-                                "No available upstream route in slot '{}' for model '{}'",
-                                input_slot.as_str(),
-                                input_model
-                            )
-                        }
-                    })
-                    .to_string(),
-                ))
-                .unwrap());
+    // count_tokens 请求不计入统计
+    if !is_count_tokens {
+        if let Some(family) = detect_model_family(input_model) {
+            let _ = log_tx.send(format!("[Stat] model_request:{}", family));
         }
-    }
-
-    if request_converter.eq_ignore_ascii_case("anthropic") {
-        resolved_target_url = build_anthropic_messages_endpoint(&resolved_target_url);
-    }
-
-    if let Some(family) = detect_model_family(input_model) {
-        let _ = log_tx.send(format!("[Stat] model_request:{}", family));
     }
 
     let display_summary = summarize_request_messages(&anthropic_body.messages);
@@ -1332,81 +1445,74 @@ async fn handle_request(
         .map(|system| system.to_string().chars().count())
         .unwrap_or(0);
 
-    let _ = log_tx.send(format!(
-        "[Req] #{} in={} out={} msgs={} stream={} tools={} system_chars={} summary={}",
-        request_id,
-        input_model,
-        model_name,
-        anthropic_body.messages.len(),
-        anthropic_body.stream,
-        tool_count,
-        system_chars,
-        display_summary,
-    ));
-
-    let route_mode = if selected_lb_route.is_some() { "lb" } else { "single" };
-    let route_slot = selected_lb_route
-        .as_ref()
-        .map(|route| route.slot.as_str())
-        .unwrap_or(input_slot.as_str());
-    let route_endpoint = selected_lb_route
-        .as_ref()
-        .map(|route| route.endpoint_id.as_str())
-        .unwrap_or("single");
-    let route_key = selected_lb_route
-        .as_ref()
-        .map(|route| route.route_key.as_str())
-        .unwrap_or("-");
-    let route_effort = if request_converter.eq_ignore_ascii_case("codex") {
-        request_reasoning_effort_override
-            .map(|effort| effort.as_str().to_string())
-            .unwrap_or_else(|| {
-                crate::models::get_reasoning_effort(input_model, &ctx.reasoning_mapping)
-                    .as_str()
-                    .to_string()
-            })
-    } else {
-        "-".to_string()
-    };
-
-    let _ = log_tx.send(format!(
-        "[Route] #{} mode={} slot={} endpoint={} base={} converter={} model={} effort={}",
-        request_id,
-        route_mode,
-        route_slot,
-        route_endpoint,
-        resolved_target_url,
-        request_converter,
-        model_name,
-        route_effort,
-    ));
-
     if is_count_tokens {
+        let route_selection = match resolve_route_selection(
+            &request_id,
+            input_model,
+            input_slot,
+            &target_url,
+            &final_api_key,
+            &ctx,
+            load_balancer_runtime.as_ref(),
+            &log_tx,
+        ) {
+            Ok(selection) => selection,
+            Err(response) => return Ok(response),
+        };
+
+        let route_mode = if route_selection.route.is_some() {
+            "lb"
+        } else {
+            "single"
+        };
+        let route_slot = route_selection
+            .route
+            .as_ref()
+            .map(|route| route.slot.as_str())
+            .unwrap_or(input_slot.as_str());
+        let route_endpoint = route_selection
+            .route
+            .as_ref()
+            .map(|route| route.endpoint_id.as_str())
+            .unwrap_or("single");
+        let route_key = route_selection
+            .route
+            .as_ref()
+            .map(|route| route.route_key.as_str())
+            .unwrap_or("-");
+
         let _ = log_tx.send(format!(
             "[Req] #{} mode=count_tokens converter={} in={} out={}",
             request_id,
-            request_converter,
+            route_selection.converter,
             input_model,
-            model_name,
+            route_selection.model_name,
         ));
 
-        let request_backend = build_backend_by_converter(&request_converter);
-
+        let request_backend = build_backend_by_converter(&route_selection.converter);
         let mut token_count: Option<u64> = None;
         let mut upstream_status: Option<u16> = None;
         let mut source = "estimate".to_string();
+        let count_tokens_endpoint = resolve_upstream_url(
+            &route_selection.converter,
+            &route_selection.target_url,
+            UpstreamOperation::CountTokens,
+            &route_selection.model_name,
+        );
 
-        if request_converter.eq_ignore_ascii_case("gemini") {
-            let endpoint = build_gemini_count_tokens_endpoint(&resolved_target_url, &model_name);
-            let (messages, _) = crate::transform::MessageProcessor::transform_messages(&anthropic_body.messages, Some(&log_tx));
+        if route_selection.converter.eq_ignore_ascii_case("gemini") {
+            let (messages, _) = crate::transform::MessageProcessor::transform_messages(
+                &anthropic_body.messages,
+                Some(&log_tx),
+            );
             let contents = GeminiBackend::build_contents_for_count(&messages);
             let body = json!({ "contents": contents });
 
             let response = http_client
-                .post(endpoint)
+                .post(&count_tokens_endpoint)
                 .header("Content-Type", "application/json")
-                .header("x-goog-api-key", &resolved_api_key)
-                .header("Authorization", format!("Bearer {}", &resolved_api_key))
+                .header("x-goog-api-key", &route_selection.api_key)
+                .header("Authorization", format!("Bearer {}", &route_selection.api_key))
                 .body(body.to_string())
                 .send()
                 .await;
@@ -1416,30 +1522,29 @@ async fn handle_request(
                 if resp.status().is_success() {
                     if let Ok(text) = resp.text().await {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        token_count = value
-                            .get("totalTokens")
-                            .and_then(|v| v.as_u64())
-                            .or_else(|| value.get("total_tokens").and_then(|v| v.as_u64()));
-                        if token_count.is_some() {
-                            source = "gemini_countTokens".to_string();
-                        }
+                            token_count = value
+                                .get("totalTokens")
+                                .and_then(|v| v.as_u64())
+                                .or_else(|| value.get("total_tokens").and_then(|v| v.as_u64()));
+                            if token_count.is_some() {
+                                source = "gemini_countTokens".to_string();
+                            }
                         }
                     }
                 }
             }
-        } else if request_converter.eq_ignore_ascii_case("anthropic") {
-            let endpoint = build_anthropic_count_tokens_endpoint(&resolved_target_url);
+        } else if route_selection.converter.eq_ignore_ascii_case("anthropic") {
             let mut request_body = raw_request_body.clone();
             if let Some(obj) = request_body.as_object_mut() {
                 obj.remove("stream");
-                obj.insert("model".to_string(), json!(model_name.clone()));
+                obj.insert("model".to_string(), json!(route_selection.model_name.clone()));
             }
 
             let response = http_client
-                .post(endpoint)
+                .post(&count_tokens_endpoint)
                 .header("Content-Type", "application/json")
-                .header("x-api-key", &resolved_api_key)
-                .header("Authorization", format!("Bearer {}", &resolved_api_key))
+                .header("x-api-key", &route_selection.api_key)
+                .header("Authorization", format!("Bearer {}", &route_selection.api_key))
                 .header("x-anthropic-version", &anthropic_version)
                 .body(request_body.to_string());
 
@@ -1463,22 +1568,21 @@ async fn handle_request(
                 }
             }
         } else {
-            let endpoint = build_codex_input_tokens_endpoint(&resolved_target_url);
             let (codex_body, _) = transform_request_with_optional_codex_effort_override(
-                &request_converter,
+                &route_selection.converter,
                 &request_backend,
                 &anthropic_body,
                 &log_tx,
                 &ctx,
-                &model_name,
-                request_reasoning_effort_override,
+                &route_selection.model_name,
+                route_selection.reasoning_effort_override,
             );
 
             let response = http_client
-                .post(endpoint)
+                .post(&count_tokens_endpoint)
                 .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", &resolved_api_key))
-                .header("x-api-key", &resolved_api_key)
+                .header("Authorization", format!("Bearer {}", &route_selection.api_key))
+                .header("x-api-key", &route_selection.api_key)
                 .header("x-anthropic-version", &anthropic_version)
                 .header("originator", "codex_cli_rs")
                 .body(codex_body.to_string());
@@ -1504,6 +1608,17 @@ async fn handle_request(
             }
         }
 
+        if let Some(route) = route_selection.route.as_ref() {
+            if let Some(runtime) = load_balancer_runtime.as_ref() {
+                runtime.handle_upstream_outcome(
+                    route,
+                    upstream_status,
+                    upstream_status.is_none(),
+                    None,
+                );
+            }
+        }
+
         let input_tokens = if let Some(tokens) = token_count {
             tokens
         } else if allow_count_tokens_fallback_estimate {
@@ -1511,8 +1626,12 @@ async fn handle_request(
             estimate_input_tokens(&anthropic_body)
         } else {
             let _ = log_tx.send(format!(
-                "[Tokens] #{} failed upstream_status={} fallback=disabled",
+                "[Tokens] #{} failed mode={} slot={} endpoint={} route_key={} upstream_status={} fallback=disabled",
                 request_id,
+                route_mode,
+                route_slot,
+                route_endpoint,
+                route_key,
                 upstream_status
                     .map(|status| status.to_string())
                     .unwrap_or_else(|| "-".to_string()),
@@ -1535,10 +1654,14 @@ async fn handle_request(
         };
 
         let _ = log_tx.send(format!(
-            "[Tokens] #{} input_tokens={} source={} upstream_status={}",
+            "[Tokens] #{} input_tokens={} source={} mode={} slot={} endpoint={} route_key={} upstream_status={}",
             request_id,
             input_tokens,
             source,
+            route_mode,
+            route_slot,
+            route_endpoint,
+            route_key,
             upstream_status
                 .map(|status| status.to_string())
                 .unwrap_or_else(|| "-".to_string())
@@ -1552,126 +1675,296 @@ async fn handle_request(
             .unwrap());
     }
 
-    if let Some(remaining_secs) = get_active_cooldown_seconds(&model_cooldowns, &model_name) {
-        let _ = log_tx.send(format!(
-            "[RateLimit] #{} local_cooldown model={} retry_after={}s in={} out={} msgs={} summary={}",
-            request_id,
-            model_name,
-            remaining_secs,
-            input_model,
-            model_name,
-            anthropic_body.messages.len(),
-            display_summary,
-        ));
+    let max_lb_attempts = load_balancer_runtime
+        .as_ref()
+        .map(|runtime| runtime.candidate_count_for_model(input_model).max(1))
+        .unwrap_or(1);
 
-        let payload = json!({
-            "error": {
-                "type": "rate_limit_error",
-                "source": "local_cooldown",
-                "model": model_name,
-                "retry_after": remaining_secs,
-                "message": format!("Model is cooling down, retry after {}s", remaining_secs)
-            }
-        });
-
-        return Ok(Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .header("Content-Type", "application/json")
-            .header("Retry-After", remaining_secs.to_string())
-            .body(full_body(payload.to_string()))
-            .unwrap());
-    }
-
-    let request_backend = build_backend_by_converter(&request_converter);
-
-    // anthropic 透传保留原始 JSON，仅按映射覆盖 model；其余 converter 走既有转换器。
-    let (upstream_body, session_id) = if request_converter.eq_ignore_ascii_case("anthropic") {
-        let mut request_body = raw_request_body.clone();
-        if let Some(obj) = request_body.as_object_mut() {
-            obj.insert("model".to_string(), json!(model_name.clone()));
-        }
-        (request_body, Uuid::new_v4().to_string())
-    } else {
-        transform_request_with_optional_codex_effort_override(
-            &request_converter,
-            &request_backend,
-            &anthropic_body,
-            &log_tx,
-            &ctx,
-            &model_name,
-            request_reasoning_effort_override,
-        )
-    };
-
-    if let Some(input_summary) = summarize_codex_payload(&upstream_body) {
-        let top_keys = sorted_object_keys(&upstream_body).join(",");
-        let input_items = upstream_body
-            .get("input")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.len())
-            .unwrap_or(0);
-        let _ = log_tx.send(format!(
-            "[ReqPayload] #{} keys={} input_items={} summary={}",
-            request_id,
-            top_keys,
-            input_items,
-            tail_chars(&input_summary, 320),
-        ));
-    }
-    let model = model_name;
-
-    // 获取全局日志记录器
     let logger = AppLogger::get();
-
-    // 记录原始 Anthropic 请求到日志文件
     if let Some(ref l) = logger {
         l.log_anthropic_request(&body_bytes);
     }
 
-    // 记录上游请求（curl 格式）
-    if let Some(ref l) = logger {
-        let headers = vec![
-            ("Content-Type", "application/json"),
-            ("Authorization", "Bearer <API_KEY>"),
-            ("User-Agent", "Anthropic-Node/0.3.4"),
-            ("x-anthropic-version", &anthropic_version),
-            ("Accept", "text/event-stream"),
-            ("session_id", &session_id),
-        ];
-        l.log_curl_request(
-            "POST",
-            &resolved_target_url,
-            &headers,
-            &upstream_body,
-            backend_label_by_converter(&request_converter),
+    let mut attempt_index = 0usize;
+    let mut successful_response: Option<reqwest::Response> = None;
+    let mut successful_backend: Option<Arc<dyn TransformBackend>> = None;
+    let mut successful_model = String::new();
+    let mut successful_converter = String::new();
+    let mut successful_upstream_status: Option<u16> = None;
+    let mut successful_lb_permit: Option<EndpointPermit> = None;
+
+    while attempt_index < max_lb_attempts {
+        attempt_index += 1;
+        let _ = log_tx.send(format!(
+            "[LB] #{} request_attempt={}/{} slot={}",
+            request_id,
+            attempt_index,
+            max_lb_attempts,
+            input_slot.as_str(),
+        ));
+
+        let mut route_selection = match resolve_route_selection(
+            &request_id,
+            input_model,
+            input_slot,
+            &target_url,
+            &final_api_key,
+            &ctx,
+            load_balancer_runtime.as_ref(),
+            &log_tx,
+        ) {
+            Ok(selection) => selection,
+            Err(response) => return Ok(response),
+        };
+
+        let route_mode = if route_selection.route.is_some() {
+            "lb"
+        } else {
+            "single"
+        };
+        let route_slot = route_selection
+            .route
+            .as_ref()
+            .map(|route| route.slot.as_str())
+            .unwrap_or(input_slot.as_str());
+        let route_endpoint = route_selection
+            .route
+            .as_ref()
+            .map(|route| route.endpoint_id.as_str())
+            .unwrap_or("single");
+        let route_key = route_selection
+            .route
+            .as_ref()
+            .map(|route| route.route_key.as_str())
+            .unwrap_or("-");
+        let route_effort = if route_selection.converter.eq_ignore_ascii_case("codex") {
+            route_selection
+                .reasoning_effort_override
+                .map(|effort| effort.as_str().to_string())
+                .unwrap_or_else(|| {
+                    crate::models::get_reasoning_effort(input_model, &ctx.reasoning_mapping)
+                        .as_str()
+                        .to_string()
+                })
+        } else {
+            "-".to_string()
+        };
+
+        let resolved_target_url = resolve_upstream_url(
+            &route_selection.converter,
+            &route_selection.target_url,
+            UpstreamOperation::Messages,
+            &route_selection.model_name,
         );
-    }
 
-    // 通过 trait 构建上游请求
-    let upstream_req = request_backend.build_upstream_request(
-        &http_client,
-        &resolved_target_url,
-        &resolved_api_key,
-        &upstream_body,
-        &session_id,
-        &anthropic_version,
-    );
+        let _ = log_tx.send(format!(
+            "[Req] #{} in={} out={} msgs={} stream={} tools={} system_chars={} summary={}",
+            request_id,
+            input_model,
+            route_selection.model_name,
+            anthropic_body.messages.len(),
+            anthropic_body.stream,
+            tool_count,
+            system_chars,
+            display_summary,
+        ));
 
-    let upstream_req = if let Some(beta) = &anthropic_beta {
-        upstream_req.header("anthropic-beta", beta)
-    } else {
-        upstream_req
-    };
+        let _ = log_tx.send(format!(
+            "[Route] #{} mode={} slot={} endpoint={} base={} converter={} model={} effort={}",
+            request_id,
+            route_mode,
+            route_slot,
+            route_endpoint,
+            resolved_target_url,
+            route_selection.converter,
+            route_selection.model_name,
+            route_effort,
+        ));
 
-    // 发送到目标服务器
-    let response = match upstream_req.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), selected_lb_route.as_ref()) {
-                runtime.handle_upstream_outcome(route, None, true, None);
-            }
+        if let Some(remaining_secs) =
+            get_active_cooldown_seconds(&model_cooldowns, &route_selection.model_name)
+        {
             let _ = log_tx.send(format!(
-                "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={}",
+                "[RateLimit] #{} local_cooldown model={} retry_after={}s in={} out={} msgs={} summary={}",
+                request_id,
+                route_selection.model_name,
+                remaining_secs,
+                input_model,
+                route_selection.model_name,
+                anthropic_body.messages.len(),
+                display_summary,
+            ));
+
+            if let (Some(runtime), Some(route)) =
+                (load_balancer_runtime.as_ref(), route_selection.route.as_ref())
+            {
+                runtime.mark_unavailable(route, "local_cooldown");
+            }
+
+            if load_balancer_runtime.is_some() && attempt_index < max_lb_attempts {
+                let _ = log_tx.send(format!(
+                    "[LB] #{} failover continue reason=local_cooldown from_route={}",
+                    request_id, route_key
+                ));
+                continue;
+            }
+
+            let payload = json!({
+                "error": {
+                    "type": "rate_limit_error",
+                    "source": "local_cooldown",
+                    "model": route_selection.model_name,
+                    "retry_after": remaining_secs,
+                    "message": format!("Model is cooling down, retry after {}s", remaining_secs)
+                }
+            });
+
+            return Ok(Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("Content-Type", "application/json")
+                .header("Retry-After", remaining_secs.to_string())
+                .body(full_body(payload.to_string()))
+                .unwrap());
+        }
+
+        let request_backend = build_backend_by_converter(&route_selection.converter);
+        let (upstream_body, session_id) = if route_selection.converter.eq_ignore_ascii_case("anthropic")
+        {
+            let mut request_body = raw_request_body.clone();
+            if let Some(obj) = request_body.as_object_mut() {
+                obj.insert("model".to_string(), json!(route_selection.model_name.clone()));
+            }
+            (request_body, Uuid::new_v4().to_string())
+        } else {
+            transform_request_with_optional_codex_effort_override(
+                &route_selection.converter,
+                &request_backend,
+                &anthropic_body,
+                &log_tx,
+                &ctx,
+                &route_selection.model_name,
+                route_selection.reasoning_effort_override,
+            )
+        };
+
+        if let Some(input_summary) = summarize_codex_payload(&upstream_body) {
+            let top_keys = sorted_object_keys(&upstream_body).join(",");
+            let input_items = upstream_body
+                .get("input")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len())
+                .unwrap_or(0);
+            let _ = log_tx.send(format!(
+                "[ReqPayload] #{} keys={} input_items={} summary={}",
+                request_id,
+                top_keys,
+                input_items,
+                tail_chars(&input_summary, 320),
+            ));
+        }
+
+        if let Some(ref l) = logger {
+            let headers = vec![
+                ("Content-Type", "application/json"),
+                ("Authorization", "Bearer <API_KEY>"),
+                ("User-Agent", "Anthropic-Node/0.3.4"),
+                ("x-anthropic-version", &anthropic_version),
+                ("Accept", "text/event-stream"),
+                ("session_id", &session_id),
+            ];
+            l.log_curl_request(
+                "POST",
+                &resolved_target_url,
+                &headers,
+                &upstream_body,
+                backend_label_by_converter(&route_selection.converter),
+            );
+        }
+
+        let upstream_req = request_backend.build_upstream_request(
+            &http_client,
+            &resolved_target_url,
+            &route_selection.api_key,
+            &upstream_body,
+            &session_id,
+            &anthropic_version,
+        );
+
+        let upstream_req = if let Some(beta) = &anthropic_beta {
+            upstream_req.header("anthropic-beta", beta)
+        } else {
+            upstream_req
+        };
+
+        let response = match upstream_req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let action = if let (Some(runtime), Some(route)) =
+                    (load_balancer_runtime.as_ref(), route_selection.route.as_ref())
+                {
+                    runtime.handle_upstream_outcome(route, None, true, None)
+                } else {
+                    UpstreamOutcomeAction::ReturnToClient
+                };
+
+                let _ = log_tx.send(format!(
+                    "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={}",
+                    request_id,
+                    path,
+                    target_url,
+                    resolved_target_url,
+                    route_mode,
+                    route_slot,
+                    route_endpoint,
+                    route_key,
+                    route_selection.converter,
+                    input_model,
+                    route_selection.model_name,
+                    route_effort,
+                ));
+                let _ = log_tx.send(format!("[Error] Request failed: {}", e));
+
+                if action == UpstreamOutcomeAction::RetryNextCandidate
+                    && load_balancer_runtime.is_some()
+                    && attempt_index < max_lb_attempts
+                {
+                    let _ = log_tx.send(format!(
+                        "[LB] #{} failover continue reason=network_error from_route={}",
+                        request_id, route_key
+                    ));
+                    continue;
+                }
+
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header("Content-Type", "application/json")
+                    .body(full_body(
+                        json!({"error": {"message": format!("Upstream error: {}", e)}}).to_string(),
+                    ))
+                    .unwrap());
+            }
+        };
+
+        if !response.status().is_success() {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string();
+            let status = response.status().as_u16();
+            let error_text = response.text().await.unwrap_or_default();
+
+            let action = if let (Some(runtime), Some(route)) =
+                (load_balancer_runtime.as_ref(), route_selection.route.as_ref())
+            {
+                runtime.handle_upstream_outcome(route, Some(status), false, Some(&error_text))
+            } else {
+                UpstreamOutcomeAction::ReturnToClient
+            };
+
+            let _ = log_tx.send(format!(
+                "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={} status={} retry_after={}",
                 request_id,
                 path,
                 target_url,
@@ -1680,91 +1973,83 @@ async fn handle_request(
                 route_slot,
                 route_endpoint,
                 route_key,
-                request_converter,
+                route_selection.converter,
                 input_model,
-                model,
+                route_selection.model_name,
                 route_effort,
+                status,
+                retry_after,
             ));
-            let _ = log_tx.send(format!("[Error] Request failed: {}", e));
+
+            if let Some((cooldown_model, cooldown_secs, reason)) =
+                extract_cooldown_info(status, &error_text, &retry_after, &route_selection.model_name)
+            {
+                set_model_cooldown(&model_cooldowns, &cooldown_model, cooldown_secs);
+                let _ = log_tx.send(format!(
+                    "[RateLimit] #{} upstream=429 reason={} model={} retry_after={}s in={} out={} msgs={} summary={}",
+                    request_id,
+                    reason,
+                    cooldown_model,
+                    cooldown_secs,
+                    input_model,
+                    route_selection.model_name,
+                    anthropic_body.messages.len(),
+                    display_summary,
+                ));
+            }
+
+            let _ = log_tx.send(format!(
+                "[Error] #{} Upstream returned {}: {}",
+                request_id, status, error_text
+            ));
+
+            if let Some(ref l) = logger {
+                l.log_upstream_response(status, &error_text);
+            }
+
+            if action == UpstreamOutcomeAction::RetryNextCandidate
+                && load_balancer_runtime.is_some()
+                && attempt_index < max_lb_attempts
+            {
+                let _ = log_tx.send(format!(
+                    "[LB] #{} failover continue reason=upstream_status_{} from_route={}",
+                    request_id, status, route_key
+                ));
+                continue;
+            }
+
             return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
                 .header("Content-Type", "application/json")
-                .body(full_body(
-                    json!({"error": {"message": format!("Upstream error: {}", e)}}).to_string(),
-                ))
+                .body(full_body(error_text))
                 .unwrap());
         }
-    };
 
-    if !response.status().is_success() {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .to_string();
-        let status = response.status().as_u16();
-        let error_text = response.text().await.unwrap_or_default();
-
-        if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), selected_lb_route.as_ref()) {
-            runtime.handle_upstream_outcome(route, Some(status), false, Some(&error_text));
-        }
-        let _ = log_tx.send(format!(
-            "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={} status={} retry_after={}",
-            request_id,
-            path,
-            target_url,
-            resolved_target_url,
-            route_mode,
-            route_slot,
-            route_endpoint,
-            route_key,
-            request_converter,
-            input_model,
-            model,
-            route_effort,
-            status,
-            retry_after,
-        ));
-
-        if let Some((cooldown_model, cooldown_secs, reason)) = extract_cooldown_info(status, &error_text, &retry_after, &model) {
-            set_model_cooldown(&model_cooldowns, &cooldown_model, cooldown_secs);
-            let _ = log_tx.send(format!(
-                "[RateLimit] #{} upstream=429 reason={} model={} retry_after={}s in={} out={} msgs={} summary={}",
-                request_id,
-                reason,
-                cooldown_model,
-                cooldown_secs,
-                input_model,
-                model,
-                anthropic_body.messages.len(),
-                display_summary,
-            ));
+        let upstream_status = response.status().as_u16();
+        if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), route_selection.route.as_ref()) {
+            runtime.handle_upstream_outcome(route, Some(upstream_status), false, None);
         }
 
-        let _ = log_tx.send(format!("[Error] #{} Upstream returned {}: {}", request_id, status, error_text));
-
-        // 记录错误响应到日志文件
-        if let Some(ref l) = logger {
-            l.log_upstream_response(status, &error_text);
-        }
-
-        return Ok(Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
-            .header("Content-Type", "application/json")
-            .body(full_body(error_text))
-            .unwrap());
+        successful_response = Some(response);
+        successful_backend = Some(request_backend);
+        successful_model = route_selection.model_name.clone();
+        successful_converter = route_selection.converter.clone();
+        successful_upstream_status = Some(upstream_status);
+        successful_lb_permit = route_selection.route_permit.take();
+        break;
     }
+
+    let response = successful_response.expect("upstream response must exist after successful loop");
+    let request_backend = successful_backend.expect("backend must exist after successful loop");
+    let model = successful_model;
+    let request_converter = successful_converter;
+    let upstream_status = successful_upstream_status.expect("upstream status must exist after successful loop");
+    let _lb_permit = successful_lb_permit;
 
     let _ = log_tx.send(format!(
         "[System] #{} Request transformed and forwarding to upstream API",
         request_id,
     ));
-
-    let upstream_status = response.status().as_u16();
-    if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), selected_lb_route.as_ref()) {
-        runtime.handle_upstream_outcome(route, Some(upstream_status), false, None);
-    }
 
     if request_converter.eq_ignore_ascii_case("anthropic") && !anthropic_body.stream {
         let content_type = response
@@ -2055,4 +2340,58 @@ async fn handle_request(
 
 fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
     BoxBody::new(Full::new(Bytes::from(s)).map_err(|_: Infallible| unreachable!()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resolve_upstream_url, UpstreamOperation,
+    };
+
+    #[test]
+    fn test_resolve_upstream_url_codex_messages_appends_responses() {
+        let url = resolve_upstream_url(
+            "codex",
+            "https://codex.funai.vip/openai",
+            UpstreamOperation::Messages,
+            "gpt-5.3-codex",
+        );
+        assert_eq!(url, "https://codex.funai.vip/openai/responses");
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_codex_count_tokens() {
+        let url = resolve_upstream_url(
+            "codex",
+            "https://codex.funai.vip/openai",
+            UpstreamOperation::CountTokens,
+            "gpt-5.3-codex",
+        );
+        assert_eq!(url, "https://codex.funai.vip/openai/responses/input_tokens");
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_anthropic_messages_from_responses_base() {
+        let url = resolve_upstream_url(
+            "anthropic",
+            "https://codex.funai.vip/openai/responses",
+            UpstreamOperation::Messages,
+            "claude-opus-4-6",
+        );
+        assert_eq!(url, "https://codex.funai.vip/openai/messages");
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_gemini_messages_from_base() {
+        let url = resolve_upstream_url(
+            "gemini",
+            "http://localhost:8317",
+            UpstreamOperation::Messages,
+            "gemini-3-flash-preview",
+        );
+        assert_eq!(
+            url,
+            "http://localhost:8317/v1beta/models/gemini-3-flash-preview:streamGenerateContent?alt=sse"
+        );
+    }
 }

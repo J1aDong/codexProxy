@@ -209,6 +209,12 @@ enum AcquireRejectReason {
     EndpointBusy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamOutcomeAction {
+    ReturnToClient,
+    RetryNextCandidate,
+}
+
 impl LoadBalancerRuntime {
     pub fn new(
         config: LoadBalancerConfig,
@@ -509,7 +515,7 @@ impl LoadBalancerRuntime {
         status: Option<u16>,
         network_error: bool,
         error_text: Option<&str>,
-    ) {
+    ) -> UpstreamOutcomeAction {
         let policy = self
             .config
             .endpoint_policies
@@ -519,22 +525,22 @@ impl LoadBalancerRuntime {
 
         if network_error {
             self.record_result(resolved, status, true);
-            return;
+            return UpstreamOutcomeAction::RetryNextCandidate;
         }
 
         let Some(code) = status else {
-            return;
+            return UpstreamOutcomeAction::ReturnToClient;
         };
 
         if (200..=299).contains(&code) {
             self.record_result(resolved, Some(code), false);
-            return;
+            return UpstreamOutcomeAction::ReturnToClient;
         }
 
         let detail = error_text.unwrap_or("");
         if let Some(reason) = Self::classify_unavailable_reason(code, detail) {
             self.mark_unavailable(resolved, reason);
-            return;
+            return UpstreamOutcomeAction::RetryNextCandidate;
         }
 
         if Self::is_transient_overload(code, detail) {
@@ -550,10 +556,15 @@ impl LoadBalancerRuntime {
                 code,
                 backoff_secs,
             ));
-            return;
+            return UpstreamOutcomeAction::RetryNextCandidate;
         }
 
         self.record_result(resolved, Some(code), false);
+        if Self::is_retryable_error(code) {
+            UpstreamOutcomeAction::RetryNextCandidate
+        } else {
+            UpstreamOutcomeAction::ReturnToClient
+        }
     }
 
     pub fn mark_unavailable(&self, resolved: &ResolvedEndpoint, reason: &str) {
@@ -596,6 +607,13 @@ impl LoadBalancerRuntime {
         let selected_id = self.config.selected_profile_id.as_ref()?;
         let index = self.profile_index_by_id.get(selected_id)?;
         self.config.profiles.get(*index)
+    }
+
+    pub fn candidate_count_for_model(&self, model_name: &str) -> usize {
+        let slot = ModelSlot::from_model_name(model_name);
+        self.current_profile()
+            .map(|profile| profile.model_mapping.get(slot).len())
+            .unwrap_or(0)
     }
 
     fn try_acquire_endpoint_for_route(
@@ -721,6 +739,13 @@ impl LoadBalancerRuntime {
         }
 
         let lower = error_text.to_ascii_lowercase();
+        let has_route_not_found_signal = lower.contains("route ")
+            && lower.contains(" not found");
+
+        if status == 404 && has_route_not_found_signal {
+            return Some("route_not_found");
+        }
+
         let has_quota_signal = lower.contains("insufficient_quota")
             || lower.contains("quota exceeded")
             || lower.contains("out of credits")
@@ -754,6 +779,14 @@ impl LoadBalancerRuntime {
         }
 
         None
+    }
+
+    fn is_retryable_error(status: u16) -> bool {
+        status == 408
+            || status == 409
+            || status == 425
+            || status == 429
+            || (500..=599).contains(&status)
     }
 
     fn is_transient_overload(status: u16, error_text: &str) -> bool {
