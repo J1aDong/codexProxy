@@ -33,6 +33,8 @@ export default {
     lbEndpoint: 'Endpoint',
     lbConverter: 'Converter',
     lbModel: 'Model',
+    lbAddMenuHint: 'Select a configured single-model endpoint to add into this slot',
+    lbNoEndpointToAdd: 'No endpoint available',
     lbFollowGlobal: 'Follow Global Converter',
     lbCustomModelPlaceholder: 'Empty = passthrough client model',
     lbAnthropicModelTip: 'Anthropic: empty passes through, filled value overrides model name.',

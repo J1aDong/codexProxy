@@ -33,6 +33,8 @@ export default {
     lbEndpoint: '端点',
     lbConverter: '转换器',
     lbModel: '模型',
+    lbAddMenuHint: '选择一个单模型已配置端点加入当前槽位',
+    lbNoEndpointToAdd: '暂无可添加端点',
     lbFollowGlobal: '跟随全局转换器',
     lbCustomModelPlaceholder: '留空 = 透传客户端模型',
     lbAnthropicModelTip: 'Anthropic：留空透传，填写则强制替换为该模型名。',

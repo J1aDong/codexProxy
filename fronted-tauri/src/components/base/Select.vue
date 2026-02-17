@@ -32,13 +32,13 @@
       </button>
       <div
         v-if="isOpen"
-        class="absolute z-50 w-full mt-1 bg-white dark:bg-dark-secondary rounded-lg shadow-lg border border-gray-200 dark:border-dark-border max-h-60 overflow-y-auto"
+        class="absolute z-50 w-full mt-1 bg-white dark:bg-slate-800 rounded-lg shadow-lg border border-gray-200 dark:border-slate-600 max-h-60 overflow-y-auto"
         @click.outside="closeDropdown"
       >
         <div
           v-for="option in options"
           :key="option.value"
-          class="px-3 py-2.5 cursor-pointer hover:bg-gray-50 dark:hover:bg-dark-tertiary text-sm transition-colors duration-150 flex items-center justify-between group text-apple-text-primary dark:text-dark-text-primary"
+          class="px-3 py-2.5 cursor-pointer hover:bg-gray-50 dark:hover:bg-slate-700 text-sm transition-colors duration-150 flex items-center justify-between group text-apple-text-primary dark:text-dark-text-primary"
           :class="{ 'text-apple-blue bg-blue-50 dark:text-accent-blue dark:bg-accent-blue/10': selectedOption?.value === option.value }"
           @click="selectOption(option)"
         >

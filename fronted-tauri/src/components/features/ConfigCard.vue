@@ -349,14 +349,58 @@
                   </div>
                 </div>
 
-                <Button
-                  size="small"
-                  type="primary"
-                  :disabled="endpointOptionsForSelect.length === 0"
-                  @click="handleAddSlotCandidate(slot)"
-                >
-                  + {{ t('add') }}
-                </Button>
+                <div class="relative inline-block">
+                  <Button
+                    size="small"
+                    type="primary"
+                    :disabled="endpointOptionsForSelect.length === 0"
+                    @click="toggleAddMenu(slot)"
+                  >
+                    + {{ t('add') }}
+                  </Button>
+                  <div
+                    v-if="openAddMenuSlot === slot"
+                    class="absolute left-0 top-full mt-2 w-72 rounded-lg border shadow-lg z-50 overflow-hidden"
+                    :class="isDarkMode ? 'bg-slate-800 border-slate-600' : 'bg-white border-gray-200'"
+                    @click.outside="closeAddMenu"
+                  >
+                    <div
+                      class="px-3 py-2 text-xs border-b"
+                      :class="isDarkMode ? 'text-dark-text-secondary border-slate-600' : 'text-apple-text-secondary border-gray-200'"
+                    >
+                      {{ t('lbAddMenuHint') }}
+                    </div>
+                    <div v-if="form.endpointOptions.length > 0" class="max-h-[14rem] overflow-y-auto">
+                      <button
+                        v-for="endpoint in form.endpointOptions"
+                        :key="`add-${slot}-${endpoint.id}`"
+                        class="w-full px-3 py-2.5 text-left transition-colors"
+                        :class="isDarkMode ? 'hover:bg-slate-700' : 'hover:bg-gray-50'"
+                        @click="handleAddSlotCandidateFromEndpoint(slot, endpoint.id)"
+                      >
+                        <div
+                          class="text-sm font-medium truncate"
+                          :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+                        >
+                          {{ endpoint.alias }}
+                        </div>
+                        <div
+                          class="text-xs mt-0.5 truncate"
+                          :class="isDarkMode ? 'text-dark-text-secondary' : 'text-apple-text-secondary'"
+                        >
+                          {{ getEndpointAddSummary(slot, endpoint) }}
+                        </div>
+                      </button>
+                    </div>
+                    <div
+                      v-else
+                      class="px-3 py-2 text-xs"
+                      :class="isDarkMode ? 'text-dark-text-secondary' : 'text-apple-text-secondary'"
+                    >
+                      {{ t('lbNoEndpointToAdd') }}
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -427,6 +471,28 @@ interface EndpointOption {
   url: string
   apiKey: string
   converter?: ConverterType
+  codexModelMapping?: {
+    opus: string
+    sonnet: string
+    haiku: string
+  }
+  anthropicModelMapping?: {
+    opus: string
+    sonnet: string
+    haiku: string
+  }
+  reasoningEffort?: {
+    opus: string
+    sonnet: string
+    haiku: string
+  }
+  geminiReasoningEffort?: {
+    opus: string
+    sonnet: string
+    haiku: string
+  }
+  codexEffortCapabilityMap?: Record<string, string[]>
+  geminiModelPreset?: string[]
 }
 
 interface FormData {
@@ -501,6 +567,10 @@ watch(() => props.form.apiKey, (newVal) => {
   localApiKey.value = newVal
 })
 
+watch(() => props.form.loadBalancer.selectedLbProfileId, () => {
+  closeAddMenu()
+})
+
 const codexModelOptions = computed(() => [
   { value: 'gpt-5.3-codex', label: t('modelRecommended') },
   { value: 'gpt-5.2-codex', label: 'GPT-5.2-Codex' },
@@ -570,6 +640,7 @@ type ModelSlot = 'opus' | 'sonnet' | 'haiku'
 
 const lbModelSlots: ModelSlot[] = ['opus', 'sonnet', 'haiku']
 const expandedSlotCandidates = ref<Record<string, boolean>>({})
+const openAddMenuSlot = ref<ModelSlot | null>(null)
 
 const toLbConverter = (value: string): LbConverterType => {
   if (value === 'gemini' || value === 'anthropic') return value
@@ -733,6 +804,15 @@ const endpointOptionsForSelect = computed(() => (
   }))
 ))
 
+const closeAddMenu = () => {
+  openAddMenuSlot.value = null
+}
+
+const toggleAddMenu = (slot: ModelSlot) => {
+  if (endpointOptionsForSelect.value.length === 0) return
+  openAddMenuSlot.value = openAddMenuSlot.value === slot ? null : slot
+}
+
 const currentLbProfile = computed(() => {
   const selectedId = props.form.loadBalancer.selectedLbProfileId
   if (!selectedId) return null
@@ -829,7 +909,11 @@ const getDefaultModelForSlot = (slot: ModelSlot, converter: LbConverterType): st
   return ''
 }
 
-const getAllowedCodexEffortsByModel = (model: string): string[] => {
+const getAllowedCodexEffortsByModel = (
+  model: string,
+  capabilityMap?: Record<string, string[]>,
+): string[] => {
+  if (capabilityMap?.[model]) return capabilityMap[model]
   return props.form.codexEffortCapabilityMap[model] || ['medium', 'high']
 }
 
@@ -837,10 +921,11 @@ const normalizeCandidateByConverter = (
   slot: ModelSlot,
   candidate: LbSlotEndpointRef,
   converter: LbConverterType,
+  capabilityMap?: Record<string, string[]>,
 ): LbSlotEndpointRef => {
   if (converter === 'codex') {
     const nextModel = candidate.customModelName || getDefaultModelForSlot(slot, 'codex')
-    const allowed = getAllowedCodexEffortsByModel(nextModel)
+    const allowed = getAllowedCodexEffortsByModel(nextModel, capabilityMap)
     const slotFallback = props.form.reasoningEffort[slot]
     const nextEffort = candidate.customReasoningEffort && allowed.includes(candidate.customReasoningEffort)
       ? candidate.customReasoningEffort
@@ -870,21 +955,45 @@ const normalizeCandidateByConverter = (
   }
 }
 
-const handleAddSlotCandidate = (slot: ModelSlot) => {
-  const defaultEndpointId = props.form.endpointOptions[0]?.id
-  if (!defaultEndpointId) return
-
-  const defaultConverter = toLbConverter(props.form.converter)
-  const rawCandidate: LbSlotEndpointRef = {
-    endpointId: defaultEndpointId,
-    converterOverride: defaultConverter,
+const buildCandidateFromEndpointSnapshot = (
+  slot: ModelSlot,
+  endpoint: EndpointOption,
+): LbSlotEndpointRef => {
+  const converter = toLbConverter(endpoint.converter || props.form.converter)
+  const candidate: LbSlotEndpointRef = {
+    endpointId: endpoint.id,
+    converterOverride: converter,
   }
 
-  const candidate = normalizeCandidateByConverter(
-    slot,
-    rawCandidate,
-    defaultConverter,
-  )
+  if (converter === 'codex') {
+    const endpointModel = (endpoint.codexModelMapping?.[slot] || '').trim()
+    const formModel = (props.form.codexModelMapping[slot] || '').trim()
+    const fallbackModel = (codexModelOptions.value[0]?.value || 'gpt-5.3-codex').trim()
+    const endpointEffort = (endpoint.reasoningEffort?.[slot] || '').trim()
+    const formEffort = (props.form.reasoningEffort[slot] || '').trim()
+
+    candidate.customModelName = endpointModel || formModel || fallbackModel
+    candidate.customReasoningEffort = endpointEffort || formEffort || undefined
+  } else if (converter === 'gemini') {
+    const endpointModel = (endpoint.geminiReasoningEffort?.[slot] || '').trim()
+    const endpointPresetModel = endpoint.geminiModelPreset?.find((item) => item.trim())?.trim() || ''
+    const formModel = (props.form.geminiReasoningEffort[slot] || '').trim()
+    const formPresetModel = props.form.geminiModelPreset[0]?.trim() || ''
+
+    candidate.customModelName = endpointModel || endpointPresetModel || formModel || formPresetModel || undefined
+  } else {
+    const endpointModel = (endpoint.anthropicModelMapping?.[slot] || '').trim()
+    candidate.customModelName = endpointModel || undefined
+  }
+
+  return normalizeCandidateByConverter(slot, candidate, converter, endpoint.codexEffortCapabilityMap)
+}
+
+const handleAddSlotCandidateFromEndpoint = (slot: ModelSlot, endpointId: string) => {
+  const endpoint = props.form.endpointOptions.find((item) => item.id === endpointId)
+  if (!endpoint) return
+
+  const candidate = buildCandidateFromEndpointSnapshot(slot, endpoint)
 
   updateCurrentLbProfile((profile) => ({
     ...profile,
@@ -893,6 +1002,13 @@ const handleAddSlotCandidate = (slot: ModelSlot) => {
       [slot]: [...profile.modelMapping[slot], candidate],
     },
   }))
+
+  closeAddMenu()
+}
+
+const getEndpointAddSummary = (slot: ModelSlot, endpoint: EndpointOption): string => {
+  const candidate = buildCandidateFromEndpointSnapshot(slot, endpoint)
+  return getSlotCandidateSummary(slot, candidate)
 }
 
 const handleDeleteSlotCandidate = (slot: ModelSlot, idx: number) => {
