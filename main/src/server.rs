@@ -2,8 +2,13 @@ use crate::load_balancer::{
     EndpointPermit, LoadBalancerRuntime, ModelSlot, ResolvedEndpoint, UpstreamOutcomeAction,
 };
 use crate::logger::AppLogger;
-use crate::models::{AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock, GeminiReasoningEffortMapping, Message, MessageContent, ReasoningEffort, ReasoningEffortMapping};
-use crate::transform::{AnthropicBackend, CodexBackend, GeminiBackend, TransformBackend, TransformContext};
+use crate::models::{
+    AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
+    GeminiReasoningEffortMapping, Message, MessageContent, ReasoningEffort, ReasoningEffortMapping,
+};
+use crate::transform::{
+    AnthropicBackend, CodexBackend, GeminiBackend, TransformBackend, TransformContext,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -24,6 +29,7 @@ use uuid::Uuid;
 
 pub struct ProxyServer {
     port: u16,
+    allow_external_access: bool,
     target_url: String,
     api_key: Option<String>,
     reasoning_mapping: ReasoningEffortMapping,
@@ -155,7 +161,9 @@ fn resolve_model_for_converter(
             let effort = crate::models::get_reasoning_effort(input_model, reasoning_mapping);
             let model = match effort {
                 ReasoningEffort::Xhigh => anthropic_model_mapping.opus.trim(),
-                ReasoningEffort::High | ReasoningEffort::Medium => anthropic_model_mapping.sonnet.trim(),
+                ReasoningEffort::High | ReasoningEffort::Medium => {
+                    anthropic_model_mapping.sonnet.trim()
+                }
                 ReasoningEffort::Low => anthropic_model_mapping.haiku.trim(),
             };
             if !model.is_empty() {
@@ -169,7 +177,9 @@ fn resolve_model_for_converter(
     if converter.eq_ignore_ascii_case("gemini") {
         return match effort {
             ReasoningEffort::Xhigh => gemini_reasoning_effort.opus.clone(),
-            ReasoningEffort::High | ReasoningEffort::Medium => gemini_reasoning_effort.sonnet.clone(),
+            ReasoningEffort::High | ReasoningEffort::Medium => {
+                gemini_reasoning_effort.sonnet.clone()
+            }
             ReasoningEffort::Low => gemini_reasoning_effort.haiku.clone(),
         };
     }
@@ -347,7 +357,11 @@ fn apply_sse_chunk_to_non_stream_message(
             }
         }
         "content_block_delta" => {
-            let Some(index) = payload.get("index").and_then(|v| v.as_u64()).map(|v| v as usize) else {
+            let Some(index) = payload
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+            else {
                 return;
             };
 
@@ -365,7 +379,8 @@ fn apply_sse_chunk_to_non_stream_message(
                     }
                 }
                 "thinking_delta" => {
-                    if let Some(thinking_delta) = delta_obj.get("thinking").and_then(|v| v.as_str()) {
+                    if let Some(thinking_delta) = delta_obj.get("thinking").and_then(|v| v.as_str())
+                    {
                         if let Some(block) = blocks.get_mut(&index) {
                             append_block_text(block, "thinking", thinking_delta);
                         }
@@ -428,19 +443,13 @@ fn sorted_object_keys(value: &Value) -> Vec<String> {
 }
 
 fn summarize_message_content_block(block: &Value) -> String {
-    let block_type = block
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
+    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("?");
     let keys = sorted_object_keys(block).join(",");
     format!("{}<{}>", block_type, keys)
 }
 
 fn summarize_codex_input_item(index: usize, item: &Value) -> String {
-    let item_type = item
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
+    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("?");
     let keys = sorted_object_keys(item).join(",");
 
     let mut summary = format!("{}:{}<{}>", index, item_type, keys);
@@ -626,7 +635,12 @@ fn parse_json_seconds(v: &Value) -> Option<u64> {
     None
 }
 
-fn extract_cooldown_info(status: u16, error_text: &str, retry_after_header: &str, default_model: &str) -> Option<(String, u64, String)> {
+fn extract_cooldown_info(
+    status: u16,
+    error_text: &str,
+    retry_after_header: &str,
+    default_model: &str,
+) -> Option<(String, u64, String)> {
     if status != StatusCode::TOO_MANY_REQUESTS.as_u16() {
         return None;
     }
@@ -684,7 +698,10 @@ fn extract_cooldown_info(status: u16, error_text: &str, retry_after_header: &str
     Some((model, seconds, reason))
 }
 
-fn get_active_cooldown_seconds(cooldowns: &Arc<Mutex<HashMap<String, Instant>>>, model: &str) -> Option<u64> {
+fn get_active_cooldown_seconds(
+    cooldowns: &Arc<Mutex<HashMap<String, Instant>>>,
+    model: &str,
+) -> Option<u64> {
     let mut map = cooldowns.lock().ok()?;
     let until = *map.get(model)?;
     let now = Instant::now();
@@ -703,7 +720,10 @@ fn set_model_cooldown(cooldowns: &Arc<Mutex<HashMap<String, Instant>>>, model: &
         return;
     }
     if let Ok(mut map) = cooldowns.lock() {
-        map.insert(model.to_string(), Instant::now() + Duration::from_secs(seconds));
+        map.insert(
+            model.to_string(),
+            Instant::now() + Duration::from_secs(seconds),
+        );
     }
 }
 
@@ -777,17 +797,17 @@ fn build_gemini_messages_endpoint(target_url: &str, model: &str) -> String {
     }
 
     let base = target_url.trim_end_matches('/');
-    format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, model)
+    format!(
+        "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+        base, model
+    )
 }
 
 fn build_codex_messages_endpoint(target_url: &str) -> String {
     let clean = strip_query(target_url.to_string());
     if let Some(idx) = clean.rfind("/responses/input_tokens") {
         let mut endpoint = clean;
-        endpoint.replace_range(
-            idx..idx + "/responses/input_tokens".len(),
-            "/responses",
-        );
+        endpoint.replace_range(idx..idx + "/responses/input_tokens".len(), "/responses");
         return endpoint;
     }
 
@@ -817,10 +837,7 @@ fn build_anthropic_messages_endpoint(target_url: &str) -> String {
     if clean.contains("/messages/count_tokens") {
         if let Some(idx) = clean.rfind("/messages/count_tokens") {
             let mut endpoint = clean;
-            endpoint.replace_range(
-                idx..idx + "/messages/count_tokens".len(),
-                "/messages",
-            );
+            endpoint.replace_range(idx..idx + "/messages/count_tokens".len(), "/messages");
             return endpoint;
         }
     }
@@ -831,10 +848,7 @@ fn build_anthropic_messages_endpoint(target_url: &str) -> String {
 
     if let Some(idx) = clean.rfind("/responses/input_tokens") {
         let mut endpoint = clean;
-        endpoint.replace_range(
-            idx..idx + "/responses/input_tokens".len(),
-            "/messages",
-        );
+        endpoint.replace_range(idx..idx + "/responses/input_tokens".len(), "/messages");
         return endpoint;
     }
 
@@ -856,10 +870,7 @@ fn build_anthropic_count_tokens_endpoint(target_url: &str) -> String {
     let messages_endpoint = build_anthropic_messages_endpoint(target_url);
     if let Some(idx) = messages_endpoint.rfind("/messages") {
         let mut endpoint = messages_endpoint;
-        endpoint.replace_range(
-            idx..idx + "/messages".len(),
-            "/messages/count_tokens",
-        );
+        endpoint.replace_range(idx..idx + "/messages".len(), "/messages/count_tokens");
         return endpoint;
     }
 
@@ -1017,15 +1028,22 @@ fn estimate_input_tokens(request: &AnthropicRequest) -> u64 {
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => chars += text.chars().count(),
-                        ContentBlock::Thinking { thinking, .. } => chars += thinking.chars().count(),
+                        ContentBlock::Thinking { thinking, .. } => {
+                            chars += thinking.chars().count()
+                        }
                         ContentBlock::ToolUse { name, input, .. } => {
                             chars += name.chars().count();
-                            chars += serde_json::to_string(input).unwrap_or_default().chars().count();
+                            chars += serde_json::to_string(input)
+                                .unwrap_or_default()
+                                .chars()
+                                .count();
                         }
                         ContentBlock::ToolResult { content, .. } => {
                             chars += content
                                 .as_ref()
-                                .map(|v| serde_json::to_string(v).unwrap_or_default().chars().count())
+                                .map(|v| {
+                                    serde_json::to_string(v).unwrap_or_default().chars().count()
+                                })
                                 .unwrap_or(0);
                         }
                         ContentBlock::Image { .. }
@@ -1043,7 +1061,10 @@ fn estimate_input_tokens(request: &AnthropicRequest) -> u64 {
     }
 
     if let Some(tools) = &request.tools {
-        chars += serde_json::to_string(tools).unwrap_or_default().chars().count();
+        chars += serde_json::to_string(tools)
+            .unwrap_or_default()
+            .chars()
+            .count();
     }
 
     ((chars as f64) / 4.0).ceil() as u64
@@ -1053,6 +1074,7 @@ impl ProxyServer {
     pub fn new(port: u16, target_url: String, api_key: Option<String>) -> Self {
         Self {
             port,
+            allow_external_access: false,
             target_url,
             api_key,
             reasoning_mapping: ReasoningEffortMapping::default(),
@@ -1099,8 +1121,6 @@ impl ProxyServer {
         self
     }
 
-
-
     pub fn with_gemini_reasoning_effort(mut self, effort: GeminiReasoningEffortMapping) -> Self {
         self.gemini_reasoning_effort = effort;
         self
@@ -1108,6 +1128,11 @@ impl ProxyServer {
 
     pub fn with_max_concurrency(mut self, max: u32) -> Self {
         self.max_concurrency = max;
+        self
+    }
+
+    pub fn with_allow_external_access(mut self, allow: bool) -> Self {
+        self.allow_external_access = allow;
         self
     }
 
@@ -1150,18 +1175,30 @@ impl ProxyServer {
     pub async fn start(
         &self,
         log_tx: broadcast::Sender<String>,
-    ) -> Result<(broadcast::Sender<()>, tokio::task::JoinHandle<()>, ProxyRuntimeHandle), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (
+            broadcast::Sender<()>,
+            tokio::task::JoinHandle<()>,
+            ProxyRuntimeHandle,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         // 初始化全局日志记录器
         let logger = AppLogger::init(Some("logs"));
         logger.log("=== Codex Proxy Started ===");
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
+        let addr = if self.allow_external_access {
+            SocketAddr::from(([0, 0, 0, 0], self.port))
+        } else {
+            SocketAddr::from(([127, 0, 0, 1], self.port))
+        };
         let listener = TcpListener::bind(addr).await?;
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         let shutdown_tx_clone = shutdown_tx.clone();
 
-        let model_cooldowns: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let model_cooldowns: Arc<Mutex<HashMap<String, Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let runtime_handle = ProxyRuntimeHandle {
             state: Arc::new(RwLock::new(RuntimeConfigState::from(self.runtime_update()))),
         };
@@ -1169,7 +1206,10 @@ impl ProxyServer {
 
         // 并发控制：0 = 不限制
         let semaphore: Option<Arc<Semaphore>> = if self.max_concurrency > 0 {
-            let _ = log_tx.send(format!("[System] Max concurrency: {}", self.max_concurrency));
+            let _ = log_tx.send(format!(
+                "[System] Max concurrency: {}",
+                self.max_concurrency
+            ));
             Some(Arc::new(Semaphore::new(self.max_concurrency as usize)))
         } else {
             None
@@ -1183,12 +1223,20 @@ impl ProxyServer {
                 .unwrap(),
         );
 
+        let listen_host = if self.allow_external_access {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
         let _ = log_tx.send(format!(
-            "[System] Init success: Codex Proxy (Rust) listening on http://localhost:{}",
-            self.port
+            "[System] Init success: Codex Proxy (Rust) listening on http://{}:{}",
+            listen_host, self.port
         ));
         let _ = log_tx.send(format!("[System] Target: {}", self.target_url));
-        logger.log(&format!("Listening on http://localhost:{}", self.port));
+        logger.log(&format!(
+            "Listening on http://{}:{}",
+            listen_host, self.port
+        ));
         logger.log(&format!("Target: {}", self.target_url));
 
         // Spawn the server loop in a separate task
@@ -1258,7 +1306,8 @@ async fn handle_request(
     let path = req.uri().path().to_string();
     let normalized_path = path.trim_end_matches('/');
     let is_messages = normalized_path == "/messages" || normalized_path == "/v1/messages";
-    let is_count_tokens = normalized_path == "/messages/count_tokens" || normalized_path == "/v1/messages/count_tokens";
+    let is_count_tokens = normalized_path == "/messages/count_tokens"
+        || normalized_path == "/v1/messages/count_tokens";
     let request_id: String = Uuid::new_v4()
         .simple()
         .to_string()
@@ -1275,7 +1324,11 @@ async fn handle_request(
 
     // 只处理 POST /messages、/v1/messages、/messages/count_tokens、/v1/messages/count_tokens
     if req.method() != Method::POST || (!is_messages && !is_count_tokens) {
-        let _ = log_tx.send(format!("[Debug] Ignored {} request to {}", req.method(), path));
+        let _ = log_tx.send(format!(
+            "[Debug] Ignored {} request to {}",
+            req.method(),
+            path
+        ));
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("Content-Type", "application/json")
@@ -1285,7 +1338,12 @@ async fn handle_request(
             .unwrap());
     }
 
-    let _ = log_tx.send(format!("[System] Processing #{} {} {}", request_id, req.method(), path));
+    let _ = log_tx.send(format!(
+        "[System] Processing #{} {} {}",
+        request_id,
+        req.method(),
+        path
+    ));
 
     // 并发控制：获取许可证，FIFO 排队
     let permit: Option<OwnedSemaphorePermit> = if let Some(ref sem) = semaphore {
@@ -1294,7 +1352,12 @@ async fn handle_request(
             request_id,
             sem.available_permits(),
         ));
-        Some(Arc::clone(sem).acquire_owned().await.expect("semaphore closed"))
+        Some(
+            Arc::clone(sem)
+                .acquire_owned()
+                .await
+                .expect("semaphore closed"),
+        )
     } else {
         None
     };
@@ -1345,7 +1408,8 @@ async fn handle_request(
             .status(StatusCode::UNAUTHORIZED)
             .header("Content-Type", "application/json")
             .body(full_body(
-                json!({"error": {"type": "unauthorized", "message": "Missing API key"}}).to_string(),
+                json!({"error": {"type": "unauthorized", "message": "Missing API key"}})
+                    .to_string(),
             ))
             .unwrap());
     };
@@ -1358,7 +1422,8 @@ async fn handle_request(
                 .status(StatusCode::BAD_REQUEST)
                 .header("Content-Type", "application/json")
                 .body(full_body(
-                    json!({"error": {"message": format!("Failed to read body: {}", e)}}).to_string(),
+                    json!({"error": {"message": format!("Failed to read body: {}", e)}})
+                        .to_string(),
                 ))
                 .unwrap());
         }
@@ -1403,7 +1468,11 @@ async fn handle_request(
                 request_id,
                 probe_kind,
                 anthropic_body.stream,
-                anthropic_body.tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
+                anthropic_body
+                    .tools
+                    .as_ref()
+                    .map(|tools| tools.len())
+                    .unwrap_or(0),
             ));
 
             if anthropic_body.stream {
@@ -1438,7 +1507,11 @@ async fn handle_request(
     }
 
     let display_summary = summarize_request_messages(&anthropic_body.messages);
-    let tool_count = anthropic_body.tools.as_ref().map(|tools| tools.len()).unwrap_or(0);
+    let tool_count = anthropic_body
+        .tools
+        .as_ref()
+        .map(|tools| tools.len())
+        .unwrap_or(0);
     let system_chars = anthropic_body
         .system
         .as_ref()
@@ -1483,10 +1556,7 @@ async fn handle_request(
 
         let _ = log_tx.send(format!(
             "[Req] #{} mode=count_tokens converter={} in={} out={}",
-            request_id,
-            route_selection.converter,
-            input_model,
-            route_selection.model_name,
+            request_id, route_selection.converter, input_model, route_selection.model_name,
         ));
 
         let request_backend = build_backend_by_converter(&route_selection.converter);
@@ -1512,7 +1582,10 @@ async fn handle_request(
                 .post(&count_tokens_endpoint)
                 .header("Content-Type", "application/json")
                 .header("x-goog-api-key", &route_selection.api_key)
-                .header("Authorization", format!("Bearer {}", &route_selection.api_key))
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", &route_selection.api_key),
+                )
                 .body(body.to_string())
                 .send()
                 .await;
@@ -1537,14 +1610,20 @@ async fn handle_request(
             let mut request_body = raw_request_body.clone();
             if let Some(obj) = request_body.as_object_mut() {
                 obj.remove("stream");
-                obj.insert("model".to_string(), json!(route_selection.model_name.clone()));
+                obj.insert(
+                    "model".to_string(),
+                    json!(route_selection.model_name.clone()),
+                );
             }
 
             let response = http_client
                 .post(&count_tokens_endpoint)
                 .header("Content-Type", "application/json")
                 .header("x-api-key", &route_selection.api_key)
-                .header("Authorization", format!("Bearer {}", &route_selection.api_key))
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", &route_selection.api_key),
+                )
                 .header("x-anthropic-version", &anthropic_version)
                 .body(request_body.to_string());
 
@@ -1581,7 +1660,10 @@ async fn handle_request(
             let response = http_client
                 .post(&count_tokens_endpoint)
                 .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", &route_selection.api_key))
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", &route_selection.api_key),
+                )
                 .header("x-api-key", &route_selection.api_key)
                 .header("x-anthropic-version", &anthropic_version)
                 .header("originator", "codex_cli_rs")
@@ -1795,9 +1877,10 @@ async fn handle_request(
                 display_summary,
             ));
 
-            if let (Some(runtime), Some(route)) =
-                (load_balancer_runtime.as_ref(), route_selection.route.as_ref())
-            {
+            if let (Some(runtime), Some(route)) = (
+                load_balancer_runtime.as_ref(),
+                route_selection.route.as_ref(),
+            ) {
                 runtime.mark_unavailable(route, "local_cooldown");
             }
 
@@ -1828,24 +1911,27 @@ async fn handle_request(
         }
 
         let request_backend = build_backend_by_converter(&route_selection.converter);
-        let (upstream_body, session_id) = if route_selection.converter.eq_ignore_ascii_case("anthropic")
-        {
-            let mut request_body = raw_request_body.clone();
-            if let Some(obj) = request_body.as_object_mut() {
-                obj.insert("model".to_string(), json!(route_selection.model_name.clone()));
-            }
-            (request_body, Uuid::new_v4().to_string())
-        } else {
-            transform_request_with_optional_codex_effort_override(
-                &route_selection.converter,
-                &request_backend,
-                &anthropic_body,
-                &log_tx,
-                &ctx,
-                &route_selection.model_name,
-                route_selection.reasoning_effort_override,
-            )
-        };
+        let (upstream_body, session_id) =
+            if route_selection.converter.eq_ignore_ascii_case("anthropic") {
+                let mut request_body = raw_request_body.clone();
+                if let Some(obj) = request_body.as_object_mut() {
+                    obj.insert(
+                        "model".to_string(),
+                        json!(route_selection.model_name.clone()),
+                    );
+                }
+                (request_body, Uuid::new_v4().to_string())
+            } else {
+                transform_request_with_optional_codex_effort_override(
+                    &route_selection.converter,
+                    &request_backend,
+                    &anthropic_body,
+                    &log_tx,
+                    &ctx,
+                    &route_selection.model_name,
+                    route_selection.reasoning_effort_override,
+                )
+            };
 
         if let Some(input_summary) = summarize_codex_payload(&upstream_body) {
             let top_keys = sorted_object_keys(&upstream_body).join(",");
@@ -1899,9 +1985,10 @@ async fn handle_request(
         let response = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                let action = if let (Some(runtime), Some(route)) =
-                    (load_balancer_runtime.as_ref(), route_selection.route.as_ref())
-                {
+                let action = if let (Some(runtime), Some(route)) = (
+                    load_balancer_runtime.as_ref(),
+                    route_selection.route.as_ref(),
+                ) {
                     runtime.handle_upstream_outcome(route, None, true, None)
                 } else {
                     UpstreamOutcomeAction::ReturnToClient
@@ -1955,9 +2042,10 @@ async fn handle_request(
             let status = response.status().as_u16();
             let error_text = response.text().await.unwrap_or_default();
 
-            let action = if let (Some(runtime), Some(route)) =
-                (load_balancer_runtime.as_ref(), route_selection.route.as_ref())
-            {
+            let action = if let (Some(runtime), Some(route)) = (
+                load_balancer_runtime.as_ref(),
+                route_selection.route.as_ref(),
+            ) {
                 runtime.handle_upstream_outcome(route, Some(status), false, Some(&error_text))
             } else {
                 UpstreamOutcomeAction::ReturnToClient
@@ -1981,9 +2069,12 @@ async fn handle_request(
                 retry_after,
             ));
 
-            if let Some((cooldown_model, cooldown_secs, reason)) =
-                extract_cooldown_info(status, &error_text, &retry_after, &route_selection.model_name)
-            {
+            if let Some((cooldown_model, cooldown_secs, reason)) = extract_cooldown_info(
+                status,
+                &error_text,
+                &retry_after,
+                &route_selection.model_name,
+            ) {
                 set_model_cooldown(&model_cooldowns, &cooldown_model, cooldown_secs);
                 let _ = log_tx.send(format!(
                     "[RateLimit] #{} upstream=429 reason={} model={} retry_after={}s in={} out={} msgs={} summary={}",
@@ -2026,7 +2117,10 @@ async fn handle_request(
         }
 
         let upstream_status = response.status().as_u16();
-        if let (Some(runtime), Some(route)) = (load_balancer_runtime.as_ref(), route_selection.route.as_ref()) {
+        if let (Some(runtime), Some(route)) = (
+            load_balancer_runtime.as_ref(),
+            route_selection.route.as_ref(),
+        ) {
             runtime.handle_upstream_outcome(route, Some(upstream_status), false, None);
         }
 
@@ -2043,7 +2137,8 @@ async fn handle_request(
     let request_backend = successful_backend.expect("backend must exist after successful loop");
     let model = successful_model;
     let request_converter = successful_converter;
-    let upstream_status = successful_upstream_status.expect("upstream status must exist after successful loop");
+    let upstream_status =
+        successful_upstream_status.expect("upstream status must exist after successful loop");
     let _lb_permit = successful_lb_permit;
 
     let _ = log_tx.send(format!(
@@ -2090,51 +2185,49 @@ async fn handle_request(
 
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
-                Ok(Some(chunk_result)) => {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            buffer.push_str(&String::from_utf8_lossy(&chunk));
+                Ok(Some(chunk_result)) => match chunk_result {
+                    Ok(chunk) => {
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                            while let Some(pos) = buffer.find('\n') {
-                                let line = buffer[..pos].to_string();
-                                buffer = buffer[pos + 1..].to_string();
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].to_string();
+                            buffer = buffer[pos + 1..].to_string();
 
-                                if line.trim().is_empty() {
-                                    continue;
-                                }
+                            if line.trim().is_empty() {
+                                continue;
+                            }
 
+                            if let Some(ref l) = AppLogger::get() {
+                                l.log_upstream_response(upstream_status, &line);
+                            }
+
+                            for event_chunk in transformer.transform_line(&line) {
                                 if let Some(ref l) = AppLogger::get() {
-                                    l.log_upstream_response(upstream_status, &line);
+                                    l.log_anthropic_response(&event_chunk);
                                 }
-
-                                for event_chunk in transformer.transform_line(&line) {
-                                    if let Some(ref l) = AppLogger::get() {
-                                        l.log_anthropic_response(&event_chunk);
-                                    }
-                                    apply_sse_chunk_to_non_stream_message(
-                                        &event_chunk,
-                                        &mut message_state,
-                                        &mut blocks,
-                                        &mut tool_input_buffers,
-                                        &mut stop_reason_state,
-                                        &mut usage_input_tokens,
-                                        &mut usage_output_tokens,
-                                    );
-                                }
+                                apply_sse_chunk_to_non_stream_message(
+                                    &event_chunk,
+                                    &mut message_state,
+                                    &mut blocks,
+                                    &mut tool_input_buffers,
+                                    &mut stop_reason_state,
+                                    &mut usage_input_tokens,
+                                    &mut usage_output_tokens,
+                                );
                             }
                         }
-                        Err(e) => {
-                            let _ = log_tx.send(format!("[Error] #{} Stream error: {}", request_id, e));
-                            return Ok(Response::builder()
+                    }
+                    Err(e) => {
+                        let _ = log_tx.send(format!("[Error] #{} Stream error: {}", request_id, e));
+                        return Ok(Response::builder()
                                 .status(StatusCode::BAD_GATEWAY)
                                 .header("Content-Type", "application/json")
                                 .body(full_body(
                                     json!({"error": {"message": format!("Upstream stream error: {}", e)}}).to_string(),
                                 ))
                                 .unwrap());
-                        }
                     }
-                }
+                },
                 Ok(None) => break,
                 Err(_) => {
                     let _ = log_tx.send(format!(
@@ -2145,7 +2238,8 @@ async fn handle_request(
                         .status(StatusCode::GATEWAY_TIMEOUT)
                         .header("Content-Type", "application/json")
                         .body(full_body(
-                            json!({"error": {"message": "Upstream read timeout (300s)"}}).to_string(),
+                            json!({"error": {"message": "Upstream read timeout (300s)"}})
+                                .to_string(),
                         ))
                         .unwrap());
                 }
@@ -2268,7 +2362,8 @@ async fn handle_request(
                                     if let Some(ref l) = AppLogger::get() {
                                         l.log_anthropic_response(&output);
                                     }
-                                    if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
+                                    if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err()
+                                    {
                                         let _ = log_tx_clone.send(format!(
                                             "[Warning] #{} Client disconnected, stopping stream",
                                             request_id_for_stream
@@ -2279,7 +2374,10 @@ async fn handle_request(
                             }
                         }
                         Err(e) => {
-                            let _ = log_tx_clone.send(format!("[Error] #{} Stream error: {}", request_id_for_stream, e));
+                            let _ = log_tx_clone.send(format!(
+                                "[Error] #{} Stream error: {}",
+                                request_id_for_stream, e
+                            ));
                             break;
                         }
                     }
@@ -2344,9 +2442,7 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        resolve_upstream_url, UpstreamOperation,
-    };
+    use super::{resolve_upstream_url, UpstreamOperation};
 
     #[test]
     fn test_resolve_upstream_url_codex_messages_appends_responses() {

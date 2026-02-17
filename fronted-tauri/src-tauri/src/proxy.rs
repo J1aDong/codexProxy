@@ -1,22 +1,12 @@
-use codex_proxy_core::{
-    AnthropicModelMapping,
-    CodexModelMapping,
-    GeminiReasoningEffortMapping,
-    ProxyRuntimeHandle,
-    ProxyServer,
-    ReasoningEffort,
-    ReasoningEffortMapping,
-    RuntimeConfigUpdate,
-    TransformContext,
-};
 use codex_proxy_core::load_balancer::{
-    EndpointPolicy as CoreEndpointPolicy,
-    LoadBalancerConfig as CoreLoadBalancerConfig,
+    EndpointPolicy as CoreEndpointPolicy, LoadBalancerConfig as CoreLoadBalancerConfig,
     LoadBalancerEndpoint as CoreLoadBalancerEndpoint,
-    LoadBalancerProfile as CoreLoadBalancerProfile,
-    LoadBalancerRuntime,
-    SlotEndpointRef as CoreSlotEndpointRef,
-    SlotMapping as CoreSlotMapping,
+    LoadBalancerProfile as CoreLoadBalancerProfile, LoadBalancerRuntime,
+    SlotEndpointRef as CoreSlotEndpointRef, SlotMapping as CoreSlotMapping,
+};
+use codex_proxy_core::{
+    AnthropicModelMapping, CodexModelMapping, GeminiReasoningEffortMapping, ProxyRuntimeHandle,
+    ProxyServer, ReasoningEffort, ReasoningEffortMapping, RuntimeConfigUpdate, TransformContext,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -228,7 +218,10 @@ pub struct ProxyConfig {
     pub api_key: String,
     #[serde(rename = "endpointOptions", default = "default_endpoint_options")]
     pub endpoint_options: Vec<EndpointOption>,
-    #[serde(rename = "selectedEndpointId", default = "default_selected_endpoint_id")]
+    #[serde(
+        rename = "selectedEndpointId",
+        default = "default_selected_endpoint_id"
+    )]
     pub selected_endpoint_id: String,
     #[serde(default = "default_converter")]
     pub converter: String,
@@ -236,7 +229,10 @@ pub struct ProxyConfig {
     pub codex_model: String,
     #[serde(rename = "codexModelMapping", default)]
     pub codex_model_mapping: CodexModelMappingConfig,
-    #[serde(rename = "anthropicModelMapping", default = "default_anthropic_model_mapping")]
+    #[serde(
+        rename = "anthropicModelMapping",
+        default = "default_anthropic_model_mapping"
+    )]
     pub anthropic_model_mapping: AnthropicModelMappingConfig,
 
     #[serde(rename = "geminiModelPreset", default = "default_gemini_model_preset")]
@@ -246,17 +242,28 @@ pub struct ProxyConfig {
     pub max_concurrency: u32,
     #[serde(rename = "ignoreProbeRequests", default)]
     pub ignore_probe_requests: bool,
-    #[serde(rename = "allowCountTokensFallbackEstimate", default = "default_allow_count_tokens_fallback_estimate")]
+    #[serde(
+        rename = "allowCountTokensFallbackEstimate",
+        default = "default_allow_count_tokens_fallback_estimate"
+    )]
     pub allow_count_tokens_fallback_estimate: bool,
+    #[serde(rename = "allowExternalAccess", default)]
+    pub allow_external_access: bool,
     #[serde(default)]
     pub force: bool,
     #[serde(rename = "proxyMode", default = "default_proxy_mode")]
     pub proxy_mode: String,
     #[serde(rename = "loadBalancer", default = "default_load_balancer")]
     pub load_balancer: LoadBalancerConfig,
-    #[serde(rename = "lbModelCooldownSeconds", default = "default_lb_model_cooldown_seconds")]
+    #[serde(
+        rename = "lbModelCooldownSeconds",
+        default = "default_lb_model_cooldown_seconds"
+    )]
     pub lb_model_cooldown_seconds: u32,
-    #[serde(rename = "lbTransientBackoffSeconds", default = "default_lb_transient_backoff_seconds")]
+    #[serde(
+        rename = "lbTransientBackoffSeconds",
+        default = "default_lb_transient_backoff_seconds"
+    )]
     pub lb_transient_backoff_seconds: u32,
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: ReasoningEffortConfig,
@@ -295,11 +302,20 @@ fn default_gemini_model_preset() -> Vec<String> {
     ]
 }
 
-fn build_lb_runtime(config: &ProxyConfig, log_tx: Option<broadcast::Sender<String>>) -> Option<LoadBalancerRuntime> {
+fn build_lb_runtime(
+    config: &ProxyConfig,
+    log_tx: Option<broadcast::Sender<String>>,
+) -> Option<LoadBalancerRuntime> {
     let selected_profile_id = config.load_balancer.selected_lb_profile_id.clone();
     let selected_profile_strategy = selected_profile_id
         .as_ref()
-        .and_then(|profile_id| config.load_balancer.lb_profiles.iter().find(|p| &p.id == profile_id))
+        .and_then(|profile_id| {
+            config
+                .load_balancer
+                .lb_profiles
+                .iter()
+                .find(|p| &p.id == profile_id)
+        })
         .map(|p| p.strategy.clone())
         .unwrap_or_default();
 
@@ -402,15 +418,17 @@ fn build_lb_runtime(config: &ProxyConfig, log_tx: Option<broadcast::Sender<Strin
         .map(|endpoint| {
             let endpoint_cfg = config.load_balancer.lb_endpoint_configs.get(&endpoint.id);
             let enabled = endpoint_cfg.map(|cfg| cfg.enabled).unwrap_or(true);
-            let max_concurrency = endpoint_cfg
-                .map(|cfg| cfg.max_concurrency)
-                .unwrap_or(16);
+            let max_concurrency = endpoint_cfg.map(|cfg| cfg.max_concurrency).unwrap_or(16);
 
             (
                 endpoint.id.clone(),
                 CoreEndpointPolicy {
                     enabled,
-                    max_concurrency: if max_concurrency == 0 { 1 } else { max_concurrency },
+                    max_concurrency: if max_concurrency == 0 {
+                        1
+                    } else {
+                        max_concurrency
+                    },
                     error_threshold,
                     error_window_seconds,
                     cooldown_seconds,
@@ -491,9 +509,6 @@ fn build_runtime_update(
         load_balancer_runtime,
     }
 }
-
-
-
 
 pub struct ProxyManager {
     running: bool,
@@ -603,7 +618,16 @@ pub fn save_lang(lang: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn check_port(port: u16) -> bool {
-    TcpListener::bind(("127.0.0.1", port)).is_err()
+    check_port_for_bind(port, false)
+}
+
+fn check_port_for_bind(port: u16, allow_external_access: bool) -> bool {
+    let bind_host = if allow_external_access {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    TcpListener::bind((bind_host, port)).is_err()
 }
 
 #[tauri::command]
@@ -638,7 +662,7 @@ pub async fn start_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), Stri
     save_config(config.clone())?;
 
     // Check port
-    if !config.force && check_port(config.port) {
+    if !config.force && check_port_for_bind(config.port, config.allow_external_access) {
         app.emit("port-in-use", config.port)
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -674,10 +698,25 @@ async fn start_proxy_with_manager(
         format!("[System] Starting proxy on port {}...", config.port),
     )
     .map_err(|e| e.to_string())?;
+    app.emit(
+        "proxy-log",
+        format!(
+            "[System] Bind mode: {}",
+            if config.allow_external_access {
+                "external (0.0.0.0)"
+            } else {
+                "local only (127.0.0.1)"
+            }
+        ),
+    )
+    .map_err(|e| e.to_string())?;
     let (resolved_target_url, api_key) = resolve_target_and_api_key(&config);
 
-    app.emit("proxy-log", format!("[System] Target: {}", resolved_target_url))
-        .map_err(|e| e.to_string())?;
+    app.emit(
+        "proxy-log",
+        format!("[System] Target: {}", resolved_target_url),
+    )
+    .map_err(|e| e.to_string())?;
 
     // 创建日志通道（容量 2048 减少高频场景下的 lag）
     let (log_tx, mut log_rx) = broadcast::channel::<String>(2048);
@@ -701,6 +740,7 @@ async fn start_proxy_with_manager(
         .with_gemini_reasoning_effort(config.gemini_reasoning_effort.to_gemini_mapping())
         .with_ignore_probe_requests(config.ignore_probe_requests)
         .with_allow_count_tokens_fallback_estimate(config.allow_count_tokens_fallback_estimate)
+        .with_allow_external_access(config.allow_external_access)
         .with_max_concurrency(config.max_concurrency);
 
     let server = if config.proxy_mode.eq_ignore_ascii_case("load_balancer") {
@@ -729,8 +769,10 @@ async fn start_proxy_with_manager(
                     let _ = app_clone.emit("proxy-log", msg);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    let _ = app_clone.emit("proxy-log",
-                        format!("[Warning] Log receiver lagged, skipped {} messages", n));
+                    let _ = app_clone.emit(
+                        "proxy-log",
+                        format!("[Warning] Log receiver lagged, skipped {} messages", n),
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -790,7 +832,9 @@ pub async fn apply_proxy_config(app: AppHandle, config: ProxyConfig) -> Result<(
         return Err("Proxy runtime handle missing".to_string());
     };
     let update = build_runtime_update(&config, manager.log_tx.clone());
-    if config.proxy_mode.eq_ignore_ascii_case("load_balancer") && update.load_balancer_runtime.is_none() {
+    if config.proxy_mode.eq_ignore_ascii_case("load_balancer")
+        && update.load_balancer_runtime.is_none()
+    {
         app.emit(
             "proxy-log",
             "[Warning] Load balancer config incomplete, hot fallback to single mode",
@@ -799,8 +843,11 @@ pub async fn apply_proxy_config(app: AppHandle, config: ProxyConfig) -> Result<(
     }
     runtime_handle.apply_update(update);
 
-    app.emit("proxy-log", "[System] Runtime config hot-updated (no restart)")
-        .map_err(|e| e.to_string())?;
+    app.emit(
+        "proxy-log",
+        "[System] Runtime config hot-updated (no restart)",
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -812,12 +859,15 @@ pub async fn restart_proxy(app: AppHandle, config: ProxyConfig) -> Result<(), St
     let mut manager = state.proxy_manager.lock().await;
 
     if manager.is_running() {
-        app.emit("proxy-log", "[System] Applying config changes and restarting proxy...")
-            .map_err(|e| e.to_string())?;
+        app.emit(
+            "proxy-log",
+            "[System] Applying config changes and restarting proxy...",
+        )
+        .map_err(|e| e.to_string())?;
         manager.stop();
     }
 
-    if !config.force && check_port(config.port) {
+    if !config.force && check_port_for_bind(config.port, config.allow_external_access) {
         app.emit("port-in-use", config.port)
             .map_err(|e| e.to_string())?;
         app.emit("proxy-status", "stopped")
@@ -857,10 +907,9 @@ pub fn export_config() -> Result<String, String> {
     let path = get_config_path()?;
     if path.exists() {
         let content = fs::read_to_string(&path).map_err(|e| format!("读取配置文件失败: {}", e))?;
-        let config: ProxyConfig = serde_json::from_str(&content)
-            .map_err(|e| format!("解析配置文件失败: {}", e))?;
-        serde_json::to_string_pretty(&config)
-            .map_err(|e| format!("序列化配置失败: {}", e))
+        let config: ProxyConfig =
+            serde_json::from_str(&content).map_err(|e| format!("解析配置文件失败: {}", e))?;
+        serde_json::to_string_pretty(&config).map_err(|e| format!("序列化配置失败: {}", e))
     } else {
         let default_config = ProxyConfig::default();
         serde_json::to_string_pretty(&default_config)
@@ -870,8 +919,8 @@ pub fn export_config() -> Result<String, String> {
 
 #[tauri::command]
 pub fn import_config(config_json: String) -> Result<(), String> {
-    let config: ProxyConfig = serde_json::from_str(&config_json)
-        .map_err(|e| format!("JSON 格式无效: {}", e))?;
+    let config: ProxyConfig =
+        serde_json::from_str(&config_json).map_err(|e| format!("JSON 格式无效: {}", e))?;
 
     if config.endpoint_options.is_empty() {
         return Err("配置无效: endpoint_options 不能为空".to_string());
@@ -882,7 +931,7 @@ pub fn import_config(config_json: String) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
     }
 
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("序列化配置失败: {}", e))?;
+    let content =
+        serde_json::to_string_pretty(&config).map_err(|e| format!("序列化配置失败: {}", e))?;
     fs::write(&path, content).map_err(|e| format!("写入配置文件失败: {}", e))
 }

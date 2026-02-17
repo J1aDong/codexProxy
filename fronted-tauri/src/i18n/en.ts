@@ -96,6 +96,8 @@ export default {
     advancedIgnoreProbeTip: 'Return locally for probe-like requests to reduce pointless upstream calls and 429 risk.',
     advancedCountTokensFallbackLabel: 'Allow estimate fallback when count_tokens fails',
     advancedCountTokensFallbackTip: 'Enabled is more stable; disable to surface upstream failures for debugging.',
+    advancedAllowExternalAccessLabel: 'Allow external access (bind 0.0.0.0)',
+    advancedAllowExternalAccessTip: 'Accept non-localhost connections. If proxy is running, saving will auto-restart to apply bind address.',
     advancedCodexCapabilityPresetLabel: 'Codex Model-Effort Preset (JSON)',
     advancedCodexCapabilityPresetTip: 'Keys are model names, values are allowed efforts (low/medium/high/xhigh). Saved value is normalized automatically.',
     advancedGeminiModelPresetLabel: 'Gemini Model Preset (JSON)',

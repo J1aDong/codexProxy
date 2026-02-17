@@ -147,6 +147,17 @@
           </div>
         </label>
 
+        <label
+          class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer dark:border-dark-border"
+          :class="form.proxyMode === 'load_balancer' ? 'border-dark-border' : 'border-gray-200'"
+        >
+          <input v-model="localAllowExternalAccess" type="checkbox" class="mt-1" />
+          <div class="flex-1">
+            <div class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedAllowExternalAccessLabel') }}</div>
+            <div class="text-xs text-apple-text-secondary dark:text-dark-text-secondary mt-1">{{ t('advancedAllowExternalAccessTip') }}</div>
+          </div>
+        </label>
+
         <div class="space-y-2">
           <div class="flex items-center justify-between">
             <label class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedCodexCapabilityPresetLabel') }}</label>
@@ -210,7 +221,7 @@ import { useI18n } from 'vue-i18n'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
-import { applyProxyConfig, loadConfig, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
+import { applyProxyConfig, loadConfig, restartProxy, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
 import type { AnthropicModelMapping, CodexEffortCapabilityMap, ConverterType, EndpointOption, GeminiModelPreset, ProxyConfigV2 } from './types/configTypes'
 import { DEFAULT_PROXY_CONFIG_V2 } from './types/configTypes'
 
@@ -266,6 +277,7 @@ const localLbModelCooldownSeconds = ref<number | null>(3600)
 const localLbTransientBackoffSeconds = ref<number | null>(6)
 const localIgnoreProbeRequests = ref(false)
 const localAllowCountTokensFallbackEstimate = ref(true)
+const localAllowExternalAccess = ref(false)
 const localCodexCapabilityJson = ref('')
 const localGeminiModelPresetJson = ref('')
 const advancedSettingsError = ref('')
@@ -357,6 +369,7 @@ const DEFAULT_CONFIG = {
   lbTransientBackoffSeconds: 6,
   ignoreProbeRequests: false,
   allowCountTokensFallbackEstimate: true,
+  allowExternalAccess: false,
   reasoningEffort: {
     opus: 'xhigh',
     sonnet: 'medium',
@@ -383,6 +396,7 @@ const form = reactive({
   lbTransientBackoffSeconds: DEFAULT_CONFIG.lbTransientBackoffSeconds,
   ignoreProbeRequests: DEFAULT_CONFIG.ignoreProbeRequests,
   allowCountTokensFallbackEstimate: DEFAULT_CONFIG.allowCountTokensFallbackEstimate,
+  allowExternalAccess: DEFAULT_CONFIG.allowExternalAccess,
   reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort },
   converter: DEFAULT_CONFIG.converter,
   codexModel: DEFAULT_CONFIG.codexModel,
@@ -531,6 +545,7 @@ const openAdvancedSettings = () => {
   localLbTransientBackoffSeconds.value = form.lbTransientBackoffSeconds
   localIgnoreProbeRequests.value = form.ignoreProbeRequests
   localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
+  localAllowExternalAccess.value = form.allowExternalAccess
   localCodexCapabilityJson.value = JSON.stringify(form.codexEffortCapabilityMap, null, 2)
   localGeminiModelPresetJson.value = JSON.stringify(form.geminiModelPreset, null, 2)
   advancedSettingsError.value = ''
@@ -538,7 +553,7 @@ const openAdvancedSettings = () => {
   showAdvancedSettings.value = true
 }
 
-const saveAdvancedSettings = () => {
+const saveAdvancedSettings = async () => {
   try {
     const parsed = JSON.parse(localCodexCapabilityJson.value || '{}')
     form.codexEffortCapabilityMap = normalizeCapabilityMap(parsed)
@@ -562,8 +577,28 @@ const saveAdvancedSettings = () => {
   form.lbTransientBackoffSeconds = Math.max(1, Math.floor(localLbTransientBackoffSeconds.value ?? DEFAULT_CONFIG.lbTransientBackoffSeconds))
   form.ignoreProbeRequests = localIgnoreProbeRequests.value
   form.allowCountTokensFallbackEstimate = localAllowCountTokensFallbackEstimate.value
+  const bindModeChanged = form.allowExternalAccess !== localAllowExternalAccess.value
+  form.allowExternalAccess = localAllowExternalAccess.value
   showAdvancedSettings.value = false
-  persistConfig(buildProxyConfig())
+
+  const config = buildProxyConfig()
+  if (bindModeChanged && isRunning.value) {
+    if (restartApplyTimer) {
+      clearTimeout(restartApplyTimer)
+      restartApplyTimer = null
+    }
+    lastAppliedConfigHash = ''
+    try {
+      await saveConfig(config)
+      await restartProxy(config)
+      lastAppliedConfigHash = configRuntimeHash({ ...config, force: false })
+    } catch (error) {
+      console.error(error)
+    }
+    return
+  }
+
+  persistConfig(config)
 }
 
 const resetCodexCapabilityPreset = () => {
@@ -671,6 +706,9 @@ const handleConfigImported = async () => {
     }
     if (typeof savedConfig.allowCountTokensFallbackEstimate === 'boolean') {
       form.allowCountTokensFallbackEstimate = savedConfig.allowCountTokensFallbackEstimate
+    }
+    if (typeof savedConfig.allowExternalAccess === 'boolean') {
+      form.allowExternalAccess = savedConfig.allowExternalAccess
     }
   }
 }
@@ -910,6 +948,7 @@ const resetDefaults = () => {
   form.lbTransientBackoffSeconds = DEFAULT_CONFIG.lbTransientBackoffSeconds
   form.ignoreProbeRequests = DEFAULT_CONFIG.ignoreProbeRequests
   form.allowCountTokensFallbackEstimate = DEFAULT_CONFIG.allowCountTokensFallbackEstimate
+  form.allowExternalAccess = DEFAULT_CONFIG.allowExternalAccess
   form.proxyMode = DEFAULT_PROXY_CONFIG_V2.proxyMode
   form.loadBalancer = {
     ...DEFAULT_PROXY_CONFIG_V2.loadBalancer,
@@ -936,6 +975,7 @@ const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   lbTransientBackoffSeconds: form.lbTransientBackoffSeconds,
   ignoreProbeRequests: form.ignoreProbeRequests,
   allowCountTokensFallbackEstimate: form.allowCountTokensFallbackEstimate,
+  allowExternalAccess: form.allowExternalAccess,
   reasoningEffort: form.reasoningEffort,
   geminiReasoningEffort: form.geminiReasoningEffort,
   skillInjectionPrompt: form.skillInjectionPrompt,
@@ -1189,11 +1229,15 @@ onMounted(() => {
         if (typeof savedConfig.allowCountTokensFallbackEstimate === 'boolean') {
           form.allowCountTokensFallbackEstimate = savedConfig.allowCountTokensFallbackEstimate
         }
+        if (typeof savedConfig.allowExternalAccess === 'boolean') {
+          form.allowExternalAccess = savedConfig.allowExternalAccess
+        }
         localMaxConcurrency.value = form.maxConcurrency
         localLbModelCooldownSeconds.value = form.lbModelCooldownSeconds
         localLbTransientBackoffSeconds.value = form.lbTransientBackoffSeconds
         localIgnoreProbeRequests.value = form.ignoreProbeRequests
         localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
+        localAllowExternalAccess.value = form.allowExternalAccess
       } else {
         syncEndpointFromSelection()
         useDefaultPrompt()
