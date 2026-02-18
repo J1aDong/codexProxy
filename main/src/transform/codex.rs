@@ -539,10 +539,10 @@ impl TransformResponse {
             return;
         }
 
-        let pending = self.pending_tool_text.trim().to_string();
-        self.pending_tool_text.clear();
+        let pending_raw = std::mem::take(&mut self.pending_tool_text);
+        let pending_for_tool_parse = pending_raw.trim();
 
-        if let Some((call_id, name, arguments)) = Self::parse_leaked_tool_line(&pending) {
+        if let Some((call_id, name, arguments)) = Self::parse_leaked_tool_line(pending_for_tool_parse) {
             self.open_tool_block_if_needed(output, call_id, name);
             self.emit_tool_json_delta(output, arguments);
             if let Some(idx) = self.open_tool_index.take() {
@@ -575,7 +575,7 @@ impl TransformResponse {
             json!({
                 "type": "content_block_delta",
                 "index": self.open_text_index,
-                "delta": { "type": "text_delta", "text": pending }
+                "delta": { "type": "text_delta", "text": pending_raw }
             })
         ));
     }
@@ -1227,12 +1227,31 @@ mod tests {
             "plain text should open a text block"
         );
         assert!(
-            joined.contains("\"type\":\"text_delta\"") && joined.contains("\"text\":\"你好\""),
-            "plain text should emit text_delta"
+            joined.contains("\"type\":\"text_delta\"") && joined.contains("\"text\":\"你好\\n\""),
+            "plain text should emit text_delta and preserve newline"
         );
         assert!(
             !joined.contains("\"type\":\"tool_use\""),
             "plain text must not be promoted to tool_use"
+        );
+    }
+
+    #[test]
+    fn test_plain_text_preserves_markdown_line_breaks() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "## Rust 入门\n\n1. 语法基础\n2. 核心机制\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        assert!(
+            joined.contains("\"text\":\"## Rust 入门\\n\\n1. 语法基础\\n2. 核心机制\\n\""),
+            "markdown text should keep line breaks to avoid collapsed layout"
         );
     }
 
