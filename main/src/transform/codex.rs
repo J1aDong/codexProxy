@@ -518,12 +518,17 @@ impl TransformResponse {
         }
 
         let (name, arguments) = if target == "multi_tool_use.parallel" {
-            let json_start = line.find('{')?;
-            let args = line[json_start..].trim();
-            if serde_json::from_str::<Value>(args).is_err() {
-                return None;
-            }
-            ("multi_tool_use.parallel".to_string(), args.to_string())
+            let args = if let Some(json_start) = line.find('{') {
+                let candidate = line[json_start..].trim();
+                if serde_json::from_str::<Value>(candidate).is_ok() {
+                    candidate.to_string()
+                } else {
+                    "{}".to_string()
+                }
+            } else {
+                "{}".to_string()
+            };
+            ("multi_tool_use.parallel".to_string(), args)
         } else {
             let args = "{}".to_string();
             (target.to_string(), args)
@@ -1204,6 +1209,34 @@ mod tests {
         assert!(
             joined.contains("\"name\":\"multi_tool_use.parallel\""),
             "tool_use name should preserve leaked tool target for client-side routing"
+        );
+    }
+
+    #[test]
+    fn test_leaked_parallel_tool_line_without_json_is_still_promoted() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "assistant to=multi_tool_use.parallel մեկնաբանություն\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        assert!(
+            joined.contains("\"type\":\"tool_use\"")
+                && joined.contains("\"name\":\"multi_tool_use.parallel\""),
+            "parallel leaked tool line should be promoted even when json payload is missing"
+        );
+        assert!(
+            joined.contains("\"partial_json\":\"{}\""),
+            "missing leaked json payload should fall back to empty object arguments"
+        );
+        assert!(
+            !joined.contains("մեկնաբանություն"),
+            "leaked tool line suffix should not appear in visible text output"
         );
     }
 
