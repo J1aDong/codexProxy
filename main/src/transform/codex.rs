@@ -133,7 +133,7 @@ impl TransformRequest {
             "input": final_input,
             "tools": transformed_tools,
             "tool_choice": "auto",
-            "parallel_tool_calls": true,
+            "parallel_tool_calls": false,
             "reasoning": { "effort": reasoning_effort.as_str(), "summary": "auto" },
             "store": false,
             "stream": true,

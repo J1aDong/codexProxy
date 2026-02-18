@@ -760,6 +760,22 @@ fn summarize_codex_payload(payload: &Value) -> Option<String> {
     Some(items.join(" | "))
 }
 
+fn contains_tool_call_text_leak(content: &Value) -> bool {
+    let Some(blocks) = content.as_array() else {
+        return false;
+    };
+
+    blocks.iter().any(|block| {
+        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if block_type != "text" {
+            return false;
+        }
+
+        let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        text.contains("assistant to=multi_tool_use.parallel") || text.contains("assistant to=functions.")
+    })
+}
+
 fn extract_message_text(message: &Message) -> Option<String> {
     match &message.content {
         Some(MessageContent::Text(text)) => Some(text.clone()),
@@ -2733,6 +2749,21 @@ async fn handle_request(
             "stop_reason": message.get("stop_reason").cloned().unwrap_or_else(|| json!("end_turn")),
             "usage": message.get("usage").cloned().unwrap_or_else(|| json!({"input_tokens":0,"output_tokens":0}))
         });
+
+        if contains_tool_call_text_leak(payload.get("content").unwrap_or(&json!([]))) {
+            let _ = log_tx.send(format!(
+                "[Error] #{} Detected tool-call text leak in non-stream response (likely upstream tool-call formatting mismatch)",
+                request_id
+            ));
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "application/json")
+                .body(full_body(
+                    json!({"error": {"message": "Detected malformed tool call text output from upstream. Please retry the request; if it persists, disable parallel tool calls and verify tool-call protocol mapping."}})
+                        .to_string(),
+                ))
+                .unwrap());
+        }
 
         if let Some(ref l) = AppLogger::get() {
             l.log("════════════════════════════════════════════════════════════════");
