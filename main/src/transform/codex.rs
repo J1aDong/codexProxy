@@ -10,6 +10,28 @@ use super::{TransformBackend, ResponseTransformer, TransformContext, MessageProc
 
 const CODEX_INSTRUCTIONS: &str = include_str!("../instructions.txt");
 
+fn sanitize_function_call_name_for_codex(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut last_was_separator = false;
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            normalized.push(ch);
+            last_was_separator = false;
+        } else if !last_was_separator {
+            normalized.push('_');
+            last_was_separator = true;
+        }
+    }
+
+    let trimmed = normalized.trim_matches('_');
+    if trimmed.is_empty() {
+        "unknown_tool".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// 请求转换器 - Anthropic -> Codex
 pub struct TransformRequest;
 
@@ -156,6 +178,12 @@ impl TransformRequest {
                 .map(|value| value.to_string());
             if item_type.as_deref() == Some("function_call") {
                 obj.remove("signature");
+                if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                    obj.insert(
+                        "name".to_string(),
+                        json!(sanitize_function_call_name_for_codex(name)),
+                    );
+                }
             }
 
             if item_type.as_deref() == Some("message") {
@@ -1153,5 +1181,164 @@ mod tests {
             normalized_texts.contains(&"second".to_string()),
             "second thinking block should be normalized to output_text"
         );
+    }
+
+    #[test]
+    fn test_leaked_tool_text_is_promoted_to_tool_use() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "assistant to=multi_tool_use.parallel {\"tool_uses\":[]}\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        assert!(
+            joined.contains("\"content_block\":{\"id\":\"tool_")
+                && joined.contains("\"type\":\"tool_use\""),
+            "leaked tool text should be converted into a tool_use block"
+        );
+        assert!(
+            joined.contains("\"name\":\"multi_tool_use.parallel\""),
+            "tool_use name should preserve leaked tool target for client-side routing"
+        );
+    }
+
+    #[test]
+    fn test_plain_text_is_not_misclassified_as_tool_use() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "你好\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        let has_text_block_payload = joined.contains("\"content_block\":{\"text\":\"\",\"type\":\"text\"}")
+            || joined.contains("\"content_block\":{\"type\":\"text\",\"text\":\"\"}");
+        assert!(
+            joined.contains("\"content_block_start\"") && has_text_block_payload,
+            "plain text should open a text block"
+        );
+        assert!(
+            joined.contains("\"type\":\"text_delta\"") && joined.contains("\"text\":\"你好\""),
+            "plain text should emit text_delta"
+        );
+        assert!(
+            !joined.contains("\"type\":\"tool_use\""),
+            "plain text must not be promoted to tool_use"
+        );
+    }
+
+    #[test]
+    fn test_codex_input_sanitizes_function_call_name() {
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5-20250929".to_string()),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_abc".to_string()),
+                    name: "functions.exec_command".to_string(),
+                    input: json!({"cmd": "echo hi"}),
+                    signature: None,
+                }])),
+            }],
+            system: None,
+            stream: true,
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        let input = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input should be an array");
+
+        let tool_call = input
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .expect("function_call item should exist");
+        assert_eq!(
+            tool_call.get("name").and_then(|v| v.as_str()),
+            Some("functions_exec_command"),
+            "function_call name should be sanitized to codex-accepted pattern"
+        );
+    }
+
+    #[test]
+    fn test_codex_input_all_function_call_names_match_pattern() {
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5-20250929".to_string()),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    ContentBlock::ToolUse {
+                        id: Some("call_1".to_string()),
+                        name: "functions.exec_command".to_string(),
+                        input: json!({"cmd": "echo hi"}),
+                        signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: Some("call_2".to_string()),
+                        name: "multi_tool_use.parallel".to_string(),
+                        input: json!({"tool_uses": []}),
+                        signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: Some("call_3".to_string()),
+                        name: "Valid_Name-01".to_string(),
+                        input: json!({"ok": true}),
+                        signature: None,
+                    },
+                ])),
+            }],
+            system: None,
+            stream: true,
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        let input = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input should be an array");
+
+        let call_names: Vec<String> = input
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .filter_map(|item| item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+
+        assert_eq!(call_names.len(), 3, "expected all tool_use blocks to become function_call");
+        for name in call_names {
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
+                "function_call name '{}' must match ^[a-zA-Z0-9_-]+$",
+                name
+            );
+        }
     }
 }
