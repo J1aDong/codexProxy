@@ -42,6 +42,14 @@ pub struct ProxyServer {
     max_concurrency: u32,
     ignore_probe_requests: bool,
     allow_count_tokens_fallback_estimate: bool,
+    force_stream_for_codex: bool,
+    enable_sse_frame_parser: bool,
+    enable_stream_heartbeat: bool,
+    stream_heartbeat_interval_ms: u64,
+    enable_stream_log_sampling: bool,
+    stream_log_sample_every_n: u32,
+    stream_log_max_chars: usize,
+    enable_stream_metrics: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -52,6 +60,14 @@ pub struct RuntimeConfigUpdate {
     pub ctx: TransformContext,
     pub ignore_probe_requests: bool,
     pub allow_count_tokens_fallback_estimate: bool,
+    pub force_stream_for_codex: bool,
+    pub enable_sse_frame_parser: bool,
+    pub enable_stream_heartbeat: bool,
+    pub stream_heartbeat_interval_ms: u64,
+    pub enable_stream_log_sampling: bool,
+    pub stream_log_sample_every_n: u32,
+    pub stream_log_max_chars: usize,
+    pub enable_stream_metrics: bool,
     pub load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -62,6 +78,14 @@ struct RuntimeConfigState {
     ctx: TransformContext,
     ignore_probe_requests: bool,
     allow_count_tokens_fallback_estimate: bool,
+    force_stream_for_codex: bool,
+    enable_sse_frame_parser: bool,
+    enable_stream_heartbeat: bool,
+    stream_heartbeat_interval_ms: u64,
+    enable_stream_log_sampling: bool,
+    stream_log_sample_every_n: u32,
+    stream_log_max_chars: usize,
+    enable_stream_metrics: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -73,6 +97,14 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             ctx: value.ctx,
             ignore_probe_requests: value.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: value.allow_count_tokens_fallback_estimate,
+            force_stream_for_codex: value.force_stream_for_codex,
+            enable_sse_frame_parser: value.enable_sse_frame_parser,
+            enable_stream_heartbeat: value.enable_stream_heartbeat,
+            stream_heartbeat_interval_ms: value.stream_heartbeat_interval_ms,
+            enable_stream_log_sampling: value.enable_stream_log_sampling,
+            stream_log_sample_every_n: value.stream_log_sample_every_n,
+            stream_log_max_chars: value.stream_log_max_chars,
+            enable_stream_metrics: value.enable_stream_metrics,
             load_balancer_runtime: value.load_balancer_runtime,
         }
     }
@@ -280,6 +312,243 @@ fn summarize_request_messages(messages: &[Message]) -> String {
         .collect();
 
     tail_chars(&msg_summaries.join(" > "), 80)
+}
+
+#[derive(Clone, Copy)]
+struct StreamRuntimeOptions {
+    force_stream_for_codex: bool,
+    enable_sse_frame_parser: bool,
+    enable_stream_heartbeat: bool,
+    stream_heartbeat_interval_ms: u64,
+    enable_stream_log_sampling: bool,
+    stream_log_sample_every_n: u32,
+    stream_log_max_chars: usize,
+    enable_stream_metrics: bool,
+}
+
+impl StreamRuntimeOptions {
+    fn from_state(state: &RuntimeConfigState) -> Self {
+        Self {
+            force_stream_for_codex: state.force_stream_for_codex,
+            enable_sse_frame_parser: state.enable_sse_frame_parser,
+            enable_stream_heartbeat: state.enable_stream_heartbeat,
+            stream_heartbeat_interval_ms: state.stream_heartbeat_interval_ms,
+            enable_stream_log_sampling: state.enable_stream_log_sampling,
+            stream_log_sample_every_n: state.stream_log_sample_every_n,
+            stream_log_max_chars: state.stream_log_max_chars,
+            enable_stream_metrics: state.enable_stream_metrics,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SseFrameParser {
+    buffer: String,
+}
+
+impl SseFrameParser {
+    fn push_chunk(&mut self, chunk: &str) -> Vec<String> {
+        self.buffer.push_str(chunk);
+        let mut frames = Vec::new();
+
+        while let Some((pos, delim_len)) = Self::find_delimiter(&self.buffer) {
+            let frame = self.buffer[..pos].to_string();
+            self.buffer = self.buffer[pos + delim_len..].to_string();
+            if !frame.trim().is_empty() {
+                frames.push(frame);
+            }
+        }
+
+        frames
+    }
+
+    fn take_remaining(&mut self) -> Option<String> {
+        let remaining = self.buffer.trim().to_string();
+        self.buffer.clear();
+        if remaining.is_empty() {
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    fn find_delimiter(buffer: &str) -> Option<(usize, usize)> {
+        let lf = buffer.find("\n\n").map(|idx| (idx, 2));
+        let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
+        match (lf, crlf) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+}
+
+struct StreamMetrics {
+    started_at: Instant,
+    first_upstream_byte_at: Option<Instant>,
+    first_delta_at: Option<Instant>,
+    last_emit_at: Option<Instant>,
+    max_silent_gap_ms: u128,
+}
+
+impl StreamMetrics {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            first_upstream_byte_at: None,
+            first_delta_at: None,
+            last_emit_at: None,
+            max_silent_gap_ms: 0,
+        }
+    }
+
+    fn mark_upstream_chunk(&mut self) {
+        if self.first_upstream_byte_at.is_none() {
+            self.first_upstream_byte_at = Some(Instant::now());
+        }
+    }
+
+    fn mark_downstream_output(&mut self, output: &str) {
+        let now = Instant::now();
+        if let Some(last) = self.last_emit_at {
+            let gap = now.duration_since(last).as_millis();
+            if gap > self.max_silent_gap_ms {
+                self.max_silent_gap_ms = gap;
+            }
+        }
+        if self.first_delta_at.is_none() && output.contains("event: content_block_delta") {
+            self.first_delta_at = Some(now);
+        }
+        self.last_emit_at = Some(now);
+    }
+
+    fn emit(&self, log_tx: &broadcast::Sender<String>, request_id: &str, enabled: bool) {
+        if !enabled {
+            return;
+        }
+
+        let total_ms = Instant::now().duration_since(self.started_at).as_millis();
+        let ttfb_ms = self
+            .first_upstream_byte_at
+            .map(|ts| ts.duration_since(self.started_at).as_millis().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let first_delta_ms = self
+            .first_delta_at
+            .map(|ts| ts.duration_since(self.started_at).as_millis().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let _ = log_tx.send(format!(
+            "[Metrics] #{} ttfb_ms={} first_delta_ms={} max_silent_gap_ms={} stream_total_ms={}",
+            request_id, ttfb_ms, first_delta_ms, self.max_silent_gap_ms, total_ms
+        ));
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max_chars).collect();
+    format!("{}... (truncated, len={})", clipped, char_count)
+}
+
+fn maybe_log_stream_upstream(
+    logger: &Option<Arc<AppLogger>>,
+    status: u16,
+    text: &str,
+    opts: StreamRuntimeOptions,
+    counter: &mut u64,
+) {
+    let Some(l) = logger else {
+        return;
+    };
+
+    *counter += 1;
+    if opts.enable_stream_log_sampling {
+        let sample_n = opts.stream_log_sample_every_n.max(1) as u64;
+        if *counter != 1 && *counter % sample_n != 0 {
+            return;
+        }
+    }
+
+    let msg = truncate_chars(text, opts.stream_log_max_chars);
+    l.log_upstream_response(status, &msg);
+}
+
+fn maybe_log_stream_downstream(
+    logger: &Option<Arc<AppLogger>>,
+    text: &str,
+    opts: StreamRuntimeOptions,
+    counter: &mut u64,
+) {
+    let Some(l) = logger else {
+        return;
+    };
+
+    *counter += 1;
+    if opts.enable_stream_log_sampling {
+        let sample_n = opts.stream_log_sample_every_n.max(1) as u64;
+        if *counter != 1 && *counter % sample_n != 0 {
+            return;
+        }
+    }
+
+    let msg = truncate_chars(text, opts.stream_log_max_chars);
+    l.log_anthropic_response(&msg);
+}
+
+fn drain_complete_lines(buffer: &mut String) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(pos) = buffer.find('\n') {
+        let mut line = buffer[..pos].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        *buffer = buffer[pos + 1..].to_string();
+        if line.trim().is_empty() {
+            continue;
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn accept_header_allows_sse(accept_header: Option<&str>) -> bool {
+    let Some(value) = accept_header else {
+        return false;
+    };
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("text/event-stream") || normalized.contains("*/*")
+}
+
+fn accept_header_explicit_json_only(accept_header: Option<&str>) -> bool {
+    let Some(value) = accept_header else {
+        return false;
+    };
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("application/json") && !normalized.contains("text/event-stream")
+}
+
+fn resolve_effective_stream(
+    requested_stream: bool,
+    converter: &str,
+    accept_header: Option<&str>,
+    opts: StreamRuntimeOptions,
+) -> bool {
+    if requested_stream {
+        return true;
+    }
+    if !opts.force_stream_for_codex || !converter.eq_ignore_ascii_case("codex") {
+        return false;
+    }
+    if accept_header_explicit_json_only(accept_header) {
+        return false;
+    }
+    accept_header_allows_sse(accept_header)
 }
 
 fn parse_sse_chunk(chunk: &str) -> Option<(String, Value)> {
@@ -1087,6 +1356,14 @@ impl ProxyServer {
             max_concurrency: 0,
             ignore_probe_requests: false,
             allow_count_tokens_fallback_estimate: true,
+            force_stream_for_codex: true,
+            enable_sse_frame_parser: true,
+            enable_stream_heartbeat: true,
+            stream_heartbeat_interval_ms: 8_000,
+            enable_stream_log_sampling: true,
+            stream_log_sample_every_n: 20,
+            stream_log_max_chars: 512,
+            enable_stream_metrics: true,
             load_balancer_runtime: None,
         }
     }
@@ -1146,6 +1423,46 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_force_stream_for_codex(mut self, enable: bool) -> Self {
+        self.force_stream_for_codex = enable;
+        self
+    }
+
+    pub fn with_enable_sse_frame_parser(mut self, enable: bool) -> Self {
+        self.enable_sse_frame_parser = enable;
+        self
+    }
+
+    pub fn with_enable_stream_heartbeat(mut self, enable: bool) -> Self {
+        self.enable_stream_heartbeat = enable;
+        self
+    }
+
+    pub fn with_stream_heartbeat_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.stream_heartbeat_interval_ms = interval_ms;
+        self
+    }
+
+    pub fn with_enable_stream_log_sampling(mut self, enable: bool) -> Self {
+        self.enable_stream_log_sampling = enable;
+        self
+    }
+
+    pub fn with_stream_log_sample_every_n(mut self, every_n: u32) -> Self {
+        self.stream_log_sample_every_n = every_n;
+        self
+    }
+
+    pub fn with_stream_log_max_chars(mut self, max_chars: usize) -> Self {
+        self.stream_log_max_chars = max_chars;
+        self
+    }
+
+    pub fn with_enable_stream_metrics(mut self, enable: bool) -> Self {
+        self.enable_stream_metrics = enable;
+        self
+    }
+
     pub fn with_load_balancer_runtime(mut self, runtime: LoadBalancerRuntime) -> Self {
         self.load_balancer_runtime = Some(runtime);
         self
@@ -1166,6 +1483,14 @@ impl ProxyServer {
             },
             ignore_probe_requests: self.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: self.allow_count_tokens_fallback_estimate,
+            force_stream_for_codex: self.force_stream_for_codex,
+            enable_sse_frame_parser: self.enable_sse_frame_parser,
+            enable_stream_heartbeat: self.enable_stream_heartbeat,
+            stream_heartbeat_interval_ms: self.stream_heartbeat_interval_ms,
+            enable_stream_log_sampling: self.enable_stream_log_sampling,
+            stream_log_sample_every_n: self.stream_log_sample_every_n,
+            stream_log_max_chars: self.stream_log_max_chars,
+            enable_stream_metrics: self.enable_stream_metrics,
             load_balancer_runtime: self.load_balancer_runtime.clone(),
         }
     }
@@ -1312,6 +1637,7 @@ async fn handle_request(
         .chars()
         .take(8)
         .collect();
+    let request_started_at = Instant::now();
 
     // 处理新增的 GET 路由
     if method == Method::GET {
@@ -1346,6 +1672,7 @@ async fn handle_request(
         || normalized_path == "/v1/messages/count_tokens";
 
     let runtime_state = runtime_handle.snapshot();
+    let stream_opts = StreamRuntimeOptions::from_state(&runtime_state);
     let target_url = runtime_state.target_url;
     let api_key = runtime_state.api_key;
     let ctx = runtime_state.ctx;
@@ -1419,6 +1746,12 @@ async fn handle_request(
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
         .map(|value| value.to_string());
+
+    let accept_header = req
+        .headers()
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
 
     // 确定最终使用的 API key
     let final_api_key = if let Some(key) = api_key.clone() {
@@ -1876,7 +2209,12 @@ async fn handle_request(
             input_model,
             route_selection.model_name,
             anthropic_body.messages.len(),
-            anthropic_body.stream,
+            resolve_effective_stream(
+                anthropic_body.stream,
+                &route_selection.converter,
+                accept_header.as_deref(),
+                stream_opts,
+            ),
             tool_count,
             system_chars,
             display_summary,
@@ -2171,13 +2509,26 @@ async fn handle_request(
     let upstream_status =
         successful_upstream_status.expect("upstream status must exist after successful loop");
     let _lb_permit = successful_lb_permit;
+    let effective_stream = resolve_effective_stream(
+        anthropic_body.stream,
+        &request_converter,
+        accept_header.as_deref(),
+        stream_opts,
+    );
 
     let _ = log_tx.send(format!(
         "[System] #{} Request transformed and forwarding to upstream API",
         request_id,
     ));
 
-    if request_converter.eq_ignore_ascii_case("anthropic") && !anthropic_body.stream {
+    if !anthropic_body.stream && effective_stream {
+        let _ = log_tx.send(format!(
+            "[Stream] #{} stream=false overridden to SSE (converter={}, force_stream_for_codex=true)",
+            request_id, request_converter
+        ));
+    }
+
+    if request_converter.eq_ignore_ascii_case("anthropic") && !effective_stream {
         let content_type = response
             .headers()
             .get("content-type")
@@ -2202,10 +2553,12 @@ async fn handle_request(
     }
 
     // 非流式：把上游 SSE 聚合成 Anthropic JSON
-    if !anthropic_body.stream {
+    if !effective_stream {
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut line_buffer = String::new();
+        let mut frame_parser = SseFrameParser::default();
         let mut transformer = request_backend.create_response_transformer(&model);
+        let mut metrics = StreamMetrics::new(request_started_at);
 
         let mut message_state: Option<Value> = None;
         let mut blocks: BTreeMap<usize, Value> = BTreeMap::new();
@@ -2218,37 +2571,57 @@ async fn handle_request(
             match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
                 Ok(Some(chunk_result)) => match chunk_result {
                     Ok(chunk) => {
-                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        metrics.mark_upstream_chunk();
+                        let chunk_text = String::from_utf8_lossy(&chunk).to_string();
 
-                        while let Some(pos) = buffer.find('\n') {
-                            let line = buffer[..pos].to_string();
-                            buffer = buffer[pos + 1..].to_string();
-
-                            if line.trim().is_empty() {
-                                continue;
-                            }
-
-                            if let Some(ref l) = AppLogger::get() {
-                                l.log_upstream_response(upstream_status, &line);
-                            }
-
-                            for event_chunk in transformer.transform_line(&line) {
-                                if let Some(ref l) = AppLogger::get() {
-                                    l.log_anthropic_response(&event_chunk);
+                        if stream_opts.enable_sse_frame_parser {
+                            for frame in frame_parser.push_chunk(&chunk_text) {
+                                if let Some(ref l) = logger {
+                                    l.log_upstream_response(upstream_status, &frame);
                                 }
-                                apply_sse_chunk_to_non_stream_message(
-                                    &event_chunk,
-                                    &mut message_state,
-                                    &mut blocks,
-                                    &mut tool_input_buffers,
-                                    &mut stop_reason_state,
-                                    &mut usage_input_tokens,
-                                    &mut usage_output_tokens,
-                                );
+                                for event_chunk in transformer.transform_event(&frame) {
+                                    metrics.mark_downstream_output(&event_chunk);
+                                    if let Some(ref l) = logger {
+                                        l.log_anthropic_response(&event_chunk);
+                                    }
+                                    apply_sse_chunk_to_non_stream_message(
+                                        &event_chunk,
+                                        &mut message_state,
+                                        &mut blocks,
+                                        &mut tool_input_buffers,
+                                        &mut stop_reason_state,
+                                        &mut usage_input_tokens,
+                                        &mut usage_output_tokens,
+                                    );
+                                }
+                            }
+                        } else {
+                            line_buffer.push_str(&chunk_text);
+                            for line in drain_complete_lines(&mut line_buffer) {
+                                if let Some(ref l) = logger {
+                                    l.log_upstream_response(upstream_status, &line);
+                                }
+
+                                for event_chunk in transformer.transform_line(&line) {
+                                    metrics.mark_downstream_output(&event_chunk);
+                                    if let Some(ref l) = logger {
+                                        l.log_anthropic_response(&event_chunk);
+                                    }
+                                    apply_sse_chunk_to_non_stream_message(
+                                        &event_chunk,
+                                        &mut message_state,
+                                        &mut blocks,
+                                        &mut tool_input_buffers,
+                                        &mut stop_reason_state,
+                                        &mut usage_input_tokens,
+                                        &mut usage_output_tokens,
+                                    );
+                                }
                             }
                         }
                     }
                     Err(e) => {
+                        metrics.emit(&log_tx, &request_id, stream_opts.enable_stream_metrics);
                         let _ = log_tx.send(format!("[Error] #{} Stream error: {}", request_id, e));
                         return Ok(Response::builder()
                                 .status(StatusCode::BAD_GATEWAY)
@@ -2261,6 +2634,7 @@ async fn handle_request(
                 },
                 Ok(None) => break,
                 Err(_) => {
+                    metrics.emit(&log_tx, &request_id, stream_opts.enable_stream_metrics);
                     let _ = log_tx.send(format!(
                         "[Error] #{} Upstream read timeout (300s)",
                         request_id
@@ -2277,13 +2651,35 @@ async fn handle_request(
             }
         }
 
-        if !buffer.trim().is_empty() {
-            if let Some(ref l) = AppLogger::get() {
-                l.log_upstream_response(upstream_status, &buffer);
+        if stream_opts.enable_sse_frame_parser {
+            if let Some(remaining) = frame_parser.take_remaining() {
+                if let Some(ref l) = logger {
+                    l.log_upstream_response(upstream_status, &remaining);
+                }
+                for event_chunk in transformer.transform_event(&remaining) {
+                    metrics.mark_downstream_output(&event_chunk);
+                    if let Some(ref l) = logger {
+                        l.log_anthropic_response(&event_chunk);
+                    }
+                    apply_sse_chunk_to_non_stream_message(
+                        &event_chunk,
+                        &mut message_state,
+                        &mut blocks,
+                        &mut tool_input_buffers,
+                        &mut stop_reason_state,
+                        &mut usage_input_tokens,
+                        &mut usage_output_tokens,
+                    );
+                }
+            }
+        } else if !line_buffer.trim().is_empty() {
+            if let Some(ref l) = logger {
+                l.log_upstream_response(upstream_status, &line_buffer);
             }
 
-            for event_chunk in transformer.transform_line(&buffer) {
-                if let Some(ref l) = AppLogger::get() {
+            for event_chunk in transformer.transform_line(&line_buffer) {
+                metrics.mark_downstream_output(&event_chunk);
+                if let Some(ref l) = logger {
                     l.log_anthropic_response(&event_chunk);
                 }
                 apply_sse_chunk_to_non_stream_message(
@@ -2343,6 +2739,7 @@ async fn handle_request(
             l.log("✅ Request completed");
             l.log("════════════════════════════════════════════════════════════════");
         }
+        metrics.emit(&log_tx, &request_id, stream_opts.enable_stream_metrics);
 
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -2360,46 +2757,103 @@ async fn handle_request(
 
     let log_tx_clone = log_tx.clone();
     let request_id_for_stream = request_id.clone();
+    let logger_for_stream = logger.clone();
+    let stream_opts_for_task = stream_opts;
+    let request_started_at_for_stream = request_started_at;
     let permit_for_stream = permit;
     tokio::spawn(async move {
         let _permit_guard = permit_for_stream;
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut line_buffer = String::new();
+        let mut frame_parser = SseFrameParser::default();
+        let mut upstream_log_counter = 0u64;
+        let mut downstream_log_counter = 0u64;
+        let mut metrics = StreamMetrics::new(request_started_at_for_stream);
+        let hard_timeout = Duration::from_secs(300);
+        let heartbeat_interval =
+            Duration::from_millis(stream_opts_for_task.stream_heartbeat_interval_ms.max(500));
+        let mut last_upstream_activity = Instant::now();
 
         loop {
-            // 添加 300 秒读取超时
-            match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
+            let wait_duration = if stream_opts_for_task.enable_stream_heartbeat {
+                heartbeat_interval
+            } else {
+                hard_timeout
+            };
+
+            match tokio::time::timeout(wait_duration, stream.next()).await {
                 Ok(Some(chunk_result)) => {
                     match chunk_result {
                         Ok(chunk) => {
-                            buffer.push_str(&String::from_utf8_lossy(&chunk));
+                            metrics.mark_upstream_chunk();
+                            last_upstream_activity = Instant::now();
+                            let chunk_text = String::from_utf8_lossy(&chunk).to_string();
 
-                            // 按行处理
-                            while let Some(pos) = buffer.find('\n') {
-                                let line = buffer[..pos].to_string();
-                                buffer = buffer[pos + 1..].to_string();
+                            if stream_opts_for_task.enable_sse_frame_parser {
+                                for frame in frame_parser.push_chunk(&chunk_text) {
+                                    maybe_log_stream_upstream(
+                                        &logger_for_stream,
+                                        upstream_status,
+                                        &frame,
+                                        stream_opts_for_task,
+                                        &mut upstream_log_counter,
+                                    );
 
-                                if line.trim().is_empty() {
-                                    continue;
-                                }
-
-                                // 记录上游原始响应
-                                if let Some(ref l) = AppLogger::get() {
-                                    l.log_upstream_response(upstream_status, &line);
-                                }
-
-                                for output in transformer.transform_line(&line) {
-                                    // 记录转换后的响应
-                                    if let Some(ref l) = AppLogger::get() {
-                                        l.log_anthropic_response(&output);
+                                    for output in transformer.transform_event(&frame) {
+                                        metrics.mark_downstream_output(&output);
+                                        maybe_log_stream_downstream(
+                                            &logger_for_stream,
+                                            &output,
+                                            stream_opts_for_task,
+                                            &mut downstream_log_counter,
+                                        );
+                                        if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err()
+                                        {
+                                            let _ = log_tx_clone.send(format!(
+                                                "[Warning] #{} Client disconnected, stopping stream",
+                                                request_id_for_stream
+                                            ));
+                                            metrics.emit(
+                                                &log_tx_clone,
+                                                &request_id_for_stream,
+                                                stream_opts_for_task.enable_stream_metrics,
+                                            );
+                                            return;
+                                        }
                                     }
-                                    if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err()
-                                    {
-                                        let _ = log_tx_clone.send(format!(
-                                            "[Warning] #{} Client disconnected, stopping stream",
-                                            request_id_for_stream
-                                        ));
-                                        return; // 客户端断开，停止处理
+                                }
+                            } else {
+                                line_buffer.push_str(&chunk_text);
+                                for line in drain_complete_lines(&mut line_buffer) {
+                                    maybe_log_stream_upstream(
+                                        &logger_for_stream,
+                                        upstream_status,
+                                        &line,
+                                        stream_opts_for_task,
+                                        &mut upstream_log_counter,
+                                    );
+
+                                    for output in transformer.transform_line(&line) {
+                                        metrics.mark_downstream_output(&output);
+                                        maybe_log_stream_downstream(
+                                            &logger_for_stream,
+                                            &output,
+                                            stream_opts_for_task,
+                                            &mut downstream_log_counter,
+                                        );
+                                        if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err()
+                                        {
+                                            let _ = log_tx_clone.send(format!(
+                                                "[Warning] #{} Client disconnected, stopping stream",
+                                                request_id_for_stream
+                                            ));
+                                            metrics.emit(
+                                                &log_tx_clone,
+                                                &request_id_for_stream,
+                                                stream_opts_for_task.enable_stream_metrics,
+                                            );
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -2415,6 +2869,34 @@ async fn handle_request(
                 }
                 Ok(None) => break, // 流结束
                 Err(_) => {
+                    if stream_opts_for_task.enable_stream_heartbeat {
+                        if last_upstream_activity.elapsed() >= hard_timeout {
+                            let _ = log_tx_clone.send(format!(
+                                "[Error] #{} Upstream read timeout (300s)",
+                                request_id_for_stream
+                            ));
+                            break;
+                        }
+
+                        if tx
+                            .send(Ok(Frame::data(Bytes::from(": keep-alive\n\n"))))
+                            .await
+                            .is_err()
+                        {
+                            let _ = log_tx_clone.send(format!(
+                                "[Warning] #{} Client disconnected while sending heartbeat",
+                                request_id_for_stream
+                            ));
+                            metrics.emit(
+                                &log_tx_clone,
+                                &request_id_for_stream,
+                                stream_opts_for_task.enable_stream_metrics,
+                            );
+                            return;
+                        }
+                        continue;
+                    }
+
                     let _ = log_tx_clone.send(format!(
                         "[Error] #{} Upstream read timeout (300s)",
                         request_id_for_stream
@@ -2424,30 +2906,78 @@ async fn handle_request(
             }
         }
 
-        // 处理剩余的 buffer
-        if !buffer.trim().is_empty() {
-            // 记录上游原始响应
-            if let Some(ref l) = AppLogger::get() {
-                l.log_upstream_response(upstream_status, &buffer);
-            }
+        if stream_opts_for_task.enable_sse_frame_parser {
+            if let Some(remaining) = frame_parser.take_remaining() {
+                maybe_log_stream_upstream(
+                    &logger_for_stream,
+                    upstream_status,
+                    &remaining,
+                    stream_opts_for_task,
+                    &mut upstream_log_counter,
+                );
 
-            for output in transformer.transform_line(&buffer) {
-                // 记录转换后的响应
-                if let Some(ref l) = AppLogger::get() {
-                    l.log_anthropic_response(&output);
+                for output in transformer.transform_event(&remaining) {
+                    metrics.mark_downstream_output(&output);
+                    maybe_log_stream_downstream(
+                        &logger_for_stream,
+                        &output,
+                        stream_opts_for_task,
+                        &mut downstream_log_counter,
+                    );
+                    if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
+                        let _ = log_tx_clone.send(format!(
+                            "[Warning] #{} Client disconnected during flush",
+                            request_id_for_stream
+                        ));
+                        metrics.emit(
+                            &log_tx_clone,
+                            &request_id_for_stream,
+                            stream_opts_for_task.enable_stream_metrics,
+                        );
+                        return;
+                    }
                 }
+            }
+        } else if !line_buffer.trim().is_empty() {
+            maybe_log_stream_upstream(
+                &logger_for_stream,
+                upstream_status,
+                &line_buffer,
+                stream_opts_for_task,
+                &mut upstream_log_counter,
+            );
+
+            for output in transformer.transform_line(&line_buffer) {
+                metrics.mark_downstream_output(&output);
+                maybe_log_stream_downstream(
+                    &logger_for_stream,
+                    &output,
+                    stream_opts_for_task,
+                    &mut downstream_log_counter,
+                );
                 if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
                     let _ = log_tx_clone.send(format!(
                         "[Warning] #{} Client disconnected during flush",
                         request_id_for_stream
                     ));
+                    metrics.emit(
+                        &log_tx_clone,
+                        &request_id_for_stream,
+                        stream_opts_for_task.enable_stream_metrics,
+                    );
                     return;
                 }
             }
         }
 
+        metrics.emit(
+            &log_tx_clone,
+            &request_id_for_stream,
+            stream_opts_for_task.enable_stream_metrics,
+        );
+
         // 记录完成
-        if let Some(ref l) = AppLogger::get() {
+        if let Some(ref l) = logger_for_stream {
             l.log("════════════════════════════════════════════════════════════════");
             l.log("✅ Request completed");
             l.log("════════════════════════════════════════════════════════════════");
@@ -2571,7 +3101,23 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_upstream_url, UpstreamOperation};
+    use super::{
+        resolve_effective_stream, resolve_upstream_url, SseFrameParser, StreamRuntimeOptions,
+        UpstreamOperation,
+    };
+
+    fn stream_opts() -> StreamRuntimeOptions {
+        StreamRuntimeOptions {
+            force_stream_for_codex: true,
+            enable_sse_frame_parser: true,
+            enable_stream_heartbeat: true,
+            stream_heartbeat_interval_ms: 8_000,
+            enable_stream_log_sampling: true,
+            stream_log_sample_every_n: 20,
+            stream_log_max_chars: 512,
+            enable_stream_metrics: true,
+        }
+    }
 
     #[test]
     fn test_resolve_upstream_url_codex_messages_appends_responses() {
@@ -2618,5 +3164,41 @@ mod tests {
             url,
             "http://localhost:8317/v1beta/models/gemini-3-flash-preview:streamGenerateContent?alt=sse"
         );
+    }
+
+    #[test]
+    fn test_resolve_effective_stream_forced_for_codex_when_accepts_sse() {
+        let opts = stream_opts();
+        assert!(resolve_effective_stream(
+            false,
+            "codex",
+            Some("text/event-stream"),
+            opts
+        ));
+    }
+
+    #[test]
+    fn test_resolve_effective_stream_respects_explicit_json_only() {
+        let opts = stream_opts();
+        assert!(!resolve_effective_stream(
+            false,
+            "codex",
+            Some("application/json"),
+            opts
+        ));
+    }
+
+    #[test]
+    fn test_sse_frame_parser_handles_partial_frames() {
+        let mut parser = SseFrameParser::default();
+        let frames_1 = parser.push_chunk("event: x\ndata: 1\n\n");
+        assert_eq!(frames_1.len(), 1);
+        assert!(frames_1[0].contains("event: x"));
+
+        let frames_2 = parser.push_chunk("event: y\ndata");
+        assert!(frames_2.is_empty());
+        let frames_3 = parser.push_chunk(": 2\n\n");
+        assert_eq!(frames_3.len(), 1);
+        assert!(frames_3[0].contains("event: y"));
     }
 }

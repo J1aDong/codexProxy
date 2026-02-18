@@ -55,6 +55,20 @@ pub trait TransformBackend: Send + Sync {
 pub trait ResponseTransformer: Send {
     /// 将上游的一行 SSE 转换为 Anthropic 格式的多行输出
     fn transform_line(&mut self, line: &str) -> Vec<String>;
+
+    /// 将上游一个完整 SSE 事件帧转换为 Anthropic 格式输出
+    /// 默认实现兼容旧逻辑：按行回退到 transform_line。
+    fn transform_event(&mut self, event: &str) -> Vec<String> {
+        let mut output = Vec::new();
+        for line in event.lines() {
+            let normalized = line.trim_end_matches('\r');
+            if normalized.trim().is_empty() {
+                continue;
+            }
+            output.extend(self.transform_line(normalized));
+        }
+        output
+    }
 }
 
 // Re-export backends

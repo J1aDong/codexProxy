@@ -4,8 +4,13 @@ use crate::logger::{is_debug_log_enabled, truncate_for_log, AppLogger};
 use crate::models::{
     ContentBlock, ImageSource, ImageUrlValue, Message, MessageContent,
 };
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 pub const IMAGE_SYSTEM_HINT: &str = "\n<system_hint>IMAGE PROVIDED. You can see the image above directly. Analyze it as requested. DO NOT ask for file paths.</system_hint>\n";
+const MAX_SKILL_CONTENT_CHARS: usize = 8_000;
+const MAX_TOTAL_SKILL_CHARS: usize = 32_000;
+const SKILL_TRUNCATION_MARKER: &str = "\n[skill content truncated]";
 
 pub struct MessageProcessor;
 
@@ -16,7 +21,8 @@ impl MessageProcessor {
     ) -> (Vec<Value>, Vec<String>) {
         let mut input = Vec::new();
         let mut extracted_skills = Vec::new();
-        let mut extracted_skill_names = std::collections::HashSet::new();
+        let mut extracted_skill_keys = std::collections::HashSet::new();
+        let mut extracted_skill_chars = 0usize;
         let mut skill_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // 获取全局日志记录器
@@ -272,13 +278,33 @@ impl MessageProcessor {
 
                                 if is_skill || Self::is_potential_skill_result(tool_content) {
                                     if let Some((s_name, s_content)) = Self::extract_skill_info(tool_content) {
-                                        if !extracted_skill_names.contains(&s_name) {
-                                            let skill_formatted = Self::convert_to_codex_skill_format(&s_name, &s_content);
-                                            extracted_skills.push(skill_formatted);
-                                            extracted_skill_names.insert(s_name.clone());
-                                            log(&format!("🎯 Skill extracted: {}", s_name));
+                                        let skill_key = Self::build_skill_key(&s_name, &s_content);
+                                        if !extracted_skill_keys.contains(&skill_key) {
+                                            let remaining_budget =
+                                                MAX_TOTAL_SKILL_CHARS.saturating_sub(extracted_skill_chars);
+                                            if let Some(skill_formatted) = Self::build_limited_skill_payload(
+                                                &s_name,
+                                                &s_content,
+                                                remaining_budget,
+                                            ) {
+                                                extracted_skill_chars += skill_formatted.chars().count();
+                                                extracted_skills.push(skill_formatted);
+                                                extracted_skill_keys.insert(skill_key);
+                                                log(&format!(
+                                                    "🎯 Skill extracted: {} (total_chars={})",
+                                                    s_name, extracted_skill_chars
+                                                ));
+                                            } else {
+                                                log(&format!(
+                                                    "🎯 Skill skipped due budget limit: {}",
+                                                    s_name
+                                                ));
+                                            }
                                         } else {
-                                            log(&format!("🎯 Skill already extracted (deduped): {}", s_name));
+                                            log(&format!(
+                                                "🎯 Skill already extracted (deduped by name+content): {}",
+                                                s_name
+                                            ));
                                         }
                                         override_result_text = Some(format!("Skill '{}' loaded.", s_name));
                                     }
@@ -661,5 +687,79 @@ impl MessageProcessor {
 
     pub fn convert_to_codex_skill_format(name: &str, content: &str) -> String {
         format!("<skill>\n<name>{}</name>\n<path>unknown</path>\n{}\n</skill>", name, content)
+    }
+
+    fn truncate_skill_content(content: &str, max_chars: usize) -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
+        let content = content.trim();
+        let char_count = content.chars().count();
+        if char_count <= max_chars {
+            return content.to_string();
+        }
+
+        let marker_chars = SKILL_TRUNCATION_MARKER.chars().count();
+        if max_chars <= marker_chars {
+            return content.chars().take(max_chars).collect();
+        }
+
+        let keep_chars = max_chars - marker_chars;
+        let mut truncated: String = content.chars().take(keep_chars).collect();
+        truncated.push_str(SKILL_TRUNCATION_MARKER);
+        truncated
+    }
+
+    fn build_skill_key(name: &str, content: &str) -> String {
+        let normalized_name = name.trim().to_ascii_lowercase();
+        let normalized_content = content.trim();
+        let mut hasher = DefaultHasher::new();
+        normalized_content.hash(&mut hasher);
+        format!("{}#{}", normalized_name, hasher.finish())
+    }
+
+    fn build_limited_skill_payload(
+        name: &str,
+        content: &str,
+        remaining_budget: usize,
+    ) -> Option<String> {
+        if remaining_budget == 0 {
+            return None;
+        }
+
+        let wrapper_overhead = Self::convert_to_codex_skill_format(name, "").chars().count();
+        if remaining_budget <= wrapper_overhead {
+            return None;
+        }
+
+        let per_skill_budget = remaining_budget - wrapper_overhead;
+        let allowed_content_chars = per_skill_budget.min(MAX_SKILL_CONTENT_CHARS);
+        let limited_content = Self::truncate_skill_content(content, allowed_content_chars);
+        if limited_content.is_empty() {
+            return None;
+        }
+
+        Some(Self::convert_to_codex_skill_format(name, &limited_content))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageProcessor;
+
+    #[test]
+    fn test_build_skill_key_changes_with_content() {
+        let k1 = MessageProcessor::build_skill_key("test-skill", "alpha");
+        let k2 = MessageProcessor::build_skill_key("test-skill", "beta");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_skill_payload_is_truncated_when_budget_is_tight() {
+        let content = "a".repeat(20_000);
+        let payload = MessageProcessor::build_limited_skill_payload("skill-a", &content, 1200)
+            .expect("payload should fit with truncation");
+        assert!(payload.contains("[skill content truncated]"));
+        assert!(payload.chars().count() <= 1200);
     }
 }

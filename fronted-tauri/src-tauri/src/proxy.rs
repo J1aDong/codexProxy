@@ -247,6 +247,31 @@ pub struct ProxyConfig {
         default = "default_allow_count_tokens_fallback_estimate"
     )]
     pub allow_count_tokens_fallback_estimate: bool,
+    #[serde(rename = "forceStreamForCodex", default = "default_force_stream_for_codex")]
+    pub force_stream_for_codex: bool,
+    #[serde(rename = "enableSseFrameParser", default = "default_enable_sse_frame_parser")]
+    pub enable_sse_frame_parser: bool,
+    #[serde(rename = "enableStreamHeartbeat", default = "default_enable_stream_heartbeat")]
+    pub enable_stream_heartbeat: bool,
+    #[serde(
+        rename = "streamHeartbeatIntervalMs",
+        default = "default_stream_heartbeat_interval_ms"
+    )]
+    pub stream_heartbeat_interval_ms: u64,
+    #[serde(
+        rename = "enableStreamLogSampling",
+        default = "default_enable_stream_log_sampling"
+    )]
+    pub enable_stream_log_sampling: bool,
+    #[serde(
+        rename = "streamLogSampleEveryN",
+        default = "default_stream_log_sample_every_n"
+    )]
+    pub stream_log_sample_every_n: u32,
+    #[serde(rename = "streamLogMaxChars", default = "default_stream_log_max_chars")]
+    pub stream_log_max_chars: usize,
+    #[serde(rename = "enableStreamMetrics", default = "default_enable_stream_metrics")]
+    pub enable_stream_metrics: bool,
     #[serde(rename = "allowExternalAccess", default)]
     pub allow_external_access: bool,
     #[serde(default)]
@@ -288,6 +313,38 @@ fn default_codex_model() -> String {
 }
 
 fn default_allow_count_tokens_fallback_estimate() -> bool {
+    true
+}
+
+fn default_force_stream_for_codex() -> bool {
+    true
+}
+
+fn default_enable_sse_frame_parser() -> bool {
+    true
+}
+
+fn default_enable_stream_heartbeat() -> bool {
+    true
+}
+
+fn default_stream_heartbeat_interval_ms() -> u64 {
+    8_000
+}
+
+fn default_enable_stream_log_sampling() -> bool {
+    true
+}
+
+fn default_stream_log_sample_every_n() -> u32 {
+    20
+}
+
+fn default_stream_log_max_chars() -> usize {
+    512
+}
+
+fn default_enable_stream_metrics() -> bool {
     true
 }
 
@@ -506,6 +563,14 @@ fn build_runtime_update(
         },
         ignore_probe_requests: config.ignore_probe_requests,
         allow_count_tokens_fallback_estimate: config.allow_count_tokens_fallback_estimate,
+        force_stream_for_codex: config.force_stream_for_codex,
+        enable_sse_frame_parser: config.enable_sse_frame_parser,
+        enable_stream_heartbeat: config.enable_stream_heartbeat,
+        stream_heartbeat_interval_ms: config.stream_heartbeat_interval_ms,
+        enable_stream_log_sampling: config.enable_stream_log_sampling,
+        stream_log_sample_every_n: config.stream_log_sample_every_n,
+        stream_log_max_chars: config.stream_log_max_chars,
+        enable_stream_metrics: config.enable_stream_metrics,
         load_balancer_runtime,
     }
 }
@@ -740,6 +805,14 @@ async fn start_proxy_with_manager(
         .with_gemini_reasoning_effort(config.gemini_reasoning_effort.to_gemini_mapping())
         .with_ignore_probe_requests(config.ignore_probe_requests)
         .with_allow_count_tokens_fallback_estimate(config.allow_count_tokens_fallback_estimate)
+        .with_force_stream_for_codex(config.force_stream_for_codex)
+        .with_enable_sse_frame_parser(config.enable_sse_frame_parser)
+        .with_enable_stream_heartbeat(config.enable_stream_heartbeat)
+        .with_stream_heartbeat_interval_ms(config.stream_heartbeat_interval_ms)
+        .with_enable_stream_log_sampling(config.enable_stream_log_sampling)
+        .with_stream_log_sample_every_n(config.stream_log_sample_every_n)
+        .with_stream_log_max_chars(config.stream_log_max_chars)
+        .with_enable_stream_metrics(config.enable_stream_metrics)
         .with_allow_external_access(config.allow_external_access)
         .with_max_concurrency(config.max_concurrency);
 

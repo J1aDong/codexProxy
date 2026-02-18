@@ -881,6 +881,7 @@ const shouldShowLog = (message: string) => {
   if (message.startsWith('[ReqPayload]')) return true
   if (message.startsWith('[RateLimit]')) return true
   if (message.startsWith('[Tokens]')) return true
+  if (message.startsWith('[Metrics]')) return true
   if (message.includes('[System] Init success')) return true
   if (message.includes('Runtime config hot-updated')) return true
   if (message.includes('[Request] Sending request')) return true

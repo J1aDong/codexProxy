@@ -412,7 +412,7 @@ impl TransformResponse {
         }
     }
 
-    pub fn transform_line(&mut self, line: &str) -> Vec<String> {
+    pub fn transform_sse_line(&mut self, line: &str) -> Vec<String> {
         let mut output = Vec::new();
 
         if !line.starts_with("data: ") {
@@ -653,8 +653,7 @@ impl TransformResponse {
 
 impl ResponseTransformer for TransformResponse {
     fn transform_line(&mut self, line: &str) -> Vec<String> {
-        // 直接代理到已有的方法
-        self.transform_line(line)
+        self.transform_sse_line(line)
     }
 }
 
@@ -773,6 +772,17 @@ mod tests {
         assert_eq!(get_reasoning_effort("CLAUDE-3-OPUS", &mapping), ReasoningEffort::Xhigh);
         assert_eq!(get_reasoning_effort("Claude-Sonnet-4", &mapping), ReasoningEffort::Medium);
         assert_eq!(get_reasoning_effort("claude-haiku", &mapping), ReasoningEffort::Low);
+    }
+
+    #[test]
+    fn test_transform_response_trait_dispatch() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let trait_obj: &mut dyn ResponseTransformer = &mut transformer;
+        let out = trait_obj.transform_line(r#"data: {"type":"response.completed"}"#);
+        assert!(
+            out.iter().any(|chunk| chunk.contains("event: message_stop")),
+            "trait dispatch should forward to internal transform logic"
+        );
     }
 
     // Helper to create a fake tool use block
