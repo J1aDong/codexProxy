@@ -133,7 +133,7 @@ impl TransformRequest {
             "input": final_input,
             "tools": transformed_tools,
             "tool_choice": "auto",
-            "parallel_tool_calls": false,
+            "parallel_tool_calls": true,
             "reasoning": { "effort": reasoning_effort.as_str(), "summary": "auto" },
             "store": false,
             "stream": true,
@@ -395,6 +395,7 @@ pub struct TransformResponse {
     tool_name: Option<String>,
     saw_tool_call: bool,
     sent_message_start: bool,
+    pending_tool_text: String,
 }
 
 impl TransformResponse {
@@ -409,7 +410,146 @@ impl TransformResponse {
             tool_name: None,
             saw_tool_call: false,
             sent_message_start: false,
+            pending_tool_text: String::new(),
         }
+    }
+
+    fn close_open_text_block(&mut self, output: &mut Vec<String>) {
+        if let Some(idx) = self.open_text_index.take() {
+            output.push(format!(
+                "event: content_block_stop\ndata: {}\n\n",
+                json!({ "type": "content_block_stop", "index": idx })
+            ));
+        }
+    }
+
+    fn open_tool_block_if_needed(
+        &mut self,
+        output: &mut Vec<String>,
+        call_id: String,
+        name: String,
+    ) {
+        self.saw_tool_call = true;
+        self.close_open_text_block(output);
+
+        if self.open_tool_index.is_some() {
+            return;
+        }
+
+        self.tool_call_id = Some(call_id.clone());
+        self.tool_name = Some(name.clone());
+
+        let idx = self.content_index;
+        self.content_index += 1;
+        self.open_tool_index = Some(idx);
+
+        output.push(format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": {}
+                }
+            })
+        ));
+    }
+
+    fn emit_tool_json_delta(&self, output: &mut Vec<String>, delta: String) {
+        output.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": self.open_tool_index,
+                "delta": { "type": "input_json_delta", "partial_json": delta }
+            })
+        ));
+    }
+
+    fn parse_leaked_tool_line(line: &str) -> Option<(String, String, String)> {
+        if !line.contains("assistant to=") {
+            return None;
+        }
+
+        let marker = "assistant to=";
+        let start = line.find(marker)? + marker.len();
+        let mut target = line[start..].trim();
+        if target.is_empty() {
+            return None;
+        }
+
+        if let Some(pos) = target.find(char::is_whitespace) {
+            target = &target[..pos];
+        }
+
+        if target.is_empty() {
+            return None;
+        }
+
+        let (name, arguments) = if target == "multi_tool_use.parallel" {
+            let json_start = line.find('{')?;
+            let args = line[json_start..].trim();
+            if serde_json::from_str::<Value>(args).is_err() {
+                return None;
+            }
+            ("multi_tool_use.parallel".to_string(), args.to_string())
+        } else {
+            let args = "{}".to_string();
+            (target.to_string(), args)
+        };
+
+        let call_id = format!("tool_{}", chrono::Utc::now().timestamp_millis());
+        Some((call_id, name, arguments))
+    }
+
+    fn flush_pending_tool_text(&mut self, output: &mut Vec<String>) {
+        if self.pending_tool_text.trim().is_empty() {
+            self.pending_tool_text.clear();
+            return;
+        }
+
+        let pending = self.pending_tool_text.trim().to_string();
+        self.pending_tool_text.clear();
+
+        if let Some((call_id, name, arguments)) = Self::parse_leaked_tool_line(&pending) {
+            self.open_tool_block_if_needed(output, call_id, name);
+            self.emit_tool_json_delta(output, arguments);
+            if let Some(idx) = self.open_tool_index.take() {
+                output.push(format!(
+                    "event: content_block_stop\ndata: {}\n\n",
+                    json!({ "type": "content_block_stop", "index": idx })
+                ));
+            }
+            self.tool_call_id = None;
+            self.tool_name = None;
+            return;
+        }
+
+        if self.open_text_index.is_none() {
+            let idx = self.content_index;
+            self.content_index += 1;
+            self.open_text_index = Some(idx);
+            output.push(format!(
+                "event: content_block_start\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": { "type": "text", "text": "" }
+                })
+            ));
+        }
+
+        output.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": self.open_text_index,
+                "delta": { "type": "text_delta", "text": pending }
+            })
+        ));
     }
 
     pub fn transform_sse_line(&mut self, line: &str) -> Vec<String> {
@@ -448,45 +588,19 @@ impl TransformResponse {
         match event_type {
             // 文本输出
             "response.output_text.delta" => {
-                if self.open_text_index.is_none() {
-                    let idx = self.content_index;
-                    self.content_index += 1;
-                    self.open_text_index = Some(idx);
-                    output.push(format!(
-                        "event: content_block_start\ndata: {}\n\n",
-                        json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": { "type": "text", "text": "" }
-                        })
-                    ));
-                }
-
                 let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                output.push(format!(
-                    "event: content_block_delta\ndata: {}\n\n",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": self.open_text_index,
-                        "delta": { "type": "text_delta", "text": delta }
-                    })
-                ));
+                self.pending_tool_text.push_str(delta);
+
+                if delta.contains('\n') {
+                    self.flush_pending_tool_text(&mut output);
+                }
             }
 
             // 工具调用开始
             "response.output_item.added" => {
+                self.flush_pending_tool_text(&mut output);
                 if let Some(item) = data.get("item") {
                     if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                        self.saw_tool_call = true;
-
-                        // 关闭文本块
-                        if let Some(idx) = self.open_text_index.take() {
-                            output.push(format!(
-                                "event: content_block_stop\ndata: {}\n\n",
-                                json!({ "type": "content_block_stop", "index": idx })
-                            ));
-                        }
-
                         let call_id = item
                             .get("call_id")
                             .and_then(|c| c.as_str())
@@ -498,66 +612,21 @@ impl TransformResponse {
                             .unwrap_or("unknown")
                             .to_string();
 
-                        self.tool_call_id = Some(call_id.clone());
-                        self.tool_name = Some(name.clone());
-
-                        let idx = self.content_index;
-                        self.content_index += 1;
-                        self.open_tool_index = Some(idx);
-
-                        output.push(format!(
-                            "event: content_block_start\ndata: {}\n\n",
-                            json!({
-                                "type": "content_block_start",
-                                "index": idx,
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "id": call_id,
-                                    "name": name,
-                                    "input": {}
-                                }
-                            })
-                        ));
+                        self.open_tool_block_if_needed(&mut output, call_id, name);
                     }
                 }
             }
 
             // 工具调用参数
             "response.function_call_arguments.delta" | "response.function_call_arguments_delta" => {
+                self.flush_pending_tool_text(&mut output);
                 if self.open_tool_index.is_none() {
-                    self.saw_tool_call = true;
-
-                    // 关闭文本块
-                    if let Some(idx) = self.open_text_index.take() {
-                        output.push(format!(
-                            "event: content_block_stop\ndata: {}\n\n",
-                            json!({ "type": "content_block_stop", "index": idx })
-                        ));
-                    }
-
                     let call_id = self
                         .tool_call_id
                         .clone()
                         .unwrap_or_else(|| format!("tool_{}", chrono::Utc::now().timestamp_millis()));
                     let name = self.tool_name.clone().unwrap_or_else(|| "unknown".to_string());
-
-                    let idx = self.content_index;
-                    self.content_index += 1;
-                    self.open_tool_index = Some(idx);
-
-                    output.push(format!(
-                        "event: content_block_start\ndata: {}\n\n",
-                        json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": call_id,
-                                "name": name,
-                                "input": {}
-                            }
-                        })
-                    ));
+                    self.open_tool_block_if_needed(&mut output, call_id, name);
                 }
 
                 let delta = data
@@ -572,18 +641,12 @@ impl TransformResponse {
                     })
                     .unwrap_or_default();
 
-                output.push(format!(
-                    "event: content_block_delta\ndata: {}\n\n",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": self.open_tool_index,
-                        "delta": { "type": "input_json_delta", "partial_json": delta }
-                    })
-                ));
+                self.emit_tool_json_delta(&mut output, delta);
             }
 
             // 工具调用完成
             "response.output_item.done" => {
+                self.flush_pending_tool_text(&mut output);
                 if let Some(idx) = self.open_tool_index.take() {
                     output.push(format!(
                         "event: content_block_stop\ndata: {}\n\n",
@@ -596,6 +659,7 @@ impl TransformResponse {
 
             // 响应完成
             "response.completed" => {
+                self.flush_pending_tool_text(&mut output);
                 // 关闭所有打开的块
                 if let Some(idx) = self.open_text_index.take() {
                     output.push(format!(
