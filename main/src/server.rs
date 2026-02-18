@@ -1305,15 +1305,46 @@ async fn handle_request(
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path().to_string();
     let normalized_path = path.trim_end_matches('/');
-    let is_messages = normalized_path == "/messages" || normalized_path == "/v1/messages";
-    let is_count_tokens = normalized_path == "/messages/count_tokens"
-        || normalized_path == "/v1/messages/count_tokens";
+    let method = req.method();
     let request_id: String = Uuid::new_v4()
         .simple()
         .to_string()
         .chars()
         .take(8)
         .collect();
+
+    // 处理新增的 GET 路由
+    if method == Method::GET {
+        match normalized_path {
+            "/v1/models" => {
+                let _ = log_tx.send(format!("[System] Processing #{} GET /v1/models", request_id));
+                return handle_models_list();
+            }
+            path if path.starts_with("/v1/models/") => {
+                let model_id = &path[11..]; // 去掉 "/v1/models/" 前缀
+                let _ = log_tx.send(format!("[System] Processing #{} GET /v1/models/{}", request_id, model_id));
+                return handle_model_detail(model_id);
+            }
+            "/health" | "/" => {
+                let _ = log_tx.send(format!("[System] Processing #{} GET {}", request_id, normalized_path));
+                return handle_health_check();
+            }
+            _ => {
+                // 继续到 404 处理
+            }
+        }
+    }
+
+    // 处理 OPTIONS 请求（CORS 预检）
+    if method == Method::OPTIONS {
+        let _ = log_tx.send(format!("[System] Processing #{} OPTIONS {}", request_id, normalized_path));
+        return handle_cors_preflight();
+    }
+
+    let is_messages = normalized_path == "/messages" || normalized_path == "/v1/messages";
+    let is_count_tokens = normalized_path == "/messages/count_tokens"
+        || normalized_path == "/v1/messages/count_tokens";
+
     let runtime_state = runtime_handle.snapshot();
     let target_url = runtime_state.target_url;
     let api_key = runtime_state.api_key;
@@ -1323,10 +1354,10 @@ async fn handle_request(
     let load_balancer_runtime = runtime_state.load_balancer_runtime;
 
     // 只处理 POST /messages、/v1/messages、/messages/count_tokens、/v1/messages/count_tokens
-    if req.method() != Method::POST || (!is_messages && !is_count_tokens) {
+    if method != Method::POST || (!is_messages && !is_count_tokens) {
         let _ = log_tx.send(format!(
             "[Debug] Ignored {} request to {}",
-            req.method(),
+            method,
             path
         ));
         return Ok(Response::builder()
@@ -2434,6 +2465,104 @@ async fn handle_request(
         .header("Access-Control-Allow-Origin", "*")
         .body(BoxBody::new(body.map_err(|_: Infallible| unreachable!())))
         .unwrap())
+}
+
+/// 处理 GET /v1/models 请求
+fn handle_models_list() -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+    let models = generate_model_list();
+    let response_body = json!({
+        "object": "list",
+        "data": models
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(full_body(response_body.to_string()))
+        .unwrap())
+}
+
+/// 处理 GET /v1/models/{model_id} 请求
+fn handle_model_detail(model_id: &str) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+    let supported_models = ["opus", "sonnet", "haiku"];
+
+    if !supported_models.contains(&model_id) {
+        let error_response = json!({
+            "error": {
+                "type": "not_found",
+                "message": format!("Model '{}' not found", model_id)
+            }
+        });
+
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "application/json")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(full_body(error_response.to_string()))
+            .unwrap());
+    }
+
+    let model_info = json!({
+        "id": model_id,
+        "object": "model",
+        "created": 1677610602,
+        "owned_by": "codex-proxy",
+        "permission": [],
+        "root": model_id,
+        "parent": null
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(full_body(model_info.to_string()))
+        .unwrap())
+}
+
+/// 处理健康检查请求 GET /health 和 GET /
+fn handle_health_check() -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+    let health_response = json!({
+        "status": "ok",
+        "version": "0.1.3"
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(full_body(health_response.to_string()))
+        .unwrap())
+}
+
+/// 处理 OPTIONS 请求（CORS 预检）
+fn handle_cors_preflight() -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        .header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key")
+        .header("Access-Control-Max-Age", "86400")
+        .body(full_body("".to_string()))
+        .unwrap())
+}
+
+/// 生成模型列表
+fn generate_model_list() -> Vec<Value> {
+    let models = ["opus", "sonnet", "haiku"];
+
+    models.iter().map(|&model_id| {
+        json!({
+            "id": model_id,
+            "object": "model",
+            "created": 1677610602,
+            "owned_by": "codex-proxy",
+            "permission": [],
+            "root": model_id,
+            "parent": null
+        })
+    }).collect()
 }
 
 fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
