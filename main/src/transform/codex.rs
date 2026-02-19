@@ -490,6 +490,38 @@ pub struct TransformResponse {
 }
 
 impl TransformResponse {
+    // 兼容不同工具命名来源（Anthropic tool 名称 / Codex 泄露文本名称）。
+    // 优先走显式映射，避免语义漂移；未命中时再回退到 `functions.` 前缀剥离。
+    fn leaked_tool_name_compat_alias(name: &str) -> Option<&'static str> {
+        match name {
+            "functions.Write" => Some("Write"),
+            "functions.Edit" => Some("Edit"),
+            "functions.Read" => Some("Read"),
+            "functions.Bash" => Some("Bash"),
+            "functions.Grep" => Some("Grep"),
+            "functions.Glob" => Some("Glob"),
+            "functions.Task" => Some("Task"),
+            "functions.WebSearch" => Some("WebSearch"),
+            "functions.WebFetch" => Some("WebFetch"),
+            "functions.TodoRead" => Some("TodoRead"),
+            "functions.TodoWrite" => Some("TodoWrite"),
+            "functions.apply_patch" => Some("apply_patch"),
+            _ => None,
+        }
+    }
+
+    fn normalize_leaked_tool_name(target: &str) -> String {
+        if let Some(mapped) = Self::leaked_tool_name_compat_alias(target) {
+            return mapped.to_string();
+        }
+
+        target
+            .strip_prefix("functions.")
+            .filter(|name| !name.is_empty())
+            .unwrap_or(target)
+            .to_string()
+    }
+
     fn extract_leaked_tool_target(line: &str) -> Option<String> {
         // Prefer explicit assistant leak marker, but also tolerate bare `to=...` leaks.
         let candidate = if let Some(start) = line.find("assistant to=") {
@@ -553,6 +585,64 @@ impl TransformResponse {
         }
     }
 
+    fn extract_content_part_text<'a>(data: &'a Value) -> Option<&'a str> {
+        data.get("part")
+            .and_then(|part| {
+                let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if part_type == "output_text" || part_type == "text" || part_type.is_empty() {
+                    part.get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| part.get("delta").and_then(|v| v.as_str()))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| data.get("delta").and_then(|v| v.as_str()))
+    }
+
+    fn handle_text_fragment(&mut self, output: &mut Vec<String>, fragment: &str, emit_plain_text: bool) {
+        if fragment.is_empty() {
+            return;
+        }
+
+        // 泄漏工具调用文本可能被拆成多个 chunk。
+        // 一旦进入泄漏拼接模式，后续 chunk 持续进入 pending，直到遇到换行/收尾再统一解析。
+        if !self.pending_tool_text.is_empty() || Self::contains_potential_leaked_tool_marker(fragment) {
+            self.pending_tool_text.push_str(fragment);
+            if fragment.contains('\n') {
+                self.flush_pending_tool_text(output);
+            }
+            return;
+        }
+
+        if !emit_plain_text || self.open_tool_index.is_some() {
+            return;
+        }
+
+        if self.open_text_index.is_none() {
+            let idx = self.content_index;
+            self.content_index += 1;
+            self.open_text_index = Some(idx);
+            output.push(format!(
+                "event: content_block_start\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": { "type": "text", "text": "" }
+                })
+            ));
+        }
+
+        output.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": self.open_text_index,
+                "delta": { "type": "text_delta", "text": fragment }
+            })
+        ));
+    }
+
     fn open_tool_block_if_needed(
         &mut self,
         output: &mut Vec<String>,
@@ -613,7 +703,7 @@ impl TransformResponse {
         } else {
             "{}".to_string()
         };
-        let name = target.to_string();
+        let name = Self::normalize_leaked_tool_name(&target);
 
         let call_id = format!("tool_{}", chrono::Utc::now().timestamp_millis());
         Some((call_id, name, arguments))
@@ -720,41 +810,29 @@ impl TransformResponse {
             // 纯文本输出 - 严格控制，只在非工具场景下开启文本块
             "response.output_text.delta" => {
                 let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                self.handle_text_fragment(&mut output, delta, true);
+            }
 
-                // 泄漏工具调用文本可能被拆成多个 chunk。
-                // 一旦进入泄漏拼接模式，后续 chunk 持续进入 pending，直到遇到换行/收尾再统一解析。
-                if !self.pending_tool_text.is_empty() || Self::contains_potential_leaked_tool_marker(delta) {
-                    self.pending_tool_text.push_str(delta);
-                    if delta.contains('\n') {
-                        self.flush_pending_tool_text(&mut output);
-                    }
-                    return output;
+            // 新版事件：内容分片直接挂在 content_part.added
+            "response.content_part.added" => {
+                if let Some(text) = Self::extract_content_part_text(&data) {
+                    self.handle_text_fragment(&mut output, text, true);
                 }
+            }
 
-                // 纯文本处理 - 只在没有工具块开启时处理
-                if self.open_tool_index.is_none() {
-                    if self.open_text_index.is_none() {
-                        let idx = self.content_index;
-                        self.content_index += 1;
-                        self.open_text_index = Some(idx);
-                        output.push(format!(
-                            "event: content_block_start\ndata: {}\n\n",
-                            json!({
-                                "type": "content_block_start",
-                                "index": idx,
-                                "content_block": { "type": "text", "text": "" }
-                            })
-                        ));
-                    }
+            // 文本分片结束：如果 pending 里还有疑似工具泄露，立即按边界强制 flush
+            "response.output_text.done" => {
+                if let Some(done_text) = data.get("text").and_then(|t| t.as_str()) {
+                    self.handle_text_fragment(&mut output, done_text, false);
+                }
+                if !self.pending_tool_text.is_empty() {
+                    self.flush_pending_tool_text(&mut output);
+                }
+            }
 
-                    output.push(format!(
-                        "event: content_block_delta\ndata: {}\n\n",
-                        json!({
-                            "type": "content_block_delta",
-                            "index": self.open_text_index,
-                            "delta": { "type": "text_delta", "text": delta }
-                        })
-                    ));
+            "response.content_part.done" => {
+                if !self.pending_tool_text.is_empty() {
+                    self.flush_pending_tool_text(&mut output);
                 }
             }
 
@@ -1359,6 +1437,28 @@ mod tests {
     }
 
     #[test]
+    fn test_leaked_tool_name_compat_map_and_fallback() {
+        assert_eq!(
+            TransformResponse::normalize_leaked_tool_name("functions.Write"),
+            "Write"
+        );
+        assert_eq!(
+            TransformResponse::normalize_leaked_tool_name("functions.Bash"),
+            "Bash"
+        );
+        assert_eq!(
+            TransformResponse::normalize_leaked_tool_name("functions.exec_command"),
+            "exec_command",
+            "unknown functions.* names should fall back to prefix stripping"
+        );
+        assert_eq!(
+            TransformResponse::normalize_leaked_tool_name("multi_tool_use.parallel"),
+            "multi_tool_use.parallel",
+            "non-functions names should be kept unchanged unless explicitly mapped"
+        );
+    }
+
+    #[test]
     fn test_leaked_parallel_tool_line_without_json_is_still_promoted() {
         let mut transformer = TransformResponse::new("gpt-5.3-codex");
         let line = format!(
@@ -1401,7 +1501,7 @@ mod tests {
         let joined = events.join("");
         assert!(
             joined.contains("\"type\":\"tool_use\"")
-                && joined.contains("\"name\":\"functions.Bash\""),
+                && joined.contains("\"name\":\"Bash\""),
             "functions leak should be promoted even without assistant prefix"
         );
         assert!(
@@ -1439,7 +1539,7 @@ mod tests {
 
         assert!(
             joined.contains("\"type\":\"tool_use\"")
-                && joined.contains("\"name\":\"functions.Read\""),
+                && joined.contains("\"name\":\"Read\""),
             "split leaked functions line should still be promoted to tool_use"
         );
         assert!(
@@ -1449,6 +1549,109 @@ mod tests {
         assert!(
             !joined.contains("\"type\":\"text_delta\""),
             "split leaked line should not fall through to text output"
+        );
+    }
+
+    #[test]
+    fn test_leaked_tool_text_from_content_part_added_is_promoted_to_tool_use() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.content_part.added",
+                "part": {
+                    "type": "output_text",
+                    "text": "assistant to=functions.Write {\"file_path\":\"/tmp/design.md\"}\n"
+                }
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        assert!(
+            joined.contains("\"type\":\"tool_use\"")
+                && joined.contains("\"name\":\"Write\""),
+            "content_part leak should be promoted to tool_use"
+        );
+        assert!(
+            joined.contains("\\\"file_path\\\":\\\"/tmp/design.md\\\""),
+            "content_part leaked json payload should be preserved as tool arguments"
+        );
+        assert!(
+            !joined.contains("\"type\":\"text_delta\""),
+            "promoted content_part leak should not emit text_delta"
+        );
+    }
+
+    #[test]
+    fn test_plain_content_part_text_is_not_misclassified_as_tool_use() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.content_part.added",
+                "part": {
+                    "type": "output_text",
+                    "text": "普通文本内容\n"
+                }
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        let has_text_block_payload = joined.contains("\"content_block\":{\"text\":\"\",\"type\":\"text\"}")
+            || joined.contains("\"content_block\":{\"type\":\"text\",\"text\":\"\"}");
+        assert!(
+            joined.contains("\"content_block_start\"") && has_text_block_payload,
+            "plain content_part text should open a text block"
+        );
+        assert!(
+            joined.contains("\"type\":\"text_delta\"")
+                && joined.contains("\"text\":\"普通文本内容\\n\""),
+            "plain content_part text should be emitted as text_delta"
+        );
+        assert!(
+            !joined.contains("\"type\":\"tool_use\""),
+            "plain content_part text must not be promoted to tool_use"
+        );
+    }
+
+    #[test]
+    fn test_leaked_functions_tool_line_split_across_mixed_events_is_promoted() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line_1 = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "to=functions.Read "
+            })
+        );
+        let line_2 = format!(
+            "data: {}",
+            json!({
+                "type": "response.content_part.added",
+                "part": {
+                    "type": "output_text",
+                    "text": "{\"file_path\":\"/tmp/mixed.txt\"}\n"
+                }
+            })
+        );
+
+        let events_1 = transformer.transform_sse_line(&line_1);
+        let events_2 = transformer.transform_sse_line(&line_2);
+        let joined = format!("{}{}", events_1.join(""), events_2.join(""));
+        assert!(
+            joined.contains("\"type\":\"tool_use\"")
+                && joined.contains("\"name\":\"Read\""),
+            "mixed-event leaked functions line should still be promoted to tool_use"
+        );
+        assert!(
+            joined.contains("\\\"file_path\\\":\\\"/tmp/mixed.txt\\\""),
+            "mixed-event leaked json payload should be forwarded as tool arguments"
+        );
+        assert!(
+            !joined.contains("\"type\":\"text_delta\""),
+            "mixed-event leaked line should not fall through to text output"
         );
     }
 
