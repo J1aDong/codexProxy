@@ -149,12 +149,19 @@ impl TransformRequest {
             transformed_tools.len()
         ));
 
+        // 关键优化：无工具时强制 tool_choice: "none"，避免模型乱吐工具 JSON 到文本
+        let tool_choice = if transformed_tools.is_empty() {
+            json!("none")
+        } else {
+            json!("auto")
+        };
+
         let body = json!({
             "model": final_codex_model,
             "instructions": CODEX_INSTRUCTIONS,
             "input": final_input,
             "tools": transformed_tools,
-            "tool_choice": "auto",
+            "tool_choice": tool_choice,
             "parallel_tool_calls": true,
             "reasoning": { "effort": reasoning_effort.as_str(), "summary": "auto" },
             "store": false,
@@ -424,6 +431,8 @@ pub struct TransformResponse {
     saw_tool_call: bool,
     sent_message_start: bool,
     pending_tool_text: String,
+    accumulated_tool_args: String,
+    logger: std::sync::Arc<AppLogger>,
 }
 
 impl TransformResponse {
@@ -439,6 +448,11 @@ impl TransformResponse {
             saw_tool_call: false,
             sent_message_start: false,
             pending_tool_text: String::new(),
+            accumulated_tool_args: String::new(),
+            logger: AppLogger::get().unwrap_or_else(|| {
+                // 如果全局 logger 未初始化，创建一个临时的
+                AppLogger::init(None)
+            }),
         }
     }
 
@@ -487,14 +501,16 @@ impl TransformResponse {
     }
 
     fn emit_tool_json_delta(&self, output: &mut Vec<String>, delta: String) {
-        output.push(format!(
-            "event: content_block_delta\ndata: {}\n\n",
-            json!({
-                "type": "content_block_delta",
-                "index": self.open_tool_index,
-                "delta": { "type": "input_json_delta", "partial_json": delta }
-            })
-        ));
+        if let Some(idx) = self.open_tool_index {
+            output.push(format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": { "type": "input_json_delta", "partial_json": delta }
+                })
+            ));
+        }
     }
 
     fn parse_leaked_tool_line(line: &str) -> Option<(String, String, String)> {
@@ -547,9 +563,23 @@ impl TransformResponse {
         let pending_raw = std::mem::take(&mut self.pending_tool_text);
         let pending_for_tool_parse = pending_raw.trim();
 
+        // 检查是否是泄漏的工具调用
         if let Some((call_id, name, arguments)) = Self::parse_leaked_tool_line(pending_for_tool_parse) {
+            // 关闭文本块（如果有）
+            self.close_open_text_block(output);
+
+            // 开启工具块
             self.open_tool_block_if_needed(output, call_id, name);
-            self.emit_tool_json_delta(output, arguments);
+
+            // 发送工具参数（即使为空也要发送空对象）
+            if !arguments.is_empty() && arguments != "{}" {
+                self.emit_tool_json_delta(output, arguments);
+            } else {
+                // 如果没有参数或参数为空对象，发送空对象
+                self.emit_tool_json_delta(output, "{}".to_string());
+            }
+
+            // 关闭工具块
             if let Some(idx) = self.open_tool_index.take() {
                 output.push(format!(
                     "event: content_block_stop\ndata: {}\n\n",
@@ -561,28 +591,31 @@ impl TransformResponse {
             return;
         }
 
-        if self.open_text_index.is_none() {
-            let idx = self.content_index;
-            self.content_index += 1;
-            self.open_text_index = Some(idx);
+        // 如果不是工具调用，作为普通文本处理
+        if !pending_raw.trim().is_empty() {
+            if self.open_text_index.is_none() {
+                let idx = self.content_index;
+                self.content_index += 1;
+                self.open_text_index = Some(idx);
+                output.push(format!(
+                    "event: content_block_start\ndata: {}\n\n",
+                    json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": { "type": "text", "text": "" }
+                    })
+                ));
+            }
+
             output.push(format!(
-                "event: content_block_start\ndata: {}\n\n",
+                "event: content_block_delta\ndata: {}\n\n",
                 json!({
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": { "type": "text", "text": "" }
+                    "type": "content_block_delta",
+                    "index": self.open_text_index,
+                    "delta": { "type": "text_delta", "text": pending_raw }
                 })
             ));
         }
-
-        output.push(format!(
-            "event: content_block_delta\ndata: {}\n\n",
-            json!({
-                "type": "content_block_delta",
-                "index": self.open_text_index,
-                "delta": { "type": "text_delta", "text": pending_raw }
-            })
-        ));
     }
 
     pub fn transform_sse_line(&mut self, line: &str) -> Vec<String> {
@@ -592,7 +625,7 @@ impl TransformResponse {
             return output;
         }
 
-        // 发送 message_start
+        // 发送 message_start（确保只发送一次）
         if !self.sent_message_start {
             self.sent_message_start = true;
             output.push(format!(
@@ -619,26 +652,61 @@ impl TransformResponse {
         let event_type = data.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match event_type {
-            // 文本输出
+            // 纯文本输出 - 严格控制，只在非工具场景下开启文本块
             "response.output_text.delta" => {
                 let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                self.pending_tool_text.push_str(delta);
 
-                if delta.contains('\n') {
-                    self.flush_pending_tool_text(&mut output);
+                // 检查是否是泄漏的工具调用文本
+                if delta.contains("assistant to=") {
+                    self.pending_tool_text.push_str(delta);
+                    if delta.contains('\n') {
+                        self.flush_pending_tool_text(&mut output);
+                    }
+                    return output;
+                }
+
+                // 纯文本处理 - 只在没有工具块开启时处理
+                if self.open_tool_index.is_none() {
+                    if self.open_text_index.is_none() {
+                        let idx = self.content_index;
+                        self.content_index += 1;
+                        self.open_text_index = Some(idx);
+                        output.push(format!(
+                            "event: content_block_start\ndata: {}\n\n",
+                            json!({
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": { "type": "text", "text": "" }
+                            })
+                        ));
+                    }
+
+                    output.push(format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": self.open_text_index,
+                            "delta": { "type": "text_delta", "text": delta }
+                        })
+                    ));
                 }
             }
 
-            // 工具调用开始
+            // 工具调用开始 - 严格按照 OpenAI Responses 格式解析
             "response.output_item.added" => {
                 self.flush_pending_tool_text(&mut output);
                 if let Some(item) = data.get("item") {
                     if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        // 关闭文本块（如果有）
+                        self.close_open_text_block(&mut output);
+
                         let call_id = item
                             .get("call_id")
                             .and_then(|c| c.as_str())
-                            .unwrap_or("tool_0")
-                            .to_string();
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                format!("tool_{}", chrono::Utc::now().timestamp_millis())
+                            });
                         let name = item
                             .get("name")
                             .and_then(|n| n.as_str())
@@ -650,31 +718,27 @@ impl TransformResponse {
                 }
             }
 
-            // 工具调用参数
+            // 工具参数增量更新
             "response.function_call_arguments.delta" | "response.function_call_arguments_delta" => {
                 self.flush_pending_tool_text(&mut output);
-                if self.open_tool_index.is_none() {
-                    let call_id = self
-                        .tool_call_id
-                        .clone()
-                        .unwrap_or_else(|| format!("tool_{}", chrono::Utc::now().timestamp_millis()));
-                    let name = self.tool_name.clone().unwrap_or_else(|| "unknown".to_string());
-                    self.open_tool_block_if_needed(&mut output, call_id, name);
-                }
 
                 let delta = data
                     .get("delta")
                     .or_else(|| data.get("arguments"))
-                    .map(|d| {
-                        if d.is_string() {
-                            d.as_str().unwrap_or("").to_string()
-                        } else {
-                            serde_json::to_string(d).unwrap_or_default()
-                        }
-                    })
-                    .unwrap_or_default();
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
 
-                self.emit_tool_json_delta(&mut output, delta);
+                if !delta.is_empty() && self.open_tool_index.is_some() {
+                    self.accumulated_tool_args.push_str(delta);
+                    output.push(format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": self.open_tool_index,
+                            "delta": { "type": "input_json_delta", "partial_json": delta }
+                        })
+                    ));
+                }
             }
 
             // 工具调用完成
@@ -688,11 +752,13 @@ impl TransformResponse {
                 }
                 self.tool_call_id = None;
                 self.tool_name = None;
+                self.accumulated_tool_args.clear();
             }
 
-            // 响应完成
+            // 响应完成 - 关键：确保完整的事件序列
             "response.completed" => {
                 self.flush_pending_tool_text(&mut output);
+
                 // 关闭所有打开的块
                 if let Some(idx) = self.open_text_index.take() {
                     output.push(format!(
@@ -707,19 +773,26 @@ impl TransformResponse {
                     ));
                 }
 
+                // 确定停止原因
                 let stop_reason = if self.saw_tool_call {
                     "tool_use"
+                } else if data.get("response").and_then(|r| r.get("status")).and_then(|s| s.as_str()) == Some("incomplete") {
+                    "max_tokens"
                 } else {
                     "end_turn"
                 };
 
-                // 发送 message_delta
+                // 提取使用统计
                 let usage = data
                     .get("response")
                     .and_then(|r| r.get("usage"))
                     .cloned()
-                    .unwrap_or(json!({}));
+                    .unwrap_or_else(|| json!({
+                        "input_tokens": 0,
+                        "output_tokens": 0
+                    }));
 
+                // 发送 message_delta（包含停止原因和使用统计）
                 output.push(format!(
                     "event: message_delta\ndata: {}\n\n",
                     json!({
@@ -732,14 +805,17 @@ impl TransformResponse {
                     })
                 ));
 
-                // 发送 message_stop
+                // 发送 message_stop（完成流式响应）
                 output.push(format!(
                     "event: message_stop\ndata: {}\n\n",
-                    json!({ "type": "message_stop", "stop_reason": stop_reason })
+                    json!({ "type": "message_stop" })
                 ));
             }
 
-            _ => {}
+            // 忽略其他事件类型（如 response.created, response.in_progress 等）
+            _ => {
+                self.logger.log(&format!("Ignored event type: {}", event_type));
+            }
         }
 
         output
@@ -875,10 +951,14 @@ mod tests {
     fn test_transform_response_trait_dispatch() {
         let mut transformer = TransformResponse::new("gpt-5.3-codex");
         let trait_obj: &mut dyn ResponseTransformer = &mut transformer;
-        let out = trait_obj.transform_line(r#"data: {"type":"response.completed"}"#);
+        let out = trait_obj.transform_line(r#"data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":20}}}"#);
         assert!(
             out.iter().any(|chunk| chunk.contains("event: message_stop")),
             "trait dispatch should forward to internal transform logic"
+        );
+        assert!(
+            out.iter().any(|chunk| chunk.contains("\"input_tokens\":10") && chunk.contains("\"output_tokens\":20")),
+            "should include usage statistics in message_delta"
         );
     }
 
