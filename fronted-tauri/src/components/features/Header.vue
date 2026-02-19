@@ -1,15 +1,18 @@
 <template>
-  <div class="flex items-center justify-between mb-8">
-    <div class="flex items-center gap-3">
+  <div class="flex flex-col min-[300px]:flex-row min-[300px]:items-center min-[300px]:justify-between mb-8 gap-3 min-w-0">
+    <div class="flex items-center justify-between min-[300px]:justify-start gap-3 min-w-0">
       <StatusBadge
         :is-running="isRunning"
         :text="isRunning ? t('statusRunning') : t('statusStopped')"
       />
+      <h1 class="text-xl min-[300px]:text-2xl font-semibold text-apple-text-primary dark:text-dark-text-primary font-pixel min-[300px]:hidden min-w-0 flex-1 text-right whitespace-nowrap overflow-hidden text-ellipsis">
+        {{ t('title') }}
+      </h1>
     </div>
-    <h1 class="text-2xl font-semibold text-apple-text-primary dark:text-dark-text-primary font-pixel">
+    <h1 class="hidden min-[300px]:block text-2xl font-semibold text-apple-text-primary dark:text-dark-text-primary font-pixel min-w-0 whitespace-nowrap overflow-hidden text-ellipsis">
       {{ t('title') }}
     </h1>
-    <div class="flex items-center gap-2">
+    <div class="flex items-center justify-end gap-2">
       <!-- Menu Button -->
       <div class="header-menu-wrapper" ref="menuRef">
         <Button

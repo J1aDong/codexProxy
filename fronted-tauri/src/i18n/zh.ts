@@ -4,7 +4,7 @@ export default {
     statusStopped: '代理已停止',
 
     // Header
-    title: 'Codex 代理',
+    title: 'Codex代理',
 
     // Config Card
     port: '端口',
