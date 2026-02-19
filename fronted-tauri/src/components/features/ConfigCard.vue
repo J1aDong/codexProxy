@@ -3,7 +3,7 @@
     class="rounded-xl shadow-sm p-6 mb-8 transition-colors duration-300"
     :class="isDarkMode ? 'bg-dark-secondary border border-dark-border' : 'bg-white'"
   >
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+    <div class="grid grid-cols-2 gap-5">
       <div>
         <div class="flex items-center h-8 mb-1">
           <label
@@ -105,7 +105,7 @@
                 class="text-sm font-semibold mb-3"
                 :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
               >{{ t('reasoningEffort') }}</h3>
-              <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-5">
                 <div>
                   <Select
                     v-if="form.converter === 'gemini'"
@@ -180,7 +180,7 @@
                 class="text-sm font-semibold mb-3"
                 :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
               >{{ t('anthropicModelMappingTitle') }}</h3>
-              <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-5">
                 <Input
                   v-model="form.anthropicModelMapping.opus"
                   label="Opus"
@@ -295,7 +295,7 @@
                     class="mt-2 pt-2 border-t"
                     :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'"
                   >
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
                       <Select
                         :model-value="getCandidateConverterValue(candidate)"
                         :options="lbConverterOptions"
