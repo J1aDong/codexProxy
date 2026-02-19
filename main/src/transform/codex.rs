@@ -436,6 +436,39 @@ pub struct TransformResponse {
 }
 
 impl TransformResponse {
+    fn extract_leaked_tool_target(line: &str) -> Option<&str> {
+        // Prefer explicit assistant leak marker, but also tolerate bare `to=...` leaks.
+        let candidate = if let Some(start) = line.find("assistant to=") {
+            let offset = start + "assistant to=".len();
+            line.get(offset..)?.trim()
+        } else if let Some(start) = line.find("to=") {
+            let offset = start + "to=".len();
+            line.get(offset..)?.trim()
+        } else {
+            return None;
+        };
+
+        let target = if let Some(pos) = candidate.find(char::is_whitespace) {
+            &candidate[..pos]
+        } else {
+            candidate
+        };
+
+        if target.is_empty() {
+            return None;
+        }
+
+        if target == "multi_tool_use.parallel" || target.starts_with("functions.") {
+            Some(target)
+        } else {
+            None
+        }
+    }
+
+    fn contains_leaked_tool_marker(line: &str) -> bool {
+        Self::extract_leaked_tool_target(line).is_some()
+    }
+
     pub fn new(model: &str) -> Self {
         Self {
             message_id: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
@@ -514,41 +547,18 @@ impl TransformResponse {
     }
 
     fn parse_leaked_tool_line(line: &str) -> Option<(String, String, String)> {
-        if !line.contains("assistant to=") {
-            return None;
-        }
-
-        let marker = "assistant to=";
-        let start = line.find(marker)? + marker.len();
-        let mut target = line[start..].trim();
-        if target.is_empty() {
-            return None;
-        }
-
-        if let Some(pos) = target.find(char::is_whitespace) {
-            target = &target[..pos];
-        }
-
-        if target.is_empty() {
-            return None;
-        }
-
-        let (name, arguments) = if target == "multi_tool_use.parallel" {
-            let args = if let Some(json_start) = line.find('{') {
-                let candidate = line[json_start..].trim();
-                if serde_json::from_str::<Value>(candidate).is_ok() {
-                    candidate.to_string()
-                } else {
-                    "{}".to_string()
-                }
+        let target = Self::extract_leaked_tool_target(line)?;
+        let arguments = if let Some(json_start) = line.find('{') {
+            let candidate = line[json_start..].trim();
+            if serde_json::from_str::<Value>(candidate).is_ok() {
+                candidate.to_string()
             } else {
                 "{}".to_string()
-            };
-            ("multi_tool_use.parallel".to_string(), args)
+            }
         } else {
-            let args = "{}".to_string();
-            (target.to_string(), args)
+            "{}".to_string()
         };
+        let name = target.to_string();
 
         let call_id = format!("tool_{}", chrono::Utc::now().timestamp_millis());
         Some((call_id, name, arguments))
@@ -657,7 +667,7 @@ impl TransformResponse {
                 let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
 
                 // 检查是否是泄漏的工具调用文本
-                if delta.contains("assistant to=") {
+                if Self::contains_leaked_tool_marker(delta) {
                     self.pending_tool_text.push_str(delta);
                     if delta.contains('\n') {
                         self.flush_pending_tool_text(&mut output);
@@ -1317,6 +1327,35 @@ mod tests {
         assert!(
             !joined.contains("մեկնաբանություն"),
             "leaked tool line suffix should not appear in visible text output"
+        );
+    }
+
+    #[test]
+    fn test_leaked_functions_tool_line_without_assistant_prefix_is_promoted() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "numerusform to=functions.Bash {\"command\":\"pwd\",\"description\":\"Check cwd\"}\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        assert!(
+            joined.contains("\"type\":\"tool_use\"")
+                && joined.contains("\"name\":\"functions.Bash\""),
+            "functions leak should be promoted even without assistant prefix"
+        );
+        assert!(
+            joined.contains("\\\"command\\\":\\\"pwd\\\"")
+                && joined.contains("\\\"description\\\":\\\"Check cwd\\\""),
+            "valid leaked json payload should be forwarded as tool arguments"
+        );
+        assert!(
+            !joined.contains("numerusform"),
+            "prefix leak text should not appear in visible assistant output"
         );
     }
 

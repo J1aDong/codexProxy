@@ -772,7 +772,10 @@ fn contains_tool_call_text_leak(content: &Value) -> bool {
         }
 
         let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        text.contains("assistant to=multi_tool_use.parallel") || text.contains("assistant to=functions.")
+        text.contains("assistant to=multi_tool_use.parallel")
+            || text.contains("assistant to=functions.")
+            || text.contains("to=multi_tool_use.parallel")
+            || text.contains("to=functions.")
     })
 }
 
