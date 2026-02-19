@@ -32,6 +32,30 @@ fn sanitize_function_call_name_for_codex(name: &str) -> String {
     }
 }
 
+fn find_leaked_tool_marker_start(text: &str) -> Option<usize> {
+    const MARKERS: [&str; 4] = [
+        "assistant to=",
+        "to=functions",
+        "to=multi_tool_use.parallel",
+        "to=multi_tool_use",
+    ];
+
+    MARKERS.iter().filter_map(|marker| text.find(marker)).min()
+}
+
+fn strip_leaked_tool_suffix_from_text(text: &str) -> Option<String> {
+    let Some(marker_pos) = find_leaked_tool_marker_start(text) else {
+        return Some(text.to_string());
+    };
+
+    let head = text[..marker_pos].trim_end();
+    if head.is_empty() {
+        None
+    } else {
+        Some(head.to_string())
+    }
+}
+
 /// 请求转换器 - Anthropic -> Codex
 pub struct TransformRequest;
 
@@ -223,7 +247,37 @@ impl TransformRequest {
                             block_obj.insert("type".to_string(), json!(normalized_type));
                             block_obj.remove("signature");
                         }
+
+                        let block_type = block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if (block_type == "input_text" || block_type == "output_text" || block_type == "text")
+                            && block_obj.get("text").and_then(|v| v.as_str()).is_some()
+                        {
+                            let text = block_obj
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            if let Some(sanitized_text) = strip_leaked_tool_suffix_from_text(text) {
+                                block_obj.insert("text".to_string(), json!(sanitized_text));
+                            } else {
+                                block_obj.insert("text".to_string(), json!(""));
+                            }
+                        }
                     }
+
+                    content_blocks.retain(|block| {
+                        let Some(block_obj) = block.as_object() else {
+                            return true;
+                        };
+                        let block_type = block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if block_type == "input_text" || block_type == "output_text" || block_type == "text" {
+                            return block_obj
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .map(|text| !text.trim().is_empty())
+                                .unwrap_or(false);
+                        }
+                        true
+                    });
                 }
             }
         }
@@ -436,7 +490,7 @@ pub struct TransformResponse {
 }
 
 impl TransformResponse {
-    fn extract_leaked_tool_target(line: &str) -> Option<&str> {
+    fn extract_leaked_tool_target(line: &str) -> Option<String> {
         // Prefer explicit assistant leak marker, but also tolerate bare `to=...` leaks.
         let candidate = if let Some(start) = line.find("assistant to=") {
             let offset = start + "assistant to=".len();
@@ -448,11 +502,10 @@ impl TransformResponse {
             return None;
         };
 
-        let target = if let Some(pos) = candidate.find(char::is_whitespace) {
-            &candidate[..pos]
-        } else {
-            candidate
-        };
+        let target: String = candidate
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '.' || *ch == '-')
+            .collect();
 
         if target.is_empty() {
             return None;
@@ -465,8 +518,10 @@ impl TransformResponse {
         }
     }
 
-    fn contains_leaked_tool_marker(line: &str) -> bool {
-        Self::extract_leaked_tool_target(line).is_some()
+    fn contains_potential_leaked_tool_marker(line: &str) -> bool {
+        line.contains("assistant to=")
+            || line.contains("to=functions")
+            || line.contains("to=multi_tool_use")
     }
 
     pub fn new(model: &str) -> Self {
@@ -666,8 +721,9 @@ impl TransformResponse {
             "response.output_text.delta" => {
                 let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
 
-                // 检查是否是泄漏的工具调用文本
-                if Self::contains_leaked_tool_marker(delta) {
+                // 泄漏工具调用文本可能被拆成多个 chunk。
+                // 一旦进入泄漏拼接模式，后续 chunk 持续进入 pending，直到遇到换行/收尾再统一解析。
+                if !self.pending_tool_text.is_empty() || Self::contains_potential_leaked_tool_marker(delta) {
                     self.pending_tool_text.push_str(delta);
                     if delta.contains('\n') {
                         self.flush_pending_tool_text(&mut output);
@@ -1360,6 +1416,43 @@ mod tests {
     }
 
     #[test]
+    fn test_leaked_functions_tool_line_split_across_chunks_is_promoted() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line_1 = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "to=functions.Read "
+            })
+        );
+        let line_2 = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "{\"file_path\":\"/tmp/a.txt\"}\n"
+            })
+        );
+
+        let events_1 = transformer.transform_sse_line(&line_1);
+        let events_2 = transformer.transform_sse_line(&line_2);
+        let joined = format!("{}{}", events_1.join(""), events_2.join(""));
+
+        assert!(
+            joined.contains("\"type\":\"tool_use\"")
+                && joined.contains("\"name\":\"functions.Read\""),
+            "split leaked functions line should still be promoted to tool_use"
+        );
+        assert!(
+            joined.contains("\\\"file_path\\\":\\\"/tmp/a.txt\\\""),
+            "split leaked json payload should be forwarded as tool arguments"
+        );
+        assert!(
+            !joined.contains("\"type\":\"text_delta\""),
+            "split leaked line should not fall through to text output"
+        );
+    }
+
+    #[test]
     fn test_plain_text_is_not_misclassified_as_tool_use() {
         let mut transformer = TransformResponse::new("gpt-5.3-codex");
         let line = format!(
@@ -1511,5 +1604,51 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_codex_input_strips_leaked_tool_suffix_from_message_text() {
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5-20250929".to_string()),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: "先起草 design。 to=functions.Write {\"file_path\":\"/tmp/design.md\"}".to_string(),
+                }])),
+            }],
+            system: None,
+            stream: true,
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        let input = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input should be an array");
+
+        let texts: Vec<String> = input
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+            .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
+            .flat_map(|content| content.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+
+        assert!(
+            texts.iter().any(|text| text.contains("先起草 design。")),
+            "normal prefix text should be preserved"
+        );
+        assert!(
+            texts.iter().all(|text| !text.contains("to=functions.Write")),
+            "leaked tool marker should be stripped from outbound message text"
+        );
     }
 }
