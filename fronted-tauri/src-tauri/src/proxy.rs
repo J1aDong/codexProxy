@@ -247,11 +247,20 @@ pub struct ProxyConfig {
         default = "default_allow_count_tokens_fallback_estimate"
     )]
     pub allow_count_tokens_fallback_estimate: bool,
-    #[serde(rename = "forceStreamForCodex", default = "default_force_stream_for_codex")]
+    #[serde(
+        rename = "forceStreamForCodex",
+        default = "default_force_stream_for_codex"
+    )]
     pub force_stream_for_codex: bool,
-    #[serde(rename = "enableSseFrameParser", default = "default_enable_sse_frame_parser")]
+    #[serde(
+        rename = "enableSseFrameParser",
+        default = "default_enable_sse_frame_parser"
+    )]
     pub enable_sse_frame_parser: bool,
-    #[serde(rename = "enableStreamHeartbeat", default = "default_enable_stream_heartbeat")]
+    #[serde(
+        rename = "enableStreamHeartbeat",
+        default = "default_enable_stream_heartbeat"
+    )]
     pub enable_stream_heartbeat: bool,
     #[serde(
         rename = "streamHeartbeatIntervalMs",
@@ -270,8 +279,45 @@ pub struct ProxyConfig {
     pub stream_log_sample_every_n: u32,
     #[serde(rename = "streamLogMaxChars", default = "default_stream_log_max_chars")]
     pub stream_log_max_chars: usize,
-    #[serde(rename = "enableStreamMetrics", default = "default_enable_stream_metrics")]
+    #[serde(
+        rename = "enableStreamMetrics",
+        default = "default_enable_stream_metrics"
+    )]
     pub enable_stream_metrics: bool,
+    #[serde(rename = "enableStallRetry", default = "default_enable_stall_retry")]
+    pub enable_stall_retry: bool,
+    #[serde(rename = "stallTimeoutMs", default = "default_stall_timeout_ms")]
+    pub stall_timeout_ms: u64,
+    #[serde(
+        rename = "stallRetryMaxAttempts",
+        default = "default_stall_retry_max_attempts"
+    )]
+    pub stall_retry_max_attempts: u32,
+    #[serde(
+        rename = "stallRetryOnlyHeartbeatPhase",
+        default = "default_stall_retry_only_heartbeat_phase"
+    )]
+    pub stall_retry_only_heartbeat_phase: bool,
+    #[serde(
+        rename = "enableEmptyCompletionRetry",
+        default = "default_enable_empty_completion_retry"
+    )]
+    pub enable_empty_completion_retry: bool,
+    #[serde(
+        rename = "emptyCompletionRetryMaxAttempts",
+        default = "default_empty_completion_retry_max_attempts"
+    )]
+    pub empty_completion_retry_max_attempts: u32,
+    #[serde(
+        rename = "enableIncompleteStreamRetry",
+        default = "default_enable_incomplete_stream_retry"
+    )]
+    pub enable_incomplete_stream_retry: bool,
+    #[serde(
+        rename = "incompleteStreamRetryMaxAttempts",
+        default = "default_incomplete_stream_retry_max_attempts"
+    )]
+    pub incomplete_stream_retry_max_attempts: u32,
     #[serde(rename = "allowExternalAccess", default)]
     pub allow_external_access: bool,
     #[serde(default)]
@@ -346,6 +392,38 @@ fn default_stream_log_max_chars() -> usize {
 
 fn default_enable_stream_metrics() -> bool {
     true
+}
+
+fn default_enable_stall_retry() -> bool {
+    true
+}
+
+fn default_stall_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_stall_retry_max_attempts() -> u32 {
+    1
+}
+
+fn default_stall_retry_only_heartbeat_phase() -> bool {
+    true
+}
+
+fn default_enable_empty_completion_retry() -> bool {
+    true
+}
+
+fn default_empty_completion_retry_max_attempts() -> u32 {
+    1
+}
+
+fn default_enable_incomplete_stream_retry() -> bool {
+    true
+}
+
+fn default_incomplete_stream_retry_max_attempts() -> u32 {
+    1
 }
 
 fn default_gemini_model_preset() -> Vec<String> {
@@ -571,6 +649,14 @@ fn build_runtime_update(
         stream_log_sample_every_n: config.stream_log_sample_every_n,
         stream_log_max_chars: config.stream_log_max_chars,
         enable_stream_metrics: config.enable_stream_metrics,
+        enable_stall_retry: config.enable_stall_retry,
+        stall_timeout_ms: config.stall_timeout_ms,
+        stall_retry_max_attempts: config.stall_retry_max_attempts,
+        stall_retry_only_heartbeat_phase: config.stall_retry_only_heartbeat_phase,
+        enable_empty_completion_retry: config.enable_empty_completion_retry,
+        empty_completion_retry_max_attempts: config.empty_completion_retry_max_attempts,
+        enable_incomplete_stream_retry: config.enable_incomplete_stream_retry,
+        incomplete_stream_retry_max_attempts: config.incomplete_stream_retry_max_attempts,
         load_balancer_runtime,
     }
 }
@@ -813,6 +899,14 @@ async fn start_proxy_with_manager(
         .with_stream_log_sample_every_n(config.stream_log_sample_every_n)
         .with_stream_log_max_chars(config.stream_log_max_chars)
         .with_enable_stream_metrics(config.enable_stream_metrics)
+        .with_enable_stall_retry(config.enable_stall_retry)
+        .with_stall_timeout_ms(config.stall_timeout_ms)
+        .with_stall_retry_max_attempts(config.stall_retry_max_attempts)
+        .with_stall_retry_only_heartbeat_phase(config.stall_retry_only_heartbeat_phase)
+        .with_enable_empty_completion_retry(config.enable_empty_completion_retry)
+        .with_empty_completion_retry_max_attempts(config.empty_completion_retry_max_attempts)
+        .with_enable_incomplete_stream_retry(config.enable_incomplete_stream_retry)
+        .with_incomplete_stream_retry_max_attempts(config.incomplete_stream_retry_max_attempts)
         .with_allow_external_access(config.allow_external_access)
         .with_max_concurrency(config.max_concurrency);
 
