@@ -195,7 +195,7 @@ mod tests {
             force_stream_for_codex: true,
             enable_sse_frame_parser: true,
             enable_stream_heartbeat: true,
-            stream_heartbeat_interval_ms: 8_000,
+            stream_heartbeat_interval_ms: 3_000,
             enable_stream_log_sampling: true,
             stream_log_sample_every_n: 20,
             stream_log_max_chars: 512,

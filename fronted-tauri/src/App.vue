@@ -384,8 +384,14 @@ const DEFAULT_CONFIG = {
   customInjectionPrompt: '',
 }
 
-const DEFAULT_PROMPT_ZH = "skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择。CRITICAL: You MUST use JSON tools instead of markdown!"
-const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose.\nCRITICAL: You MUST use JSON tools instead of markdown!"
+const DEFAULT_PROMPT_ZH = `skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择。
+
+CRITICAL: When calling tools, you MUST use JSON format instead of markdown blocks! 对于与用户的日常交流或进度汇报，请务必使用流畅的纯文本或 Markdown 格式，绝对不要回复纯 JSON 数据。
+如果你收到 <tool_use_error>Sibling tool call errored</tool_use_error>，请不要将其作为普通文本输出，而是分析导致该错误的原始Sibling的报错原因并继续工作。`
+const DEFAULT_PROMPT_EN = `If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose.
+
+CRITICAL: When calling tools, you MUST use JSON format instead of markdown blocks! For normal conversation and reporting, please use plain text or readable Markdown. DO NOT output raw JSON data as conversational text.
+If you receive <tool_use_error>Sibling tool call errored</tool_use_error>, DO NOT output it as plain text. Instead, analyze the root cause from the failed sibling tool and proceed.`
 
 const form = reactive({
   ...DEFAULT_CONFIG,
