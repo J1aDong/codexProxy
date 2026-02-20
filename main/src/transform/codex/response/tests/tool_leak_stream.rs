@@ -325,3 +325,55 @@ fn test_malformed_functions_leak_is_dropped() {
         "malformed functions leak should not be shown as plain text"
     );
 }
+
+#[test]
+fn test_raw_parallel_tool_json_without_marker_is_promoted_and_prefix_preserved() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Reviewing specs first。 {\"tool_uses\":[{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/tmp/spec-a.md\"}},{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/tmp/spec-b.md\"}}]}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+    let tool_use_count = joined.matches("\"type\":\"tool_use\"").count();
+    assert_eq!(
+        tool_use_count, 2,
+        "raw tool_uses json should be converted into 2 tool_use blocks"
+    );
+    assert!(
+        joined.contains("\"type\":\"text_delta\"")
+            && joined.contains("\"text\":\"Reviewing specs first。 \""),
+        "normal prefix text should stay visible"
+    );
+    assert!(
+        !joined.contains("\"recipient_name\""),
+        "raw leaked tool json should not leak into visible text"
+    );
+}
+
+#[test]
+fn test_unparsable_raw_parallel_tool_json_is_dropped_from_visible_text() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "{\"tool_uses\":[{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/tmp/spec-a.md\"}}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "malformed raw tool_uses json should not fabricate tool_use events"
+    );
+    assert!(
+        !joined.contains("\"recipient_name\""),
+        "malformed raw tool_uses json should be suppressed from visible text"
+    );
+}

@@ -120,6 +120,32 @@ impl TransformResponse {
             || trimmed.starts_with("to=multi_tool_use")
     }
 
+    fn find_potential_raw_tool_json_start(line: &str) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (idx, ch) in line.char_indices() {
+            if ch != '{' {
+                continue;
+            }
+            let tail = &line[idx..];
+            if tail.contains("\"tool_uses\"")
+                && tail.contains("\"recipient_name\"")
+                && (tail.contains("functions.") || tail.contains("multi_tool_use."))
+            {
+                best = Some(idx);
+                break;
+            }
+        }
+        best
+    }
+
+    fn looks_like_raw_tool_json_fragment(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('{')
+            && trimmed.contains("\"tool_uses\"")
+            && trimmed.contains("\"recipient_name\"")
+            && (trimmed.contains("functions.") || trimmed.contains("multi_tool_use."))
+    }
+
     pub fn new(model: &str) -> Self {
         Self {
             message_id: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
@@ -251,6 +277,21 @@ impl TransformResponse {
             }
             self.pending_tool_text.push_str(leaked_fragment);
             if leaked_fragment.contains('\n') || !emit_plain_text {
+                self.flush_pending_tool_text(output);
+            }
+            return;
+        }
+
+        // 某些泄漏不带 `assistant to=`/`to=` 前缀，而是直接混入 `{"tool_uses":[...]}`。
+        // 这里按裸 JSON 形态进入 pending，再由统一解析逻辑提取 tool_use。
+        if let Some(raw_json_start) = Self::find_potential_raw_tool_json_start(&combined) {
+            let (prefix_text, leaked_fragment) = combined.split_at(raw_json_start);
+            if emit_plain_text && self.open_tool_index.is_none() && !prefix_text.is_empty() {
+                self.emit_plain_text_fragment(output, prefix_text);
+            }
+            self.pending_tool_text.push_str(leaked_fragment);
+            let json_complete = Self::extract_first_json_object_fragment(leaked_fragment).is_some();
+            if leaked_fragment.contains('\n') || !emit_plain_text || json_complete {
                 self.flush_pending_tool_text(output);
             }
             return;
@@ -419,25 +460,27 @@ impl TransformResponse {
     }
 
     fn parse_leaked_tool_line(line: &str) -> Option<Vec<(String, String)>> {
-        let target = Self::extract_leaked_tool_target(line)?;
+        if let Some(target) = Self::extract_leaked_tool_target(line) {
+            if target == "multi_tool_use.parallel" {
+                return Self::parse_leaked_parallel_tool_calls(line);
+            }
 
-        if target == "multi_tool_use.parallel" {
-            return Self::parse_leaked_parallel_tool_calls(line);
+            let arguments = if line.contains('{') {
+                let candidate = Self::extract_first_json_object_fragment(line)?;
+                if serde_json::from_str::<Value>(&candidate).is_ok() {
+                    candidate
+                } else {
+                    return None;
+                }
+            } else {
+                "{}".to_string()
+            };
+
+            let name = Self::normalize_leaked_tool_name(&target);
+            return Some(vec![(name, arguments)]);
         }
 
-        let arguments = if line.contains('{') {
-            let candidate = Self::extract_first_json_object_fragment(line)?;
-            if serde_json::from_str::<Value>(&candidate).is_ok() {
-                candidate
-            } else {
-                return None;
-            }
-        } else {
-            "{}".to_string()
-        };
-
-        let name = Self::normalize_leaked_tool_name(&target);
-        Some(vec![(name, arguments)])
+        Self::parse_leaked_parallel_tool_calls(line)
     }
 
     fn emit_leaked_tool_calls(&mut self, output: &mut Vec<String>, calls: Vec<(String, String)>) {
@@ -506,6 +549,11 @@ impl TransformResponse {
             self.logger.log_raw(
                 "[Warn] Dropping unparsable leaked tool marker fragment from visible text",
             );
+            return;
+        }
+        if Self::looks_like_raw_tool_json_fragment(pending_for_tool_parse) {
+            self.logger
+                .log_raw("[Warn] Dropping unparsable raw leaked tool json fragment");
             return;
         }
 

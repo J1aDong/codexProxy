@@ -863,7 +863,7 @@ async fn try_send_keep_alive(
     enable_stream_metrics: bool,
     disconnect_context: &str,
 ) -> bool {
-    let keep_alive = "event: ping\ndata: {}\n\n";
+    let keep_alive = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
     if tx
         .send(Ok(Frame::data(Bytes::from(keep_alive))))
         .await
@@ -4908,7 +4908,7 @@ data: {"type":"message_stop"}
         let mut counters = StreamEventCounters::default();
         counters.mark_downstream_chunk(
             r#"event: ping
-data: {}
+data: {"type": "ping"}
 
 "#,
         );
