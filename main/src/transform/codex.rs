@@ -2,11 +2,9 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use super::{MessageProcessor, ResponseTransformer, TransformBackend, TransformContext};
 use crate::logger::{is_debug_log_enabled, AppLogger};
-use crate::models::{
-    AnthropicRequest, ReasoningEffortMapping, get_reasoning_effort,
-};
-use super::{TransformBackend, ResponseTransformer, TransformContext, MessageProcessor};
+use crate::models::{get_reasoning_effort, AnthropicRequest, ReasoningEffortMapping};
 
 const CODEX_INSTRUCTIONS: &str = include_str!("../instructions.txt");
 
@@ -92,13 +90,22 @@ impl TransformRequest {
         let original_model = anthropic_body.model.as_deref().unwrap_or("unknown");
         let reasoning_effort = get_reasoning_effort(original_model, reasoning_mapping);
         // 使用用户配置的 codex_model（从前端传入）
-        let final_codex_model = codex_model.trim().is_empty()
+        let final_codex_model = codex_model
+            .trim()
+            .is_empty()
             .then(|| "gpt-5.3-codex")
             .unwrap_or(codex_model);
 
-        log(&format!("🤖 [Transform] {} → {} | 🧠 reasoning: {} (from {})", original_model, final_codex_model, reasoning_effort.as_str(), original_model));
+        log(&format!(
+            "🤖 [Transform] {} → {} | 🧠 reasoning: {} (from {})",
+            original_model,
+            final_codex_model,
+            reasoning_effort.as_str(),
+            original_model
+        ));
 
-        let (chat_messages, extracted_skills) = MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
+        let (chat_messages, extracted_skills) =
+            MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
 
         // 构建 input 数组
         let mut final_input: Vec<Value> = vec![Self::build_template_input()];
@@ -106,7 +113,10 @@ impl TransformRequest {
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let system_text = system.to_string();
-            log(&format!("📋 [Transform] System prompt: {} chars", system_text.len()));
+            log(&format!(
+                "📋 [Transform] System prompt: {} chars",
+                system_text.len()
+            ));
 
             final_input.push(json!({
                 "type": "message",
@@ -135,7 +145,10 @@ impl TransformRequest {
 
         // 注入提取的 Skills
         if !extracted_skills.is_empty() {
-            log(&format!("🎯 [Transform] Injecting {} skill(s)", extracted_skills.len()));
+            log(&format!(
+                "🎯 [Transform] Injecting {} skill(s)",
+                extracted_skills.len()
+            ));
             for skill in extracted_skills {
                 final_input.push(json!({
                     "type": "message",
@@ -148,7 +161,10 @@ impl TransformRequest {
             }
 
             if !skill_injection_prompt.trim().is_empty() {
-                log(&format!("🎯 [Transform] Injecting custom skill prompt ({} chars)", skill_injection_prompt.len()));
+                log(&format!(
+                    "🎯 [Transform] Injecting custom skill prompt ({} chars)",
+                    skill_injection_prompt.len()
+                ));
                 final_input.push(json!({
                     "type": "message",
                     "role": "user",
@@ -223,7 +239,8 @@ impl TransformRequest {
                     .and_then(|v| v.as_str())
                     .unwrap_or("assistant")
                     .to_string();
-                if let Some(content_blocks) = obj.get_mut("content").and_then(|v| v.as_array_mut()) {
+                if let Some(content_blocks) = obj.get_mut("content").and_then(|v| v.as_array_mut())
+                {
                     for block in content_blocks.iter_mut() {
                         let Some(block_obj) = block.as_object_mut() else {
                             continue;
@@ -248,8 +265,11 @@ impl TransformRequest {
                             block_obj.remove("signature");
                         }
 
-                        let block_type = block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        if (block_type == "input_text" || block_type == "output_text" || block_type == "text")
+                        let block_type =
+                            block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if (block_type == "input_text"
+                            || block_type == "output_text"
+                            || block_type == "text")
                             && block_obj.get("text").and_then(|v| v.as_str()).is_some()
                         {
                             let text = block_obj
@@ -268,8 +288,12 @@ impl TransformRequest {
                         let Some(block_obj) = block.as_object() else {
                             return true;
                         };
-                        let block_type = block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        if block_type == "input_text" || block_type == "output_text" || block_type == "text" {
+                        let block_type =
+                            block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if block_type == "input_text"
+                            || block_type == "output_text"
+                            || block_type == "text"
+                        {
                             return block_obj
                                 .get("text")
                                 .and_then(|v| v.as_str())
@@ -295,7 +319,7 @@ impl TransformRequest {
                 }
             }
         }
-        
+
         // 如果无法读取模板，使用备用值
         json!({
             "type": "message",
@@ -306,7 +330,6 @@ impl TransformRequest {
             }]
         })
     }
-
 
     fn transform_tools(
         tools: Option<&Vec<Value>>,
@@ -453,7 +476,7 @@ impl TransformRequest {
                 }
             }
         }
-        
+
         vec![json!({
             "type": "function",
             "name": "shell_command",
@@ -550,10 +573,18 @@ impl TransformResponse {
         }
     }
 
-    fn contains_potential_leaked_tool_marker(line: &str) -> bool {
-        line.contains("assistant to=")
-            || line.contains("to=functions")
-            || line.contains("to=multi_tool_use")
+    fn find_potential_leaked_tool_marker_start(line: &str) -> Option<usize> {
+        ["assistant to=", "to=functions", "to=multi_tool_use"]
+            .iter()
+            .filter_map(|marker| line.find(marker))
+            .min()
+    }
+
+    fn starts_with_leaked_tool_marker(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("assistant to=")
+            || trimmed.starts_with("to=functions")
+            || trimmed.starts_with("to=multi_tool_use")
     }
 
     pub fn new(model: &str) -> Self {
@@ -600,14 +631,19 @@ impl TransformResponse {
             .or_else(|| data.get("delta").and_then(|v| v.as_str()))
     }
 
-    fn handle_text_fragment(&mut self, output: &mut Vec<String>, fragment: &str, emit_plain_text: bool) {
+    fn handle_text_fragment(
+        &mut self,
+        output: &mut Vec<String>,
+        fragment: &str,
+        emit_plain_text: bool,
+    ) {
         if fragment.is_empty() {
             return;
         }
 
         // 泄漏工具调用文本可能被拆成多个 chunk。
         // 一旦进入泄漏拼接模式，后续 chunk 持续进入 pending，直到遇到换行/收尾再统一解析。
-        if !self.pending_tool_text.is_empty() || Self::contains_potential_leaked_tool_marker(fragment) {
+        if !self.pending_tool_text.is_empty() {
             self.pending_tool_text.push_str(fragment);
             if fragment.contains('\n') {
                 self.flush_pending_tool_text(output);
@@ -615,7 +651,27 @@ impl TransformResponse {
             return;
         }
 
+        if let Some(marker_start) = Self::find_potential_leaked_tool_marker_start(fragment) {
+            let (prefix_text, leaked_fragment) = fragment.split_at(marker_start);
+            if emit_plain_text && self.open_tool_index.is_none() && !prefix_text.is_empty() {
+                self.emit_plain_text_fragment(output, prefix_text);
+            }
+            self.pending_tool_text.push_str(leaked_fragment);
+            if leaked_fragment.contains('\n') {
+                self.flush_pending_tool_text(output);
+            }
+            return;
+        }
+
         if !emit_plain_text || self.open_tool_index.is_some() {
+            return;
+        }
+
+        self.emit_plain_text_fragment(output, fragment);
+    }
+
+    fn emit_plain_text_fragment(&mut self, output: &mut Vec<String>, fragment: &str) {
+        if fragment.is_empty() {
             return;
         }
 
@@ -719,7 +775,9 @@ impl TransformResponse {
         let pending_for_tool_parse = pending_raw.trim();
 
         // 检查是否是泄漏的工具调用
-        if let Some((call_id, name, arguments)) = Self::parse_leaked_tool_line(pending_for_tool_parse) {
+        if let Some((call_id, name, arguments)) =
+            Self::parse_leaked_tool_line(pending_for_tool_parse)
+        {
             // 关闭文本块（如果有）
             self.close_open_text_block(output);
 
@@ -746,30 +804,16 @@ impl TransformResponse {
             return;
         }
 
+        // 疑似泄漏但解析失败时，不回落到可见文本，避免把 tool 片段/乱码暴露给客户端。
+        if Self::starts_with_leaked_tool_marker(pending_for_tool_parse) {
+            self.logger
+                .log_raw("[Warn] Dropping unparsable leaked tool marker fragment from visible text");
+            return;
+        }
+
         // 如果不是工具调用，作为普通文本处理
         if !pending_raw.trim().is_empty() {
-            if self.open_text_index.is_none() {
-                let idx = self.content_index;
-                self.content_index += 1;
-                self.open_text_index = Some(idx);
-                output.push(format!(
-                    "event: content_block_start\ndata: {}\n\n",
-                    json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": { "type": "text", "text": "" }
-                    })
-                ));
-            }
-
-            output.push(format!(
-                "event: content_block_delta\ndata: {}\n\n",
-                json!({
-                    "type": "content_block_delta",
-                    "index": self.open_text_index,
-                    "delta": { "type": "text_delta", "text": pending_raw }
-                })
-            ));
+            self.emit_plain_text_fragment(output, &pending_raw);
         }
     }
 
@@ -920,7 +964,12 @@ impl TransformResponse {
                 // 确定停止原因
                 let stop_reason = if self.saw_tool_call {
                     "tool_use"
-                } else if data.get("response").and_then(|r| r.get("status")).and_then(|s| s.as_str()) == Some("incomplete") {
+                } else if data
+                    .get("response")
+                    .and_then(|r| r.get("status"))
+                    .and_then(|s| s.as_str())
+                    == Some("incomplete")
+                {
                     "max_tokens"
                 } else {
                     "end_turn"
@@ -931,10 +980,12 @@ impl TransformResponse {
                     .get("response")
                     .and_then(|r| r.get("usage"))
                     .cloned()
-                    .unwrap_or_else(|| json!({
-                        "input_tokens": 0,
-                        "output_tokens": 0
-                    }));
+                    .unwrap_or_else(|| {
+                        json!({
+                            "input_tokens": 0,
+                            "output_tokens": 0
+                        })
+                    });
 
                 // 发送 message_delta（包含停止原因和使用统计）
                 output.push(format!(
@@ -958,7 +1009,8 @@ impl TransformResponse {
 
             // 忽略其他事件类型（如 response.created, response.in_progress 等）
             _ => {
-                self.logger.log(&format!("Ignored event type: {}", event_type));
+                self.logger
+                    .log(&format!("Ignored event type: {}", event_type));
             }
         }
 
@@ -1054,7 +1106,7 @@ mod tests {
     fn test_custom_mapping_applied() {
         let mut mapping = ReasoningEffortMapping::default();
         mapping.sonnet = ReasoningEffort::High;
-        
+
         let effort = get_reasoning_effort("claude-sonnet-4-20250514", &mapping);
         assert_eq!(effort, ReasoningEffort::High);
     }
@@ -1073,7 +1125,10 @@ mod tests {
         assert_eq!(ReasoningEffort::from_str("HIGH"), ReasoningEffort::High);
         assert_eq!(ReasoningEffort::from_str("Medium"), ReasoningEffort::Medium);
         assert_eq!(ReasoningEffort::from_str("low"), ReasoningEffort::Low);
-        assert_eq!(ReasoningEffort::from_str("invalid"), ReasoningEffort::Medium); // default
+        assert_eq!(
+            ReasoningEffort::from_str("invalid"),
+            ReasoningEffort::Medium
+        ); // default
     }
 
     #[test]
@@ -1086,9 +1141,18 @@ mod tests {
     #[test]
     fn test_case_insensitive_model_matching() {
         let mapping = ReasoningEffortMapping::default();
-        assert_eq!(get_reasoning_effort("CLAUDE-3-OPUS", &mapping), ReasoningEffort::Xhigh);
-        assert_eq!(get_reasoning_effort("Claude-Sonnet-4", &mapping), ReasoningEffort::Medium);
-        assert_eq!(get_reasoning_effort("claude-haiku", &mapping), ReasoningEffort::Low);
+        assert_eq!(
+            get_reasoning_effort("CLAUDE-3-OPUS", &mapping),
+            ReasoningEffort::Xhigh
+        );
+        assert_eq!(
+            get_reasoning_effort("Claude-Sonnet-4", &mapping),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            get_reasoning_effort("claude-haiku", &mapping),
+            ReasoningEffort::Low
+        );
     }
 
     #[test]
@@ -1097,11 +1161,13 @@ mod tests {
         let trait_obj: &mut dyn ResponseTransformer = &mut transformer;
         let out = trait_obj.transform_line(r#"data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":20}}}"#);
         assert!(
-            out.iter().any(|chunk| chunk.contains("event: message_stop")),
+            out.iter()
+                .any(|chunk| chunk.contains("event: message_stop")),
             "trait dispatch should forward to internal transform logic"
         );
         assert!(
-            out.iter().any(|chunk| chunk.contains("\"input_tokens\":10") && chunk.contains("\"output_tokens\":20")),
+            out.iter().any(|chunk| chunk.contains("\"input_tokens\":10")
+                && chunk.contains("\"output_tokens\":20")),
             "should include usage statistics in message_delta"
         );
     }
@@ -1131,19 +1197,22 @@ mod tests {
         let messages = vec![
             Message {
                 role: "assistant".to_string(),
-                content: Some(MessageContent::Blocks(vec![
-                    create_tool_use("call_1", "skill", json!({
+                content: Some(MessageContent::Blocks(vec![create_tool_use(
+                    "call_1",
+                    "skill",
+                    json!({
                         "skill": "test-skill",
                         "args": "arg1"
-                    }))
-                ]))
+                    }),
+                )])),
             },
             Message {
                 role: "user".to_string(),
-                content: Some(MessageContent::Blocks(vec![
-                    create_tool_result("call_1", "<command-name>test-skill</command-name>\nBase Path: /tmp\nSome content")
-                ]))
-            }
+                content: Some(MessageContent::Blocks(vec![create_tool_result(
+                    "call_1",
+                    "<command-name>test-skill</command-name>\nBase Path: /tmp\nSome content",
+                )])),
+            },
         ];
 
         let (input, skills) = MessageProcessor::transform_messages(&messages, None);
@@ -1155,14 +1224,20 @@ mod tests {
 
         // Verify input structure
         // Find function_call
-        let func_call = input.iter().find(|v| v["type"] == "function_call").expect("Should have function_call");
+        let func_call = input
+            .iter()
+            .find(|v| v["type"] == "function_call")
+            .expect("Should have function_call");
         assert_eq!(func_call["name"], "skill");
         let args_str = func_call["arguments"].as_str().unwrap();
         let args: Value = serde_json::from_str(args_str).unwrap();
         assert_eq!(args["command"], "test-skill arg1");
 
         // Find function_call_output
-        let func_out = input.iter().find(|v| v["type"] == "function_call_output").expect("Should have function_call_output");
+        let func_out = input
+            .iter()
+            .find(|v| v["type"] == "function_call_output")
+            .expect("Should have function_call_output");
         assert_eq!(func_out["output"], "Skill 'test-skill' loaded.");
     }
 
@@ -1171,37 +1246,46 @@ mod tests {
         let messages = vec![
             Message {
                 role: "assistant".to_string(),
-                content: Some(MessageContent::Blocks(vec![
-                    create_tool_use("call_1", "skill", json!({"command": "test-skill"}))
-                ]))
+                content: Some(MessageContent::Blocks(vec![create_tool_use(
+                    "call_1",
+                    "skill",
+                    json!({"command": "test-skill"}),
+                )])),
             },
             Message {
                 role: "user".to_string(),
-                content: Some(MessageContent::Blocks(vec![
-                    create_tool_result("call_1", "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent 1")
-                ]))
+                content: Some(MessageContent::Blocks(vec![create_tool_result(
+                    "call_1",
+                    "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent 1",
+                )])),
             },
             Message {
                 role: "assistant".to_string(),
-                content: Some(MessageContent::Blocks(vec![
-                    create_tool_use("call_2", "skill", json!({"command": "test-skill"}))
-                ]))
+                content: Some(MessageContent::Blocks(vec![create_tool_use(
+                    "call_2",
+                    "skill",
+                    json!({"command": "test-skill"}),
+                )])),
             },
             Message {
                 role: "user".to_string(),
-                content: Some(MessageContent::Blocks(vec![
-                    create_tool_result("call_2", "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent 1")
-                ]))
-            }
+                content: Some(MessageContent::Blocks(vec![create_tool_result(
+                    "call_2",
+                    "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent 1",
+                )])),
+            },
         ];
 
         let (input, skills) = MessageProcessor::transform_messages(&messages, None);
 
         // Should only extract once
         assert_eq!(skills.len(), 1);
-        
+
         // But should have two outputs
-        let outputs: Vec<_> = input.iter().filter(|v| v["type"] == "function_call_output").collect();
+        let outputs: Vec<_> = input
+            .iter()
+            .filter(|v| v["type"] == "function_call_output")
+            .collect();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0]["output"], "Skill 'test-skill' loaded.");
         assert_eq!(outputs[1]["output"], "Skill 'test-skill' loaded.");
@@ -1213,18 +1297,21 @@ mod tests {
         let messages = vec![
             Message {
                 role: "assistant".to_string(),
-                content: Some(MessageContent::Blocks(vec![
-                    create_tool_use("call_1", "skill", json!({"command": "test-skill"}))
-                ]))
+                content: Some(MessageContent::Blocks(vec![create_tool_use(
+                    "call_1",
+                    "skill",
+                    json!({"command": "test-skill"}),
+                )])),
             },
             Message {
                 role: "user".to_string(),
-                content: Some(MessageContent::Blocks(vec![
-                    create_tool_result("call_1", "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent")
-                ]))
-            }
+                content: Some(MessageContent::Blocks(vec![create_tool_result(
+                    "call_1",
+                    "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent",
+                )])),
+            },
         ];
-        
+
         let request = AnthropicRequest {
             model: Some("claude-3-opus".to_string()),
             messages,
@@ -1240,22 +1327,22 @@ mod tests {
 
         let mapping = ReasoningEffortMapping::default();
         let prompt = "Auto-install dependencies please.";
-        
-        let (body, _) = TransformRequest::transform(&request, None, &mapping, prompt, "gpt-5.3-codex");
-        
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, prompt, "gpt-5.3-codex");
+
         let input_arr = body.get("input").unwrap().as_array().unwrap();
-        
+
         // Find the injected prompt
         // It should be after the skill injection.
         // Input structure: [Template, Skill, Prompt, ...History]
         // Since history starts with assistant, and we inject user messages.
-        
+
         // Let's look for the prompt text
         let prompt_msg = input_arr.iter().find(|msg| {
-            msg["role"] == "user" && 
-            msg["content"][0]["text"].as_str().unwrap_or("") == prompt
+            msg["role"] == "user" && msg["content"][0]["text"].as_str().unwrap_or("") == prompt
         });
-        
+
         assert!(prompt_msg.is_some(), "Should inject custom prompt");
     }
 
@@ -1266,23 +1353,19 @@ mod tests {
             messages: vec![
                 Message {
                     role: "assistant".to_string(),
-                    content: Some(MessageContent::Blocks(vec![
-                        ContentBlock::ToolUse {
-                            id: Some("call_123".to_string()),
-                            name: "WebFetch".to_string(),
-                            input: json!({"url": "https://example.com"}),
-                            signature: Some("sig_tool_abc".to_string()),
-                        },
-                    ])),
+                    content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                        id: Some("call_123".to_string()),
+                        name: "WebFetch".to_string(),
+                        input: json!({"url": "https://example.com"}),
+                        signature: Some("sig_tool_abc".to_string()),
+                    }])),
                 },
                 Message {
                     role: "assistant".to_string(),
-                    content: Some(MessageContent::Blocks(vec![
-                        ContentBlock::Thinking {
-                            thinking: "internal".to_string(),
-                            signature: Some("sig_thinking_abc".to_string()),
-                        },
-                    ])),
+                    content: Some(MessageContent::Blocks(vec![ContentBlock::Thinking {
+                        thinking: "internal".to_string(),
+                        signature: Some("sig_thinking_abc".to_string()),
+                    }])),
                 },
             ],
             system: None,
@@ -1342,7 +1425,10 @@ mod tests {
             .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
             .flat_map(|content| content.iter())
             .any(|block| block.get("type").and_then(|v| v.as_str()) == Some("thinking"));
-        assert!(!has_thinking_type, "codex payload must not contain thinking type");
+        assert!(
+            !has_thinking_type,
+            "codex payload must not contain thinking type"
+        );
 
         let has_summary_text_type = input
             .iter()
@@ -1399,7 +1485,12 @@ mod tests {
             .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
             .flat_map(|content| content.iter())
             .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("output_text"))
-            .filter_map(|block| block.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|block| {
+                block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
 
         assert!(
@@ -1433,6 +1524,34 @@ mod tests {
         assert!(
             joined.contains("\"name\":\"multi_tool_use.parallel\""),
             "tool_use name should preserve leaked tool target for client-side routing"
+        );
+    }
+
+    #[test]
+    fn test_leaked_tool_suffix_keeps_prefix_text_visible() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "先修正 loader。 assistant to=functions.Edit {\"file_path\":\"/tmp/loader.ts\"}\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        assert!(
+            joined.contains("\"type\":\"text_delta\"")
+                && joined.contains("\"text\":\"先修正 loader。 \""),
+            "prefix text before leaked tool marker should stay visible"
+        );
+        assert!(
+            joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Edit\""),
+            "leaked tool suffix should still be promoted to tool_use"
+        );
+        assert!(
+            !joined.contains("assistant to=functions.Edit"),
+            "leaked tool marker should not appear in visible text output"
         );
     }
 
@@ -1500,8 +1619,7 @@ mod tests {
         let events = transformer.transform_sse_line(&line);
         let joined = events.join("");
         assert!(
-            joined.contains("\"type\":\"tool_use\"")
-                && joined.contains("\"name\":\"Bash\""),
+            joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Bash\""),
             "functions leak should be promoted even without assistant prefix"
         );
         assert!(
@@ -1510,8 +1628,8 @@ mod tests {
             "valid leaked json payload should be forwarded as tool arguments"
         );
         assert!(
-            !joined.contains("numerusform"),
-            "prefix leak text should not appear in visible assistant output"
+            !joined.contains("to=functions.Bash"),
+            "functions leak marker should not appear in visible assistant output"
         );
     }
 
@@ -1538,8 +1656,7 @@ mod tests {
         let joined = format!("{}{}", events_1.join(""), events_2.join(""));
 
         assert!(
-            joined.contains("\"type\":\"tool_use\"")
-                && joined.contains("\"name\":\"Read\""),
+            joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Read\""),
             "split leaked functions line should still be promoted to tool_use"
         );
         assert!(
@@ -1569,8 +1686,7 @@ mod tests {
         let events = transformer.transform_sse_line(&line);
         let joined = events.join("");
         assert!(
-            joined.contains("\"type\":\"tool_use\"")
-                && joined.contains("\"name\":\"Write\""),
+            joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Write\""),
             "content_part leak should be promoted to tool_use"
         );
         assert!(
@@ -1599,7 +1715,8 @@ mod tests {
 
         let events = transformer.transform_sse_line(&line);
         let joined = events.join("");
-        let has_text_block_payload = joined.contains("\"content_block\":{\"text\":\"\",\"type\":\"text\"}")
+        let has_text_block_payload = joined
+            .contains("\"content_block\":{\"text\":\"\",\"type\":\"text\"}")
             || joined.contains("\"content_block\":{\"type\":\"text\",\"text\":\"\"}");
         assert!(
             joined.contains("\"content_block_start\"") && has_text_block_payload,
@@ -1641,8 +1758,7 @@ mod tests {
         let events_2 = transformer.transform_sse_line(&line_2);
         let joined = format!("{}{}", events_1.join(""), events_2.join(""));
         assert!(
-            joined.contains("\"type\":\"tool_use\"")
-                && joined.contains("\"name\":\"Read\""),
+            joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Read\""),
             "mixed-event leaked functions line should still be promoted to tool_use"
         );
         assert!(
@@ -1668,7 +1784,8 @@ mod tests {
 
         let events = transformer.transform_sse_line(&line);
         let joined = events.join("");
-        let has_text_block_payload = joined.contains("\"content_block\":{\"text\":\"\",\"type\":\"text\"}")
+        let has_text_block_payload = joined
+            .contains("\"content_block\":{\"text\":\"\",\"type\":\"text\"}")
             || joined.contains("\"content_block\":{\"type\":\"text\",\"text\":\"\"}");
         assert!(
             joined.contains("\"content_block_start\"") && has_text_block_payload,
@@ -1700,6 +1817,33 @@ mod tests {
         assert!(
             joined.contains("\"text\":\"## Rust 入门\\n\\n1. 语法基础\\n2. 核心机制\\n\""),
             "markdown text should keep line breaks to avoid collapsed layout"
+        );
+    }
+
+    #[test]
+    fn test_unparsable_leaked_tool_prefix_is_suppressed_from_visible_text() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "assistant to=multi_tool_use.parallelExtra {\"tool_uses\":[]}\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        assert!(
+            !joined.contains("\"type\":\"text_delta\""),
+            "unparsable leaked tool prefix should not fall through to text output"
+        );
+        assert!(
+            !joined.contains("\"type\":\"tool_use\""),
+            "unparsable leaked tool prefix should not fabricate a tool_use block"
+        );
+        assert!(
+            !joined.contains("parallelExtra"),
+            "suppressed unparsable leaked marker should stay hidden from client text"
         );
     }
 
@@ -1793,10 +1937,18 @@ mod tests {
         let call_names: Vec<String> = input
             .iter()
             .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
-            .filter_map(|item| item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|item| {
+                item.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
 
-        assert_eq!(call_names.len(), 3, "expected all tool_use blocks to become function_call");
+        assert_eq!(
+            call_names.len(),
+            3,
+            "expected all tool_use blocks to become function_call"
+        );
         for name in call_names {
             assert!(
                 !name.is_empty()
@@ -1816,7 +1968,8 @@ mod tests {
             messages: vec![Message {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
-                    text: "先起草 design。 to=functions.Write {\"file_path\":\"/tmp/design.md\"}".to_string(),
+                    text: "先起草 design。 to=functions.Write {\"file_path\":\"/tmp/design.md\"}"
+                        .to_string(),
                 }])),
             }],
             system: None,
@@ -1842,7 +1995,12 @@ mod tests {
             .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
             .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
             .flat_map(|content| content.iter())
-            .filter_map(|block| block.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|block| {
+                block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
 
         assert!(
@@ -1850,7 +2008,9 @@ mod tests {
             "normal prefix text should be preserved"
         );
         assert!(
-            texts.iter().all(|text| !text.contains("to=functions.Write")),
+            texts
+                .iter()
+                .all(|text| !text.contains("to=functions.Write")),
             "leaked tool marker should be stripped from outbound message text"
         );
     }

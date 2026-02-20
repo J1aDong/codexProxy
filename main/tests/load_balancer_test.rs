@@ -186,12 +186,18 @@ fn test_transient_overload_uses_short_backoff_without_marking_unavailable() {
     );
 
     let immediate = runtime.resolve_and_acquire("claude-opus");
-    assert!(immediate.is_none(), "endpoint should be in transient backoff");
+    assert!(
+        immediate.is_none(),
+        "endpoint should be in transient backoff"
+    );
 
     sleep(Duration::from_millis(1100));
 
     let after = runtime.resolve_and_acquire("claude-opus");
-    assert!(after.is_some(), "endpoint should recover after transient backoff");
+    assert!(
+        after.is_some(),
+        "endpoint should recover after transient backoff"
+    );
 }
 
 #[test]
@@ -295,7 +301,10 @@ fn test_model_unavailable_signal_immediately_fallbacks_to_next_route_in_same_slo
     );
 
     let second = runtime.resolve_and_acquire("claude-opus-4-6");
-    assert!(second.is_some(), "should fallback to next route in opus slot");
+    assert!(
+        second.is_some(),
+        "should fallback to next route in opus slot"
+    );
     let (second_resolved, _second_permit) = second.unwrap();
     assert_eq!(second_resolved.endpoint_id, "ep-good");
 }
@@ -401,7 +410,10 @@ fn test_route_not_found_404_immediately_fallbacks_to_next_route_in_same_slot() {
     assert_eq!(action, UpstreamOutcomeAction::RetryNextCandidate);
 
     let second = runtime.resolve_and_acquire("claude-opus-4-6");
-    assert!(second.is_some(), "should fallback to next route in opus slot");
+    assert!(
+        second.is_some(),
+        "should fallback to next route in opus slot"
+    );
     let (second_resolved, _second_permit) = second.unwrap();
     assert_eq!(second_resolved.endpoint_id, "ep-good");
 }

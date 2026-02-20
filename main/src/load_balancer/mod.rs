@@ -270,7 +270,10 @@ impl LoadBalancerRuntime {
         self.send_log(msg);
     }
 
-    pub fn resolve_and_acquire(&self, model_name: &str) -> Option<(ResolvedEndpoint, EndpointPermit)> {
+    pub fn resolve_and_acquire(
+        &self,
+        model_name: &str,
+    ) -> Option<(ResolvedEndpoint, EndpointPermit)> {
         let slot = ModelSlot::from_model_name(model_name);
         let profile = self.current_profile()?;
 
@@ -306,7 +309,8 @@ impl LoadBalancerRuntime {
                 .clone()
                 .unwrap_or_else(|| endpoint.converter.clone());
             let model_hint = Self::normalize_model_hint(candidate.custom_model_name.as_deref());
-            let route_key = Self::build_route_key(slot, &candidate.endpoint_id, &converter, &model_hint);
+            let route_key =
+                Self::build_route_key(slot, &candidate.endpoint_id, &converter, &model_hint);
 
             match self.try_acquire_endpoint_for_route(
                 &candidate.endpoint_id,
@@ -385,7 +389,12 @@ impl LoadBalancerRuntime {
         None
     }
 
-    pub fn record_result(&self, resolved: &ResolvedEndpoint, status: Option<u16>, network_error: bool) {
+    pub fn record_result(
+        &self,
+        resolved: &ResolvedEndpoint,
+        status: Option<u16>,
+        network_error: bool,
+    ) {
         let policy = self
             .config
             .endpoint_policies
@@ -404,7 +413,9 @@ impl LoadBalancerRuntime {
 
             let previous_health = route_state.health;
             let now = Instant::now();
-            if Self::refresh_route_state(route_state, &policy, now) && previous_health == EndpointHealth::Cooldown {
+            if Self::refresh_route_state(route_state, &policy, now)
+                && previous_health == EndpointHealth::Cooldown
+            {
                 became_available = true;
             }
 
@@ -436,7 +447,8 @@ impl LoadBalancerRuntime {
                 route_state.health = match route_state.health {
                     EndpointHealth::Healthy => EndpointHealth::Constrained,
                     EndpointHealth::Constrained => {
-                        route_state.cooldown_until = Some(now + Duration::from_secs(policy.cooldown_seconds as u64));
+                        route_state.cooldown_until =
+                            Some(now + Duration::from_secs(policy.cooldown_seconds as u64));
                         EndpointHealth::Cooldown
                     }
                     EndpointHealth::Cooldown => EndpointHealth::Cooldown,
@@ -451,8 +463,7 @@ impl LoadBalancerRuntime {
                     (EndpointHealth::Healthy, EndpointHealth::Constrained) => {
                         self.send_log(format!(
                             "[LB] route={} state=Healthy->Constrained errors>={}",
-                            resolved.route_key,
-                            policy.error_threshold,
+                            resolved.route_key, policy.error_threshold,
                         ));
                     }
                     (EndpointHealth::Constrained, EndpointHealth::Cooldown)
@@ -460,9 +471,7 @@ impl LoadBalancerRuntime {
                         became_unavailable = true;
                         self.send_log(format!(
                             "[LB] route={} state={:?}->Cooldown cooldown_secs={}",
-                            resolved.route_key,
-                            previous_health,
-                            policy.cooldown_seconds,
+                            resolved.route_key, previous_health, policy.cooldown_seconds,
                         ));
                     }
                     (EndpointHealth::Cooldown, EndpointHealth::Constrained)
@@ -470,16 +479,13 @@ impl LoadBalancerRuntime {
                         became_available = true;
                         self.send_log(format!(
                             "[LB] route={} state=Cooldown->{:?}",
-                            resolved.route_key,
-                            current_health,
+                            resolved.route_key, current_health,
                         ));
                     }
                     _ => {
                         self.send_log(format!(
                             "[LB] route={} state={:?}->{:?}",
-                            resolved.route_key,
-                            previous_health,
-                            current_health,
+                            resolved.route_key, previous_health, current_health,
                         ));
                     }
                 }
@@ -545,16 +551,10 @@ impl LoadBalancerRuntime {
 
         if Self::is_transient_overload(code, detail) {
             let backoff_secs = policy.transient_backoff_seconds.max(1) as u64;
-            self.set_endpoint_backoff(
-                &resolved.endpoint_id,
-                backoff_secs,
-                "overload",
-            );
+            self.set_endpoint_backoff(&resolved.endpoint_id, backoff_secs, "overload");
             self.send_log(format!(
                 "[LB] route={} transient_overload status={} endpoint_backoff={}s",
-                resolved.route_key,
-                code,
-                backoff_secs,
+                resolved.route_key, code, backoff_secs,
             ));
             return UpstreamOutcomeAction::RetryNextCandidate;
         }
@@ -581,15 +581,14 @@ impl LoadBalancerRuntime {
                 .entry(resolved.route_key.clone())
                 .or_insert_with(RouteState::default);
             route_state.health = EndpointHealth::Cooldown;
-            route_state.cooldown_until = Some(Instant::now() + Duration::from_secs(policy.cooldown_seconds as u64));
+            route_state.cooldown_until =
+                Some(Instant::now() + Duration::from_secs(policy.cooldown_seconds as u64));
             route_state.errors.clear();
         }
 
         self.send_log(format!(
             "[LB] route={} force_cooldown reason={} cooldown_secs={}",
-            resolved.route_key,
-            reason,
-            policy.cooldown_seconds,
+            resolved.route_key, reason, policy.cooldown_seconds,
         ));
 
         self.send_route_status(
@@ -673,13 +672,25 @@ impl LoadBalancerRuntime {
         }
 
         if cooldown_expired {
-            self.send_route_status(slot, endpoint_id, converter, model_hint, "available", "cooldown_expired", None);
+            self.send_route_status(
+                slot,
+                endpoint_id,
+                converter,
+                model_hint,
+                "available",
+                "cooldown_expired",
+                None,
+            );
         }
 
         result
     }
 
-    fn refresh_route_state(route_state: &mut RouteState, policy: &EndpointPolicy, now: Instant) -> bool {
+    fn refresh_route_state(
+        route_state: &mut RouteState,
+        policy: &EndpointPolicy,
+        now: Instant,
+    ) -> bool {
         Self::prune_errors(route_state, policy, now);
 
         let mut cooldown_expired = false;
@@ -722,14 +733,13 @@ impl LoadBalancerRuntime {
                 .by_endpoint
                 .entry(endpoint_id.to_string())
                 .or_insert_with(EndpointState::default);
-            endpoint_state.transient_backoff_until = Some(Instant::now() + Duration::from_secs(seconds));
+            endpoint_state.transient_backoff_until =
+                Some(Instant::now() + Duration::from_secs(seconds));
         }
 
         self.send_log(format!(
             "[LB] endpoint={} transient_backoff_secs={} reason={}",
-            endpoint_id,
-            seconds,
-            reason,
+            endpoint_id, seconds, reason,
         ));
     }
 
@@ -739,8 +749,7 @@ impl LoadBalancerRuntime {
         }
 
         let lower = error_text.to_ascii_lowercase();
-        let has_route_not_found_signal = lower.contains("route ")
-            && lower.contains(" not found");
+        let has_route_not_found_signal = lower.contains("route ") && lower.contains(" not found");
 
         if status == 404 && has_route_not_found_signal {
             return Some("route_not_found");
@@ -770,10 +779,8 @@ impl LoadBalancerRuntime {
             || lower.contains("模型不存在")
             || lower.contains("模型不可用");
 
-        let model_unavailable_status = status == 400
-            || status == 404
-            || status == 422
-            || (500..=599).contains(&status);
+        let model_unavailable_status =
+            status == 400 || status == 404 || status == 422 || (500..=599).contains(&status);
         if model_unavailable_status && has_model_signal {
             return Some("model_unavailable");
         }
@@ -831,7 +838,12 @@ impl LoadBalancerRuntime {
         }
     }
 
-    fn build_route_key(slot: ModelSlot, endpoint_id: &str, converter: &str, model_hint: &str) -> String {
+    fn build_route_key(
+        slot: ModelSlot,
+        endpoint_id: &str,
+        converter: &str,
+        model_hint: &str,
+    ) -> String {
         format!(
             "{}|{}|{}|{}",
             slot.as_str(),
@@ -845,7 +857,13 @@ impl LoadBalancerRuntime {
         value
             .trim()
             .chars()
-            .map(|ch| if ch.is_whitespace() || ch == '|' { '_' } else { ch })
+            .map(|ch| {
+                if ch.is_whitespace() || ch == '|' {
+                    '_'
+                } else {
+                    ch
+                }
+            })
             .collect()
     }
 }

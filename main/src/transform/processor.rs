@@ -1,11 +1,9 @@
-use serde_json::{json, Value};
-use tokio::sync::broadcast;
 use crate::logger::{is_debug_log_enabled, truncate_for_log, AppLogger};
-use crate::models::{
-    ContentBlock, ImageSource, ImageUrlValue, Message, MessageContent,
-};
+use crate::models::{ContentBlock, ImageSource, ImageUrlValue, Message, MessageContent};
+use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use tokio::sync::broadcast;
 
 pub const IMAGE_SYSTEM_HINT: &str = "\n<system_hint>IMAGE PROVIDED. You can see the image above directly. Analyze it as requested. DO NOT ask for file paths.</system_hint>\n";
 const MAX_SKILL_CONTENT_CHARS: usize = 8_000;
@@ -23,7 +21,8 @@ impl MessageProcessor {
         let mut extracted_skills = Vec::new();
         let mut extracted_skill_keys = std::collections::HashSet::new();
         let mut extracted_skill_chars = 0usize;
-        let mut skill_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut skill_tool_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // 获取全局日志记录器
         let logger = AppLogger::get();
@@ -40,7 +39,10 @@ impl MessageProcessor {
             }
         };
 
-        log(&format!("📝 [Messages] Processing {} messages", messages.len()));
+        log(&format!(
+            "📝 [Messages] Processing {} messages",
+            messages.len()
+        ));
 
         // 第一遍：收集 skill tool ids
         for msg in messages {
@@ -74,7 +76,10 @@ impl MessageProcessor {
             };
 
             let Some(content) = &msg.content else {
-                log(&format!("📝 [Message #{}] role={}, content=null (skipped)", msg_idx, msg.role));
+                log(&format!(
+                    "📝 [Message #{}] role={}, content=null (skipped)",
+                    msg_idx, msg.role
+                ));
                 continue;
             };
 
@@ -134,14 +139,21 @@ impl MessageProcessor {
                                     "text": text
                                 }));
                             }
-                            ContentBlock::Thinking { thinking, signature } => {
+                            ContentBlock::Thinking {
+                                thinking,
+                                signature,
+                            } => {
                                 current_msg_content.push(json!({
                                     "type": "thinking",
                                     "thinking": thinking,
                                     "signature": signature
                                 }));
                             }
-                            ContentBlock::Image { source, source_raw, image_url } => {
+                            ContentBlock::Image {
+                                source,
+                                source_raw,
+                                image_url,
+                            } => {
                                 let mut resolved_url = if let Some(image_url) = image_url {
                                     match image_url {
                                         ImageUrlValue::Str(s) => s.clone(),
@@ -155,8 +167,9 @@ impl MessageProcessor {
                                 };
 
                                 if !resolved_url.is_empty() {
-                                    let media_type = source.as_ref()
-                                        .and_then(|s| s.media_type.as_deref().or(s.mime_type.as_deref()));
+                                    let media_type = source.as_ref().and_then(|s| {
+                                        s.media_type.as_deref().or(s.mime_type.as_deref())
+                                    });
                                     resolved_url = Self::normalize_image_url(
                                         resolved_url,
                                         media_type,
@@ -168,7 +181,9 @@ impl MessageProcessor {
 
                                 if resolved_url.is_empty() {
                                     if let Some(raw) = source_raw {
-                                        resolved_url = Self::resolve_image_url_raw(raw, &log, msg_idx, block_idx);
+                                        resolved_url = Self::resolve_image_url_raw(
+                                            raw, &log, msg_idx, block_idx,
+                                        );
                                     }
                                 }
 
@@ -193,7 +208,8 @@ impl MessageProcessor {
                                     ImageUrlValue::ObjUrl { url } => url.clone(),
                                     ImageUrlValue::ObjUri { uri } => uri.clone(),
                                 };
-                                let url = Self::normalize_image_url(url, None, &log, msg_idx, block_idx);
+                                let url =
+                                    Self::normalize_image_url(url, None, &log, msg_idx, block_idx);
                                 if !url.is_empty() && msg.role == "user" {
                                     ensure_image_hint(&mut current_msg_content);
                                     log(&format!(
@@ -216,7 +232,13 @@ impl MessageProcessor {
                                     Some(ImageUrlValue::ObjUri { uri }) => uri.clone(),
                                     None => url.clone().unwrap_or_default(),
                                 };
-                                let resolved_url = Self::normalize_image_url(resolved_url, None, &log, msg_idx, block_idx);
+                                let resolved_url = Self::normalize_image_url(
+                                    resolved_url,
+                                    None,
+                                    &log,
+                                    msg_idx,
+                                    block_idx,
+                                );
                                 if !resolved_url.is_empty() && msg.role == "user" {
                                     ensure_image_hint(&mut current_msg_content);
                                     log(&format!(
@@ -232,7 +254,12 @@ impl MessageProcessor {
                                     }));
                                 }
                             }
-                            ContentBlock::ToolUse { id, name, input: tool_input, signature } => {
+                            ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input: tool_input,
+                                signature,
+                            } => {
                                 if !current_msg_content.is_empty() {
                                     input.push(json!({
                                         "type": "message",
@@ -244,17 +271,27 @@ impl MessageProcessor {
 
                                 let mut final_tool_input = tool_input.clone();
                                 if name.to_lowercase() == "skill" {
-                                    if let serde_json::Value::Object(ref mut obj) = final_tool_input {
-                                        if let Some(skill_name) = obj.get("skill").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                                    if let serde_json::Value::Object(ref mut obj) = final_tool_input
+                                    {
+                                        if let Some(skill_name) = obj
+                                            .get("skill")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                        {
                                             let mut cmd = skill_name;
-                                            if let Some(args) = obj.get("args").and_then(|v| v.as_str()) {
+                                            if let Some(args) =
+                                                obj.get("args").and_then(|v| v.as_str())
+                                            {
                                                 if !args.is_empty() {
                                                     cmd.push(' ');
                                                     cmd.push_str(args);
                                                 }
                                             }
                                             obj.clear();
-                                            obj.insert("command".to_string(), serde_json::Value::String(cmd));
+                                            obj.insert(
+                                                "command".to_string(),
+                                                serde_json::Value::String(cmd),
+                                            );
                                         }
                                     }
                                 }
@@ -267,7 +304,11 @@ impl MessageProcessor {
                                     "signature": signature
                                 }));
                             }
-                            ContentBlock::ToolResult { tool_use_id, content: tool_content, .. } => {
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content: tool_content,
+                                ..
+                            } => {
                                 let is_skill = if let Some(tid) = tool_use_id {
                                     skill_tool_ids.contains(tid)
                                 } else {
@@ -277,17 +318,22 @@ impl MessageProcessor {
                                 let mut override_result_text = None;
 
                                 if is_skill || Self::is_potential_skill_result(tool_content) {
-                                    if let Some((s_name, s_content)) = Self::extract_skill_info(tool_content) {
+                                    if let Some((s_name, s_content)) =
+                                        Self::extract_skill_info(tool_content)
+                                    {
                                         let skill_key = Self::build_skill_key(&s_name, &s_content);
                                         if !extracted_skill_keys.contains(&skill_key) {
-                                            let remaining_budget =
-                                                MAX_TOTAL_SKILL_CHARS.saturating_sub(extracted_skill_chars);
-                                            if let Some(skill_formatted) = Self::build_limited_skill_payload(
-                                                &s_name,
-                                                &s_content,
-                                                remaining_budget,
-                                            ) {
-                                                extracted_skill_chars += skill_formatted.chars().count();
+                                            let remaining_budget = MAX_TOTAL_SKILL_CHARS
+                                                .saturating_sub(extracted_skill_chars);
+                                            if let Some(skill_formatted) =
+                                                Self::build_limited_skill_payload(
+                                                    &s_name,
+                                                    &s_content,
+                                                    remaining_budget,
+                                                )
+                                            {
+                                                extracted_skill_chars +=
+                                                    skill_formatted.chars().count();
                                                 extracted_skills.push(skill_formatted);
                                                 extracted_skill_keys.insert(skill_key);
                                                 log(&format!(
@@ -306,7 +352,8 @@ impl MessageProcessor {
                                                 s_name
                                             ));
                                         }
-                                        override_result_text = Some(format!("Skill '{}' loaded.", s_name));
+                                        override_result_text =
+                                            Some(format!("Skill '{}' loaded.", s_name));
                                     }
                                 }
 
@@ -319,21 +366,26 @@ impl MessageProcessor {
                                     current_msg_content = Vec::new();
                                 }
 
-                                let result_text = if let Some(override_text) = override_result_text {
+                                let result_text = if let Some(override_text) = override_result_text
+                                {
                                     override_text
                                 } else if let Some(cv) = tool_content {
                                     match cv {
                                         serde_json::Value::String(s) => s.clone(),
-                                        serde_json::Value::Array(arr) => {
-                                            arr.iter().filter_map(|item| {
+                                        serde_json::Value::Array(arr) => arr
+                                            .iter()
+                                            .filter_map(|item| {
                                                 if let serde_json::Value::Object(obj) = item {
-                                                    if let Some(serde_json::Value::String(text)) = obj.get("text") {
+                                                    if let Some(serde_json::Value::String(text)) =
+                                                        obj.get("text")
+                                                    {
                                                         return Some(text.clone());
                                                     }
                                                 }
                                                 None
-                                            }).collect::<Vec<_>>().join("\n")
-                                        },
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
                                         _ => cv.to_string(),
                                     }
                                 } else {
@@ -353,7 +405,8 @@ impl MessageProcessor {
                                 }));
                             }
                             ContentBlock::OtherValue(v) => {
-                                let text = serde_json::to_string(v).unwrap_or_else(|_| "[unknown content]".to_string());
+                                let text = serde_json::to_string(v)
+                                    .unwrap_or_else(|_| "[unknown content]".to_string());
                                 current_msg_content.push(json!({
                                     "type": text_type,
                                     "text": text
@@ -399,10 +452,13 @@ impl MessageProcessor {
         F: Fn(&str),
     {
         if let Some(url) = &source.url {
-            let media_type = source.media_type.as_deref()
+            let media_type = source
+                .media_type
+                .as_deref()
                 .or(source.mime_type.as_deref())
                 .unwrap_or("image/png");
-            let normalized = Self::normalize_image_url(url.clone(), Some(media_type), log, msg_idx, block_idx);
+            let normalized =
+                Self::normalize_image_url(url.clone(), Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source.url: {}",
                 msg_idx,
@@ -413,10 +469,13 @@ impl MessageProcessor {
         }
 
         if let Some(uri) = &source.uri {
-            let media_type = source.media_type.as_deref()
+            let media_type = source
+                .media_type
+                .as_deref()
                 .or(source.mime_type.as_deref())
                 .unwrap_or("image/png");
-            let normalized = Self::normalize_image_url(uri.clone(), Some(media_type), log, msg_idx, block_idx);
+            let normalized =
+                Self::normalize_image_url(uri.clone(), Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source.uri: {}",
                 msg_idx,
@@ -427,7 +486,9 @@ impl MessageProcessor {
         }
 
         if let Some(path) = &source.path {
-            let media_type = source.media_type.as_deref()
+            let media_type = source
+                .media_type
+                .as_deref()
                 .or(source.mime_type.as_deref())
                 .unwrap_or("image/png");
             let file_url = if path.starts_with("file://") {
@@ -435,7 +496,8 @@ impl MessageProcessor {
             } else {
                 format!("file://{}", path)
             };
-            let normalized = Self::normalize_image_url(file_url, Some(media_type), log, msg_idx, block_idx);
+            let normalized =
+                Self::normalize_image_url(file_url, Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source.path: {}",
                 msg_idx,
@@ -446,7 +508,9 @@ impl MessageProcessor {
         }
 
         if let Some(data) = &source.data {
-            let media_type = source.media_type.as_deref()
+            let media_type = source
+                .media_type
+                .as_deref()
                 .or(source.mime_type.as_deref())
                 .unwrap_or("image/png");
 
@@ -467,26 +531,19 @@ impl MessageProcessor {
 
         log(&format!(
             "🖼️ [Message #{} Block #{}] Image source is empty (no url/uri/data)",
-            msg_idx,
-            block_idx
+            msg_idx, block_idx
         ));
         String::new()
     }
 
-    fn resolve_image_url_raw<F>(
-        source: &Value,
-        log: &F,
-        msg_idx: usize,
-        block_idx: usize,
-    ) -> String
+    fn resolve_image_url_raw<F>(source: &Value, log: &F, msg_idx: usize, block_idx: usize) -> String
     where
         F: Fn(&str),
     {
         let Some(obj) = source.as_object() else {
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source raw is not object",
-                msg_idx,
-                block_idx
+                msg_idx, block_idx
             ));
             return String::new();
         };
@@ -494,12 +551,11 @@ impl MessageProcessor {
         let keys = obj.keys().cloned().collect::<Vec<_>>().join(",");
         log(&format!(
             "🖼️ [Message #{} Block #{}] Image source raw keys: {}",
-            msg_idx,
-            block_idx,
-            keys
+            msg_idx, block_idx, keys
         ));
 
-        let media_type = obj.get("media_type")
+        let media_type = obj
+            .get("media_type")
             .or_else(|| obj.get("mediaType"))
             .or_else(|| obj.get("mime_type"))
             .or_else(|| obj.get("mimeType"))
@@ -528,7 +584,8 @@ impl MessageProcessor {
         };
 
         if let Some(url) = obj.get("url").and_then(|v| extract_str(v)) {
-            let normalized = Self::normalize_image_url(url, Some(media_type), log, msg_idx, block_idx);
+            let normalized =
+                Self::normalize_image_url(url, Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source raw.url: {}",
                 msg_idx,
@@ -539,7 +596,8 @@ impl MessageProcessor {
         }
 
         if let Some(uri) = obj.get("uri").and_then(|v| extract_str(v)) {
-            let normalized = Self::normalize_image_url(uri, Some(media_type), log, msg_idx, block_idx);
+            let normalized =
+                Self::normalize_image_url(uri, Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source raw.uri: {}",
                 msg_idx,
@@ -550,7 +608,8 @@ impl MessageProcessor {
         }
 
         if let Some(image_url) = obj.get("image_url").and_then(|v| extract_str(v)) {
-            let normalized = Self::normalize_image_url(image_url, Some(media_type), log, msg_idx, block_idx);
+            let normalized =
+                Self::normalize_image_url(image_url, Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source raw.image_url: {}",
                 msg_idx,
@@ -560,14 +619,35 @@ impl MessageProcessor {
             return normalized;
         }
 
-        let path_value = obj.get("path")
+        let path_value = obj
+            .get("path")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .or_else(|| obj.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .or_else(|| obj.get("filePath").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .or_else(|| obj.get("local_path").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .or_else(|| obj.get("localPath").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .or_else(|| obj.get("file").and_then(|v| v.as_str()).map(|s| s.to_string()));
+            .or_else(|| {
+                obj.get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                obj.get("filePath")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                obj.get("local_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                obj.get("localPath")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                obj.get("file")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
 
         if let Some(path) = path_value {
             let file_url = if path.starts_with("file://") {
@@ -575,7 +655,8 @@ impl MessageProcessor {
             } else {
                 format!("file://{}", path)
             };
-            let normalized = Self::normalize_image_url(file_url, Some(media_type), log, msg_idx, block_idx);
+            let normalized =
+                Self::normalize_image_url(file_url, Some(media_type), log, msg_idx, block_idx);
             log(&format!(
                 "🖼️ [Message #{} Block #{}] Image source raw.path: {}",
                 msg_idx,
@@ -585,9 +666,11 @@ impl MessageProcessor {
             return normalized;
         }
 
-        let data = obj.get("data")
-            .and_then(|v| extract_str(v))
-            .or_else(|| obj.get("base64").and_then(|v| v.as_str()).map(|s| s.to_string()));
+        let data = obj.get("data").and_then(|v| extract_str(v)).or_else(|| {
+            obj.get("base64")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
 
         if let Some(data) = data {
             log(&format!(
@@ -606,14 +689,15 @@ impl MessageProcessor {
 
         log(&format!(
             "🖼️ [Message #{} Block #{}] Image source raw is empty",
-            msg_idx,
-            block_idx
+            msg_idx, block_idx
         ));
         String::new()
     }
 
     pub fn is_potential_skill_result(content: &Option<Value>) -> bool {
-        let Some(content_val) = content else { return false; };
+        let Some(content_val) = content else {
+            return false;
+        };
         let text = match content_val {
             Value::String(s) => s.as_str(),
             Value::Array(arr) => {
@@ -686,7 +770,10 @@ impl MessageProcessor {
     }
 
     pub fn convert_to_codex_skill_format(name: &str, content: &str) -> String {
-        format!("<skill>\n<name>{}</name>\n<path>unknown</path>\n{}\n</skill>", name, content)
+        format!(
+            "<skill>\n<name>{}</name>\n<path>unknown</path>\n{}\n</skill>",
+            name, content
+        )
     }
 
     fn truncate_skill_content(content: &str, max_chars: usize) -> String {
@@ -727,7 +814,9 @@ impl MessageProcessor {
             return None;
         }
 
-        let wrapper_overhead = Self::convert_to_codex_skill_format(name, "").chars().count();
+        let wrapper_overhead = Self::convert_to_codex_skill_format(name, "")
+            .chars()
+            .count();
         if remaining_budget <= wrapper_overhead {
             return None;
         }

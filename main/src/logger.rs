@@ -41,25 +41,29 @@ pub struct AppLogger {
 impl AppLogger {
     /// 初始化全局日志记录器（应用启动时调用一次）
     pub fn init(log_dir: Option<&str>) -> Arc<AppLogger> {
-        APP_LOGGER.get_or_init(|| {
-            let dir = log_dir.unwrap_or(LOG_DIR);
-            let _ = fs::create_dir_all(dir);
+        APP_LOGGER
+            .get_or_init(|| {
+                let dir = log_dir.unwrap_or(LOG_DIR);
+                let _ = fs::create_dir_all(dir);
 
-            let start_time = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-            let log_path = PathBuf::from(dir).join(format!("proxy_{}.log", start_time));
+                let start_time = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+                let log_path = PathBuf::from(dir).join(format!("proxy_{}.log", start_time));
 
-            let logger = Arc::new(AppLogger {
-                log_path,
-            });
+                let logger = Arc::new(AppLogger { log_path });
 
-            // 写入启动信息
-            logger.log("════════════════════════════════════════════════════════════════════════");
-            logger.log("🚀 Codex Proxy Started");
-            logger.log(&format!("📁 Log file: {:?}", logger.log_path));
-            logger.log("════════════════════════════════════════════════════════════════════════");
+                // 写入启动信息
+                logger.log(
+                    "════════════════════════════════════════════════════════════════════════",
+                );
+                logger.log("🚀 Codex Proxy Started");
+                logger.log(&format!("📁 Log file: {:?}", logger.log_path));
+                logger.log(
+                    "════════════════════════════════════════════════════════════════════════",
+                );
 
-            logger
-        }).clone()
+                logger
+            })
+            .clone()
     }
 
     /// 获取全局日志记录器

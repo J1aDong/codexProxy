@@ -6,7 +6,10 @@ pub mod processor;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::models::{AnthropicModelMapping, AnthropicRequest, ReasoningEffortMapping, GeminiReasoningEffortMapping, CodexModelMapping};
+use crate::models::{
+    AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
+    ReasoningEffortMapping,
+};
 
 /// 转换上下文 —— 从 ProxyServer 配置派生，传入 transform 方法
 #[derive(Clone)]
@@ -72,7 +75,7 @@ pub trait ResponseTransformer: Send {
 }
 
 // Re-export backends
+pub use anthropic::AnthropicBackend;
 pub use codex::CodexBackend;
 pub use gemini::GeminiBackend;
-pub use anthropic::AnthropicBackend;
 pub use processor::MessageProcessor;

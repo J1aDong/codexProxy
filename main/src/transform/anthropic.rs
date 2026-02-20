@@ -92,7 +92,9 @@ mod tests {
     #[test]
     fn test_passthrough_event_data_pair() {
         let mut transformer = AnthropicPassthroughResponseTransformer::default();
-        assert!(transformer.transform_line("event: message_start").is_empty());
+        assert!(transformer
+            .transform_line("event: message_start")
+            .is_empty());
         let chunks = transformer.transform_line("data: {\"type\":\"message_start\"}");
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].contains("event: message_start"));

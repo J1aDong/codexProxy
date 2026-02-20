@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::models::AnthropicRequest;
 
-use super::{ResponseTransformer, TransformBackend, TransformContext, MessageProcessor};
+use super::{MessageProcessor, ResponseTransformer, TransformBackend, TransformContext};
 
 pub struct GeminiBackend;
 
@@ -15,70 +15,84 @@ impl GeminiBackend {
 
     fn convert_content_block(block: &Value) -> Option<Value> {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        
+
         match block_type {
             "text" | "input_text" | "output_text" => {
                 let text = block.get("text").and_then(|t| t.as_str())?;
                 Some(json!({ "text": text }))
-            },
+            }
             "thinking" | "thought" | "reasoning" => {
-                let text = block.get("thinking").or_else(|| block.get("text")).and_then(|t| t.as_str())?;
+                let text = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(|t| t.as_str())?;
                 let sig = block.get("signature").and_then(|s| s.as_str());
                 if let Some(s) = sig {
                     Some(json!({ "text": text, "thought": true, "thought_signature": s }))
                 } else {
                     Some(json!({ "text": text, "thought": true }))
                 }
-            },
+            }
             "image" | "image_url" | "input_image" => {
                 let source = block.get("source").or_else(|| block.get("image_url"));
                 if let Some(src) = source {
-                     // Handle data URI in image_url string (common in Codex output)
-                     if let Some(url_str) = src.as_str() {
-                         if url_str.starts_with("data:") {
-                             let parts: Vec<&str> = url_str.splitn(2, ",").collect();
-                             if parts.len() == 2 {
-                                 let header = parts[0]; 
-                                 let mime_type = header.trim_start_matches("data:").split(";").next().unwrap_or("image/jpeg");
-                                 return Some(json!({
-                                     "inline_data": {
-                                         "mime_type": mime_type,
-                                         "data": parts[1]
-                                     }
-                                 }));
-                             }
-                         }
-                     }
-                     // Handle object source
-                     if let Some(data) = src.get("data").and_then(|d| d.as_str()) {
-                         let mime_type = src.get("media_type").and_then(|m| m.as_str()).unwrap_or("image/jpeg");
-                         return Some(json!({
-                             "inline_data": {
-                                 "mime_type": mime_type,
-                                 "data": data
-                             }
-                         }));
-                     }
+                    // Handle data URI in image_url string (common in Codex output)
+                    if let Some(url_str) = src.as_str() {
+                        if url_str.starts_with("data:") {
+                            let parts: Vec<&str> = url_str.splitn(2, ",").collect();
+                            if parts.len() == 2 {
+                                let header = parts[0];
+                                let mime_type = header
+                                    .trim_start_matches("data:")
+                                    .split(";")
+                                    .next()
+                                    .unwrap_or("image/jpeg");
+                                return Some(json!({
+                                    "inline_data": {
+                                        "mime_type": mime_type,
+                                        "data": parts[1]
+                                    }
+                                }));
+                            }
+                        }
+                    }
+                    // Handle object source
+                    if let Some(data) = src.get("data").and_then(|d| d.as_str()) {
+                        let mime_type = src
+                            .get("media_type")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("image/jpeg");
+                        return Some(json!({
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": data
+                            }
+                        }));
+                    }
                 }
                 None
-            },
+            }
             // Note: Codex outputs function_call as separate item, not content block usually
-            _ => None
+            _ => None,
         }
     }
 
     fn build_contents(messages: &[Value]) -> Vec<Value> {
         let mut gemini_messages: Vec<Value> = Vec::new();
-        let mut tool_id_name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        
+        let mut tool_id_name_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         for item in messages {
-            let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("message");
-            
+            let item_type = item
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("message");
+
             if item_type == "message" {
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
                 let content = item.get("content");
                 let mut parts = Vec::new();
-                
+
                 if let Some(content_array) = content.and_then(|c| c.as_array()) {
                     for block in content_array {
                         if let Some(part) = Self::convert_content_block(block) {
@@ -86,13 +100,15 @@ impl GeminiBackend {
                         }
                     }
                 } else if let Some(text) = content.and_then(|c| c.as_str()) {
-                     parts.push(json!({ "text": text }));
+                    parts.push(json!({ "text": text }));
                 }
-                
-                if parts.is_empty() { continue; }
-                
+
+                if parts.is_empty() {
+                    continue;
+                }
+
                 let gemini_role = if role == "assistant" { "model" } else { "user" };
-                
+
                 // Merge logic
                 if let Some(last_msg) = gemini_messages.last_mut() {
                     if last_msg["role"] == gemini_role {
@@ -102,70 +118,43 @@ impl GeminiBackend {
                         continue;
                     }
                 }
-                
+
                 gemini_messages.push(json!({
                     "role": gemini_role,
                     "parts": parts
                 }));
-
             } else if item_type == "function_call" {
-                 let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                 let args_str = item.get("arguments").and_then(|s| s.as_str()).unwrap_or("{}");
-                 let args = serde_json::from_str::<Value>(args_str).unwrap_or(json!({}));
-                 let signature = item.get("signature").and_then(|s| s.as_str());
-                 
-                 if let Some(id) = item.get("call_id").and_then(|i| i.as_str()) {
-                     tool_id_name_map.insert(id.to_string(), name.to_string());
-                 }
+                let name = item
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
+                let args_str = item
+                    .get("arguments")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("{}");
+                let args = serde_json::from_str::<Value>(args_str).unwrap_or(json!({}));
+                let signature = item.get("signature").and_then(|s| s.as_str());
 
-                 let fc_obj = json!({
-                     "name": name,
-                     "args": args
-                 });
-                 
-                 let mut part = json!({
-                     "functionCall": fc_obj
-                 });
+                if let Some(id) = item.get("call_id").and_then(|i| i.as_str()) {
+                    tool_id_name_map.insert(id.to_string(), name.to_string());
+                }
 
-                 if let Some(s) = signature {
-                     if let Some(obj) = part.as_object_mut() {
-                         obj.insert("thought_signature".to_string(), json!(s));
-                     }
-                 }
-                 
-                 let gemini_role = "model";
-                 if let Some(last_msg) = gemini_messages.last_mut() {
-                    if last_msg["role"] == gemini_role {
-                        if let Some(last_parts) = last_msg["parts"].as_array_mut() {
-                            last_parts.push(part);
-                        }
-                        continue;
-                    }
-                 }
-                 gemini_messages.push(json!({
-                     "role": gemini_role,
-                     "parts": [part]
-                 }));
-
-            } else if item_type == "function_call_output" {
-                 let id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
-                 let name = tool_id_name_map.get(id).map(|s| s.as_str()).unwrap_or("unknown_tool");
-                 
-                 let output_text = item.get("output").and_then(|s| s.as_str()).unwrap_or("");
-                 let content = json!({ "result": output_text });
-
-                 let part = json!({
-                    "functionResponse": {
-                        "name": name,
-                        "response": content
-                    }
+                let fc_obj = json!({
+                    "name": name,
+                    "args": args
                 });
-                
-                // Gemini REST requires role 'user' for function response in some documentation, 
-                // but 'function' is correct for the Python SDK. Let's try 'user' or 'function'.
-                // Standard REST API often uses 'function' role.
-                let gemini_role = "function"; 
-                
+
+                let mut part = json!({
+                    "functionCall": fc_obj
+                });
+
+                if let Some(s) = signature {
+                    if let Some(obj) = part.as_object_mut() {
+                        obj.insert("thought_signature".to_string(), json!(s));
+                    }
+                }
+
+                let gemini_role = "model";
                 if let Some(last_msg) = gemini_messages.last_mut() {
                     if last_msg["role"] == gemini_role {
                         if let Some(last_parts) = last_msg["parts"].as_array_mut() {
@@ -173,15 +162,49 @@ impl GeminiBackend {
                         }
                         continue;
                     }
-                 }
-                 
-                 gemini_messages.push(json!({
-                     "role": gemini_role,
-                     "parts": [part]
-                 }));
+                }
+                gemini_messages.push(json!({
+                    "role": gemini_role,
+                    "parts": [part]
+                }));
+            } else if item_type == "function_call_output" {
+                let id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
+                let name = tool_id_name_map
+                    .get(id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown_tool");
+
+                let output_text = item.get("output").and_then(|s| s.as_str()).unwrap_or("");
+                let content = json!({ "result": output_text });
+
+                let part = json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": content
+                    }
+                });
+
+                // Gemini REST requires role 'user' for function response in some documentation,
+                // but 'function' is correct for the Python SDK. Let's try 'user' or 'function'.
+                // Standard REST API often uses 'function' role.
+                let gemini_role = "function";
+
+                if let Some(last_msg) = gemini_messages.last_mut() {
+                    if last_msg["role"] == gemini_role {
+                        if let Some(last_parts) = last_msg["parts"].as_array_mut() {
+                            last_parts.push(part);
+                        }
+                        continue;
+                    }
+                }
+
+                gemini_messages.push(json!({
+                    "role": gemini_role,
+                    "parts": [part]
+                }));
             }
         }
-        
+
         gemini_messages
     }
 
@@ -195,19 +218,28 @@ impl GeminiBackend {
             return None;
         }
 
-        let function_declarations: Vec<Value> = tools.iter().filter_map(|tool| {
-            // Anthropic format: { name, description, input_schema }
-            // Gemini format: { name, description, parameters }
-            let name = tool.get("name").and_then(|n| n.as_str())?;
-            let description = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");
-            let input_schema = tool.get("input_schema").cloned().unwrap_or(json!({ "type": "object", "properties": {} }));
-            
-            Some(json!({
-                "name": name,
-                "description": description,
-                "parameters": input_schema
-            }))
-        }).collect();
+        let function_declarations: Vec<Value> = tools
+            .iter()
+            .filter_map(|tool| {
+                // Anthropic format: { name, description, input_schema }
+                // Gemini format: { name, description, parameters }
+                let name = tool.get("name").and_then(|n| n.as_str())?;
+                let description = tool
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                let input_schema = tool
+                    .get("input_schema")
+                    .cloned()
+                    .unwrap_or(json!({ "type": "object", "properties": {} }));
+
+                Some(json!({
+                    "name": name,
+                    "description": description,
+                    "parameters": input_schema
+                }))
+            })
+            .collect();
 
         if function_declarations.is_empty() {
             None
@@ -239,20 +271,20 @@ impl TransformBackend for GeminiBackend {
         // We reuse TransformRequest::transform_messages to resolve images and extract basic info
         // BUT here we need to map to Gemini structure directly.
         // Actually, let's use the `build_contents` we just wrote, but we need `messages` with resolved images first.
-        // Since `TransformRequest::transform_messages` returns Codex-specific JSON, it might be better to 
-        // iterate `anthropic_body.messages` directly and resolve images using helper if needed, 
+        // Since `TransformRequest::transform_messages` returns Codex-specific JSON, it might be better to
+        // iterate `anthropic_body.messages` directly and resolve images using helper if needed,
         // OR reuse `transform_messages` output if it's generic enough.
         // usage: let (messages, _) = TransformRequest::transform_messages(&anthropic_body.messages, None);
         // The output of `transform_messages` is `Vec<Value>` in Codex format (content blocks).
         // Our `convert_content_block` expects Codex-like blocks (type=text, image, tool_use).
         // So yes, we can reuse `TransformRequest::transform_messages` to handle the heavy lifting of image resolution!
         // Note: we pass None for log_tx to avoid double logging or just pass it if we want.
-        
+
         let (messages, _) = MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
         let contents = Self::build_contents(&messages);
 
         let system_instruction = if let Some(system) = &anthropic_body.system {
-             Some(json!({
+            Some(json!({
                 "parts": [{ "text": system.to_string() }]
             }))
         } else {
@@ -330,7 +362,10 @@ impl TransformBackend for GeminiBackend {
             target_url.replace("{model}", model)
         } else {
             let base = target_url.trim_end_matches('/');
-            format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, model)
+            format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                base, model
+            )
         };
 
         let mut upstream_body = body.clone();
@@ -554,7 +589,11 @@ impl GeminiResponseTransformer {
                                 parts
                                     .iter()
                                     .filter_map(|part| {
-                                        if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                        if part
+                                            .get("thought")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                        {
                                             part.get("text")
                                                 .and_then(|t| t.as_str())
                                                 .map(|s| s.to_string())
@@ -579,7 +618,11 @@ impl GeminiResponseTransformer {
                 return Some(sig.to_string());
             }
             // Check in parts (sometimes it's inside a part)
-            if let Some(parts) = candidate.get("content").and_then(|v| v.get("parts")).and_then(|v| v.as_array()) {
+            if let Some(parts) = candidate
+                .get("content")
+                .and_then(|v| v.get("parts"))
+                .and_then(|v| v.as_array())
+            {
                 for part in parts {
                     if let Some(sig) = part.get("thoughtSignature").and_then(|v| v.as_str()) {
                         return Some(sig.to_string());
@@ -605,7 +648,10 @@ impl GeminiResponseTransformer {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    let args = function_call.get("args").cloned().unwrap_or_else(|| json!({}));
+                    let args = function_call
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
                     return Some((name, args));
                 }
             }
@@ -641,7 +687,11 @@ impl ResponseTransformer for GeminiResponseTransformer {
 
         let payload = line[6..].trim();
         if payload == "[DONE]" {
-            let stop_reason = if self.saw_tool_call { "tool_use" } else { "end_turn" };
+            let stop_reason = if self.saw_tool_call {
+                "tool_use"
+            } else {
+                "end_turn"
+            };
             self.emit_message_stop(&mut output, stop_reason);
             return output;
         }
@@ -658,7 +708,9 @@ impl ResponseTransformer for GeminiResponseTransformer {
         // 2. Process Thinking/Thought
         let sig = self.thought_signature.clone();
         for thinking in Self::extract_thinking_from_candidates(&data) {
-            if thinking.is_empty() { continue; }
+            if thinking.is_empty() {
+                continue;
+            }
             self.open_thinking_block_if_needed(&mut output, sig.as_deref());
             output.push(format!(
                 "event: content_block_delta\ndata: {}\n\n",
@@ -675,14 +727,24 @@ impl ResponseTransformer for GeminiResponseTransformer {
             .and_then(|v| v.as_array())
             .map(|candidates| {
                 for candidate in candidates {
-                    if let Some(parts) = candidate.get("content").and_then(|v| v.get("parts")).and_then(|v| v.as_array()) {
+                    if let Some(parts) = candidate
+                        .get("content")
+                        .and_then(|v| v.get("parts"))
+                        .and_then(|v| v.as_array())
+                    {
                         for part in parts {
                             // Only process text that is NOT thought
-                            if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            if part
+                                .get("thought")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
                                 continue;
                             }
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                if text.is_empty() { continue; }
+                                if text.is_empty() {
+                                    continue;
+                                }
                                 self.open_text_block_if_needed(&mut output);
                                 output.push(format!(
                                     "event: content_block_delta\ndata: {}\n\n",
@@ -724,7 +786,11 @@ impl ResponseTransformer for GeminiResponseTransformer {
         }
 
         if Self::has_finish_reason(&data) {
-            let stop_reason = if self.saw_tool_call { "tool_use" } else { "end_turn" };
+            let stop_reason = if self.saw_tool_call {
+                "tool_use"
+            } else {
+                "end_turn"
+            };
             self.emit_message_stop(&mut output, stop_reason);
         }
 
@@ -761,7 +827,8 @@ mod tests {
         let line = r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"internal reasoning"},{"text":"final answer"}]}}]}"#;
 
         let events = transformer.transform_line(line);
-        let parsed_events: Vec<(String, Value)> = events.iter().map(|event| parse_sse_event(event)).collect();
+        let parsed_events: Vec<(String, Value)> =
+            events.iter().map(|event| parse_sse_event(event)).collect();
 
         let thinking_start = parsed_events
             .iter()
@@ -785,10 +852,7 @@ mod tests {
             .iter()
             .position(|(name, payload)| {
                 name == "content_block_stop"
-                    && payload
-                        .get("index")
-                        .and_then(|value| value.as_u64())
-                        == Some(thinking_index)
+                    && payload.get("index").and_then(|value| value.as_u64()) == Some(thinking_index)
             })
             .expect("missing thinking block stop event");
 
@@ -814,10 +878,7 @@ mod tests {
             .iter()
             .position(|(name, payload)| {
                 name == "content_block_delta"
-                    && payload
-                        .get("index")
-                        .and_then(|value| value.as_u64())
-                        == Some(text_index)
+                    && payload.get("index").and_then(|value| value.as_u64()) == Some(text_index)
                     && payload
                         .get("delta")
                         .and_then(|delta| delta.get("type"))
@@ -831,9 +892,17 @@ mod tests {
             })
             .expect("missing text delta on text block");
 
-        assert_ne!(thinking_index, text_index, "thinking/text should use different block indices");
-        assert!(thinking_stop < text_start, "thinking block should stop before text starts");
-        assert!(text_start < text_delta, "text delta should follow text block start");
+        assert_ne!(
+            thinking_index, text_index,
+            "thinking/text should use different block indices"
+        );
+        assert!(
+            thinking_stop < text_start,
+            "thinking block should stop before text starts"
+        );
+        assert!(
+            text_start < text_delta,
+            "text delta should follow text block start"
+        );
     }
-
 }

@@ -43,9 +43,15 @@ pub struct ReasoningEffortMapping {
     pub haiku: ReasoningEffort,
 }
 
-fn default_opus() -> ReasoningEffort { ReasoningEffort::Xhigh }
-fn default_sonnet() -> ReasoningEffort { ReasoningEffort::Medium }
-fn default_haiku() -> ReasoningEffort { ReasoningEffort::Low }
+fn default_opus() -> ReasoningEffort {
+    ReasoningEffort::Xhigh
+}
+fn default_sonnet() -> ReasoningEffort {
+    ReasoningEffort::Medium
+}
+fn default_haiku() -> ReasoningEffort {
+    ReasoningEffort::Low
+}
 
 impl Default for ReasoningEffortMapping {
     fn default() -> Self {
@@ -104,8 +110,12 @@ pub struct GeminiReasoningEffortMapping {
     pub haiku: String,
 }
 
-fn default_gemini_pro() -> String { "gemini-3-pro-preview".to_string() }
-fn default_gemini_flash() -> String { "gemini-3-flash-preview".to_string() }
+fn default_gemini_pro() -> String {
+    "gemini-3-pro-preview".to_string()
+}
+fn default_gemini_flash() -> String {
+    "gemini-3-flash-preview".to_string()
+}
 
 impl Default for GeminiReasoningEffortMapping {
     fn default() -> Self {
@@ -127,9 +137,15 @@ pub struct CodexModelMapping {
     pub haiku: String,
 }
 
-fn default_codex_opus() -> String { "gpt-5.3-codex".to_string() }
-fn default_codex_sonnet() -> String { "gpt-5.2-codex".to_string() }
-fn default_codex_haiku() -> String { "gpt-5.1-codex-mini".to_string() }
+fn default_codex_opus() -> String {
+    "gpt-5.3-codex".to_string()
+}
+fn default_codex_sonnet() -> String {
+    "gpt-5.2-codex".to_string()
+}
+fn default_codex_haiku() -> String {
+    "gpt-5.1-codex-mini".to_string()
+}
 
 impl Default for CodexModelMapping {
     fn default() -> Self {

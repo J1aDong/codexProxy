@@ -1,4 +1,4 @@
-use codex_proxy_core::{ProxyServer, ReasoningEffortMapping, ReasoningEffort, set_debug_log};
+use codex_proxy_core::{set_debug_log, ProxyServer, ReasoningEffort, ReasoningEffortMapping};
 use tokio::sync::broadcast;
 
 #[tokio::main]
@@ -20,19 +20,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = ProxyServer::new(
         8889,
         "https://api.aicodemirror.com/api/codex/backend-api/codex/responses".to_string(),
-        std::env::var("ANTHROPIC_API_KEY").ok()
-    ).with_reasoning_mapping(reasoning_mapping);
-    
+        std::env::var("ANTHROPIC_API_KEY").ok(),
+    )
+    .with_reasoning_mapping(reasoning_mapping);
+
     println!("🌐 Server listening on http://127.0.0.1:8889");
     println!("📡 Ready to proxy requests to Anthropic API");
-    
+
     let (log_tx, _log_rx) = broadcast::channel(100);
     let _shutdown_tx = server.start(log_tx).await?;
-    
+
     println!("✅ Server started successfully!");
-    
+
     tokio::signal::ctrl_c().await?;
     println!("🛑 Shutting down server...");
-    
+
     Ok(())
 }

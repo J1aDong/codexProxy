@@ -1,4 +1,7 @@
-use codex_proxy_core::{set_debug_log, is_debug_log_enabled, TransformRequest, AppLogger, ReasoningEffortMapping, ReasoningEffort, get_reasoning_effort};
+use codex_proxy_core::{
+    get_reasoning_effort, is_debug_log_enabled, set_debug_log, AppLogger, ReasoningEffort,
+    ReasoningEffortMapping, TransformRequest,
+};
 use serde_json::json;
 use std::fs;
 
@@ -114,7 +117,10 @@ fn test_transform_with_logging() {
     );
 
     println!("Session ID: {}", session_id);
-    println!("Codex Body: {}", serde_json::to_string_pretty(&codex_body).unwrap());
+    println!(
+        "Codex Body: {}",
+        serde_json::to_string_pretty(&codex_body).unwrap()
+    );
 
     // 收集 broadcast 日志
     let mut broadcast_logs = Vec::new();
@@ -127,8 +133,14 @@ fn test_transform_with_logging() {
     assert!(!broadcast_logs.is_empty(), "应该有 broadcast 日志");
 
     let all_logs = broadcast_logs.join("\n");
-    assert!(all_logs.contains("[Transform] Session"), "应该包含 Session 日志");
-    assert!(all_logs.contains("[Transform]") && all_logs.contains("→"), "应该包含 Model 日志");
+    assert!(
+        all_logs.contains("[Transform] Session"),
+        "应该包含 Session 日志"
+    );
+    assert!(
+        all_logs.contains("[Transform]") && all_logs.contains("→"),
+        "应该包含 Model 日志"
+    );
     assert!(all_logs.contains("[Messages]"), "应该包含 Messages 日志");
 
     println!("✅ Transform 日志测试通过");
@@ -208,7 +220,10 @@ fn test_image_in_message() {
 
     // 验证图片日志
     assert!(all_logs.contains("🖼️"), "应该包含图片日志");
-    assert!(all_logs.contains("Image base64") || all_logs.contains("Image source"), "应该包含图片详情");
+    assert!(
+        all_logs.contains("Image base64") || all_logs.contains("Image source"),
+        "应该包含图片详情"
+    );
 
     println!("✅ 图片消息日志测试通过");
 }
@@ -219,52 +234,88 @@ fn test_reasoning_effort_mapping() {
     assert_eq!(default_mapping.opus, ReasoningEffort::Xhigh);
     assert_eq!(default_mapping.sonnet, ReasoningEffort::Medium);
     assert_eq!(default_mapping.haiku, ReasoningEffort::Low);
-    
-    assert_eq!(get_reasoning_effort("claude-3-opus-20240229", &default_mapping), ReasoningEffort::Xhigh);
-    assert_eq!(get_reasoning_effort("claude-sonnet-4-20250514", &default_mapping), ReasoningEffort::Medium);
-    assert_eq!(get_reasoning_effort("claude-3-5-sonnet-20241022", &default_mapping), ReasoningEffort::Medium);
-    assert_eq!(get_reasoning_effort("claude-3-haiku-20240307", &default_mapping), ReasoningEffort::Low);
-    
+
+    assert_eq!(
+        get_reasoning_effort("claude-3-opus-20240229", &default_mapping),
+        ReasoningEffort::Xhigh
+    );
+    assert_eq!(
+        get_reasoning_effort("claude-sonnet-4-20250514", &default_mapping),
+        ReasoningEffort::Medium
+    );
+    assert_eq!(
+        get_reasoning_effort("claude-3-5-sonnet-20241022", &default_mapping),
+        ReasoningEffort::Medium
+    );
+    assert_eq!(
+        get_reasoning_effort("claude-3-haiku-20240307", &default_mapping),
+        ReasoningEffort::Low
+    );
+
     let custom_mapping = ReasoningEffortMapping {
         opus: ReasoningEffort::High,
         sonnet: ReasoningEffort::Low,
         haiku: ReasoningEffort::Medium,
     };
-    assert_eq!(get_reasoning_effort("claude-3-opus-20240229", &custom_mapping), ReasoningEffort::High);
-    assert_eq!(get_reasoning_effort("claude-sonnet-4-20250514", &custom_mapping), ReasoningEffort::Low);
-    assert_eq!(get_reasoning_effort("claude-3-haiku-20240307", &custom_mapping), ReasoningEffort::Medium);
-    
-    assert_eq!(get_reasoning_effort("unknown-model", &default_mapping), ReasoningEffort::Medium);
-    
+    assert_eq!(
+        get_reasoning_effort("claude-3-opus-20240229", &custom_mapping),
+        ReasoningEffort::High
+    );
+    assert_eq!(
+        get_reasoning_effort("claude-sonnet-4-20250514", &custom_mapping),
+        ReasoningEffort::Low
+    );
+    assert_eq!(
+        get_reasoning_effort("claude-3-haiku-20240307", &custom_mapping),
+        ReasoningEffort::Medium
+    );
+
+    assert_eq!(
+        get_reasoning_effort("unknown-model", &default_mapping),
+        ReasoningEffort::Medium
+    );
+
     assert_eq!(ReasoningEffort::Low.as_str(), "low");
     assert_eq!(ReasoningEffort::Medium.as_str(), "medium");
     assert_eq!(ReasoningEffort::High.as_str(), "high");
     assert_eq!(ReasoningEffort::Xhigh.as_str(), "xhigh");
-    
+
     println!("✅ Reasoning effort mapping 测试通过");
 }
 
 #[test]
 fn test_transform_with_custom_reasoning_effort() {
     set_debug_log(true);
-    
+
     let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(256);
-    
+
     let opus_request = json!({
         "model": "claude-3-opus-20240229",
         "messages": [{ "role": "user", "content": "Hello" }],
         "stream": true
     });
-    
+
     let anthropic_body: codex_proxy_core::AnthropicRequest =
         serde_json::from_value(opus_request).expect("应该能解析请求");
-    
+
     let default_mapping = ReasoningEffortMapping::default();
-    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping, "", "gpt-5.3-codex");
+    let (codex_body, _) = TransformRequest::transform(
+        &anthropic_body,
+        Some(&log_tx),
+        &default_mapping,
+        "",
+        "gpt-5.3-codex",
+    );
 
     let body_str = serde_json::to_string(&codex_body).unwrap();
-    assert!(body_str.contains("\"reasoning\""), "Should contain reasoning field");
-    assert!(body_str.contains("\"effort\":\"xhigh\""), "Opus should have xhigh effort");
+    assert!(
+        body_str.contains("\"reasoning\""),
+        "Should contain reasoning field"
+    );
+    assert!(
+        body_str.contains("\"effort\":\"xhigh\""),
+        "Opus should have xhigh effort"
+    );
 
     let sonnet_request = json!({
         "model": "claude-sonnet-4-20250514",
@@ -275,10 +326,19 @@ fn test_transform_with_custom_reasoning_effort() {
     let anthropic_body: codex_proxy_core::AnthropicRequest =
         serde_json::from_value(sonnet_request).expect("应该能解析请求");
 
-    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping, "", "gpt-5.3-codex");
+    let (codex_body, _) = TransformRequest::transform(
+        &anthropic_body,
+        Some(&log_tx),
+        &default_mapping,
+        "",
+        "gpt-5.3-codex",
+    );
 
     let body_str = serde_json::to_string(&codex_body).unwrap();
-    assert!(body_str.contains("\"effort\":\"medium\""), "Sonnet should have medium effort");
+    assert!(
+        body_str.contains("\"effort\":\"medium\""),
+        "Sonnet should have medium effort"
+    );
 
     let haiku_request = json!({
         "model": "claude-3-haiku-20240307",
@@ -289,10 +349,19 @@ fn test_transform_with_custom_reasoning_effort() {
     let anthropic_body: codex_proxy_core::AnthropicRequest =
         serde_json::from_value(haiku_request).expect("应该能解析请求");
 
-    let (codex_body, _) = TransformRequest::transform(&anthropic_body, Some(&log_tx), &default_mapping, "", "gpt-5.3-codex");
-    
+    let (codex_body, _) = TransformRequest::transform(
+        &anthropic_body,
+        Some(&log_tx),
+        &default_mapping,
+        "",
+        "gpt-5.3-codex",
+    );
+
     let body_str = serde_json::to_string(&codex_body).unwrap();
-    assert!(body_str.contains("\"effort\":\"low\""), "Haiku should have low effort");
-    
+    assert!(
+        body_str.contains("\"effort\":\"low\""),
+        "Haiku should have low effort"
+    );
+
     println!("✅ Transform with custom reasoning effort 测试通过");
 }

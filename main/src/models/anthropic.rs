@@ -130,14 +130,21 @@ fn parse_content_block(value: Value) -> ContentBlock {
 
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
-    Text { text: String },
-    Thinking { thinking: String, signature: Option<String> },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
     Image {
         source: Option<ImageSource>,
         source_raw: Option<Value>,
         image_url: Option<ImageUrlValue>,
     },
-    ImageUrl { image_url: ImageUrlValue },
+    ImageUrl {
+        image_url: ImageUrlValue,
+    },
     InputImage {
         image_url: Option<ImageUrlValue>,
         url: Option<String>,
@@ -154,7 +161,10 @@ pub enum ContentBlock {
         id: Option<String>,
         content: Option<Value>,
     },
-    Document { source: Option<Value>, name: Option<String> },
+    Document {
+        source: Option<Value>,
+        name: Option<String>,
+    },
     /// 用于存储无法解析的原始值
     OtherValue(Value),
 }
@@ -172,7 +182,10 @@ impl Serialize for ContentBlock {
                 map.serialize_entry("text", text)?;
                 map.end()
             }
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("type", "thinking")?;
@@ -182,7 +195,12 @@ impl Serialize for ContentBlock {
                 }
                 map.end()
             }
-            ContentBlock::ToolUse { id, name, input, signature } => {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                signature,
+            } => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(4))?;
                 map.serialize_entry("type", "tool_use")?;
@@ -227,91 +245,166 @@ fn parse_content_block_from_value(value: Value) -> ContentBlock {
 
     match block_type {
         "text" => {
-            let text = obj.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let text = obj
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
             ContentBlock::Text { text }
         }
         "thinking" | "thought" => {
-            let thinking = obj.get("thinking")
+            let thinking = obj
+                .get("thinking")
                 .or_else(|| obj.get("text"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_string();
-            let signature = obj.get("signature").and_then(|s| s.as_str()).map(|s| s.to_string());
-            ContentBlock::Thinking { thinking, signature }
+            let signature = obj
+                .get("signature")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            }
         }
         "image" => {
             let source_raw = obj.get("source").cloned();
-            let source = source_raw.as_ref().and_then(|s| serde_json::from_value(s.clone()).ok());
-            let image_url = obj.get("image_url").and_then(|u| serde_json::from_value(u.clone()).ok());
-            ContentBlock::Image { source, source_raw, image_url }
+            let source = source_raw
+                .as_ref()
+                .and_then(|s| serde_json::from_value(s.clone()).ok());
+            let image_url = obj
+                .get("image_url")
+                .and_then(|u| serde_json::from_value(u.clone()).ok());
+            ContentBlock::Image {
+                source,
+                source_raw,
+                image_url,
+            }
         }
         "image_url" => {
-            let image_url = obj.get("image_url")
+            let image_url = obj
+                .get("image_url")
                 .and_then(|u| serde_json::from_value(u.clone()).ok())
                 .unwrap_or(ImageUrlValue::Str(String::new()));
             ContentBlock::ImageUrl { image_url }
         }
         "input_image" => {
-            let image_url = obj.get("image_url").and_then(|u| serde_json::from_value(u.clone()).ok());
-            let url = obj.get("url").and_then(|u| u.as_str()).map(|s| s.to_string());
-            let detail = obj.get("detail").and_then(|d| d.as_str()).map(|s| s.to_string());
-            ContentBlock::InputImage { image_url, url, detail }
+            let image_url = obj
+                .get("image_url")
+                .and_then(|u| serde_json::from_value(u.clone()).ok());
+            let url = obj
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string());
+            let detail = obj
+                .get("detail")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string());
+            ContentBlock::InputImage {
+                image_url,
+                url,
+                detail,
+            }
         }
         "tool_use" => {
-            let id = obj.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
-            let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let id = obj
+                .get("id")
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string());
+            let name = obj
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
             // input 为 null 或缺失时归一化为 {}
-            let input = obj.get("input")
+            let input = obj
+                .get("input")
                 .filter(|v| !v.is_null())
                 .cloned()
                 .unwrap_or(json!({}));
-            let signature = obj.get("signature")
+            let signature = obj
+                .get("signature")
                 .or_else(|| obj.get("thought_signature"))
                 .or_else(|| obj.get("thoughtSignature"))
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());
-            ContentBlock::ToolUse { id, name, input, signature }
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                signature,
+            }
         }
         "tool_result" => {
-            let tool_use_id = obj.get("tool_use_id").and_then(|i| i.as_str()).map(|s| s.to_string());
-            let id = obj.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
+            let tool_use_id = obj
+                .get("tool_use_id")
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string());
+            let id = obj
+                .get("id")
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string());
             let content = obj.get("content").cloned();
-            ContentBlock::ToolResult { tool_use_id, id, content }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                id,
+                content,
+            }
         }
         "document" => {
             let source = obj.get("source").cloned();
-            let name = obj.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+            let name = obj
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string());
             ContentBlock::Document { source, name }
         }
         "" => {
             // 没有 type 字段，检查是否有 text 字段
             if obj.get("image_url").is_some() {
-                let image_url = obj.get("image_url")
+                let image_url = obj
+                    .get("image_url")
                     .and_then(|u| serde_json::from_value(u.clone()).ok())
                     .unwrap_or(ImageUrlValue::Str(String::new()));
                 return ContentBlock::ImageUrl { image_url };
             }
             if obj.get("source").is_some() {
                 let source_raw = obj.get("source").cloned();
-                let source = source_raw.as_ref().and_then(|s| serde_json::from_value(s.clone()).ok());
-                return ContentBlock::Image { source, source_raw, image_url: None };
+                let source = source_raw
+                    .as_ref()
+                    .and_then(|s| serde_json::from_value(s.clone()).ok());
+                return ContentBlock::Image {
+                    source,
+                    source_raw,
+                    image_url: None,
+                };
             }
             if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
-                return ContentBlock::Text { text: text.to_string() };
+                return ContentBlock::Text {
+                    text: text.to_string(),
+                };
             }
             ContentBlock::OtherValue(value)
         }
         _ => {
             if obj.get("image_url").is_some() {
-                let image_url = obj.get("image_url")
+                let image_url = obj
+                    .get("image_url")
                     .and_then(|u| serde_json::from_value(u.clone()).ok())
                     .unwrap_or(ImageUrlValue::Str(String::new()));
                 return ContentBlock::ImageUrl { image_url };
             }
             if obj.get("source").is_some() {
                 let source_raw = obj.get("source").cloned();
-                let source = source_raw.as_ref().and_then(|s| serde_json::from_value(s.clone()).ok());
-                return ContentBlock::Image { source, source_raw, image_url: None };
+                let source = source_raw
+                    .as_ref()
+                    .and_then(|s| serde_json::from_value(s.clone()).ok());
+                return ContentBlock::Image {
+                    source,
+                    source_raw,
+                    image_url: None,
+                };
             }
             ContentBlock::OtherValue(value)
         }
@@ -329,7 +422,13 @@ pub struct ImageSource {
     pub data: Option<String>,
     pub url: Option<String>,
     pub uri: Option<String>,
-    #[serde(alias = "file_path", alias = "filePath", alias = "local_path", alias = "localPath", alias = "file")]
+    #[serde(
+        alias = "file_path",
+        alias = "filePath",
+        alias = "local_path",
+        alias = "localPath",
+        alias = "file"
+    )]
     pub path: Option<String>,
 }
 
