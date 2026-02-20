@@ -284,6 +284,21 @@ pub struct ProxyConfig {
         default = "default_enable_stream_metrics"
     )]
     pub enable_stream_metrics: bool,
+    #[serde(
+        rename = "enableStreamEventMetrics",
+        default = "default_enable_stream_event_metrics"
+    )]
+    pub enable_stream_event_metrics: bool,
+    #[serde(
+        rename = "streamSilenceWarnMs",
+        default = "default_stream_silence_warn_ms"
+    )]
+    pub stream_silence_warn_ms: u64,
+    #[serde(
+        rename = "streamSilenceErrorMs",
+        default = "default_stream_silence_error_ms"
+    )]
+    pub stream_silence_error_ms: u64,
     #[serde(rename = "enableStallRetry", default = "default_enable_stall_retry")]
     pub enable_stall_retry: bool,
     #[serde(rename = "stallTimeoutMs", default = "default_stall_timeout_ms")]
@@ -394,20 +409,32 @@ fn default_enable_stream_metrics() -> bool {
     true
 }
 
+fn default_enable_stream_event_metrics() -> bool {
+    true
+}
+
+fn default_stream_silence_warn_ms() -> u64 {
+    20_000
+}
+
+fn default_stream_silence_error_ms() -> u64 {
+    90_000
+}
+
 fn default_enable_stall_retry() -> bool {
     true
 }
 
 fn default_stall_timeout_ms() -> u64 {
-    60_000
+    240_000
 }
 
 fn default_stall_retry_max_attempts() -> u32 {
-    1
+    5
 }
 
 fn default_stall_retry_only_heartbeat_phase() -> bool {
-    true
+    false
 }
 
 fn default_enable_empty_completion_retry() -> bool {
@@ -423,7 +450,7 @@ fn default_enable_incomplete_stream_retry() -> bool {
 }
 
 fn default_incomplete_stream_retry_max_attempts() -> u32 {
-    1
+    5
 }
 
 fn default_gemini_model_preset() -> Vec<String> {
@@ -649,6 +676,9 @@ fn build_runtime_update(
         stream_log_sample_every_n: config.stream_log_sample_every_n,
         stream_log_max_chars: config.stream_log_max_chars,
         enable_stream_metrics: config.enable_stream_metrics,
+        enable_stream_event_metrics: config.enable_stream_event_metrics,
+        stream_silence_warn_ms: config.stream_silence_warn_ms,
+        stream_silence_error_ms: config.stream_silence_error_ms,
         enable_stall_retry: config.enable_stall_retry,
         stall_timeout_ms: config.stall_timeout_ms,
         stall_retry_max_attempts: config.stall_retry_max_attempts,
@@ -899,6 +929,9 @@ async fn start_proxy_with_manager(
         .with_stream_log_sample_every_n(config.stream_log_sample_every_n)
         .with_stream_log_max_chars(config.stream_log_max_chars)
         .with_enable_stream_metrics(config.enable_stream_metrics)
+        .with_enable_stream_event_metrics(config.enable_stream_event_metrics)
+        .with_stream_silence_warn_ms(config.stream_silence_warn_ms)
+        .with_stream_silence_error_ms(config.stream_silence_error_ms)
         .with_enable_stall_retry(config.enable_stall_retry)
         .with_stall_timeout_ms(config.stall_timeout_ms)
         .with_stall_retry_max_attempts(config.stall_retry_max_attempts)
