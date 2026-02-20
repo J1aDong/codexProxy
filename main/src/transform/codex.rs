@@ -507,12 +507,16 @@ pub struct TransformResponse {
     tool_name: Option<String>,
     saw_tool_call: bool,
     sent_message_start: bool,
+    text_carryover: String,
     pending_tool_text: String,
     accumulated_tool_args: String,
     logger: std::sync::Arc<AppLogger>,
 }
 
 impl TransformResponse {
+    const LEAKED_TOOL_MARKERS: [&'static str; 3] =
+        ["assistant to=", "to=functions", "to=multi_tool_use"];
+
     // 兼容不同工具命名来源（Anthropic tool 名称 / Codex 泄露文本名称）。
     // 优先走显式映射，避免语义漂移；未命中时再回退到 `functions.` 前缀剥离。
     fn leaked_tool_name_compat_alias(name: &str) -> Option<&'static str> {
@@ -574,10 +578,32 @@ impl TransformResponse {
     }
 
     fn find_potential_leaked_tool_marker_start(line: &str) -> Option<usize> {
-        ["assistant to=", "to=functions", "to=multi_tool_use"]
+        Self::LEAKED_TOOL_MARKERS
             .iter()
             .filter_map(|marker| line.find(marker))
             .min()
+    }
+
+    fn leaked_marker_suffix_len(line: &str) -> usize {
+        let bytes = line.as_bytes();
+        let mut max_len = 0usize;
+
+        for marker in Self::LEAKED_TOOL_MARKERS {
+            let marker_bytes = marker.as_bytes();
+            if marker_bytes.len() <= 1 {
+                continue;
+            }
+
+            let upper = std::cmp::min(bytes.len(), marker_bytes.len() - 1);
+            for len in (1..=upper).rev() {
+                if bytes.ends_with(&marker_bytes[..len]) {
+                    max_len = max_len.max(len);
+                    break;
+                }
+            }
+        }
+
+        max_len
     }
 
     fn starts_with_leaked_tool_marker(line: &str) -> bool {
@@ -598,6 +624,7 @@ impl TransformResponse {
             tool_name: None,
             saw_tool_call: false,
             sent_message_start: false,
+            text_carryover: String::new(),
             pending_tool_text: String::new(),
             accumulated_tool_args: String::new(),
             logger: AppLogger::get().unwrap_or_else(|| {
@@ -641,23 +668,31 @@ impl TransformResponse {
             return;
         }
 
+        let combined = if self.text_carryover.is_empty() {
+            fragment.to_string()
+        } else {
+            let mut merged = std::mem::take(&mut self.text_carryover);
+            merged.push_str(fragment);
+            merged
+        };
+
         // 泄漏工具调用文本可能被拆成多个 chunk。
         // 一旦进入泄漏拼接模式，后续 chunk 持续进入 pending，直到遇到换行/收尾再统一解析。
         if !self.pending_tool_text.is_empty() {
-            self.pending_tool_text.push_str(fragment);
-            if fragment.contains('\n') {
+            self.pending_tool_text.push_str(&combined);
+            if combined.contains('\n') {
                 self.flush_pending_tool_text(output);
             }
             return;
         }
 
-        if let Some(marker_start) = Self::find_potential_leaked_tool_marker_start(fragment) {
-            let (prefix_text, leaked_fragment) = fragment.split_at(marker_start);
+        if let Some(marker_start) = Self::find_potential_leaked_tool_marker_start(&combined) {
+            let (prefix_text, leaked_fragment) = combined.split_at(marker_start);
             if emit_plain_text && self.open_tool_index.is_none() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
             }
             self.pending_tool_text.push_str(leaked_fragment);
-            if leaked_fragment.contains('\n') {
+            if leaked_fragment.contains('\n') || !emit_plain_text {
                 self.flush_pending_tool_text(output);
             }
             return;
@@ -667,7 +702,18 @@ impl TransformResponse {
             return;
         }
 
-        self.emit_plain_text_fragment(output, fragment);
+        let carry_len = Self::leaked_marker_suffix_len(&combined);
+        if carry_len == 0 {
+            self.emit_plain_text_fragment(output, &combined);
+            return;
+        }
+
+        let split_at = combined.len() - carry_len;
+        let (safe_text, carryover) = combined.split_at(split_at);
+        if !safe_text.is_empty() {
+            self.emit_plain_text_fragment(output, safe_text);
+        }
+        self.text_carryover.push_str(carryover);
     }
 
     fn emit_plain_text_fragment(&mut self, output: &mut Vec<String>, fragment: &str) {
@@ -747,22 +793,131 @@ impl TransformResponse {
         }
     }
 
-    fn parse_leaked_tool_line(line: &str) -> Option<(String, String, String)> {
+    fn extract_first_json_object_fragment(line: &str) -> Option<String> {
+        let start = line.find('{')?;
+        let candidate = &line[start..];
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for (idx, ch) in candidate.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(candidate[..=idx].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    fn parse_leaked_parallel_tool_calls(line: &str) -> Option<Vec<(String, String)>> {
+        let payload_fragment = Self::extract_first_json_object_fragment(line)?;
+        let payload = serde_json::from_str::<Value>(&payload_fragment).ok()?;
+        let tool_uses = payload.get("tool_uses")?.as_array()?;
+
+        let mut calls = Vec::new();
+        for tool_use in tool_uses {
+            let Some(recipient_name) = tool_use.get("recipient_name").and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+
+            let name = Self::normalize_leaked_tool_name(recipient_name);
+            let parameters = tool_use
+                .get("parameters")
+                .cloned()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| json!({}));
+            let arguments = serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string());
+            calls.push((name, arguments));
+        }
+
+        Some(calls)
+    }
+
+    fn parse_leaked_tool_line(line: &str) -> Option<Vec<(String, String)>> {
         let target = Self::extract_leaked_tool_target(line)?;
-        let arguments = if let Some(json_start) = line.find('{') {
-            let candidate = line[json_start..].trim();
-            if serde_json::from_str::<Value>(candidate).is_ok() {
-                candidate.to_string()
+
+        if target == "multi_tool_use.parallel" {
+            return Self::parse_leaked_parallel_tool_calls(line);
+        }
+
+        let arguments = if line.contains('{') {
+            let candidate = Self::extract_first_json_object_fragment(line)?;
+            if serde_json::from_str::<Value>(&candidate).is_ok() {
+                candidate
             } else {
-                "{}".to_string()
+                return None;
             }
         } else {
             "{}".to_string()
         };
-        let name = Self::normalize_leaked_tool_name(&target);
 
-        let call_id = format!("tool_{}", chrono::Utc::now().timestamp_millis());
-        Some((call_id, name, arguments))
+        let name = Self::normalize_leaked_tool_name(&target);
+        Some(vec![(name, arguments)])
+    }
+
+    fn emit_leaked_tool_calls(&mut self, output: &mut Vec<String>, calls: Vec<(String, String)>) {
+        for (idx, (name, arguments)) in calls.into_iter().enumerate() {
+            let call_id = format!("tool_{}_{}", chrono::Utc::now().timestamp_millis(), idx);
+            self.open_tool_block_if_needed(output, call_id, name);
+            self.emit_tool_json_delta(output, arguments);
+
+            if let Some(block_idx) = self.open_tool_index.take() {
+                output.push(format!(
+                    "event: content_block_stop\ndata: {}\n\n",
+                    json!({ "type": "content_block_stop", "index": block_idx })
+                ));
+            }
+            self.tool_call_id = None;
+            self.tool_name = None;
+        }
+    }
+
+    fn flush_text_carryover(&mut self, output: &mut Vec<String>) {
+        if self.text_carryover.is_empty() {
+            return;
+        }
+
+        let carryover = std::mem::take(&mut self.text_carryover);
+        if let Some(marker_start) = Self::find_potential_leaked_tool_marker_start(&carryover) {
+            let (prefix_text, leaked_fragment) = carryover.split_at(marker_start);
+            if self.open_tool_index.is_none() && !prefix_text.is_empty() {
+                self.emit_plain_text_fragment(output, prefix_text);
+            }
+            self.pending_tool_text.push_str(leaked_fragment);
+            self.flush_pending_tool_text(output);
+            return;
+        }
+
+        if self.open_tool_index.is_none() {
+            self.emit_plain_text_fragment(output, &carryover);
+        }
     }
 
     fn flush_pending_tool_text(&mut self, output: &mut Vec<String>) {
@@ -775,32 +930,15 @@ impl TransformResponse {
         let pending_for_tool_parse = pending_raw.trim();
 
         // 检查是否是泄漏的工具调用
-        if let Some((call_id, name, arguments)) =
-            Self::parse_leaked_tool_line(pending_for_tool_parse)
-        {
+        if let Some(calls) = Self::parse_leaked_tool_line(pending_for_tool_parse) {
+            if calls.is_empty() {
+                self.logger
+                    .log_raw("[Warn] Dropping leaked multi_tool_use.parallel with no valid tool_uses");
+                return;
+            }
             // 关闭文本块（如果有）
             self.close_open_text_block(output);
-
-            // 开启工具块
-            self.open_tool_block_if_needed(output, call_id, name);
-
-            // 发送工具参数（即使为空也要发送空对象）
-            if !arguments.is_empty() && arguments != "{}" {
-                self.emit_tool_json_delta(output, arguments);
-            } else {
-                // 如果没有参数或参数为空对象，发送空对象
-                self.emit_tool_json_delta(output, "{}".to_string());
-            }
-
-            // 关闭工具块
-            if let Some(idx) = self.open_tool_index.take() {
-                output.push(format!(
-                    "event: content_block_stop\ndata: {}\n\n",
-                    json!({ "type": "content_block_stop", "index": idx })
-                ));
-            }
-            self.tool_call_id = None;
-            self.tool_name = None;
+            self.emit_leaked_tool_calls(output, calls);
             return;
         }
 
@@ -866,6 +1004,7 @@ impl TransformResponse {
 
             // 文本分片结束：如果 pending 里还有疑似工具泄露，立即按边界强制 flush
             "response.output_text.done" => {
+                self.flush_text_carryover(&mut output);
                 if let Some(done_text) = data.get("text").and_then(|t| t.as_str()) {
                     self.handle_text_fragment(&mut output, done_text, false);
                 }
@@ -875,6 +1014,7 @@ impl TransformResponse {
             }
 
             "response.content_part.done" => {
+                self.flush_text_carryover(&mut output);
                 if !self.pending_tool_text.is_empty() {
                     self.flush_pending_tool_text(&mut output);
                 }
@@ -882,6 +1022,7 @@ impl TransformResponse {
 
             // 工具调用开始 - 严格按照 OpenAI Responses 格式解析
             "response.output_item.added" => {
+                self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 if let Some(item) = data.get("item") {
                     if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
@@ -908,6 +1049,7 @@ impl TransformResponse {
 
             // 工具参数增量更新
             "response.function_call_arguments.delta" | "response.function_call_arguments_delta" => {
+                self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
 
                 let delta = data
@@ -931,6 +1073,7 @@ impl TransformResponse {
 
             // 工具调用完成
             "response.output_item.done" => {
+                self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 if let Some(idx) = self.open_tool_index.take() {
                     output.push(format!(
@@ -945,6 +1088,7 @@ impl TransformResponse {
 
             // 响应完成 - 关键：确保完整的事件序列
             "response.completed" => {
+                self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
 
                 // 关闭所有打开的块
@@ -1510,20 +1654,26 @@ mod tests {
             "data: {}",
             json!({
                 "type": "response.output_text.delta",
-                "delta": "assistant to=multi_tool_use.parallel {\"tool_uses\":[]}\n"
+                "delta": "assistant to=multi_tool_use.parallel {\"tool_uses\":[{\"recipient_name\":\"functions.Write\",\"parameters\":{\"file_path\":\"/tmp/a.ts\"}},{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/tmp/b.ts\"}}]}\n"
             })
         );
 
         let events = transformer.transform_sse_line(&line);
         let joined = events.join("");
+        let tool_use_count = joined.matches("\"type\":\"tool_use\"").count();
         assert!(
-            joined.contains("\"content_block\":{\"id\":\"tool_")
-                && joined.contains("\"type\":\"tool_use\""),
-            "leaked tool text should be converted into a tool_use block"
+            tool_use_count == 2,
+            "parallel leaked tool text should be split into 2 tool_use blocks, got {}",
+            tool_use_count
         );
         assert!(
-            joined.contains("\"name\":\"multi_tool_use.parallel\""),
-            "tool_use name should preserve leaked tool target for client-side routing"
+            joined.contains("\"name\":\"Write\"") && joined.contains("\"name\":\"Read\""),
+            "parallel leaked tool targets should be normalized into concrete tool names"
+        );
+        assert!(
+            joined.contains("\\\"file_path\\\":\\\"/tmp/a.ts\\\"")
+                && joined.contains("\\\"file_path\\\":\\\"/tmp/b.ts\\\""),
+            "split tool_use blocks should preserve parameters for each leaked call"
         );
     }
 
@@ -1578,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn test_leaked_parallel_tool_line_without_json_is_still_promoted() {
+    fn test_malformed_parallel_leak_is_dropped() {
         let mut transformer = TransformResponse::new("gpt-5.3-codex");
         let line = format!(
             "data: {}",
@@ -1591,17 +1741,16 @@ mod tests {
         let events = transformer.transform_sse_line(&line);
         let joined = events.join("");
         assert!(
-            joined.contains("\"type\":\"tool_use\"")
-                && joined.contains("\"name\":\"multi_tool_use.parallel\""),
-            "parallel leaked tool line should be promoted even when json payload is missing"
-        );
-        assert!(
-            joined.contains("\"partial_json\":\"{}\""),
-            "missing leaked json payload should fall back to empty object arguments"
+            !joined.contains("\"type\":\"tool_use\""),
+            "malformed parallel leak should not fabricate a tool_use block"
         );
         assert!(
             !joined.contains("մեկնաբանություն"),
             "leaked tool line suffix should not appear in visible text output"
+        );
+        assert!(
+            !joined.contains("\"type\":\"text_delta\""),
+            "malformed parallel leak should be dropped from visible text"
         );
     }
 
@@ -1666,6 +1815,43 @@ mod tests {
         assert!(
             !joined.contains("\"type\":\"text_delta\""),
             "split leaked line should not fall through to text output"
+        );
+    }
+
+    #[test]
+    fn test_split_marker_across_chunks_keeps_prefix_and_promotes_tool_use() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line_1 = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "先做这个 assistant t"
+            })
+        );
+        let line_2 = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "o=functions.Read {\"file_path\":\"/tmp/chunk.txt\"}\n"
+            })
+        );
+
+        let events_1 = transformer.transform_sse_line(&line_1);
+        let events_2 = transformer.transform_sse_line(&line_2);
+        let joined = format!("{}{}", events_1.join(""), events_2.join(""));
+
+        assert!(
+            joined.contains("\"type\":\"text_delta\"")
+                && joined.contains("\"text\":\"先做这个 \""),
+            "prefix text should remain visible even when marker is split across chunks"
+        );
+        assert!(
+            joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Read\""),
+            "split marker across chunks should still be promoted to tool_use"
+        );
+        assert!(
+            !joined.contains("assistant to=functions.Read"),
+            "leaked marker text should not appear in visible output"
         );
     }
 
@@ -1768,6 +1954,58 @@ mod tests {
         assert!(
             !joined.contains("\"type\":\"text_delta\""),
             "mixed-event leaked line should not fall through to text output"
+        );
+    }
+
+    #[test]
+    fn test_parallel_leak_with_partial_invalid_entries_keeps_valid_calls() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "assistant to=multi_tool_use.parallel {\"tool_uses\":[{\"recipient_name\":\"functions.Write\",\"parameters\":{\"file_path\":\"/tmp/design.md\"}},{\"parameters\":{\"foo\":\"bar\"}},{\"recipient_name\":\"functions.Bash\",\"parameters\":{\"command\":\"pwd\"}}]}\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        let tool_use_count = joined.matches("\"type\":\"tool_use\"").count();
+        assert_eq!(
+            tool_use_count, 2,
+            "only valid tool_uses should be emitted as tool_use blocks"
+        );
+        assert!(
+            joined.contains("\"name\":\"Write\"") && joined.contains("\"name\":\"Bash\""),
+            "valid entries should be preserved and normalized"
+        );
+        assert!(
+            joined.contains("\\\"file_path\\\":\\\"/tmp/design.md\\\"")
+                && joined.contains("\\\"command\\\":\\\"pwd\\\""),
+            "valid parameters should be forwarded to emitted tool_use blocks"
+        );
+    }
+
+    #[test]
+    fn test_malformed_functions_leak_is_dropped() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "assistant to=functions.Write {\"file_path\":\"/tmp/a.ts\"\n"
+            })
+        );
+
+        let events = transformer.transform_sse_line(&line);
+        let joined = events.join("");
+        assert!(
+            !joined.contains("\"type\":\"tool_use\""),
+            "malformed functions leak should not emit tool_use"
+        );
+        assert!(
+            !joined.contains("\"type\":\"text_delta\""),
+            "malformed functions leak should not be shown as plain text"
         );
     }
 
