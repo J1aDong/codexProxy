@@ -561,6 +561,7 @@ impl StreamEventCounters {
         };
 
         match event.as_str() {
+            "ping" => self.downstream_keepalive += 1,
             "message_start" => self.downstream_message_start += 1,
             "message_delta" => self.downstream_message_delta += 1,
             "message_stop" => self.downstream_message_stop += 1,
@@ -602,7 +603,9 @@ fn observe_upstream_chunk_events(
     counters: &mut StreamEventCounters,
 ) {
     counters.mark_upstream_frame();
-    if upstream_chunk_contains_event(chunk, "response.completed") {
+    if upstream_chunk_contains_event(chunk, "response.completed")
+        || upstream_chunk_indicates_done(chunk)
+    {
         *saw_response_completed = true;
         counters.mark_response_completed();
     }
@@ -857,7 +860,7 @@ async fn try_send_keep_alive(
     enable_stream_metrics: bool,
     disconnect_context: &str,
 ) -> bool {
-    let keep_alive = ": keep-alive\n\n";
+    let keep_alive = "event: ping\ndata: {}\n\n";
     if tx
         .send(Ok(Frame::data(Bytes::from(keep_alive))))
         .await
@@ -944,6 +947,23 @@ fn parse_sse_chunk(chunk: &str) -> Option<(String, Value)> {
     }
 }
 
+fn upstream_chunk_indicates_done(chunk: &str) -> bool {
+    for line in chunk.lines() {
+        if let Some(value) = line.strip_prefix("event: ") {
+            if value.trim() == "done" {
+                return true;
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("data: ") {
+            if value.trim() == "[DONE]" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn upstream_chunk_contains_event(chunk: &str, target_event_type: &str) -> bool {
     let target = target_event_type.trim();
     if target.is_empty() {
@@ -968,6 +988,24 @@ fn upstream_chunk_contains_event(chunk: &str, target_event_type: &str) -> bool {
     }
 
     false
+}
+
+fn chunk_is_message_stop(output: &str) -> bool {
+    parse_sse_chunk(output)
+        .map(|(event, _)| event == "message_stop")
+        .unwrap_or_else(|| output.contains("event: message_stop"))
+}
+
+fn should_suppress_premature_message_stop(
+    output: &str,
+    is_codex_stream: bool,
+    saw_response_completed: bool,
+    saw_response_failed: bool,
+) -> bool {
+    is_codex_stream
+        && chunk_is_message_stop(output)
+        && !saw_response_completed
+        && !saw_response_failed
 }
 
 fn should_drop_duplicate_message_start(
@@ -2208,19 +2246,21 @@ impl ProxyServer {
                                             listen_port,
                                             &e,
                                         );
-                                        eprintln!(
-                                            "Connection error [{} {}] peer={} local_port={}: {}",
-                                            conn_id,
-                                            classify_connection_error(
-                                                &e.to_string(),
-                                                &format!("{e:?}"),
-                                                &collect_error_source_chain(&e)
-                                            )
-                                            .as_str(),
-                                            peer_addr,
-                                            listen_port,
-                                            e
+                                        let class = classify_connection_error(
+                                            &e.to_string(),
+                                            &format!("{e:?}"),
+                                            &collect_error_source_chain(&e),
                                         );
+                                        if matches!(class, ConnErrorClass::ProtocolOrNetwork) {
+                                            eprintln!(
+                                                "Connection error [{} {}] peer={} local_port={}: {}",
+                                                conn_id,
+                                                class.as_str(),
+                                                peer_addr,
+                                                listen_port,
+                                                e
+                                            );
+                                        }
                                     }
                                 });
                             }
@@ -3423,6 +3463,7 @@ async fn handle_request(
     let http_client_for_stream = http_client.clone();
     let anthropic_version_for_stream = anthropic_version.clone();
     let anthropic_beta_for_stream = anthropic_beta.clone();
+    let is_codex_stream_for_task = request_converter.eq_ignore_ascii_case("codex");
     tokio::spawn(async move {
         let _permit_guard = permit_for_stream;
         let mut stream = response.bytes_stream();
@@ -3435,7 +3476,7 @@ async fn handle_request(
         let mut downstream_log_counter = 0u64;
         let mut metrics = StreamMetrics::new(request_started_at_for_stream);
         let mut event_counters = StreamEventCounters::default();
-        let hard_timeout = Duration::from_secs(300);
+        let hard_timeout = Duration::from_secs(600);
         let stall_timeout = Duration::from_millis(stream_opts_for_task.stall_timeout_ms.max(1_000));
         let heartbeat_interval =
             Duration::from_millis(stream_opts_for_task.stream_heartbeat_interval_ms.max(500));
@@ -3466,6 +3507,7 @@ async fn handle_request(
         let mut sibling_tool_error_retry_attempted = false;
         let mut emitted_empty_completion_fallback_notice = false;
         let mut fallback_completion_injected = false;
+        let mut logged_premature_stop_suppression = false;
         #[allow(unused_assignments)]
         let mut stream_close_cause: Option<&'static str> = None;
         let mut silence_warn_logged = false;
@@ -3516,7 +3558,26 @@ async fn handle_request(
                                         ) {
                                             continue;
                                         }
-                                        if output.contains("event: message_stop") {
+                                        if should_suppress_premature_message_stop(
+                                            &output,
+                                            is_codex_stream_for_task,
+                                            saw_response_completed,
+                                            saw_response_failed,
+                                        ) {
+                                            if !logged_premature_stop_suppression {
+                                                emit_stream_diag(
+                                                    &log_tx_clone,
+                                                    &logger_for_stream,
+                                                    format!(
+                                                        "[Stream] #{} suppress_premature_message_stop=true",
+                                                        request_id_for_stream
+                                                    ),
+                                                );
+                                                logged_premature_stop_suppression = true;
+                                            }
+                                            continue;
+                                        }
+                                        if chunk_is_message_stop(&output) {
                                             saw_message_stop = true;
                                         }
                                         emitted_non_heartbeat_event = true;
@@ -3597,7 +3658,26 @@ async fn handle_request(
                                         ) {
                                             continue;
                                         }
-                                        if output.contains("event: message_stop") {
+                                        if should_suppress_premature_message_stop(
+                                            &output,
+                                            is_codex_stream_for_task,
+                                            saw_response_completed,
+                                            saw_response_failed,
+                                        ) {
+                                            if !logged_premature_stop_suppression {
+                                                emit_stream_diag(
+                                                    &log_tx_clone,
+                                                    &logger_for_stream,
+                                                    format!(
+                                                        "[Stream] #{} suppress_premature_message_stop=true",
+                                                        request_id_for_stream
+                                                    ),
+                                                );
+                                                logged_premature_stop_suppression = true;
+                                            }
+                                            continue;
+                                        }
+                                        if chunk_is_message_stop(&output) {
                                             saw_message_stop = true;
                                         }
                                         emitted_non_heartbeat_event = true;
@@ -3703,8 +3783,9 @@ async fn handle_request(
                             }
                             if silent_elapsed >= hard_timeout {
                                 let _ = log_tx_clone.send(format!(
-                                    "[Error] #{} Upstream read timeout (300s)",
-                                    request_id_for_stream
+                                    "[Error] #{} Upstream read timeout ({}s)",
+                                    request_id_for_stream,
+                                    hard_timeout.as_secs()
                                 ));
                                 stream_close_cause = Some("upstream_read_timeout");
                                 break;
@@ -3847,8 +3928,9 @@ async fn handle_request(
                         }
 
                         let _ = log_tx_clone.send(format!(
-                            "[Error] #{} Upstream read timeout (300s)",
-                            request_id_for_stream
+                            "[Error] #{} Upstream read timeout ({}s)",
+                            request_id_for_stream,
+                            hard_timeout.as_secs()
                         ));
                         stream_close_cause = Some("upstream_read_timeout");
                         break;
@@ -3880,7 +3962,26 @@ async fn handle_request(
                         ) {
                             continue;
                         }
-                        if output.contains("event: message_stop") {
+                        if should_suppress_premature_message_stop(
+                            &output,
+                            is_codex_stream_for_task,
+                            saw_response_completed,
+                            saw_response_failed,
+                        ) {
+                            if !logged_premature_stop_suppression {
+                                emit_stream_diag(
+                                    &log_tx_clone,
+                                    &logger_for_stream,
+                                    format!(
+                                        "[Stream] #{} suppress_premature_message_stop=true",
+                                        request_id_for_stream
+                                    ),
+                                );
+                                logged_premature_stop_suppression = true;
+                            }
+                            continue;
+                        }
+                        if chunk_is_message_stop(&output) {
                             saw_message_stop = true;
                         }
                         emitted_non_heartbeat_event = true;
@@ -3932,7 +4033,26 @@ async fn handle_request(
                     ) {
                         continue;
                     }
-                    if output.contains("event: message_stop") {
+                    if should_suppress_premature_message_stop(
+                        &output,
+                        is_codex_stream_for_task,
+                        saw_response_completed,
+                        saw_response_failed,
+                    ) {
+                        if !logged_premature_stop_suppression {
+                            emit_stream_diag(
+                                &log_tx_clone,
+                                &logger_for_stream,
+                                format!(
+                                    "[Stream] #{} suppress_premature_message_stop=true",
+                                    request_id_for_stream
+                                ),
+                            );
+                            logged_premature_stop_suppression = true;
+                        }
+                        continue;
+                    }
+                    if chunk_is_message_stop(&output) {
                         saw_message_stop = true;
                     }
                     emitted_non_heartbeat_event = true;
@@ -4409,7 +4529,7 @@ async fn handle_request(
                 if should_drop_duplicate_message_start(&output, &mut sent_message_start_to_client) {
                     continue;
                 }
-                if output.contains("event: message_stop") {
+                if chunk_is_message_stop(&output) {
                     saw_message_stop = true;
                 }
                 if is_business_stream_output(&output) {
@@ -4472,7 +4592,7 @@ async fn handle_request(
                     ) {
                         continue;
                     }
-                    if output.contains("event: message_stop") {
+                    if chunk_is_message_stop(&output) {
                         saw_message_stop = true;
                     }
                     metrics.mark_downstream_output(&output);
@@ -4752,8 +4872,8 @@ mod tests {
         chunk_contains_sibling_tool_call_error, classify_connection_error,
         derive_stream_close_cause, disable_parallel_tool_calls_in_upstream_body,
         is_business_stream_output, observe_upstream_chunk_events, resolve_effective_stream,
-        resolve_upstream_url, ConnErrorClass, SseFrameParser, StreamEventCounters,
-        StreamRuntimeOptions, UpstreamOperation,
+        resolve_upstream_url, should_suppress_premature_message_stop, ConnErrorClass,
+        SseFrameParser, StreamEventCounters, StreamRuntimeOptions, UpstreamOperation,
     };
     use serde_json::json;
 
@@ -4948,6 +5068,18 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn test_stream_event_counters_recognize_ping_keepalive() {
+        let mut counters = StreamEventCounters::default();
+        counters.mark_downstream_chunk(
+            r#"event: ping
+data: {}
+
+"#,
+        );
+        assert_eq!(counters.downstream_keepalive, 1);
+    }
+
+    #[test]
     fn test_observe_upstream_chunk_events_marks_flags_and_counts() {
         let mut saw_completed = false;
         let mut saw_failed = false;
@@ -4971,6 +5103,31 @@ data: {"type":"response.failed","response":{"error":{"message":"Sibling tool cal
         assert!(saw_sibling);
         assert_eq!(counters.upstream_frames, 1);
         assert_eq!(counters.upstream_response_failed, 1);
+    }
+
+    #[test]
+    fn test_observe_upstream_chunk_events_marks_done_as_completed() {
+        let mut saw_completed = false;
+        let mut saw_failed = false;
+        let mut saw_sibling = false;
+        let mut counters = StreamEventCounters::default();
+        let chunk = r#"event: done
+data: [DONE]
+
+"#;
+
+        observe_upstream_chunk_events(
+            chunk,
+            &mut saw_completed,
+            &mut saw_failed,
+            &mut saw_sibling,
+            &mut counters,
+        );
+
+        assert!(saw_completed);
+        assert!(!saw_failed);
+        assert!(!saw_sibling);
+        assert_eq!(counters.upstream_response_completed, 1);
     }
 
     #[test]
@@ -5003,5 +5160,23 @@ data: {"type":"response.failed","response":{"error":{"message":"Sibling tool cal
             "-",
         );
         assert!(matches!(class, ConnErrorClass::ProtocolOrNetwork));
+    }
+
+    #[test]
+    fn test_should_suppress_premature_message_stop_for_codex() {
+        let output = r#"event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+        assert!(should_suppress_premature_message_stop(
+            output, true, false, false
+        ));
+        assert!(!should_suppress_premature_message_stop(
+            output, false, false, false
+        ));
+        assert!(!should_suppress_premature_message_stop(
+            output, true, true, false
+        ));
     }
 }
