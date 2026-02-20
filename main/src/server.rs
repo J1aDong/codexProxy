@@ -927,6 +927,66 @@ fn contains_tool_call_text_leak(content: &Value) -> bool {
     })
 }
 
+fn disable_parallel_tool_calls_in_upstream_body(body: &Value) -> Option<Value> {
+    let mut next = body.clone();
+    let obj = next.as_object_mut()?;
+    let current = obj.get("parallel_tool_calls").and_then(|v| v.as_bool())?;
+    if !current {
+        return None;
+    }
+    obj.insert("parallel_tool_calls".to_string(), json!(false));
+    Some(next)
+}
+
+fn extract_response_failed_error_message(chunk: &str) -> Option<String> {
+    let mut response_failed_event_seen = false;
+
+    for line in chunk.lines() {
+        if let Some(event_name) = line.strip_prefix("event: ") {
+            response_failed_event_seen = event_name.trim() == "response.failed";
+            continue;
+        }
+
+        let Some(data_line) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(data_line) else {
+            continue;
+        };
+
+        let type_is_failed = parsed.get("type").and_then(|v| v.as_str()) == Some("response.failed");
+        if !response_failed_event_seen && !type_is_failed {
+            continue;
+        }
+
+        if let Some(message) = parsed
+            .pointer("/response/error/message")
+            .or_else(|| parsed.pointer("/error/message"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(message.to_string());
+        }
+    }
+
+    None
+}
+
+fn is_sibling_tool_call_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("sibling tool call errored")
+}
+
+fn chunk_contains_sibling_tool_call_error(chunk: &str) -> bool {
+    if let Some(message) = extract_response_failed_error_message(chunk) {
+        return is_sibling_tool_call_error_message(&message);
+    }
+    chunk
+        .to_ascii_lowercase()
+        .contains("sibling tool call errored")
+}
+
 fn extract_message_text(message: &Message) -> Option<String> {
     match &message.content {
         Some(MessageContent::Text(text)) => Some(text.clone()),
@@ -3019,6 +3079,8 @@ async fn handle_request(
     let upstream_url_for_stream = resolved_target_url_for_stream.clone();
     let upstream_api_key_for_stream = api_key_for_stream.clone();
     let upstream_body_for_stream = upstream_body_for_stream.clone();
+    let serial_fallback_upstream_body_for_stream =
+        disable_parallel_tool_calls_in_upstream_body(&upstream_body_for_stream);
     let http_client_for_stream = http_client.clone();
     let anthropic_version_for_stream = anthropic_version.clone();
     let anthropic_beta_for_stream = anthropic_beta.clone();
@@ -3027,6 +3089,7 @@ async fn handle_request(
         let mut stream = response.bytes_stream();
         let mut transformer =
             request_backend_for_stream.create_response_transformer(&model_for_stream);
+        let mut active_upstream_body_for_stream = upstream_body_for_stream.clone();
         let mut line_buffer = String::new();
         let mut frame_parser = SseFrameParser::default();
         let mut upstream_log_counter = 0u64;
@@ -3041,6 +3104,7 @@ async fn handle_request(
         let mut current_upstream_status = upstream_status;
         let mut saw_response_completed = false;
         let mut saw_response_failed = false;
+        let mut saw_sibling_tool_call_error = false;
         let mut saw_message_stop = false;
         let mut sent_message_start_to_client = false;
         let mut retry_attempts = 0u32;
@@ -3052,6 +3116,7 @@ async fn handle_request(
         let mut empty_completion_retry_succeeded = false;
         let mut incomplete_stream_retry_attempts = 0u32;
         let mut incomplete_stream_retry_succeeded = false;
+        let mut sibling_tool_error_retry_attempted = false;
         let mut emitted_empty_completion_fallback_notice = false;
         let mut fallback_completion_injected = false;
 
@@ -3087,6 +3152,9 @@ async fn handle_request(
                                     }
                                     if upstream_chunk_contains_event(&frame, "response.failed") {
                                         saw_response_failed = true;
+                                        if chunk_contains_sibling_tool_call_error(&frame) {
+                                            saw_sibling_tool_call_error = true;
+                                        }
                                     }
 
                                     for output in transformer.transform_event(&frame) {
@@ -3165,6 +3233,9 @@ async fn handle_request(
                                     }
                                     if upstream_chunk_contains_event(&line, "response.failed") {
                                         saw_response_failed = true;
+                                        if chunk_contains_sibling_tool_call_error(&line) {
+                                            saw_sibling_tool_call_error = true;
+                                        }
                                     }
 
                                     for output in transformer.transform_line(&line) {
@@ -3289,7 +3360,7 @@ async fn handle_request(
                                             &http_client_for_stream,
                                             &upstream_url_for_stream,
                                             &upstream_api_key_for_stream,
-                                            &upstream_body_for_stream,
+                                            &active_upstream_body_for_stream,
                                             &retry_session_id,
                                             &anthropic_version_for_stream,
                                         );
@@ -3316,6 +3387,7 @@ async fn handle_request(
                                                 frame_parser = SseFrameParser::default();
                                                 saw_response_completed = false;
                                                 saw_response_failed = false;
+                                                saw_sibling_tool_call_error = false;
                                                 saw_message_stop = false;
                                                 last_upstream_activity = Instant::now();
                                                 stall_detected_logged = false;
@@ -3404,6 +3476,9 @@ async fn handle_request(
                     }
                     if upstream_chunk_contains_event(&remaining, "response.failed") {
                         saw_response_failed = true;
+                        if chunk_contains_sibling_tool_call_error(&remaining) {
+                            saw_sibling_tool_call_error = true;
+                        }
                     }
 
                     for output in transformer.transform_event(&remaining) {
@@ -3454,6 +3529,9 @@ async fn handle_request(
                 }
                 if upstream_chunk_contains_event(&line_buffer, "response.failed") {
                     saw_response_failed = true;
+                    if chunk_contains_sibling_tool_call_error(&line_buffer) {
+                        saw_sibling_tool_call_error = true;
+                    }
                 }
 
                 for output in transformer.transform_line(&line_buffer) {
@@ -3492,6 +3570,96 @@ async fn handle_request(
                 }
             }
 
+            let sibling_tool_error_retry_allowed = saw_response_failed
+                && saw_sibling_tool_call_error
+                && !saw_message_stop
+                && !emitted_business_event
+                && !sibling_tool_error_retry_attempted
+                && serial_fallback_upstream_body_for_stream.is_some();
+
+            if sibling_tool_error_retry_allowed {
+                sibling_tool_error_retry_attempted = true;
+                active_upstream_body_for_stream = serial_fallback_upstream_body_for_stream
+                    .as_ref()
+                    .cloned()
+                    .expect("serial fallback body should exist");
+                emit_stream_diag(
+                    &log_tx_clone,
+                    &logger_for_stream,
+                    format!(
+                        "[Stream] #{} sibling_tool_error_retry_started mode=serial_parallel_tool_calls_false",
+                        request_id_for_stream
+                    ),
+                );
+
+                let retry_session_id = Uuid::new_v4().to_string();
+                let retry_req = request_backend_for_stream.build_upstream_request(
+                    &http_client_for_stream,
+                    &upstream_url_for_stream,
+                    &upstream_api_key_for_stream,
+                    &active_upstream_body_for_stream,
+                    &retry_session_id,
+                    &anthropic_version_for_stream,
+                );
+                let retry_req = if let Some(beta) = anthropic_beta_for_stream.as_ref() {
+                    retry_req.header("anthropic-beta", beta)
+                } else {
+                    retry_req
+                };
+
+                match retry_req.send().await {
+                    Ok(retry_response) => {
+                        let retry_status = retry_response.status().as_u16();
+                        if retry_response.status().is_success() {
+                            emit_stream_diag(
+                                &log_tx_clone,
+                                &logger_for_stream,
+                                format!(
+                                    "[Stream] #{} sibling_tool_error_retry_succeeded status={}",
+                                    request_id_for_stream, retry_status
+                                ),
+                            );
+                            current_upstream_status = retry_status;
+                            stream = retry_response.bytes_stream();
+                            transformer = request_backend_for_stream
+                                .create_response_transformer(&model_for_stream);
+                            line_buffer.clear();
+                            frame_parser = SseFrameParser::default();
+                            saw_response_completed = false;
+                            saw_response_failed = false;
+                            saw_sibling_tool_call_error = false;
+                            saw_message_stop = false;
+                            emitted_non_heartbeat_event = false;
+                            emitted_business_event = false;
+                            last_upstream_activity = Instant::now();
+                            stall_detected_logged = false;
+                            stall_retry_skipped_logged = false;
+                            continue 'stream_attempt;
+                        }
+
+                        let retry_error = retry_response.text().await.unwrap_or_default();
+                        emit_stream_diag(
+                            &log_tx_clone,
+                            &logger_for_stream,
+                            format!(
+                                "[Stream] #{} sibling_tool_error_retry_failed status={} body={}",
+                                request_id_for_stream, retry_status, retry_error
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        emit_stream_diag(
+                            &log_tx_clone,
+                            &logger_for_stream,
+                            format!(
+                                "[Stream] #{} sibling_tool_error_retry_failed network_error={}",
+                                request_id_for_stream, err
+                            ),
+                        );
+                    }
+                }
+            }
+
             let stream_incomplete = !saw_response_completed;
             let incomplete_retry_allowed = stream_incomplete
                 && !saw_response_failed
@@ -3520,7 +3688,7 @@ async fn handle_request(
                     &http_client_for_stream,
                     &upstream_url_for_stream,
                     &upstream_api_key_for_stream,
-                    &upstream_body_for_stream,
+                    &active_upstream_body_for_stream,
                     &retry_session_id,
                     &anthropic_version_for_stream,
                 );
@@ -3549,6 +3717,7 @@ async fn handle_request(
                             frame_parser = SseFrameParser::default();
                             saw_response_completed = false;
                             saw_response_failed = false;
+                            saw_sibling_tool_call_error = false;
                             saw_message_stop = false;
                             last_upstream_activity = Instant::now();
                             stall_detected_logged = false;
@@ -3630,7 +3799,7 @@ async fn handle_request(
                     &http_client_for_stream,
                     &upstream_url_for_stream,
                     &upstream_api_key_for_stream,
-                    &upstream_body_for_stream,
+                    &active_upstream_body_for_stream,
                     &retry_session_id,
                     &anthropic_version_for_stream,
                 );
@@ -3659,6 +3828,7 @@ async fn handle_request(
                             frame_parser = SseFrameParser::default();
                             saw_response_completed = false;
                             saw_response_failed = false;
+                            saw_sibling_tool_call_error = false;
                             saw_message_stop = false;
                             last_upstream_activity = Instant::now();
                             stall_detected_logged = false;
@@ -3755,13 +3925,23 @@ async fn handle_request(
                 ),
             );
 
+            let fallback_error_message = if saw_sibling_tool_call_error {
+                if sibling_tool_error_retry_attempted {
+                    "上游返回 response.failed（Sibling tool call errored），已自动降级串行重试 1 次仍失败，请直接重试。"
+                } else {
+                    "上游返回 response.failed（Sibling tool call errored），建议直接重试；若持续失败，可暂时降低并行工具调用。"
+                }
+            } else {
+                "上游返回 response.failed，已终止本次流式输出，请直接重试。"
+            };
+
             let error_event = format!(
                 "event: error\ndata: {}\n\n",
                 json!({
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": "上游返回 response.failed，已终止本次流式输出，请直接重试。"
+                        "message": fallback_error_message
                     }
                 })
             );
@@ -3858,46 +4038,88 @@ async fn handle_request(
 
         if !saw_message_stop {
             fallback_completion_injected = true;
-            let _ = log_tx_clone.send(format!(
-                "[Warning] #{} Upstream stream ended without message_stop; injecting fallback completion",
-                request_id_for_stream
-            ));
-            let synthetic_completed = format!(
-                "event: response.completed\ndata: {}\n\n",
-                json!({
-                    "type": "response.completed",
-                    "response": {
-                        "status": "completed",
-                        "usage": { "input_tokens": 0, "output_tokens": 0 }
-                    }
-                })
-            );
 
-            let mut fallback_outputs = transformer.transform_event(&synthetic_completed);
-            if fallback_outputs.is_empty() {
-                fallback_outputs.push(format!(
-                    "event: message_stop\ndata: {}\n\n",
-                    json!({ "type": "message_stop" })
+            if saw_response_completed {
+                let _ = log_tx_clone.send(format!(
+                    "[Warning] #{} Upstream stream ended without message_stop; injecting fallback completion",
+                    request_id_for_stream
                 ));
-            }
-
-            for output in fallback_outputs {
-                if should_drop_duplicate_message_start(&output, &mut sent_message_start_to_client) {
-                    continue;
-                }
-                if output.contains("event: message_stop") {
-                    saw_message_stop = true;
-                }
-                metrics.mark_downstream_output(&output);
-                maybe_log_stream_downstream(
-                    &logger_for_stream,
-                    &output,
-                    stream_opts_for_task,
-                    &mut downstream_log_counter,
+                let synthetic_completed = format!(
+                    "event: response.completed\ndata: {}\n\n",
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "status": "completed",
+                            "usage": { "input_tokens": 0, "output_tokens": 0 }
+                        }
+                    })
                 );
-                if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
+
+                let mut fallback_outputs = transformer.transform_event(&synthetic_completed);
+                if fallback_outputs.is_empty() {
+                    fallback_outputs.push(format!(
+                        "event: message_stop\ndata: {}\n\n",
+                        json!({ "type": "message_stop" })
+                    ));
+                }
+
+                for output in fallback_outputs {
+                    if should_drop_duplicate_message_start(
+                        &output,
+                        &mut sent_message_start_to_client,
+                    ) {
+                        continue;
+                    }
+                    if output.contains("event: message_stop") {
+                        saw_message_stop = true;
+                    }
+                    metrics.mark_downstream_output(&output);
+                    maybe_log_stream_downstream(
+                        &logger_for_stream,
+                        &output,
+                        stream_opts_for_task,
+                        &mut downstream_log_counter,
+                    );
+                    if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
+                        let _ = log_tx_clone.send(format!(
+                            "[Warning] #{} Client disconnected during fallback completion",
+                            request_id_for_stream
+                        ));
+                        metrics.emit(
+                            &log_tx_clone,
+                            &request_id_for_stream,
+                            stream_opts_for_task.enable_stream_metrics,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                emit_stream_diag(
+                    &log_tx_clone,
+                    &logger_for_stream,
+                    format!(
+                        "[Warning] #{} Upstream stream ended before response.completed; emitting interruption error instead of synthetic completion",
+                        request_id_for_stream
+                    ),
+                );
+
+                let interrupted_error = format!(
+                    "event: error\ndata: {}\n\n",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": "上游流在 response.completed 前结束，当前结果可能不完整。系统已尝试自动恢复但未成功，请直接重试。"
+                        }
+                    })
+                );
+                if tx
+                    .send(Ok(Frame::data(Bytes::from(interrupted_error))))
+                    .await
+                    .is_err()
+                {
                     let _ = log_tx_clone.send(format!(
-                        "[Warning] #{} Client disconnected during fallback completion",
+                        "[Warning] #{} Client disconnected while sending interruption error",
                         request_id_for_stream
                     ));
                     metrics.emit(
@@ -3907,6 +4129,28 @@ async fn handle_request(
                     );
                     return;
                 }
+
+                let stop_event = format!(
+                    "event: message_stop\ndata: {}\n\n",
+                    json!({ "type": "message_stop" })
+                );
+                if tx
+                    .send(Ok(Frame::data(Bytes::from(stop_event))))
+                    .await
+                    .is_err()
+                {
+                    let _ = log_tx_clone.send(format!(
+                        "[Warning] #{} Client disconnected while sending interruption stop",
+                        request_id_for_stream
+                    ));
+                    metrics.emit(
+                        &log_tx_clone,
+                        &request_id_for_stream,
+                        stream_opts_for_task.enable_stream_metrics,
+                    );
+                    return;
+                }
+                saw_message_stop = true;
             }
         }
 
@@ -4073,9 +4317,11 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 #[cfg(test)]
 mod tests {
     use super::{
+        chunk_contains_sibling_tool_call_error, disable_parallel_tool_calls_in_upstream_body,
         is_business_stream_output, resolve_effective_stream, resolve_upstream_url, SseFrameParser,
         StreamRuntimeOptions, UpstreamOperation,
     };
+    use serde_json::json;
 
     fn stream_opts() -> StreamRuntimeOptions {
         StreamRuntimeOptions {
@@ -4197,5 +4443,41 @@ data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"a
 
 "#;
         assert!(!is_business_stream_output(chunk));
+    }
+
+    #[test]
+    fn test_disable_parallel_tool_calls_in_upstream_body() {
+        let original = json!({
+            "model": "gpt-5.3-codex",
+            "parallel_tool_calls": true,
+            "input": []
+        });
+        let rewritten =
+            disable_parallel_tool_calls_in_upstream_body(&original).expect("should rewrite");
+        assert_eq!(
+            rewritten
+                .get("parallel_tool_calls")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(rewritten.get("model"), original.get("model"));
+    }
+
+    #[test]
+    fn test_chunk_contains_sibling_tool_call_error_from_response_failed() {
+        let chunk = r#"event: response.failed
+data: {"type":"response.failed","response":{"error":{"message":"Sibling tool call errored: Invalid tool parameters"}}}
+
+"#;
+        assert!(chunk_contains_sibling_tool_call_error(chunk));
+    }
+
+    #[test]
+    fn test_chunk_contains_sibling_tool_call_error_false_for_other_errors() {
+        let chunk = r#"event: response.failed
+data: {"type":"response.failed","response":{"error":{"message":"rate_limit_exceeded"}}}
+
+"#;
+        assert!(!chunk_contains_sibling_tool_call_error(chunk));
     }
 }
