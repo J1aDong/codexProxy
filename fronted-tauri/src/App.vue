@@ -55,9 +55,10 @@
     <!-- Settings Dialog -->
     <SettingsDialog
       :visible="showSettings"
-      :skillInjectionPrompt="form.skillInjectionPrompt"
+      :customInjectionPrompt="form.customInjectionPrompt"
       @close="showSettings = false"
-      @update="updateSkillInjectionPrompt"
+      @update="updateCustomInjectionPrompt"
+      @useDefault="handleSettingsUseDefault"
     />
 
     <!-- About Dialog -->
@@ -380,11 +381,11 @@ const DEFAULT_CONFIG = {
     sonnet: 'gemini-3-flash-preview',
     haiku: 'gemini-3-flash-preview',
   },
-  skillInjectionPrompt: '',
+  customInjectionPrompt: '',
 }
 
-const DEFAULT_PROMPT_ZH = "skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择"
-const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose."
+const DEFAULT_PROMPT_ZH = "skills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择。CRITICAL: You MUST use JSON tools instead of markdown!"
+const DEFAULT_PROMPT_EN = "If skills require dependencies, install them first. Do not use workarounds. If issues persist, provide solutions for the user to choose.\nCRITICAL: You MUST use JSON tools instead of markdown!"
 
 const form = reactive({
   ...DEFAULT_CONFIG,
@@ -534,8 +535,8 @@ const normalizeLoadBalancerConfig = (
   }
 }
 
-const updateSkillInjectionPrompt = (prompt: string) => {
-  form.skillInjectionPrompt = prompt
+const updateCustomInjectionPrompt = (prompt: string) => {
+  form.customInjectionPrompt = prompt
   persistConfig(buildProxyConfig())
 }
 
@@ -610,7 +611,11 @@ const resetGeminiModelPreset = () => {
 }
 
 const useDefaultPrompt = () => {
-  form.skillInjectionPrompt = lang.value === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
+  form.customInjectionPrompt = lang.value === 'zh' ? DEFAULT_PROMPT_ZH : DEFAULT_PROMPT_EN
+}
+
+const handleSettingsUseDefault = () => {
+  useDefaultPrompt()
 }
 
 const handleConfigImported = async () => {
@@ -657,8 +662,8 @@ const handleConfigImported = async () => {
       form.selectedEndpointId = legacyOption.id
     }
     syncEndpointFromSelection()
-    if (savedConfig.skillInjectionPrompt) {
-      form.skillInjectionPrompt = savedConfig.skillInjectionPrompt
+    if (savedConfig.customInjectionPrompt) {
+      form.customInjectionPrompt = savedConfig.customInjectionPrompt
     } else {
       useDefaultPrompt()
     }
@@ -979,7 +984,7 @@ const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   allowExternalAccess: form.allowExternalAccess,
   reasoningEffort: form.reasoningEffort,
   geminiReasoningEffort: form.geminiReasoningEffort,
-  skillInjectionPrompt: form.skillInjectionPrompt,
+  customInjectionPrompt: form.customInjectionPrompt,
   lang: locale.value,
   force,
   proxyMode: form.proxyMode,
@@ -1191,8 +1196,8 @@ onMounted(() => {
           form.selectedEndpointId = legacyOption.id
         }
         syncEndpointFromSelection()
-        if (savedConfig.skillInjectionPrompt) {
-          form.skillInjectionPrompt = savedConfig.skillInjectionPrompt
+        if (savedConfig.customInjectionPrompt) {
+          form.customInjectionPrompt = savedConfig.customInjectionPrompt
         } else {
           useDefaultPrompt()
         }

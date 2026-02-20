@@ -355,8 +355,8 @@ pub struct ProxyConfig {
     pub reasoning_effort: ReasoningEffortConfig,
     #[serde(rename = "geminiReasoningEffort", default)]
     pub gemini_reasoning_effort: ReasoningEffortConfig,
-    #[serde(rename = "skillInjectionPrompt", default)]
-    pub skill_injection_prompt: String,
+    #[serde(rename = "customInjectionPrompt", alias = "skillInjectionPrompt", default)]
+    pub custom_injection_prompt: String,
     #[serde(default = "default_lang")]
     pub lang: String,
 }
@@ -661,7 +661,7 @@ fn build_runtime_update(
                 sonnet: config.anthropic_model_mapping.sonnet.clone(),
                 haiku: config.anthropic_model_mapping.haiku.clone(),
             },
-            skill_injection_prompt: config.skill_injection_prompt.clone(),
+            custom_injection_prompt: config.custom_injection_prompt.clone(),
             converter: config.converter.clone(),
             codex_model: config.codex_model.clone(),
             gemini_reasoning_effort: config.gemini_reasoning_effort.to_gemini_mapping(),
@@ -905,7 +905,7 @@ async fn start_proxy_with_manager(
 
     let server = ProxyServer::new(config.port, resolved_target_url.clone(), api_key)
         .with_reasoning_mapping(config.reasoning_effort.to_mapping())
-        .with_skill_injection_prompt(config.skill_injection_prompt.clone())
+        .with_custom_injection_prompt(config.custom_injection_prompt.clone())
         .with_converter(config.converter.clone())
         .with_codex_model(config.codex_model.clone())
         .with_codex_model_mapping(CodexModelMapping {

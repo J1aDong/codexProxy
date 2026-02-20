@@ -120,9 +120,9 @@ export default {
 
     // Settings
     settingsTitle: 'Settings',
-    skillInjection: 'Skill Injection Config',
-    skillInjectionTip: 'Inject this prompt into User Message when Skills are used. Leave empty to disable.',
-    skillInjectionPlaceholder: 'E.g. Auto-install dependencies if missing...',
+    customInjection: 'Custom Prompt Injection',
+    customInjectionTip: 'Inject this prompt into User Message globally for all chats. Leave empty to disable.',
+    customInjectionPlaceholder: 'E.g. CRITICAL: You MUST use JSON tools...',
     useDefaultPrompt: 'Use Default Prompt',
 
     // Import/Export

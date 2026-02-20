@@ -377,3 +377,50 @@ fn test_unparsable_raw_parallel_tool_json_is_dropped_from_visible_text() {
         "malformed raw tool_uses json should be suppressed from visible text"
     );
 }
+
+#[test]
+fn test_markdown_bash_interception() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Let me run this.\n```bash\necho \"hello\"\n"
+        })
+    );
+    let line_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "```\nDone."
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&line_1);
+    events.extend(transformer.transform_sse_line(&line_2));
+    
+    // send response.completed to flush the buffer
+    let line_3 = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": { "status": "completed" }
+        })
+    );
+    events.extend(transformer.transform_sse_line(&line_3));
+
+    let joined = events.join("");
+    println!("{}", joined);
+    assert!(
+        joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Bash\""),
+        "markdown bash blocks should be converted to Bash tool calls"
+    );
+    assert!(
+        joined.contains(r#"\"command\":\"echo \\\"hello\\\"\""#),
+        "the content of the bash block should be the command argument"
+    );
+    assert!(
+        joined.contains("\"type\":\"text_delta\"") && joined.contains("\"text\":\"Let me run this.\\n\""),
+        "prefix text before markdown block should remain visible"
+    );
+}

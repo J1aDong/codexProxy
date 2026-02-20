@@ -120,9 +120,9 @@ export default {
 
     // Settings
     settingsTitle: '设置',
-    skillInjection: '技能注入配置',
-    skillInjectionTip: '当使用 Skill 时，将此提示词注入到 User Message 中。留空则不注入。',
-    skillInjectionPlaceholder: '例如：如果依赖缺失，请自动安装...',
+    customInjection: '附加指令注入',
+    customInjectionTip: '每次对话时，将此提示词注入到上下文中去规范 AI 的行为。留空则不注入。',
+    customInjectionPlaceholder: '例如：CRITICAL: You MUST use JSON tools...',
     useDefaultPrompt: '使用默认提示词',
 
     // Import/Export

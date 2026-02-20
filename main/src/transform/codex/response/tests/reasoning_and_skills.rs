@@ -211,7 +211,7 @@ fn test_skill_deduplication() {
 }
 
 #[test]
-fn test_skill_injection_prompt() {
+fn test_custom_injection_prompt() {
     // Setup request with skill usage
     let messages = vec![
         Message {

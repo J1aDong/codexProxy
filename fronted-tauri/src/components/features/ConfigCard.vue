@@ -536,7 +536,7 @@ interface FormData {
     sonnet: string
     haiku: string
   }
-  skillInjectionPrompt: string
+  customInjectionPrompt: string
 }
 
 const props = defineProps({

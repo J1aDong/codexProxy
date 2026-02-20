@@ -62,7 +62,7 @@ impl TransformRequest {
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
         reasoning_mapping: &ReasoningEffortMapping,
-        skill_injection_prompt: &str,
+        custom_injection_prompt: &str,
         codex_model: &str,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
@@ -159,21 +159,21 @@ impl TransformRequest {
                     }]
                 }));
             }
+        }
 
-            if !skill_injection_prompt.trim().is_empty() {
-                log(&format!(
-                    "🎯 [Transform] Injecting custom skill prompt ({} chars)",
-                    skill_injection_prompt.len()
-                ));
-                final_input.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": skill_injection_prompt
-                    }]
-                }));
-            }
+        if !custom_injection_prompt.trim().is_empty() {
+            log(&format!(
+                "🎯 [Transform] Injecting custom global prompt ({} chars)",
+                custom_injection_prompt.len()
+            ));
+            final_input.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": custom_injection_prompt
+                }]
+            }));
         }
 
         // 追加对话历史

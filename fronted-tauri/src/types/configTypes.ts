@@ -63,7 +63,7 @@ export interface ProxyConfig {
     lbTransientBackoffSeconds: number
     reasoningEffort: ReasoningEffort
     geminiReasoningEffort: ReasoningEffort
-    skillInjectionPrompt: string
+    customInjectionPrompt: string
     lang: string
     force: boolean
 }

@@ -36,7 +36,7 @@ pub struct ProxyServer {
     target_url: String,
     api_key: Option<String>,
     reasoning_mapping: ReasoningEffortMapping,
-    skill_injection_prompt: String,
+    custom_injection_prompt: String,
     converter: String,
     codex_model: String,
     codex_model_mapping: CodexModelMapping,
@@ -289,7 +289,7 @@ fn transform_request_with_optional_codex_effort_override(
                 anthropic_body,
                 Some(log_tx),
                 &override_mapping,
-                &ctx.skill_injection_prompt,
+                &ctx.custom_injection_prompt,
                 model_name,
             );
         }
@@ -1932,7 +1932,7 @@ impl ProxyServer {
             target_url,
             api_key,
             reasoning_mapping: ReasoningEffortMapping::default(),
-            skill_injection_prompt: String::new(),
+            custom_injection_prompt: String::new(),
             converter: "codex".to_string(),
             codex_model: "gpt-5.3-codex".to_string(),
             codex_model_mapping: CodexModelMapping::default(),
@@ -1969,8 +1969,8 @@ impl ProxyServer {
         self
     }
 
-    pub fn with_skill_injection_prompt(mut self, prompt: String) -> Self {
-        self.skill_injection_prompt = prompt;
+    pub fn with_custom_injection_prompt(mut self, prompt: String) -> Self {
+        self.custom_injection_prompt = prompt;
         self
     }
 
@@ -2127,7 +2127,7 @@ impl ProxyServer {
                 reasoning_mapping: self.reasoning_mapping.clone(),
                 codex_model_mapping: self.codex_model_mapping.clone(),
                 anthropic_model_mapping: self.anthropic_model_mapping.clone(),
-                skill_injection_prompt: self.skill_injection_prompt.clone(),
+                custom_injection_prompt: self.custom_injection_prompt.clone(),
                 converter: self.converter.clone(),
                 codex_model: self.codex_model.clone(),
                 gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),

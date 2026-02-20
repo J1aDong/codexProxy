@@ -21,7 +21,7 @@ impl TransformBackend for CodexBackend {
             anthropic_body,
             log_tx,
             &ctx.reasoning_mapping,
-            &ctx.skill_injection_prompt,
+            &ctx.custom_injection_prompt,
             model_override.as_deref().unwrap_or(&ctx.codex_model),
         )
     }

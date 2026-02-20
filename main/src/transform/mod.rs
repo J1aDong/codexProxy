@@ -17,7 +17,7 @@ pub struct TransformContext {
     pub reasoning_mapping: ReasoningEffortMapping,
     pub codex_model_mapping: CodexModelMapping,
     pub anthropic_model_mapping: AnthropicModelMapping,
-    pub skill_injection_prompt: String,
+    pub custom_injection_prompt: String,
     pub converter: String,
     pub codex_model: String,
     pub gemini_reasoning_effort: GeminiReasoningEffortMapping,

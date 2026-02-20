@@ -17,12 +17,20 @@ pub struct TransformResponse {
     text_carryover: String,
     pending_tool_text: String,
     accumulated_tool_args: String,
+    
+    // Markdown Base Interception
+    in_markdown_bash: bool,
+    markdown_bash_buffer: String,
+    
     logger: std::sync::Arc<AppLogger>,
 }
 
 impl TransformResponse {
     const LEAKED_TOOL_MARKERS: [&'static str; 3] =
         ["assistant to=", "to=functions", "to=multi_tool_use"];
+    
+    const MARKDOWN_BASH_MARKERS: [&'static str; 3] = 
+        ["```bash", "```sh", "```shell"];
 
     // 兼容不同工具命名来源（Anthropic tool 名称 / Codex 泄露文本名称）。
     // 优先走显式映射，避免语义漂移；未命中时再回退到 `functions.` 前缀剥离。
@@ -95,7 +103,11 @@ impl TransformResponse {
         let bytes = line.as_bytes();
         let mut max_len = 0usize;
 
-        for marker in Self::LEAKED_TOOL_MARKERS {
+        let all_markers = Self::LEAKED_TOOL_MARKERS
+            .iter()
+            .chain(Self::MARKDOWN_BASH_MARKERS.iter());
+
+        for marker in all_markers {
             let marker_bytes = marker.as_bytes();
             if marker_bytes.len() <= 1 {
                 continue;
@@ -111,6 +123,15 @@ impl TransformResponse {
         }
 
         max_len
+    }
+
+    fn find_markdown_bash_start(line: &str) -> Option<(usize, usize)> {
+        for marker in Self::MARKDOWN_BASH_MARKERS {
+            if let Some(idx) = line.find(marker) {
+                return Some((idx, marker.len()));
+            }
+        }
+        None
     }
 
     fn starts_with_leaked_tool_marker(line: &str) -> bool {
@@ -161,6 +182,8 @@ impl TransformResponse {
             text_carryover: String::new(),
             pending_tool_text: String::new(),
             accumulated_tool_args: String::new(),
+            in_markdown_bash: false,
+            markdown_bash_buffer: String::new(),
             logger: AppLogger::get().unwrap_or_else(|| {
                 // 如果全局 logger 未初始化，创建一个临时的
                 AppLogger::init(None)
@@ -259,6 +282,38 @@ impl TransformResponse {
             merged.push_str(fragment);
             merged
         };
+
+        if self.in_markdown_bash {
+            self.markdown_bash_buffer.push_str(&combined);
+            
+            // Check if we hit the closing ```
+            if self.markdown_bash_buffer.contains("\n```\n")
+                || self.markdown_bash_buffer.ends_with("\n```")
+                || !emit_plain_text
+            {
+                self.flush_markdown_bash(output);
+            }
+            return;
+        }
+
+        if let Some((marker_start, marker_len)) = Self::find_markdown_bash_start(&combined) {
+            let prefix_text = &combined[..marker_start];
+            let after_marker = &combined[marker_start + marker_len..];
+
+            if emit_plain_text && self.open_tool_index.is_none() && !prefix_text.is_empty() {
+                self.emit_plain_text_fragment(output, prefix_text);
+            }
+            self.in_markdown_bash = true;
+            self.markdown_bash_buffer.push_str(after_marker);
+
+            if self.markdown_bash_buffer.contains("\n```\n")
+                || self.markdown_bash_buffer.ends_with("\n```")
+                || !emit_plain_text
+            {
+                self.flush_markdown_bash(output);
+            }
+            return;
+        }
 
         // 泄漏工具调用文本可能被拆成多个 chunk。
         // 一旦进入泄漏拼接模式，后续 chunk 持续进入 pending，直到遇到换行/收尾再统一解析。
@@ -500,12 +555,82 @@ impl TransformResponse {
         }
     }
 
+    fn flush_markdown_bash(&mut self, output: &mut Vec<String>) {
+        if !self.in_markdown_bash {
+            return;
+        }
+        self.in_markdown_bash = false;
+
+        let mut script = std::mem::take(&mut self.markdown_bash_buffer);
+        let mut leftover_text = String::new();
+
+        if let Some(end_idx) = script.find("\n```\n") {
+            leftover_text = script[end_idx + 5..].to_string();
+            script.truncate(end_idx);
+        } else if let Some(end_idx) = script.find("\n```") {
+            leftover_text = script[end_idx + 4..].to_string();
+            script.truncate(end_idx);
+        } else if script.ends_with("```\n") {
+            script.truncate(script.len() - 4);
+        } else if script.ends_with("```") {
+            script.truncate(script.len() - 3);
+        }
+
+        let script = script.trim().to_string();
+
+        if script.is_empty() {
+            if !leftover_text.is_empty() {
+                self.text_carryover.push_str(&leftover_text);
+                self.flush_text_carryover(output);
+            }
+            return;
+        }
+
+        self.close_open_text_block(output);
+
+        let call_id = format!("tool_{}", chrono::Utc::now().timestamp_millis());
+        let name = "Bash".to_string();
+        let arguments = json!({ "command": script }).to_string();
+
+        self.open_tool_block_if_needed(output, call_id, name);
+        self.emit_tool_json_delta(output, arguments);
+
+        if let Some(block_idx) = self.open_tool_index.take() {
+            output.push(format!(
+                "event: content_block_stop\ndata: {}\n\n",
+                json!({ "type": "content_block_stop", "index": block_idx })
+            ));
+        }
+        self.tool_call_id = None;
+        self.tool_name = None;
+
+        if !leftover_text.is_empty() {
+            self.text_carryover.push_str(&leftover_text);
+            // Re-eval leftovers to see if another markdown block exists or just emit
+            self.flush_text_carryover(output); 
+        }
+    }
+
     fn flush_text_carryover(&mut self, output: &mut Vec<String>) {
         if self.text_carryover.is_empty() {
             return;
         }
 
         let carryover = std::mem::take(&mut self.text_carryover);
+
+        if let Some((marker_start, marker_len)) = Self::find_markdown_bash_start(&carryover) {
+            let prefix_text = &carryover[..marker_start];
+            let after_marker = &carryover[marker_start + marker_len..];
+
+            if self.open_tool_index.is_none() && !prefix_text.is_empty() {
+                self.emit_plain_text_fragment(output, prefix_text);
+            }
+            self.in_markdown_bash = true;
+            self.markdown_bash_buffer.push_str(after_marker);
+            self.flush_markdown_bash(output);
+            return;
+        }
+
         if let Some(marker_start) = Self::find_potential_leaked_tool_marker_start(&carryover) {
             let (prefix_text, leaked_fragment) = carryover.split_at(marker_start);
             if self.open_tool_index.is_none() && !prefix_text.is_empty() {
@@ -733,6 +858,7 @@ impl TransformResponse {
             "response.completed" => {
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
+                self.flush_markdown_bash(&mut output);
 
                 // 关闭所有打开的块
                 if let Some(idx) = self.open_text_index.take() {
