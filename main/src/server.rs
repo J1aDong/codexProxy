@@ -27,6 +27,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+mod stream_decision;
+use stream_decision::{OutputDisposition, StreamDecisionState};
+
 pub struct ProxyServer {
     port: u16,
     allow_external_access: bool,
@@ -1043,6 +1046,34 @@ fn is_business_stream_output(chunk: &str) -> bool {
             .map(|kind| matches!(kind, "text_delta" | "input_json_delta" | "thinking_delta"))
             .unwrap_or(false),
         _ => false,
+    }
+}
+
+fn should_skip_transformed_output(
+    decision: &mut StreamDecisionState,
+    output: &str,
+    is_codex_stream: bool,
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+    request_id: &str,
+) -> bool {
+    match decision.classify_output(output, is_codex_stream) {
+        OutputDisposition::SkipDuplicateMessageStart => true,
+        OutputDisposition::SkipPrematureMessageStop => {
+            if !decision.logged_premature_stop_suppression {
+                emit_stream_diag(
+                    log_tx,
+                    logger,
+                    format!(
+                        "[Stream] #{} suppress_premature_message_stop=true",
+                        request_id
+                    ),
+                );
+                decision.logged_premature_stop_suppression = true;
+            }
+            true
+        }
+        OutputDisposition::Accepted { .. } => false,
     }
 }
 
@@ -3490,26 +3521,7 @@ async fn handle_request(
         let mut last_upstream_activity = Instant::now();
         let mut last_downstream_activity = Instant::now();
         let mut current_upstream_status = upstream_status;
-        let mut saw_response_completed = false;
-        let mut saw_response_failed = false;
-        let mut saw_sibling_tool_call_error = false;
-        let mut saw_message_stop = false;
-        let mut sent_message_start_to_client = false;
-        let mut retry_attempts = 0u32;
-        let mut emitted_non_heartbeat_event = false;
-        let mut emitted_business_event = false;
-        let mut stall_detected_logged = false;
-        let mut stall_retry_skipped_logged = false;
-        let mut empty_completion_retry_attempts = 0u32;
-        let mut empty_completion_retry_succeeded = false;
-        let mut incomplete_stream_retry_attempts = 0u32;
-        let mut incomplete_stream_retry_succeeded = false;
-        let mut sibling_tool_error_retry_attempted = false;
-        let mut emitted_empty_completion_fallback_notice = false;
-        let mut fallback_completion_injected = false;
-        let mut logged_premature_stop_suppression = false;
-        #[allow(unused_assignments)]
-        let mut stream_close_cause: Option<&'static str> = None;
+        let mut decision = StreamDecisionState::default();
         let mut silence_warn_logged = false;
         let mut silence_error_logged = false;
 
@@ -3527,8 +3539,8 @@ async fn handle_request(
                             metrics.mark_upstream_chunk();
                             event_counters.mark_upstream_chunk();
                             last_upstream_activity = Instant::now();
-                            stall_detected_logged = false;
-                            stall_retry_skipped_logged = false;
+                            decision.stall_detected_logged = false;
+                            decision.stall_retry_skipped_logged = false;
                             silence_warn_logged = false;
                             silence_error_logged = false;
                             let chunk_text = String::from_utf8_lossy(&chunk).to_string();
@@ -3545,44 +3557,22 @@ async fn handle_request(
                                     );
                                     observe_upstream_chunk_events(
                                         &frame,
-                                        &mut saw_response_completed,
-                                        &mut saw_response_failed,
-                                        &mut saw_sibling_tool_call_error,
+                                        &mut decision.saw_response_completed,
+                                        &mut decision.saw_response_failed,
+                                        &mut decision.saw_sibling_tool_call_error,
                                         &mut event_counters,
                                     );
 
                                     for output in transformer.transform_event(&frame) {
-                                        if should_drop_duplicate_message_start(
-                                            &output,
-                                            &mut sent_message_start_to_client,
-                                        ) {
-                                            continue;
-                                        }
-                                        if should_suppress_premature_message_stop(
+                                        if should_skip_transformed_output(
+                                            &mut decision,
                                             &output,
                                             is_codex_stream_for_task,
-                                            saw_response_completed,
-                                            saw_response_failed,
+                                            &log_tx_clone,
+                                            &logger_for_stream,
+                                            &request_id_for_stream,
                                         ) {
-                                            if !logged_premature_stop_suppression {
-                                                emit_stream_diag(
-                                                    &log_tx_clone,
-                                                    &logger_for_stream,
-                                                    format!(
-                                                        "[Stream] #{} suppress_premature_message_stop=true",
-                                                        request_id_for_stream
-                                                    ),
-                                                );
-                                                logged_premature_stop_suppression = true;
-                                            }
                                             continue;
-                                        }
-                                        if chunk_is_message_stop(&output) {
-                                            saw_message_stop = true;
-                                        }
-                                        emitted_non_heartbeat_event = true;
-                                        if is_business_stream_output(&output) {
-                                            emitted_business_event = true;
                                         }
                                         metrics.mark_downstream_output(&output);
                                         event_counters.mark_downstream_chunk(&output);
@@ -3645,44 +3635,22 @@ async fn handle_request(
                                     );
                                     observe_upstream_chunk_events(
                                         &line,
-                                        &mut saw_response_completed,
-                                        &mut saw_response_failed,
-                                        &mut saw_sibling_tool_call_error,
+                                        &mut decision.saw_response_completed,
+                                        &mut decision.saw_response_failed,
+                                        &mut decision.saw_sibling_tool_call_error,
                                         &mut event_counters,
                                     );
 
                                     for output in transformer.transform_line(&line) {
-                                        if should_drop_duplicate_message_start(
-                                            &output,
-                                            &mut sent_message_start_to_client,
-                                        ) {
-                                            continue;
-                                        }
-                                        if should_suppress_premature_message_stop(
+                                        if should_skip_transformed_output(
+                                            &mut decision,
                                             &output,
                                             is_codex_stream_for_task,
-                                            saw_response_completed,
-                                            saw_response_failed,
+                                            &log_tx_clone,
+                                            &logger_for_stream,
+                                            &request_id_for_stream,
                                         ) {
-                                            if !logged_premature_stop_suppression {
-                                                emit_stream_diag(
-                                                    &log_tx_clone,
-                                                    &logger_for_stream,
-                                                    format!(
-                                                        "[Stream] #{} suppress_premature_message_stop=true",
-                                                        request_id_for_stream
-                                                    ),
-                                                );
-                                                logged_premature_stop_suppression = true;
-                                            }
                                             continue;
-                                        }
-                                        if chunk_is_message_stop(&output) {
-                                            saw_message_stop = true;
-                                        }
-                                        emitted_non_heartbeat_event = true;
-                                        if is_business_stream_output(&output) {
-                                            emitted_business_event = true;
                                         }
                                         metrics.mark_downstream_output(&output);
                                         event_counters.mark_downstream_chunk(&output);
@@ -3739,12 +3707,12 @@ async fn handle_request(
                                 "[Error] #{} Stream error: {}",
                                 request_id_for_stream, e
                             ));
-                            stream_close_cause = Some("upstream_stream_error");
+                            decision.stream_close_cause = Some("upstream_stream_error");
                             break;
                         }
                     },
                     Ok(None) => {
-                        stream_close_cause = Some("upstream_eof");
+                        decision.stream_close_cause = Some("upstream_eof");
                         break;
                     }
                     Err(_) => {
@@ -3787,40 +3755,31 @@ async fn handle_request(
                                     request_id_for_stream,
                                     hard_timeout.as_secs()
                                 ));
-                                stream_close_cause = Some("upstream_read_timeout");
+                                decision.stream_close_cause = Some("upstream_read_timeout");
                                 break;
                             }
 
                             if silent_elapsed >= stall_timeout {
-                                if !stall_detected_logged {
+                                if !decision.stall_detected_logged {
                                     let _ = log_tx_clone.send(format!(
                                         "[Stream] #{} stall_detected silent_ms={} retry_attempts={}/{}",
                                         request_id_for_stream,
                                         silent_elapsed.as_millis(),
-                                        retry_attempts,
+                                        decision.stall_retry_attempts,
                                         stream_opts_for_task.stall_retry_max_attempts
                                     ));
-                                    stall_detected_logged = true;
+                                    decision.stall_detected_logged = true;
                                 }
 
-                                let phase_retry_allowed =
-                                    if stream_opts_for_task.stall_retry_only_heartbeat_phase {
-                                        !emitted_non_heartbeat_event
-                                    } else {
-                                        !emitted_business_event
-                                    };
-                                let retry_allowed = stream_opts_for_task.enable_stall_retry
-                                    && stream_opts_for_task.stall_retry_max_attempts > 0
-                                    && retry_attempts
-                                        < stream_opts_for_task.stall_retry_max_attempts
-                                    && phase_retry_allowed;
+                                let retry_allowed =
+                                    decision.allow_stall_retry(stream_opts_for_task);
 
                                 if retry_allowed {
-                                    retry_attempts += 1;
+                                    decision.stall_retry_attempts += 1;
                                     let _ = log_tx_clone.send(format!(
                                         "[Stream] #{} stall_retry_started attempt={}/{} heartbeat_only={}",
                                         request_id_for_stream,
-                                        retry_attempts,
+                                        decision.stall_retry_attempts,
                                         stream_opts_for_task.stall_retry_max_attempts,
                                         stream_opts_for_task.stall_retry_only_heartbeat_phase
                                     ));
@@ -3856,13 +3815,8 @@ async fn handle_request(
                                                     .create_response_transformer(&model_for_stream);
                                                 line_buffer.clear();
                                                 frame_parser = SseFrameParser::default();
-                                                saw_response_completed = false;
-                                                saw_response_failed = false;
-                                                saw_sibling_tool_call_error = false;
-                                                saw_message_stop = false;
+                                                decision.on_retry_success_reset();
                                                 last_upstream_activity = Instant::now();
-                                                stall_detected_logged = false;
-                                                stall_retry_skipped_logged = false;
                                                 continue;
                                             }
 
@@ -3872,7 +3826,8 @@ async fn handle_request(
                                                 "[Stream] #{} stall_retry_failed status={} body={}",
                                                 request_id_for_stream, retry_status, retry_error
                                             ));
-                                            stream_close_cause = Some("stall_retry_failed");
+                                            decision.stream_close_cause =
+                                                Some("stall_retry_failed");
                                             break;
                                         }
                                         Err(err) => {
@@ -3880,33 +3835,19 @@ async fn handle_request(
                                                 "[Stream] #{} stall_retry_failed network_error={}",
                                                 request_id_for_stream, err
                                             ));
-                                            stream_close_cause = Some("stall_retry_failed");
+                                            decision.stream_close_cause =
+                                                Some("stall_retry_failed");
                                             break;
                                         }
                                     }
-                                } else if !stall_retry_skipped_logged {
-                                    let reason = if !stream_opts_for_task.enable_stall_retry {
-                                        "disabled"
-                                    } else if stream_opts_for_task.stall_retry_max_attempts == 0 {
-                                        "max_attempts_zero"
-                                    } else if retry_attempts
-                                        >= stream_opts_for_task.stall_retry_max_attempts
-                                    {
-                                        "attempts_exhausted"
-                                    } else if stream_opts_for_task.stall_retry_only_heartbeat_phase
-                                        && emitted_non_heartbeat_event
-                                    {
-                                        "non_heartbeat_event_emitted"
-                                    } else if emitted_business_event {
-                                        "business_event_emitted"
-                                    } else {
-                                        "guard_blocked"
-                                    };
+                                } else if !decision.stall_retry_skipped_logged {
+                                    let reason =
+                                        decision.stall_retry_skip_reason(stream_opts_for_task);
                                     let _ = log_tx_clone.send(format!(
                                         "[Stream] #{} stall_retry_skipped reason={}",
                                         request_id_for_stream, reason
                                     ));
-                                    stall_retry_skipped_logged = true;
+                                    decision.stall_retry_skipped_logged = true;
                                 }
                             }
 
@@ -3932,7 +3873,7 @@ async fn handle_request(
                             request_id_for_stream,
                             hard_timeout.as_secs()
                         ));
-                        stream_close_cause = Some("upstream_read_timeout");
+                        decision.stream_close_cause = Some("upstream_read_timeout");
                         break;
                     }
                 }
@@ -3949,44 +3890,22 @@ async fn handle_request(
                     );
                     observe_upstream_chunk_events(
                         &remaining,
-                        &mut saw_response_completed,
-                        &mut saw_response_failed,
-                        &mut saw_sibling_tool_call_error,
+                        &mut decision.saw_response_completed,
+                        &mut decision.saw_response_failed,
+                        &mut decision.saw_sibling_tool_call_error,
                         &mut event_counters,
                     );
 
                     for output in transformer.transform_event(&remaining) {
-                        if should_drop_duplicate_message_start(
-                            &output,
-                            &mut sent_message_start_to_client,
-                        ) {
-                            continue;
-                        }
-                        if should_suppress_premature_message_stop(
+                        if should_skip_transformed_output(
+                            &mut decision,
                             &output,
                             is_codex_stream_for_task,
-                            saw_response_completed,
-                            saw_response_failed,
+                            &log_tx_clone,
+                            &logger_for_stream,
+                            &request_id_for_stream,
                         ) {
-                            if !logged_premature_stop_suppression {
-                                emit_stream_diag(
-                                    &log_tx_clone,
-                                    &logger_for_stream,
-                                    format!(
-                                        "[Stream] #{} suppress_premature_message_stop=true",
-                                        request_id_for_stream
-                                    ),
-                                );
-                                logged_premature_stop_suppression = true;
-                            }
                             continue;
-                        }
-                        if chunk_is_message_stop(&output) {
-                            saw_message_stop = true;
-                        }
-                        emitted_non_heartbeat_event = true;
-                        if is_business_stream_output(&output) {
-                            emitted_business_event = true;
                         }
                         metrics.mark_downstream_output(&output);
                         event_counters.mark_downstream_chunk(&output);
@@ -4020,44 +3939,22 @@ async fn handle_request(
                 );
                 observe_upstream_chunk_events(
                     &line_buffer,
-                    &mut saw_response_completed,
-                    &mut saw_response_failed,
-                    &mut saw_sibling_tool_call_error,
+                    &mut decision.saw_response_completed,
+                    &mut decision.saw_response_failed,
+                    &mut decision.saw_sibling_tool_call_error,
                     &mut event_counters,
                 );
 
                 for output in transformer.transform_line(&line_buffer) {
-                    if should_drop_duplicate_message_start(
-                        &output,
-                        &mut sent_message_start_to_client,
-                    ) {
-                        continue;
-                    }
-                    if should_suppress_premature_message_stop(
+                    if should_skip_transformed_output(
+                        &mut decision,
                         &output,
                         is_codex_stream_for_task,
-                        saw_response_completed,
-                        saw_response_failed,
+                        &log_tx_clone,
+                        &logger_for_stream,
+                        &request_id_for_stream,
                     ) {
-                        if !logged_premature_stop_suppression {
-                            emit_stream_diag(
-                                &log_tx_clone,
-                                &logger_for_stream,
-                                format!(
-                                    "[Stream] #{} suppress_premature_message_stop=true",
-                                    request_id_for_stream
-                                ),
-                            );
-                            logged_premature_stop_suppression = true;
-                        }
                         continue;
-                    }
-                    if chunk_is_message_stop(&output) {
-                        saw_message_stop = true;
-                    }
-                    emitted_non_heartbeat_event = true;
-                    if is_business_stream_output(&output) {
-                        emitted_business_event = true;
                     }
                     metrics.mark_downstream_output(&output);
                     event_counters.mark_downstream_chunk(&output);
@@ -4082,15 +3979,11 @@ async fn handle_request(
                 }
             }
 
-            let sibling_tool_error_retry_allowed = saw_response_failed
-                && saw_sibling_tool_call_error
-                && !saw_message_stop
-                && !emitted_business_event
-                && !sibling_tool_error_retry_attempted
-                && serial_fallback_upstream_body_for_stream.is_some();
+            let sibling_tool_error_retry_allowed = decision
+                .allow_sibling_tool_retry(serial_fallback_upstream_body_for_stream.is_some());
 
             if sibling_tool_error_retry_allowed {
-                sibling_tool_error_retry_attempted = true;
+                decision.sibling_tool_error_retry_attempted = true;
                 active_upstream_body_for_stream = serial_fallback_upstream_body_for_stream
                     .as_ref()
                     .cloned()
@@ -4137,15 +4030,10 @@ async fn handle_request(
                                 .create_response_transformer(&model_for_stream);
                             line_buffer.clear();
                             frame_parser = SseFrameParser::default();
-                            saw_response_completed = false;
-                            saw_response_failed = false;
-                            saw_sibling_tool_call_error = false;
-                            saw_message_stop = false;
-                            emitted_non_heartbeat_event = false;
-                            emitted_business_event = false;
+                            decision.on_retry_success_reset();
+                            decision.emitted_non_heartbeat_event = false;
+                            decision.emitted_business_event = false;
                             last_upstream_activity = Instant::now();
-                            stall_detected_logged = false;
-                            stall_retry_skipped_logged = false;
                             continue 'stream_attempt;
                         }
 
@@ -4172,18 +4060,12 @@ async fn handle_request(
                 }
             }
 
-            let stream_incomplete = !saw_response_completed;
-            let incomplete_retry_allowed = stream_incomplete
-                && !saw_response_failed
-                && !saw_message_stop
-                && stream_opts_for_task.enable_incomplete_stream_retry
-                && stream_opts_for_task.incomplete_stream_retry_max_attempts > 0
-                && incomplete_stream_retry_attempts
-                    < stream_opts_for_task.incomplete_stream_retry_max_attempts;
+            let stream_incomplete = !decision.saw_response_completed;
+            let incomplete_retry_allowed = decision.allow_incomplete_retry(stream_opts_for_task);
 
             if incomplete_retry_allowed {
-                incomplete_stream_retry_attempts += 1;
-                if emitted_business_event {
+                decision.incomplete_stream_retry_attempts += 1;
+                if decision.emitted_business_event {
                     emit_stream_diag(
                         &log_tx_clone,
                         &logger_for_stream,
@@ -4199,7 +4081,7 @@ async fn handle_request(
                     format!(
                         "[Stream] #{} incomplete_stream_retry_started attempt={}/{}",
                         request_id_for_stream,
-                        incomplete_stream_retry_attempts,
+                        decision.incomplete_stream_retry_attempts,
                         stream_opts_for_task.incomplete_stream_retry_max_attempts
                     ),
                 );
@@ -4231,18 +4113,13 @@ async fn handle_request(
                                     request_id_for_stream, retry_status
                                 ),
                             );
-                            incomplete_stream_retry_succeeded = true;
+                            decision.incomplete_stream_retry_succeeded = true;
                             current_upstream_status = retry_status;
                             stream = retry_response.bytes_stream();
                             line_buffer.clear();
                             frame_parser = SseFrameParser::default();
-                            saw_response_completed = false;
-                            saw_response_failed = false;
-                            saw_sibling_tool_call_error = false;
-                            saw_message_stop = false;
+                            decision.on_retry_success_reset();
                             last_upstream_activity = Instant::now();
-                            stall_detected_logged = false;
-                            stall_retry_skipped_logged = false;
                             continue 'stream_attempt;
                         }
 
@@ -4267,20 +4144,8 @@ async fn handle_request(
                         );
                     }
                 }
-            } else if stream_incomplete && !saw_message_stop {
-                let reason = if !stream_opts_for_task.enable_incomplete_stream_retry {
-                    "disabled"
-                } else if stream_opts_for_task.incomplete_stream_retry_max_attempts == 0 {
-                    "max_attempts_zero"
-                } else if incomplete_stream_retry_attempts
-                    >= stream_opts_for_task.incomplete_stream_retry_max_attempts
-                {
-                    "attempts_exhausted"
-                } else if saw_response_failed {
-                    "response_failed_seen"
-                } else {
-                    "guard_blocked"
-                };
+            } else if stream_incomplete && !decision.saw_message_stop {
+                let reason = decision.incomplete_retry_skip_reason(stream_opts_for_task);
                 emit_stream_diag(
                     &log_tx_clone,
                     &logger_for_stream,
@@ -4291,24 +4156,17 @@ async fn handle_request(
                 );
             }
 
-            let empty_retry_allowed = saw_response_completed
-                && !saw_response_failed
-                && !emitted_business_event
-                && !saw_message_stop
-                && stream_opts_for_task.enable_empty_completion_retry
-                && stream_opts_for_task.empty_completion_retry_max_attempts > 0
-                && empty_completion_retry_attempts
-                    < stream_opts_for_task.empty_completion_retry_max_attempts;
+            let empty_retry_allowed = decision.allow_empty_completion_retry(stream_opts_for_task);
 
             if empty_retry_allowed {
-                empty_completion_retry_attempts += 1;
+                decision.empty_completion_retry_attempts += 1;
                 emit_stream_diag(
                     &log_tx_clone,
                     &logger_for_stream,
                     format!(
                         "[Stream] #{} empty_completion_retry_started attempt={}/{}",
                         request_id_for_stream,
-                        empty_completion_retry_attempts,
+                        decision.empty_completion_retry_attempts,
                         stream_opts_for_task.empty_completion_retry_max_attempts
                     ),
                 );
@@ -4340,18 +4198,13 @@ async fn handle_request(
                                     request_id_for_stream, retry_status
                                 ),
                             );
-                            empty_completion_retry_succeeded = true;
+                            decision.empty_completion_retry_succeeded = true;
                             current_upstream_status = retry_status;
                             stream = retry_response.bytes_stream();
                             line_buffer.clear();
                             frame_parser = SseFrameParser::default();
-                            saw_response_completed = false;
-                            saw_response_failed = false;
-                            saw_sibling_tool_call_error = false;
-                            saw_message_stop = false;
+                            decision.on_retry_success_reset();
                             last_upstream_activity = Instant::now();
-                            stall_detected_logged = false;
-                            stall_retry_skipped_logged = false;
                             continue 'stream_attempt;
                         }
 
@@ -4376,18 +4229,11 @@ async fn handle_request(
                         );
                     }
                 }
-            } else if saw_response_completed && !emitted_business_event && !saw_message_stop {
-                let reason = if !stream_opts_for_task.enable_empty_completion_retry {
-                    "disabled"
-                } else if stream_opts_for_task.empty_completion_retry_max_attempts == 0 {
-                    "max_attempts_zero"
-                } else if empty_completion_retry_attempts
-                    >= stream_opts_for_task.empty_completion_retry_max_attempts
-                {
-                    "attempts_exhausted"
-                } else {
-                    "guard_blocked"
-                };
+            } else if decision.saw_response_completed
+                && !decision.emitted_business_event
+                && !decision.saw_message_stop
+            {
+                let reason = decision.empty_completion_retry_skip_reason(stream_opts_for_task);
                 emit_stream_diag(
                     &log_tx_clone,
                     &logger_for_stream,
@@ -4401,40 +4247,36 @@ async fn handle_request(
             break 'stream_attempt;
         }
 
-        if empty_completion_retry_attempts > 0 {
+        if decision.empty_completion_retry_attempts > 0 {
             emit_stream_diag(
                 &log_tx_clone,
                 &logger_for_stream,
                 format!(
                     "[Stream] #{} empty_completion_retry_hits={} success={}",
                     request_id_for_stream,
-                    empty_completion_retry_attempts,
-                    empty_completion_retry_succeeded
+                    decision.empty_completion_retry_attempts,
+                    decision.empty_completion_retry_succeeded
                 ),
             );
         }
 
-        if incomplete_stream_retry_attempts > 0 {
+        if decision.incomplete_stream_retry_attempts > 0 {
             emit_stream_diag(
                 &log_tx_clone,
                 &logger_for_stream,
                 format!(
                     "[Stream] #{} incomplete_stream_retry_hits={} success={}",
                     request_id_for_stream,
-                    incomplete_stream_retry_attempts,
-                    incomplete_stream_retry_succeeded
+                    decision.incomplete_stream_retry_attempts,
+                    decision.incomplete_stream_retry_succeeded
                 ),
             );
         }
 
-        let should_emit_empty_notice = saw_response_completed
-            && !saw_response_failed
-            && !emitted_business_event
-            && !saw_message_stop
-            && !empty_completion_retry_succeeded;
+        let should_emit_empty_notice = decision.should_emit_empty_notice();
 
-        if saw_response_failed && !saw_message_stop {
-            fallback_completion_injected = true;
+        if decision.saw_response_failed && !decision.saw_message_stop {
+            decision.fallback_completion_injected = true;
             emit_stream_diag(
                 &log_tx_clone,
                 &logger_for_stream,
@@ -4444,8 +4286,8 @@ async fn handle_request(
                 ),
             );
 
-            let fallback_error_message = if saw_sibling_tool_call_error {
-                if sibling_tool_error_retry_attempted {
+            let fallback_error_message = if decision.saw_sibling_tool_call_error {
+                if decision.sibling_tool_error_retry_attempted {
                     "上游返回 response.failed（Sibling tool call errored），已自动降级串行重试 1 次仍失败，请直接重试。"
                 } else {
                     "上游返回 response.failed（Sibling tool call errored），建议直接重试；若持续失败，可暂时降低并行工具调用。"
@@ -4505,11 +4347,11 @@ async fn handle_request(
                 );
                 return;
             }
-            saw_message_stop = true;
+            decision.saw_message_stop = true;
         }
 
         if should_emit_empty_notice {
-            emitted_empty_completion_fallback_notice = true;
+            decision.emitted_empty_completion_fallback_notice = true;
             emit_stream_diag(
                 &log_tx_clone,
                 &logger_for_stream,
@@ -4526,14 +4368,17 @@ async fn handle_request(
                 })
             );
             for output in transformer.transform_event(&synthetic_notice_delta) {
-                if should_drop_duplicate_message_start(&output, &mut sent_message_start_to_client) {
+                if should_drop_duplicate_message_start(
+                    &output,
+                    &mut decision.sent_message_start_to_client,
+                ) {
                     continue;
                 }
                 if chunk_is_message_stop(&output) {
-                    saw_message_stop = true;
+                    decision.saw_message_stop = true;
                 }
                 if is_business_stream_output(&output) {
-                    emitted_business_event = true;
+                    decision.emitted_business_event = true;
                 }
                 metrics.mark_downstream_output(&output);
                 event_counters.mark_downstream_chunk(&output);
@@ -4558,10 +4403,10 @@ async fn handle_request(
             }
         }
 
-        if !saw_message_stop {
-            fallback_completion_injected = true;
+        if !decision.saw_message_stop {
+            decision.fallback_completion_injected = true;
 
-            if saw_response_completed {
+            if decision.saw_response_completed {
                 let _ = log_tx_clone.send(format!(
                     "[Warning] #{} Upstream stream ended without message_stop; injecting fallback completion",
                     request_id_for_stream
@@ -4588,12 +4433,12 @@ async fn handle_request(
                 for output in fallback_outputs {
                     if should_drop_duplicate_message_start(
                         &output,
-                        &mut sent_message_start_to_client,
+                        &mut decision.sent_message_start_to_client,
                     ) {
                         continue;
                     }
                     if chunk_is_message_stop(&output) {
-                        saw_message_stop = true;
+                        decision.saw_message_stop = true;
                     }
                     metrics.mark_downstream_output(&output);
                     event_counters.mark_downstream_chunk(&output);
@@ -4676,28 +4521,18 @@ async fn handle_request(
                     );
                     return;
                 }
-                saw_message_stop = true;
-                stream_close_cause = Some("upstream_incomplete_before_completed");
+                decision.saw_message_stop = true;
+                decision.stream_close_cause = Some("upstream_incomplete_before_completed");
             }
         }
 
         let close_cause = derive_stream_close_cause(
-            stream_close_cause,
-            saw_response_completed,
-            saw_response_failed,
-            saw_message_stop,
+            decision.stream_close_cause,
+            decision.saw_response_completed,
+            decision.saw_response_failed,
+            decision.saw_message_stop,
         );
-        let stream_outcome = if !saw_response_completed {
-            if saw_response_failed {
-                "failed"
-            } else {
-                "incomplete"
-            }
-        } else if !emitted_business_event {
-            "empty_completed"
-        } else {
-            "success"
-        };
+        let stream_outcome = decision.stream_outcome();
         emit_stream_diag(
             &log_tx_clone,
             &logger_for_stream,
@@ -4705,11 +4540,11 @@ async fn handle_request(
                 "[Stream] #{} stream_outcome={} saw_response_completed={} saw_response_failed={} saw_message_stop={} emitted_business_event={} final_fallback_emitted={}",
                 request_id_for_stream,
                 stream_outcome,
-                saw_response_completed,
-                saw_response_failed,
-                saw_message_stop,
-                emitted_business_event,
-                emitted_empty_completion_fallback_notice || fallback_completion_injected
+                decision.saw_response_completed,
+                decision.saw_response_failed,
+                decision.saw_message_stop,
+                decision.emitted_business_event,
+                decision.emitted_empty_completion_fallback_notice || decision.fallback_completion_injected
             ),
         );
         if stream_opts_for_task.enable_stream_event_metrics {
@@ -4720,15 +4555,16 @@ async fn handle_request(
                 &close_cause,
                 &event_counters,
                 &metrics,
-                saw_response_completed,
-                saw_response_failed,
-                saw_message_stop,
-                emitted_business_event,
-                emitted_empty_completion_fallback_notice || fallback_completion_injected,
-                empty_completion_retry_attempts,
-                empty_completion_retry_succeeded,
-                incomplete_stream_retry_attempts,
-                incomplete_stream_retry_succeeded,
+                decision.saw_response_completed,
+                decision.saw_response_failed,
+                decision.saw_message_stop,
+                decision.emitted_business_event,
+                decision.emitted_empty_completion_fallback_notice
+                    || decision.fallback_completion_injected,
+                decision.empty_completion_retry_attempts,
+                decision.empty_completion_retry_succeeded,
+                decision.incomplete_stream_retry_attempts,
+                decision.incomplete_stream_retry_succeeded,
             );
         }
 
