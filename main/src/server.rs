@@ -560,6 +560,31 @@ fn emit_stream_diag(
     }
 }
 
+async fn try_send_keep_alive(
+    tx: &tokio::sync::mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+    log_tx: &broadcast::Sender<String>,
+    request_id: &str,
+    metrics: &mut StreamMetrics,
+    enable_stream_metrics: bool,
+    disconnect_context: &str,
+) -> bool {
+    let keep_alive = ": keep-alive\n\n";
+    if tx
+        .send(Ok(Frame::data(Bytes::from(keep_alive))))
+        .await
+        .is_err()
+    {
+        let _ = log_tx.send(format!(
+            "[Warning] #{} Client disconnected while {}",
+            request_id, disconnect_context
+        ));
+        metrics.emit(log_tx, request_id, enable_stream_metrics);
+        return false;
+    }
+    metrics.mark_downstream_output(keep_alive);
+    true
+}
+
 fn drain_complete_lines(buffer: &mut String) -> Vec<String> {
     let mut lines = Vec::new();
     while let Some(pos) = buffer.find('\n') {
@@ -656,7 +681,10 @@ fn upstream_chunk_contains_event(chunk: &str, target_event_type: &str) -> bool {
     false
 }
 
-fn should_drop_duplicate_message_start(output: &str, sent_message_start_to_client: &mut bool) -> bool {
+fn should_drop_duplicate_message_start(
+    output: &str,
+    sent_message_start_to_client: &mut bool,
+) -> bool {
     if !output.contains("event: message_start") {
         return false;
     }
@@ -3009,6 +3037,7 @@ async fn handle_request(
         let heartbeat_interval =
             Duration::from_millis(stream_opts_for_task.stream_heartbeat_interval_ms.max(500));
         let mut last_upstream_activity = Instant::now();
+        let mut last_downstream_activity = Instant::now();
         let mut current_upstream_status = upstream_status;
         let mut saw_response_completed = false;
         let mut saw_response_failed = false;
@@ -3045,6 +3074,7 @@ async fn handle_request(
 
                             if stream_opts_for_task.enable_sse_frame_parser {
                                 for frame in frame_parser.push_chunk(&chunk_text) {
+                                    let mut emitted_output_for_frame = false;
                                     maybe_log_stream_upstream(
                                         &logger_for_stream,
                                         current_upstream_status,
@@ -3096,11 +3126,33 @@ async fn handle_request(
                                             );
                                             return;
                                         }
+                                        last_downstream_activity = Instant::now();
+                                        emitted_output_for_frame = true;
+                                    }
+
+                                    if stream_opts_for_task.enable_stream_heartbeat
+                                        && !emitted_output_for_frame
+                                        && last_downstream_activity.elapsed() >= heartbeat_interval
+                                    {
+                                        if !try_send_keep_alive(
+                                            &tx,
+                                            &log_tx_clone,
+                                            &request_id_for_stream,
+                                            &mut metrics,
+                                            stream_opts_for_task.enable_stream_metrics,
+                                            "sending keepalive during upstream-only events",
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                        last_downstream_activity = Instant::now();
                                     }
                                 }
                             } else {
                                 line_buffer.push_str(&chunk_text);
                                 for line in drain_complete_lines(&mut line_buffer) {
+                                    let mut emitted_output_for_line = false;
                                     maybe_log_stream_upstream(
                                         &logger_for_stream,
                                         current_upstream_status,
@@ -3152,6 +3204,27 @@ async fn handle_request(
                                             );
                                             return;
                                         }
+                                        last_downstream_activity = Instant::now();
+                                        emitted_output_for_line = true;
+                                    }
+
+                                    if stream_opts_for_task.enable_stream_heartbeat
+                                        && !emitted_output_for_line
+                                        && last_downstream_activity.elapsed() >= heartbeat_interval
+                                    {
+                                        if !try_send_keep_alive(
+                                            &tx,
+                                            &log_tx_clone,
+                                            &request_id_for_stream,
+                                            &mut metrics,
+                                            stream_opts_for_task.enable_stream_metrics,
+                                            "sending keepalive during upstream-only events",
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                        last_downstream_activity = Instant::now();
                                     }
                                 }
                             }
@@ -3292,23 +3365,19 @@ async fn handle_request(
                                 }
                             }
 
-                            if tx
-                                .send(Ok(Frame::data(Bytes::from(": keep-alive\n\n"))))
-                                .await
-                                .is_err()
+                            if !try_send_keep_alive(
+                                &tx,
+                                &log_tx_clone,
+                                &request_id_for_stream,
+                                &mut metrics,
+                                stream_opts_for_task.enable_stream_metrics,
+                                "sending heartbeat",
+                            )
+                            .await
                             {
-                                let _ = log_tx_clone.send(format!(
-                                    "[Warning] #{} Client disconnected while sending heartbeat",
-                                    request_id_for_stream
-                                ));
-                                metrics.emit(
-                                    &log_tx_clone,
-                                    &request_id_for_stream,
-                                    stream_opts_for_task.enable_stream_metrics,
-                                );
                                 return;
                             }
-                            metrics.mark_downstream_output(": keep-alive\n\n");
+                            last_downstream_activity = Instant::now();
                             continue;
                         }
 
@@ -3718,7 +3787,11 @@ async fn handle_request(
                 "event: message_stop\ndata: {}\n\n",
                 json!({ "type": "message_stop" })
             );
-            if tx.send(Ok(Frame::data(Bytes::from(stop_event)))).await.is_err() {
+            if tx
+                .send(Ok(Frame::data(Bytes::from(stop_event))))
+                .await
+                .is_err()
+            {
                 let _ = log_tx_clone.send(format!(
                     "[Warning] #{} Client disconnected while sending response.failed fallback stop",
                     request_id_for_stream

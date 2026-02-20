@@ -502,6 +502,7 @@ pub struct TransformResponse {
     model: String,
     content_index: usize,
     open_text_index: Option<usize>,
+    open_thinking_index: Option<usize>,
     open_tool_index: Option<usize>,
     tool_call_id: Option<String>,
     tool_name: Option<String>,
@@ -619,6 +620,7 @@ impl TransformResponse {
             model: model.to_string(),
             content_index: 0,
             open_text_index: None,
+            open_thinking_index: None,
             open_tool_index: None,
             tool_call_id: None,
             tool_name: None,
@@ -639,6 +641,56 @@ impl TransformResponse {
             output.push(format!(
                 "event: content_block_stop\ndata: {}\n\n",
                 json!({ "type": "content_block_stop", "index": idx })
+            ));
+        }
+    }
+
+    fn close_open_thinking_block(&mut self, output: &mut Vec<String>) {
+        if let Some(idx) = self.open_thinking_index.take() {
+            output.push(format!(
+                "event: content_block_stop\ndata: {}\n\n",
+                json!({ "type": "content_block_stop", "index": idx })
+            ));
+        }
+    }
+
+    fn open_thinking_block_if_needed(&mut self, output: &mut Vec<String>) {
+        if self.open_tool_index.is_some() {
+            return;
+        }
+
+        if self.open_thinking_index.is_some() {
+            return;
+        }
+
+        self.close_open_text_block(output);
+
+        let idx = self.content_index;
+        self.content_index += 1;
+        self.open_thinking_index = Some(idx);
+        output.push(format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": { "type": "thinking", "thinking": "" }
+            })
+        ));
+    }
+
+    fn emit_thinking_delta(&self, output: &mut Vec<String>, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+
+        if let Some(idx) = self.open_thinking_index {
+            output.push(format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": { "type": "thinking_delta", "thinking": delta }
+                })
             ));
         }
     }
@@ -932,8 +984,9 @@ impl TransformResponse {
         // 检查是否是泄漏的工具调用
         if let Some(calls) = Self::parse_leaked_tool_line(pending_for_tool_parse) {
             if calls.is_empty() {
-                self.logger
-                    .log_raw("[Warn] Dropping leaked multi_tool_use.parallel with no valid tool_uses");
+                self.logger.log_raw(
+                    "[Warn] Dropping leaked multi_tool_use.parallel with no valid tool_uses",
+                );
                 return;
             }
             // 关闭文本块（如果有）
@@ -944,8 +997,9 @@ impl TransformResponse {
 
         // 疑似泄漏但解析失败时，不回落到可见文本，避免把 tool 片段/乱码暴露给客户端。
         if Self::starts_with_leaked_tool_marker(pending_for_tool_parse) {
-            self.logger
-                .log_raw("[Warn] Dropping unparsable leaked tool marker fragment from visible text");
+            self.logger.log_raw(
+                "[Warn] Dropping unparsable leaked tool marker fragment from visible text",
+            );
             return;
         }
 
@@ -991,12 +1045,14 @@ impl TransformResponse {
         match event_type {
             // 纯文本输出 - 严格控制，只在非工具场景下开启文本块
             "response.output_text.delta" => {
+                self.close_open_thinking_block(&mut output);
                 let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
                 self.handle_text_fragment(&mut output, delta, true);
             }
 
             // 新版事件：内容分片直接挂在 content_part.added
             "response.content_part.added" => {
+                self.close_open_thinking_block(&mut output);
                 if let Some(text) = Self::extract_content_part_text(&data) {
                     self.handle_text_fragment(&mut output, text, true);
                 }
@@ -1020,10 +1076,42 @@ impl TransformResponse {
                 }
             }
 
+            // 推理摘要分片：映射为 Anthropic thinking 增量事件，避免长阶段无可见流输出
+            "response.reasoning_summary_part.added" => {
+                self.flush_text_carryover(&mut output);
+                self.flush_pending_tool_text(&mut output);
+                self.close_open_thinking_block(&mut output);
+                self.open_thinking_block_if_needed(&mut output);
+            }
+
+            "response.reasoning_summary_text.delta" => {
+                self.flush_text_carryover(&mut output);
+                self.flush_pending_tool_text(&mut output);
+                self.open_thinking_block_if_needed(&mut output);
+                let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                self.emit_thinking_delta(&mut output, delta);
+            }
+
+            "response.reasoning_summary_text.done" => {
+                self.flush_text_carryover(&mut output);
+                self.flush_pending_tool_text(&mut output);
+                if let Some(done_text) = data.get("text").and_then(|t| t.as_str()) {
+                    self.open_thinking_block_if_needed(&mut output);
+                    self.emit_thinking_delta(&mut output, done_text);
+                }
+            }
+
+            "response.reasoning_summary_part.done" => {
+                self.flush_text_carryover(&mut output);
+                self.flush_pending_tool_text(&mut output);
+                self.close_open_thinking_block(&mut output);
+            }
+
             // 工具调用开始 - 严格按照 OpenAI Responses 格式解析
             "response.output_item.added" => {
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
+                self.close_open_thinking_block(&mut output);
                 if let Some(item) = data.get("item") {
                     if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
                         // 关闭文本块（如果有）
@@ -1075,6 +1163,7 @@ impl TransformResponse {
             "response.output_item.done" => {
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
+                self.close_open_thinking_block(&mut output);
                 if let Some(idx) = self.open_tool_index.take() {
                     output.push(format!(
                         "event: content_block_stop\ndata: {}\n\n",
@@ -1093,6 +1182,12 @@ impl TransformResponse {
 
                 // 关闭所有打开的块
                 if let Some(idx) = self.open_text_index.take() {
+                    output.push(format!(
+                        "event: content_block_stop\ndata: {}\n\n",
+                        json!({ "type": "content_block_stop", "index": idx })
+                    ));
+                }
+                if let Some(idx) = self.open_thinking_index.take() {
                     output.push(format!(
                         "event: content_block_stop\ndata: {}\n\n",
                         json!({ "type": "content_block_stop", "index": idx })
@@ -1841,8 +1936,7 @@ mod tests {
         let joined = format!("{}{}", events_1.join(""), events_2.join(""));
 
         assert!(
-            joined.contains("\"type\":\"text_delta\"")
-                && joined.contains("\"text\":\"先做这个 \""),
+            joined.contains("\"type\":\"text_delta\"") && joined.contains("\"text\":\"先做这个 \""),
             "prefix text should remain visible even when marker is split across chunks"
         );
         assert!(
@@ -1916,6 +2010,170 @@ mod tests {
         assert!(
             !joined.contains("\"type\":\"tool_use\""),
             "plain content_part text must not be promoted to tool_use"
+        );
+    }
+
+    #[test]
+    fn test_reasoning_summary_events_are_mapped_to_thinking_deltas() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line_part_added = format!(
+            "data: {}",
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "summary_index": 0
+            })
+        );
+        let line_delta_1 = format!(
+            "data: {}",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "summary_index": 0,
+                "delta": "先分析上下文。"
+            })
+        );
+        let line_delta_2 = format!(
+            "data: {}",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "summary_index": 0,
+                "delta": "再给结论。"
+            })
+        );
+        let line_part_done = format!(
+            "data: {}",
+            json!({
+                "type": "response.reasoning_summary_part.done",
+                "summary_index": 0
+            })
+        );
+
+        let joined = format!(
+            "{}{}{}{}",
+            transformer.transform_sse_line(&line_part_added).join(""),
+            transformer.transform_sse_line(&line_delta_1).join(""),
+            transformer.transform_sse_line(&line_delta_2).join(""),
+            transformer.transform_sse_line(&line_part_done).join("")
+        );
+
+        let has_thinking_block_payload = joined
+            .contains("\"content_block\":{\"thinking\":\"\",\"type\":\"thinking\"}")
+            || joined.contains("\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}");
+        assert!(
+            joined.contains("\"content_block_start\"") && has_thinking_block_payload,
+            "reasoning summary should open a thinking block"
+        );
+        assert!(
+            joined.contains("\"type\":\"thinking_delta\"")
+                && joined.contains("\"thinking\":\"先分析上下文。\"")
+                && joined.contains("\"thinking\":\"再给结论。\""),
+            "reasoning summary deltas should be mapped to thinking_delta"
+        );
+        assert!(
+            joined.contains("\"type\":\"content_block_stop\""),
+            "reasoning summary part.done should close the thinking block"
+        );
+    }
+
+    #[test]
+    fn test_reasoning_summary_block_closes_before_output_text() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line_part_added = format!(
+            "data: {}",
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "summary_index": 0
+            })
+        );
+        let line_reasoning_delta = format!(
+            "data: {}",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "summary_index": 0,
+                "delta": "推理中"
+            })
+        );
+        let line_text_delta = format!(
+            "data: {}",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "最终答案"
+            })
+        );
+
+        let joined = format!(
+            "{}{}{}",
+            transformer.transform_sse_line(&line_part_added).join(""),
+            transformer
+                .transform_sse_line(&line_reasoning_delta)
+                .join(""),
+            transformer.transform_sse_line(&line_text_delta).join("")
+        );
+
+        let pos_thinking_delta = joined
+            .find("\"type\":\"thinking_delta\"")
+            .expect("thinking_delta should exist");
+        let pos_block_stop = joined[pos_thinking_delta..]
+            .find("\"type\":\"content_block_stop\"")
+            .map(|pos| pos + pos_thinking_delta)
+            .expect("thinking block should be closed before switching to text");
+        let pos_text_delta = joined
+            .find("\"type\":\"text_delta\"")
+            .expect("text_delta should exist");
+        assert!(
+            pos_block_stop < pos_text_delta,
+            "thinking block must close before text delta is emitted"
+        );
+        assert!(
+            joined.contains("\"text\":\"最终答案\""),
+            "final answer text should still stream as text_delta"
+        );
+    }
+
+    #[test]
+    fn test_response_completed_closes_open_thinking_block() {
+        let mut transformer = TransformResponse::new("gpt-5.3-codex");
+        let line_part_added = format!(
+            "data: {}",
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "summary_index": 0
+            })
+        );
+        let line_reasoning_delta = format!(
+            "data: {}",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "summary_index": 0,
+                "delta": "仍在推理"
+            })
+        );
+        let line_completed = format!(
+            "data: {}",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": { "input_tokens": 10, "output_tokens": 20 }
+                }
+            })
+        );
+
+        let joined = format!(
+            "{}{}{}",
+            transformer.transform_sse_line(&line_part_added).join(""),
+            transformer
+                .transform_sse_line(&line_reasoning_delta)
+                .join(""),
+            transformer.transform_sse_line(&line_completed).join("")
+        );
+        assert!(
+            joined.contains("\"type\":\"content_block_stop\""),
+            "response.completed should close any open thinking block"
+        );
+        assert!(
+            joined.contains("\"type\":\"message_delta\"")
+                && joined.contains("\"type\":\"message_stop\""),
+            "response.completed should still emit message_delta + message_stop"
         );
     }
 
