@@ -269,3 +269,73 @@ fn test_codex_input_all_function_call_names_match_pattern() {
         );
     }
 }
+
+#[test]
+fn test_codex_request_without_tools_uses_none_tool_choice_and_empty_tools() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }])),
+        }],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    let tools = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .expect("tools should be an array");
+    assert!(tools.is_empty(), "tools should stay empty when request has no tools");
+    assert_eq!(
+        body.get("tool_choice").and_then(|v| v.as_str()),
+        Some("none"),
+        "tool_choice should be none when tools are empty"
+    );
+}
+
+#[test]
+fn test_codex_request_does_not_inject_template_input() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "say hi".to_string(),
+            }])),
+        }],
+        system: None,
+        stream: true,
+        tools: Some(vec![]),
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+    let serialized = serde_json::to_string(input).expect("input should serialize");
+
+    assert!(
+        !serialized.contains("name: engineer-professional"),
+        "legacy codex-request template content must not be injected"
+    );
+}

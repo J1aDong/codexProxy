@@ -107,8 +107,8 @@ impl TransformRequest {
         let (chat_messages, extracted_skills) =
             MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
 
-        // 构建 input 数组
-        let mut final_input: Vec<Value> = vec![Self::build_template_input()];
+        // 构建 input 数组（只包含当前请求上下文，不注入静态模板文件）
+        let mut final_input: Vec<Value> = Vec::new();
 
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
@@ -307,30 +307,6 @@ impl TransformRequest {
         }
     }
 
-    fn build_template_input() -> Value {
-        // 从 codex-request.json 读取完整的模板，与 JavaScript 版本保持一致
-        let template_path = std::path::Path::new("codex-request.json");
-        if let Ok(template_content) = std::fs::read_to_string(template_path) {
-            if let Ok(template) = serde_json::from_str::<Value>(&template_content) {
-                if let Some(input) = template.get("input").and_then(|i| i.as_array()) {
-                    if let Some(first_input) = input.first() {
-                        return first_input.clone();
-                    }
-                }
-            }
-        }
-
-        // 如果无法读取模板，使用备用值
-        json!({
-            "type": "message",
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": "# AGENTS.md instructions for /Users/mr.j\n\n<INSTRUCTIONS>\n---\nname: engineer-professional\ndescription: 专业的软件工程师\n---\n</INSTRUCTIONS>"
-            }]
-        })
-    }
-
     fn transform_tools(
         tools: Option<&Vec<Value>>,
         log_tx: Option<&broadcast::Sender<String>>,
@@ -351,13 +327,13 @@ impl TransformRequest {
         };
 
         let Some(tools) = tools else {
-            log("🔧 [Tools] No tools provided, using defaults");
-            return Self::default_tools();
+            log("🔧 [Tools] No tools provided");
+            return Vec::new();
         };
 
         if tools.is_empty() {
-            log("🔧 [Tools] Empty tools array, using defaults");
-            return Self::default_tools();
+            log("🔧 [Tools] Empty tools array");
+            return Vec::new();
         }
 
         log(&format!("🔧 [Tools] Processing {} tools", tools.len()));
@@ -465,33 +441,5 @@ impl TransformRequest {
                 })
             })
             .collect()
-    }
-
-    fn default_tools() -> Vec<Value> {
-        let template_path = std::path::Path::new("codex-request.json");
-        if let Ok(template_content) = std::fs::read_to_string(template_path) {
-            if let Ok(template) = serde_json::from_str::<Value>(&template_content) {
-                if let Some(tools) = template.get("tools").and_then(|t| t.as_array()) {
-                    return tools.clone();
-                }
-            }
-        }
-
-        vec![json!({
-            "type": "function",
-            "name": "shell_command",
-            "description": "Runs a shell command and returns its output.",
-            "strict": false,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell script to execute"
-                    }
-                },
-                "required": ["command"]
-            }
-        })]
     }
 }
