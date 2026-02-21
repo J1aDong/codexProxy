@@ -355,7 +355,11 @@ pub struct ProxyConfig {
     pub reasoning_effort: ReasoningEffortConfig,
     #[serde(rename = "geminiReasoningEffort", default)]
     pub gemini_reasoning_effort: ReasoningEffortConfig,
-    #[serde(rename = "customInjectionPrompt", alias = "skillInjectionPrompt", default)]
+    #[serde(
+        rename = "customInjectionPrompt",
+        alias = "skillInjectionPrompt",
+        default
+    )]
     pub custom_injection_prompt: String,
     #[serde(default = "default_lang")]
     pub lang: String,
@@ -422,15 +426,15 @@ fn default_stream_silence_error_ms() -> u64 {
 }
 
 fn default_enable_stall_retry() -> bool {
-    true
+    false
 }
 
 fn default_stall_timeout_ms() -> u64 {
-    240_000
+    300_000
 }
 
 fn default_stall_retry_max_attempts() -> u32 {
-    5
+    0
 }
 
 fn default_stall_retry_only_heartbeat_phase() -> bool {
@@ -438,11 +442,11 @@ fn default_stall_retry_only_heartbeat_phase() -> bool {
 }
 
 fn default_enable_empty_completion_retry() -> bool {
-    true
+    false
 }
 
 fn default_empty_completion_retry_max_attempts() -> u32 {
-    1
+    0
 }
 
 fn default_enable_incomplete_stream_retry() -> bool {

@@ -114,10 +114,7 @@ struct RuntimeConfigState {
     enable_stream_event_metrics: bool,
     stream_silence_warn_ms: u64,
     stream_silence_error_ms: u64,
-    enable_stall_retry: bool,
     stall_timeout_ms: u64,
-    stall_retry_max_attempts: u32,
-    stall_retry_only_heartbeat_phase: bool,
     enable_empty_completion_retry: bool,
     empty_completion_retry_max_attempts: u32,
     enable_incomplete_stream_retry: bool,
@@ -144,10 +141,7 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             enable_stream_event_metrics: value.enable_stream_event_metrics,
             stream_silence_warn_ms: value.stream_silence_warn_ms,
             stream_silence_error_ms: value.stream_silence_error_ms,
-            enable_stall_retry: value.enable_stall_retry,
             stall_timeout_ms: value.stall_timeout_ms,
-            stall_retry_max_attempts: value.stall_retry_max_attempts,
-            stall_retry_only_heartbeat_phase: value.stall_retry_only_heartbeat_phase,
             enable_empty_completion_retry: value.enable_empty_completion_retry,
             empty_completion_retry_max_attempts: value.empty_completion_retry_max_attempts,
             enable_incomplete_stream_retry: value.enable_incomplete_stream_retry,
@@ -374,10 +368,7 @@ struct StreamRuntimeOptions {
     enable_stream_event_metrics: bool,
     stream_silence_warn_ms: u64,
     stream_silence_error_ms: u64,
-    enable_stall_retry: bool,
     stall_timeout_ms: u64,
-    stall_retry_max_attempts: u32,
-    stall_retry_only_heartbeat_phase: bool,
     enable_empty_completion_retry: bool,
     empty_completion_retry_max_attempts: u32,
     enable_incomplete_stream_retry: bool,
@@ -398,10 +389,7 @@ impl StreamRuntimeOptions {
             enable_stream_event_metrics: state.enable_stream_event_metrics,
             stream_silence_warn_ms: state.stream_silence_warn_ms,
             stream_silence_error_ms: state.stream_silence_error_ms,
-            enable_stall_retry: state.enable_stall_retry,
             stall_timeout_ms: state.stall_timeout_ms,
-            stall_retry_max_attempts: state.stall_retry_max_attempts,
-            stall_retry_only_heartbeat_phase: state.stall_retry_only_heartbeat_phase,
             enable_empty_completion_retry: state.enable_empty_completion_retry,
             empty_completion_retry_max_attempts: state.empty_completion_retry_max_attempts,
             enable_incomplete_stream_retry: state.enable_incomplete_stream_retry,
@@ -1952,12 +1940,12 @@ impl ProxyServer {
             enable_stream_event_metrics: true,
             stream_silence_warn_ms: 20_000,
             stream_silence_error_ms: 90_000,
-            enable_stall_retry: true,
-            stall_timeout_ms: 240_000,
-            stall_retry_max_attempts: 5,
+            enable_stall_retry: false,
+            stall_timeout_ms: 300_000,
+            stall_retry_max_attempts: 0,
             stall_retry_only_heartbeat_phase: false,
-            enable_empty_completion_retry: true,
-            empty_completion_retry_max_attempts: 1,
+            enable_empty_completion_retry: false,
+            empty_completion_retry_max_attempts: 0,
             enable_incomplete_stream_retry: true,
             incomplete_stream_retry_max_attempts: 5,
             load_balancer_runtime: None,
@@ -3508,7 +3496,8 @@ async fn handle_request(
         let mut metrics = StreamMetrics::new(request_started_at_for_stream);
         let mut event_counters = StreamEventCounters::default();
         let hard_timeout = Duration::from_secs(600);
-        let stall_timeout = Duration::from_millis(stream_opts_for_task.stall_timeout_ms.max(1_000));
+        let stream_idle_timeout =
+            Duration::from_millis(stream_opts_for_task.stall_timeout_ms.max(1_000));
         let heartbeat_interval =
             Duration::from_millis(stream_opts_for_task.stream_heartbeat_interval_ms.max(500));
         let silence_warn_threshold =
@@ -3539,8 +3528,6 @@ async fn handle_request(
                             metrics.mark_upstream_chunk();
                             event_counters.mark_upstream_chunk();
                             last_upstream_activity = Instant::now();
-                            decision.stall_detected_logged = false;
-                            decision.stall_retry_skipped_logged = false;
                             silence_warn_logged = false;
                             silence_error_logged = false;
                             let chunk_text = String::from_utf8_lossy(&chunk).to_string();
@@ -3759,96 +3746,19 @@ async fn handle_request(
                                 break;
                             }
 
-                            if silent_elapsed >= stall_timeout {
-                                if !decision.stall_detected_logged {
-                                    let _ = log_tx_clone.send(format!(
-                                        "[Stream] #{} stall_detected silent_ms={} retry_attempts={}/{}",
+                            if silent_elapsed >= stream_idle_timeout {
+                                emit_stream_diag(
+                                    &log_tx_clone,
+                                    &logger_for_stream,
+                                    format!(
+                                        "[Stream] #{} stream_idle_timeout_reached silent_ms={} threshold_ms={}",
                                         request_id_for_stream,
                                         silent_elapsed.as_millis(),
-                                        decision.stall_retry_attempts,
-                                        stream_opts_for_task.stall_retry_max_attempts
-                                    ));
-                                    decision.stall_detected_logged = true;
-                                }
-
-                                let retry_allowed =
-                                    decision.allow_stall_retry(stream_opts_for_task);
-
-                                if retry_allowed {
-                                    decision.stall_retry_attempts += 1;
-                                    let _ = log_tx_clone.send(format!(
-                                        "[Stream] #{} stall_retry_started attempt={}/{} heartbeat_only={}",
-                                        request_id_for_stream,
-                                        decision.stall_retry_attempts,
-                                        stream_opts_for_task.stall_retry_max_attempts,
-                                        stream_opts_for_task.stall_retry_only_heartbeat_phase
-                                    ));
-
-                                    let retry_session_id = Uuid::new_v4().to_string();
-                                    let retry_req = request_backend_for_stream
-                                        .build_upstream_request(
-                                            &http_client_for_stream,
-                                            &upstream_url_for_stream,
-                                            &upstream_api_key_for_stream,
-                                            &active_upstream_body_for_stream,
-                                            &retry_session_id,
-                                            &anthropic_version_for_stream,
-                                        );
-                                    let retry_req =
-                                        if let Some(beta) = anthropic_beta_for_stream.as_ref() {
-                                            retry_req.header("anthropic-beta", beta)
-                                        } else {
-                                            retry_req
-                                        };
-
-                                    match retry_req.send().await {
-                                        Ok(retry_response) => {
-                                            let retry_status = retry_response.status().as_u16();
-                                            if retry_response.status().is_success() {
-                                                let _ = log_tx_clone.send(format!(
-                                                    "[Stream] #{} stall_retry_succeeded status={}",
-                                                    request_id_for_stream, retry_status
-                                                ));
-                                                current_upstream_status = retry_status;
-                                                stream = retry_response.bytes_stream();
-                                                transformer = request_backend_for_stream
-                                                    .create_response_transformer(&model_for_stream);
-                                                line_buffer.clear();
-                                                frame_parser = SseFrameParser::default();
-                                                decision.on_retry_success_reset();
-                                                last_upstream_activity = Instant::now();
-                                                continue;
-                                            }
-
-                                            let retry_error =
-                                                retry_response.text().await.unwrap_or_default();
-                                            let _ = log_tx_clone.send(format!(
-                                                "[Stream] #{} stall_retry_failed status={} body={}",
-                                                request_id_for_stream, retry_status, retry_error
-                                            ));
-                                            decision.stream_close_cause =
-                                                Some("stall_retry_failed");
-                                            break;
-                                        }
-                                        Err(err) => {
-                                            let _ = log_tx_clone.send(format!(
-                                                "[Stream] #{} stall_retry_failed network_error={}",
-                                                request_id_for_stream, err
-                                            ));
-                                            decision.stream_close_cause =
-                                                Some("stall_retry_failed");
-                                            break;
-                                        }
-                                    }
-                                } else if !decision.stall_retry_skipped_logged {
-                                    let reason =
-                                        decision.stall_retry_skip_reason(stream_opts_for_task);
-                                    let _ = log_tx_clone.send(format!(
-                                        "[Stream] #{} stall_retry_skipped reason={}",
-                                        request_id_for_stream, reason
-                                    ));
-                                    decision.stall_retry_skipped_logged = true;
-                                }
+                                        stream_idle_timeout.as_millis()
+                                    ),
+                                );
+                                decision.stream_close_cause = Some("stream_idle_timeout");
+                                break;
                             }
 
                             if !try_send_keep_alive(
@@ -3979,8 +3889,11 @@ async fn handle_request(
                 }
             }
 
-            let sibling_tool_error_retry_allowed = decision
-                .allow_sibling_tool_retry(serial_fallback_upstream_body_for_stream.is_some());
+            // V2 alignment: retry policy is unified and no longer has a separate
+            // sibling-tool fallback branch.
+            let sibling_tool_error_retry_allowed = false
+                && decision
+                    .allow_sibling_tool_retry(serial_fallback_upstream_body_for_stream.is_some());
 
             if sibling_tool_error_retry_allowed {
                 decision.sibling_tool_error_retry_attempted = true;
@@ -4070,7 +3983,7 @@ async fn handle_request(
                         &log_tx_clone,
                         &logger_for_stream,
                         format!(
-                            "[Stream] #{} incomplete_stream_retry_with_partial_output=true",
+                            "[Stream] #{} stream_retry_with_partial_output=true",
                             request_id_for_stream
                         ),
                     );
@@ -4079,7 +3992,7 @@ async fn handle_request(
                     &log_tx_clone,
                     &logger_for_stream,
                     format!(
-                        "[Stream] #{} incomplete_stream_retry_started attempt={}/{}",
+                        "[Stream] #{} stream_retry_started attempt={}/{}",
                         request_id_for_stream,
                         decision.incomplete_stream_retry_attempts,
                         stream_opts_for_task.incomplete_stream_retry_max_attempts
@@ -4109,7 +4022,7 @@ async fn handle_request(
                                 &log_tx_clone,
                                 &logger_for_stream,
                                 format!(
-                                    "[Stream] #{} incomplete_stream_retry_succeeded status={}",
+                                    "[Stream] #{} stream_retry_succeeded status={}",
                                     request_id_for_stream, retry_status
                                 ),
                             );
@@ -4128,7 +4041,7 @@ async fn handle_request(
                             &log_tx_clone,
                             &logger_for_stream,
                             format!(
-                                "[Stream] #{} incomplete_stream_retry_failed status={} body={}",
+                                "[Stream] #{} stream_retry_failed status={} body={}",
                                 request_id_for_stream, retry_status, retry_error
                             ),
                         );
@@ -4138,7 +4051,7 @@ async fn handle_request(
                             &log_tx_clone,
                             &logger_for_stream,
                             format!(
-                                "[Stream] #{} incomplete_stream_retry_failed network_error={}",
+                                "[Stream] #{} stream_retry_failed network_error={}",
                                 request_id_for_stream, err
                             ),
                         );
@@ -4150,13 +4063,15 @@ async fn handle_request(
                     &log_tx_clone,
                     &logger_for_stream,
                     format!(
-                        "[Stream] #{} incomplete_stream_retry_skipped reason={}",
+                        "[Stream] #{} stream_retry_skipped reason={}",
                         request_id_for_stream, reason
                     ),
                 );
             }
 
-            let empty_retry_allowed = decision.allow_empty_completion_retry(stream_opts_for_task);
+            // V2 alignment: remove empty-completion dedicated retry branch.
+            let empty_retry_allowed =
+                false && decision.allow_empty_completion_retry(stream_opts_for_task);
 
             if empty_retry_allowed {
                 decision.empty_completion_retry_attempts += 1;
@@ -4273,7 +4188,7 @@ async fn handle_request(
             );
         }
 
-        let should_emit_empty_notice = decision.should_emit_empty_notice();
+        let should_emit_empty_notice = false && decision.should_emit_empty_notice();
 
         if decision.saw_response_failed && !decision.saw_message_stop {
             decision.fallback_completion_injected = true;
@@ -4407,60 +4322,14 @@ async fn handle_request(
             decision.fallback_completion_injected = true;
 
             if decision.saw_response_completed {
-                let _ = log_tx_clone.send(format!(
-                    "[Warning] #{} Upstream stream ended without message_stop; injecting fallback completion",
-                    request_id_for_stream
-                ));
-                let synthetic_completed = format!(
-                    "event: response.completed\ndata: {}\n\n",
-                    json!({
-                        "type": "response.completed",
-                        "response": {
-                            "status": "completed",
-                            "usage": { "input_tokens": 0, "output_tokens": 0 }
-                        }
-                    })
+                emit_stream_diag(
+                    &log_tx_clone,
+                    &logger_for_stream,
+                    format!(
+                        "[Warning] #{} completed_without_message_stop; emitting interruption error",
+                        request_id_for_stream
+                    ),
                 );
-
-                let mut fallback_outputs = transformer.transform_event(&synthetic_completed);
-                if fallback_outputs.is_empty() {
-                    fallback_outputs.push(format!(
-                        "event: message_stop\ndata: {}\n\n",
-                        json!({ "type": "message_stop" })
-                    ));
-                }
-
-                for output in fallback_outputs {
-                    if should_drop_duplicate_message_start(
-                        &output,
-                        &mut decision.sent_message_start_to_client,
-                    ) {
-                        continue;
-                    }
-                    if chunk_is_message_stop(&output) {
-                        decision.saw_message_stop = true;
-                    }
-                    metrics.mark_downstream_output(&output);
-                    event_counters.mark_downstream_chunk(&output);
-                    maybe_log_stream_downstream(
-                        &logger_for_stream,
-                        &output,
-                        stream_opts_for_task,
-                        &mut downstream_log_counter,
-                    );
-                    if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
-                        let _ = log_tx_clone.send(format!(
-                            "[Warning] #{} Client disconnected during fallback completion",
-                            request_id_for_stream
-                        ));
-                        metrics.emit(
-                            &log_tx_clone,
-                            &request_id_for_stream,
-                            stream_opts_for_task.enable_stream_metrics,
-                        );
-                        return;
-                    }
-                }
             } else {
                 emit_stream_diag(
                     &log_tx_clone,
@@ -4470,60 +4339,60 @@ async fn handle_request(
                         request_id_for_stream
                     ),
                 );
-
-                let interrupted_error = format!(
-                    "event: error\ndata: {}\n\n",
-                    json!({
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": "上游流在 response.completed 前结束，当前结果可能不完整。系统已尝试自动恢复但未成功，请直接重试。"
-                        }
-                    })
-                );
-                metrics.mark_downstream_output(&interrupted_error);
-                event_counters.mark_downstream_chunk(&interrupted_error);
-                if tx
-                    .send(Ok(Frame::data(Bytes::from(interrupted_error))))
-                    .await
-                    .is_err()
-                {
-                    let _ = log_tx_clone.send(format!(
-                        "[Warning] #{} Client disconnected while sending interruption error",
-                        request_id_for_stream
-                    ));
-                    metrics.emit(
-                        &log_tx_clone,
-                        &request_id_for_stream,
-                        stream_opts_for_task.enable_stream_metrics,
-                    );
-                    return;
-                }
-                let stop_event = format!(
-                    "event: message_stop\ndata: {}\n\n",
-                    json!({ "type": "message_stop" })
-                );
-                metrics.mark_downstream_output(&stop_event);
-                event_counters.mark_downstream_chunk(&stop_event);
-                if tx
-                    .send(Ok(Frame::data(Bytes::from(stop_event))))
-                    .await
-                    .is_err()
-                {
-                    let _ = log_tx_clone.send(format!(
-                        "[Warning] #{} Client disconnected while sending interruption stop",
-                        request_id_for_stream
-                    ));
-                    metrics.emit(
-                        &log_tx_clone,
-                        &request_id_for_stream,
-                        stream_opts_for_task.enable_stream_metrics,
-                    );
-                    return;
-                }
-                decision.saw_message_stop = true;
-                decision.stream_close_cause = Some("upstream_incomplete_before_completed");
             }
+
+            let interrupted_error = format!(
+                "event: error\ndata: {}\n\n",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "流式响应未正常收口（缺少 message_stop 或 response.completed 前中断）。系统已自动重试但未恢复，请直接重试。"
+                    }
+                })
+            );
+            metrics.mark_downstream_output(&interrupted_error);
+            event_counters.mark_downstream_chunk(&interrupted_error);
+            if tx
+                .send(Ok(Frame::data(Bytes::from(interrupted_error))))
+                .await
+                .is_err()
+            {
+                let _ = log_tx_clone.send(format!(
+                    "[Warning] #{} Client disconnected while sending interruption error",
+                    request_id_for_stream
+                ));
+                metrics.emit(
+                    &log_tx_clone,
+                    &request_id_for_stream,
+                    stream_opts_for_task.enable_stream_metrics,
+                );
+                return;
+            }
+            let stop_event = format!(
+                "event: message_stop\ndata: {}\n\n",
+                json!({ "type": "message_stop" })
+            );
+            metrics.mark_downstream_output(&stop_event);
+            event_counters.mark_downstream_chunk(&stop_event);
+            if tx
+                .send(Ok(Frame::data(Bytes::from(stop_event))))
+                .await
+                .is_err()
+            {
+                let _ = log_tx_clone.send(format!(
+                    "[Warning] #{} Client disconnected while sending interruption stop",
+                    request_id_for_stream
+                ));
+                metrics.emit(
+                    &log_tx_clone,
+                    &request_id_for_stream,
+                    stream_opts_for_task.enable_stream_metrics,
+                );
+                return;
+            }
+            decision.saw_message_stop = true;
+            decision.stream_close_cause = Some("upstream_incomplete_before_completed");
         }
 
         let close_cause = derive_stream_close_cause(
@@ -4726,10 +4595,7 @@ mod tests {
             enable_stream_event_metrics: true,
             stream_silence_warn_ms: 20_000,
             stream_silence_error_ms: 90_000,
-            enable_stall_retry: true,
             stall_timeout_ms: 60_000,
-            stall_retry_max_attempts: 1,
-            stall_retry_only_heartbeat_phase: true,
             enable_empty_completion_retry: true,
             empty_completion_retry_max_attempts: 1,
             enable_incomplete_stream_retry: true,

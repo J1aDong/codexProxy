@@ -19,9 +19,6 @@ pub(crate) struct StreamDecisionState {
     pub sent_message_start_to_client: bool,
     pub emitted_non_heartbeat_event: bool,
     pub emitted_business_event: bool,
-    pub stall_retry_attempts: u32,
-    pub stall_detected_logged: bool,
-    pub stall_retry_skipped_logged: bool,
     pub empty_completion_retry_attempts: u32,
     pub empty_completion_retry_succeeded: bool,
     pub incomplete_stream_retry_attempts: u32,
@@ -73,37 +70,6 @@ impl StreamDecisionState {
         self.saw_response_failed = false;
         self.saw_sibling_tool_call_error = false;
         self.saw_message_stop = false;
-        self.stall_detected_logged = false;
-        self.stall_retry_skipped_logged = false;
-    }
-
-    pub fn allow_stall_retry(&self, opts: StreamRuntimeOptions) -> bool {
-        let phase_retry_allowed = if opts.stall_retry_only_heartbeat_phase {
-            !self.emitted_non_heartbeat_event
-        } else {
-            !self.emitted_business_event
-        };
-
-        opts.enable_stall_retry
-            && opts.stall_retry_max_attempts > 0
-            && self.stall_retry_attempts < opts.stall_retry_max_attempts
-            && phase_retry_allowed
-    }
-
-    pub fn stall_retry_skip_reason(&self, opts: StreamRuntimeOptions) -> &'static str {
-        if !opts.enable_stall_retry {
-            "disabled"
-        } else if opts.stall_retry_max_attempts == 0 {
-            "max_attempts_zero"
-        } else if self.stall_retry_attempts >= opts.stall_retry_max_attempts {
-            "attempts_exhausted"
-        } else if opts.stall_retry_only_heartbeat_phase && self.emitted_non_heartbeat_event {
-            "non_heartbeat_event_emitted"
-        } else if self.emitted_business_event {
-            "business_event_emitted"
-        } else {
-            "guard_blocked"
-        }
     }
 
     pub fn allow_sibling_tool_retry(&self, has_serial_fallback: bool) -> bool {
@@ -203,10 +169,7 @@ mod tests {
             enable_stream_event_metrics: true,
             stream_silence_warn_ms: 20_000,
             stream_silence_error_ms: 90_000,
-            enable_stall_retry: true,
             stall_timeout_ms: 60_000,
-            stall_retry_max_attempts: 2,
-            stall_retry_only_heartbeat_phase: false,
             enable_empty_completion_retry: true,
             empty_completion_retry_max_attempts: 1,
             enable_incomplete_stream_retry: true,
@@ -247,7 +210,6 @@ mod tests {
     #[test]
     fn guard_methods_reflect_retry_policies() {
         let mut state = StreamDecisionState::default();
-        assert!(state.allow_stall_retry(opts()));
         assert!(state.allow_incomplete_retry(opts()));
         assert!(!state.allow_empty_completion_retry(opts()));
 
@@ -306,8 +268,6 @@ mod tests {
             saw_response_failed: true,
             saw_sibling_tool_call_error: true,
             saw_message_stop: true,
-            stall_detected_logged: true,
-            stall_retry_skipped_logged: true,
             ..Default::default()
         };
 
@@ -317,7 +277,5 @@ mod tests {
         assert!(!state.saw_response_failed);
         assert!(!state.saw_sibling_tool_call_error);
         assert!(!state.saw_message_stop);
-        assert!(!state.stall_detected_logged);
-        assert!(!state.stall_retry_skipped_logged);
     }
 }

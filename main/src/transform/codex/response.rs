@@ -17,80 +17,19 @@ pub struct TransformResponse {
     text_carryover: String,
     pending_tool_text: String,
     accumulated_tool_args: String,
-    
+
     // Markdown Base Interception
     in_markdown_bash: bool,
     markdown_bash_buffer: String,
-    
+
     logger: std::sync::Arc<AppLogger>,
 }
 
 impl TransformResponse {
     const LEAKED_TOOL_MARKERS: [&'static str; 3] =
         ["assistant to=", "to=functions", "to=multi_tool_use"];
-    
-    const MARKDOWN_BASH_MARKERS: [&'static str; 3] = 
-        ["```bash", "```sh", "```shell"];
 
-    // 兼容不同工具命名来源（Anthropic tool 名称 / Codex 泄露文本名称）。
-    // 优先走显式映射，避免语义漂移；未命中时再回退到 `functions.` 前缀剥离。
-    fn leaked_tool_name_compat_alias(name: &str) -> Option<&'static str> {
-        match name {
-            "functions.Write" => Some("Write"),
-            "functions.Edit" => Some("Edit"),
-            "functions.Read" => Some("Read"),
-            "functions.Bash" => Some("Bash"),
-            "functions.Grep" => Some("Grep"),
-            "functions.Glob" => Some("Glob"),
-            "functions.Task" => Some("Task"),
-            "functions.WebSearch" => Some("WebSearch"),
-            "functions.WebFetch" => Some("WebFetch"),
-            "functions.TodoRead" => Some("TodoRead"),
-            "functions.TodoWrite" => Some("TodoWrite"),
-            "functions.apply_patch" => Some("apply_patch"),
-            _ => None,
-        }
-    }
-
-    fn normalize_leaked_tool_name(target: &str) -> String {
-        if let Some(mapped) = Self::leaked_tool_name_compat_alias(target) {
-            return mapped.to_string();
-        }
-
-        target
-            .strip_prefix("functions.")
-            .filter(|name| !name.is_empty())
-            .unwrap_or(target)
-            .to_string()
-    }
-
-    fn extract_leaked_tool_target(line: &str) -> Option<String> {
-        // Prefer explicit assistant leak marker, but also tolerate bare `to=...` leaks.
-        let candidate = if let Some(start) = line.find("assistant to=") {
-            let offset = start + "assistant to=".len();
-            line.get(offset..)?.trim()
-        } else if let Some(start) = line.find("to=") {
-            let offset = start + "to=".len();
-            line.get(offset..)?.trim()
-        } else {
-            return None;
-        };
-
-        let target: String = candidate
-            .chars()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '.' || *ch == '-')
-            .collect();
-
-        if target.is_empty() {
-            return None;
-        }
-
-        if target == "multi_tool_use.parallel" || target.starts_with("functions.") {
-            Some(target)
-        } else {
-            None
-        }
-    }
+    const MARKDOWN_BASH_MARKERS: [&'static str; 3] = ["```bash", "```sh", "```shell"];
 
     fn find_potential_leaked_tool_marker_start(line: &str) -> Option<usize> {
         Self::LEAKED_TOOL_MARKERS
@@ -285,7 +224,7 @@ impl TransformResponse {
 
         if self.in_markdown_bash {
             self.markdown_bash_buffer.push_str(&combined);
-            
+
             // Check if we hit the closing ```
             if self.markdown_bash_buffer.contains("\n```\n")
                 || self.markdown_bash_buffer.ends_with("\n```")
@@ -489,72 +428,6 @@ impl TransformResponse {
         None
     }
 
-    fn parse_leaked_parallel_tool_calls(line: &str) -> Option<Vec<(String, String)>> {
-        let payload_fragment = Self::extract_first_json_object_fragment(line)?;
-        let payload = serde_json::from_str::<Value>(&payload_fragment).ok()?;
-        let tool_uses = payload.get("tool_uses")?.as_array()?;
-
-        let mut calls = Vec::new();
-        for tool_use in tool_uses {
-            let Some(recipient_name) = tool_use.get("recipient_name").and_then(|v| v.as_str())
-            else {
-                continue;
-            };
-
-            let name = Self::normalize_leaked_tool_name(recipient_name);
-            let parameters = tool_use
-                .get("parameters")
-                .cloned()
-                .filter(|v| v.is_object())
-                .unwrap_or_else(|| json!({}));
-            let arguments = serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string());
-            calls.push((name, arguments));
-        }
-
-        Some(calls)
-    }
-
-    fn parse_leaked_tool_line(line: &str) -> Option<Vec<(String, String)>> {
-        if let Some(target) = Self::extract_leaked_tool_target(line) {
-            if target == "multi_tool_use.parallel" {
-                return Self::parse_leaked_parallel_tool_calls(line);
-            }
-
-            let arguments = if line.contains('{') {
-                let candidate = Self::extract_first_json_object_fragment(line)?;
-                if serde_json::from_str::<Value>(&candidate).is_ok() {
-                    candidate
-                } else {
-                    return None;
-                }
-            } else {
-                "{}".to_string()
-            };
-
-            let name = Self::normalize_leaked_tool_name(&target);
-            return Some(vec![(name, arguments)]);
-        }
-
-        Self::parse_leaked_parallel_tool_calls(line)
-    }
-
-    fn emit_leaked_tool_calls(&mut self, output: &mut Vec<String>, calls: Vec<(String, String)>) {
-        for (idx, (name, arguments)) in calls.into_iter().enumerate() {
-            let call_id = format!("tool_{}_{}", chrono::Utc::now().timestamp_millis(), idx);
-            self.open_tool_block_if_needed(output, call_id, name);
-            self.emit_tool_json_delta(output, arguments);
-
-            if let Some(block_idx) = self.open_tool_index.take() {
-                output.push(format!(
-                    "event: content_block_stop\ndata: {}\n\n",
-                    json!({ "type": "content_block_stop", "index": block_idx })
-                ));
-            }
-            self.tool_call_id = None;
-            self.tool_name = None;
-        }
-    }
-
     fn flush_markdown_bash(&mut self, output: &mut Vec<String>) {
         if !self.in_markdown_bash {
             return;
@@ -607,7 +480,7 @@ impl TransformResponse {
         if !leftover_text.is_empty() {
             self.text_carryover.push_str(&leftover_text);
             // Re-eval leftovers to see if another markdown block exists or just emit
-            self.flush_text_carryover(output); 
+            self.flush_text_carryover(output);
         }
     }
 
@@ -655,30 +528,16 @@ impl TransformResponse {
         let pending_raw = std::mem::take(&mut self.pending_tool_text);
         let pending_for_tool_parse = pending_raw.trim();
 
-        // 检查是否是泄漏的工具调用
-        if let Some(calls) = Self::parse_leaked_tool_line(pending_for_tool_parse) {
-            if calls.is_empty() {
-                self.logger.log_raw(
-                    "[Warn] Dropping leaked multi_tool_use.parallel with no valid tool_uses",
-                );
-                return;
-            }
-            // 关闭文本块（如果有）
-            self.close_open_text_block(output);
-            self.emit_leaked_tool_calls(output, calls);
-            return;
-        }
-
-        // 疑似泄漏但解析失败时，不回落到可见文本，避免把 tool 片段/乱码暴露给客户端。
+        // 疑似泄漏文本（包括 JSON 片段）统一抑制，不参与 tool 执行路径。
+        // tool 调用只接受结构化事件（response.output_item.*）。
         if Self::starts_with_leaked_tool_marker(pending_for_tool_parse) {
-            self.logger.log_raw(
-                "[Warn] Dropping unparsable leaked tool marker fragment from visible text",
-            );
+            self.logger
+                .log_raw("[Warn] Dropping leaked tool marker fragment from visible text");
             return;
         }
         if Self::looks_like_raw_tool_json_fragment(pending_for_tool_parse) {
             self.logger
-                .log_raw("[Warn] Dropping unparsable raw leaked tool json fragment");
+                .log_raw("[Warn] Dropping raw leaked tool json fragment");
             return;
         }
 
