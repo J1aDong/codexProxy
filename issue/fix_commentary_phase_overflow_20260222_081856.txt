@@ -1,0 +1,107 @@
+================================================================================
+ FIX: Codex Response 文本+工具调用溢出问题 (Commentary Phase Overflow)
+================================================================================
+日期: 2026-02-22
+状态: 已完成 (70/70 tests passed, 0 regression)
+
+────────────────────────────────────────────────────────────────────────────────
+1. 问题描述
+────────────────────────────────────────────────────────────────────────────────
+
+Codex 模型在执行工具调用前，会先生成一段 commentary 文本（如 "Using the
+openspec-apply-change skill for this request."），然后才发出 function_call 事件。
+
+由于 SSE 是单向流，已发出的 text_delta 事件无法撤回，导致 Claude Code 收到的
+响应中同时包含 text blocks 和 tool_use blocks，造成输出混乱。
+
+典型表现：
+  - Claude Code 界面出现 "Using the openspec-apply-change skill..." 等非预期文本
+  - 文本块与工具调用块混合在同一个响应中
+  - 影响对话上下文的清晰度
+
+────────────────────────────────────────────────────────────────────────────────
+2. 根因分析
+────────────────────────────────────────────────────────────────────────────────
+
+Codex Response API 的 SSE 事件流中，response.output_item.added (type: "message")
+携带 phase 字段：
+
+  - phase: "commentary"    → 中间推理/叙述文本，后面通常跟工具调用
+  - phase: "final_answer"  → 最终回答文本
+  - phase: null/缺失       → 兼容旧版本
+
+codexProxy 此前完全忽略了 phase 字段，将所有文本统一作为 text_delta 输出。
+
+参考来源：
+  - Codex CLI 源码: codex-rs/protocol/src/models.rs → MessagePhase 枚举
+  - Codex 日志: .codex-log/session.jsonl → 实际携带 phase 字段的事件
+
+────────────────────────────────────────────────────────────────────────────────
+3. 解决方案
+────────────────────────────────────────────────────────────────────────────────
+
+策略：将 commentary 阶段的文本重定向为 Anthropic thinking blocks。
+
+  phase            | 处理方式
+  -----------------+-------------------------------
+  "commentary"     | 文本 → thinking_delta (thinking blocks)
+  "final_answer"   | 文本 → text_delta (正常文本)
+  null / 缺失      | 文本 → text_delta (向后兼容)
+
+优势：
+  - commentary 内容保留为 thinking blocks，在 Claude Code 中可见但不污染对话
+  - 工具调用与文本块完全分离，不再混合
+  - 完全向后兼容：无 phase 字段时行为不变
+  - 不修改 instructions.txt（修改会导致上游报错）
+
+────────────────────────────────────────────────────────────────────────────────
+4. 修改文件
+────────────────────────────────────────────────────────────────────────────────
+
+[Modified] main/src/transform/codex/response.rs
+  - TransformResponse 结构体增加 in_commentary_phase: bool 字段
+  - 构造函数初始化 in_commentary_phase: false
+  - response.output_item.added 处理器：检测 Message item 的 phase 字段
+    - phase == "commentary" → 设置 in_commentary_phase = true
+    - 其他 → 设置 in_commentary_phase = false
+  - emit_plain_text_fragment：当 in_commentary_phase 为 true 时，
+    调用 open_thinking_block_if_needed + emit_thinking_delta 替代文本输出
+  - response.output_item.done 处理器：重置 in_commentary_phase = false
+
+[Modified] main/src/transform/codex/response/tests.rs
+  - 新增 mod commentary_phase 声明
+
+[Created] main/src/transform/codex/response/tests/commentary_phase.rs
+  - 6 个测试用例：
+    1. commentary_text_redirected_to_thinking_blocks
+       → 验证 commentary 文本转为 thinking_delta
+    2. final_answer_text_remains_as_text_blocks
+       → 验证 final_answer 文本保持 text_delta
+    3. no_phase_text_defaults_to_text_blocks
+       → 验证无 phase 时向后兼容
+    4. commentary_then_tool_call_produces_thinking_plus_tool_use
+       → 验证完整流程：commentary→thinking + tool_call→tool_use，无 text_delta
+    5. commentary_phase_resets_after_item_done
+       → 验证 item_done 后 flag 重置
+    6. text_without_preceding_item_added_defaults_to_text
+       → 验证无 item metadata 时默认文本输出
+
+────────────────────────────────────────────────────────────────────────────────
+5. 测试结果
+────────────────────────────────────────────────────────────────────────────────
+
+  cargo test --lib
+  test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+  新增: 6 tests (commentary_phase)
+  既有: 64 tests (无回归)
+
+────────────────────────────────────────────────────────────────────────────────
+6. 约束与注意事项
+────────────────────────────────────────────────────────────────────────────────
+
+  - main/src/instructions.txt 不可修改（修改会导致上游 API 直接报错）
+  - 本修复仅作用于 transformer 层，不影响请求侧逻辑
+  - phase 字段仅在 Codex Response API 中存在，Gemini/Anthropic 透传路径不受影响
+  - 若未来 Codex API 新增其他 phase 值，默认走 text_delta 路径（安全降级）
+================================================================================
