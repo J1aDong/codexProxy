@@ -78,6 +78,25 @@ fn test_reasoning_summary_block_closes_before_output_text() {
             "delta": "推理中"
         })
     );
+    let line_part_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.reasoning_summary_part.done",
+            "summary_index": 0
+        })
+    );
+    // Real API sends output_item.added for final answer message
+    let line_message_item = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer"
+            }
+        })
+    );
     let line_text_delta = format!(
         "data: {}",
         json!({
@@ -87,10 +106,14 @@ fn test_reasoning_summary_block_closes_before_output_text() {
     );
 
     let joined = format!(
-        "{}{}{}",
+        "{}{}{}{}{}",
         transformer.transform_sse_line(&line_part_added).join(""),
         transformer
             .transform_sse_line(&line_reasoning_delta)
+            .join(""),
+        transformer.transform_sse_line(&line_part_done).join(""),
+        transformer
+            .transform_sse_line(&line_message_item)
             .join(""),
         transformer.transform_sse_line(&line_text_delta).join("")
     );

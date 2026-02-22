@@ -83,6 +83,75 @@ fn test_plain_text_preserves_markdown_line_breaks() {
 }
 
 #[test]
+fn test_log_sample_overflow_text_is_safely_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    // Sample extracted from fronted-tauri/src-tauri/logs/proxy_20260222_104127.log
+    let output_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "**Aligning document chat model path****Aligning document chat model path**"
+        })
+    );
+    let leaked_tail = format!(
+        "data: {}",
+        json!({
+            "type": "response.content_part.added",
+            "part": {
+                "type": "output_text",
+                "text": "{\"file_path\":\"/Users/mr.j/myRoom/code/ai/MyProjects/Proma/apps/electron/src/main/lib/plugins/document-chat-bridge.ts\",\"new_string\":\"import { computeEmbedding, loadKnowledgeBaseIndex, resolvePluginModelOrThrow } from './ai-indexing-service'\\n\",\"old_string\":\"import { computeEmbedding, loadKnowledgeBaseIndex } from './ai-indexing-service'\",\"replace_all\":false}"
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&output_delta);
+    events.extend(transformer.transform_sse_line(&leaked_tail));
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("Aligning document chat model path")
+            && !joined.contains("\\\"file_path\\\"")
+            && !joined.contains("\\\"new_string\\\"")
+            && !joined.contains("\\\"old_string\\\"")
+            && !joined.contains("\\\"replace_all\\\""),
+        "log-derived leaked tool json tail must be suppressed while keeping readable prefix"
+    );
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "log-derived leaked payload must not become tool_use"
+    );
+}
+
+#[test]
+fn test_plain_business_json_text_is_not_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "业务示例：{\"name\":\"alice\",\"age\":18,\"ok\":true}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("业务示例"),
+        "plain business json text should remain visible"
+    );
+    assert!(
+        joined.contains("\\\"name\\\":\\\"alice\\\""),
+        "business json should not be suppressed when it does not match tool payload"
+    );
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "business json text must not create tool_use"
+    );
+}
+
+#[test]
 fn test_unparsable_leaked_tool_prefix_is_suppressed_from_visible_text() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(

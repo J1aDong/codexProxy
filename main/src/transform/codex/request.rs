@@ -41,17 +41,122 @@ fn find_leaked_tool_marker_start(text: &str) -> Option<usize> {
     MARKERS.iter().filter_map(|marker| text.find(marker)).min()
 }
 
-fn strip_leaked_tool_suffix_from_text(text: &str) -> Option<String> {
-    let Some(marker_pos) = find_leaked_tool_marker_start(text) else {
-        return Some(text.to_string());
-    };
-
-    let head = text[..marker_pos].trim_end();
-    if head.is_empty() {
-        None
-    } else {
-        Some(head.to_string())
+fn looks_like_high_confidence_tool_json_object(json: &str) -> bool {
+    let trimmed = json.trim_start();
+    if !trimmed.starts_with('{') {
+        return false;
     }
+
+    let is_parallel_tool_json = trimmed.contains("\"tool_uses\"")
+        && trimmed.contains("\"recipient_name\"")
+        && (trimmed.contains("functions.") || trimmed.contains("multi_tool_use."));
+    if is_parallel_tool_json {
+        return true;
+    }
+
+    let is_single_edit_json = trimmed.contains("\"file_path\"")
+        && ((trimmed.contains("\"old_string\"") && trimmed.contains("\"new_string\""))
+            || trimmed.contains("\"replace_all\""));
+    if is_single_edit_json {
+        return true;
+    }
+
+    let is_basic_tool_envelope = trimmed.contains("\"recipient_name\"")
+        && trimmed.contains("\"parameters\"")
+        && (trimmed.contains("\"file_path\"")
+            || trimmed.contains("\"pattern\"")
+            || trimmed.contains("\"command\""));
+    is_basic_tool_envelope
+}
+
+fn extract_first_json_object_fragment(line: &str) -> Option<String> {
+    let start = line.find('{')?;
+    let candidate = &line[start..];
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in candidate.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(candidate[..=idx].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn find_high_confidence_tool_json_tail_start(text: &str) -> Option<usize> {
+    let mut matched_start = None;
+
+    for (idx, ch) in text.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+
+        let candidate = &text[idx..];
+        let Some(json_object) = extract_first_json_object_fragment(candidate) else {
+            continue;
+        };
+
+        if !looks_like_high_confidence_tool_json_object(&json_object) {
+            continue;
+        }
+
+        let suffix = &candidate[json_object.len()..];
+        if suffix.trim().is_empty() {
+            matched_start = Some(idx);
+        }
+    }
+
+    matched_start
+}
+
+fn strip_leaked_tool_suffix_from_text(text: &str) -> Option<String> {
+    if let Some(marker_pos) = find_leaked_tool_marker_start(text) {
+        let head = text[..marker_pos].trim_end();
+        return if head.is_empty() {
+            None
+        } else {
+            Some(head.to_string())
+        };
+    }
+
+    if let Some(json_start) = find_high_confidence_tool_json_tail_start(text) {
+        let head = text[..json_start].trim_end();
+        return if head.is_empty() {
+            None
+        } else {
+            Some(head.to_string())
+        };
+    }
+
+    Some(text.to_string())
 }
 
 /// 请求转换器 - Anthropic -> Codex
