@@ -1,6 +1,7 @@
 use crate::logger::AppLogger;
 use crate::transform::ResponseTransformer;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextEventSource {
@@ -15,14 +16,16 @@ pub struct TransformResponse {
     content_index: usize,
     open_text_index: Option<usize>,
     open_thinking_index: Option<usize>,
-    open_tool_index: Option<usize>,
-    tool_call_id: Option<String>,
-    tool_name: Option<String>,
+    open_tool_indices: HashSet<usize>,
+    last_open_tool_index: Option<usize>,
+    tool_index_by_output_index: HashMap<u64, usize>,
+    tool_index_by_item_id: HashMap<String, usize>,
+    tool_index_by_call_id: HashMap<String, usize>,
+    tool_args_by_index: HashMap<usize, String>,
     saw_tool_call: bool,
     sent_message_start: bool,
     text_carryover: String,
     pending_tool_text: String,
-    accumulated_tool_args: String,
 
     // Cross-chunk leak suppression state
     suppressing_cross_chunk_leak: bool,
@@ -177,7 +180,7 @@ impl TransformResponse {
             "天天中彩票",
             "assistantuser",
             " user ",
-            " user"
+            " user",
         ];
 
         for pattern in &noise_patterns {
@@ -246,7 +249,10 @@ impl TransformResponse {
         Some((prefix, json, suffix))
     }
 
-    fn split_contextual_note_json_prefix_suffix(fragment: &str, context: &str) -> Option<(String, String, String, bool)> {
+    fn split_contextual_note_json_prefix_suffix(
+        fragment: &str,
+        context: &str,
+    ) -> Option<(String, String, String, bool)> {
         // 首先尝试查找 ```json 包装的情况
         if let Some(json_start) = context.find("```json") {
             // 查找 JSON 内容开始位置（跳过 ```json 和可能的换行符）
@@ -277,17 +283,19 @@ impl TransformResponse {
 
                         if has_suspicious_tail {
                             // 计算在原始 fragment 中的位置
-                            let fragment_json_start = if json_start >= context.len() - fragment.len() {
-                                json_start - (context.len() - fragment.len())
-                            } else {
-                                0
-                            };
+                            let fragment_json_start =
+                                if json_start >= context.len() - fragment.len() {
+                                    json_start - (context.len() - fragment.len())
+                                } else {
+                                    0
+                                };
 
-                            let fragment_after_json_end = if after_json_end >= context.len() - fragment.len() {
-                                after_json_end - (context.len() - fragment.len())
-                            } else {
-                                fragment.len()
-                            };
+                            let fragment_after_json_end =
+                                if after_json_end >= context.len() - fragment.len() {
+                                    after_json_end - (context.len() - fragment.len())
+                                } else {
+                                    fragment.len()
+                                };
 
                             let prefix_in_fragment = if fragment_json_start > 0 {
                                 fragment[..fragment_json_start].to_string()
@@ -301,14 +309,21 @@ impl TransformResponse {
                                 String::new()
                             };
 
-                            return Some((prefix_in_fragment, String::new(), suffix_in_fragment, false));
+                            return Some((
+                                prefix_in_fragment,
+                                String::new(),
+                                suffix_in_fragment,
+                                false,
+                            ));
                         }
                     }
                 } else {
                     // 没有找到结束标记，可能是跨块分割的情况
                     // 检查剩余内容是否看起来像 JSON 开始
                     let remaining_content = &context[json_content_start..];
-                    if remaining_content.contains("\"note\"") || remaining_content.starts_with("{\"note\":") {
+                    if remaining_content.contains("\"note\"")
+                        || remaining_content.starts_with("{\"note\":")
+                    {
                         // 这很可能是跨块分割的 contextual note-json 泄漏
                         // 计算在原始 fragment 中的位置
                         let fragment_json_start = if json_start >= context.len() - fragment.len() {
@@ -360,9 +375,12 @@ impl TransformResponse {
         let pending_for_tool_parse = &pending_raw[trimmed_start_len..];
 
         if Self::starts_with_leaked_tool_marker(pending_for_tool_parse) {
-            if let Some((_, _, suffix)) = Self::split_tool_json_prefix_suffix(pending_for_tool_parse) {
-                self.logger
-                    .log_raw("[Warn] Dropping leaked tool marker + json fragment from visible text");
+            if let Some((_, _, suffix)) =
+                Self::split_tool_json_prefix_suffix(pending_for_tool_parse)
+            {
+                self.logger.log_raw(
+                    "[Warn] Dropping leaked tool marker + json fragment from visible text",
+                );
                 if !suffix.is_empty() {
                     self.handle_text_fragment(output, &suffix, true);
                 }
@@ -409,7 +427,9 @@ impl TransformResponse {
 
         // 检查上下文 note-json 泄漏（新增）
         let context = format!("{}{}", self.text_carryover, &pending_raw);
-        if let Some((prefix, _, suffix, is_cross_chunk)) = Self::split_contextual_note_json_prefix_suffix(&pending_raw, &context) {
+        if let Some((prefix, _, suffix, is_cross_chunk)) =
+            Self::split_contextual_note_json_prefix_suffix(&pending_raw, &context)
+        {
             self.logger
                 .log_raw("[Warn] Dropping contextual note-json leak from visible text");
             if is_cross_chunk {
@@ -460,14 +480,16 @@ impl TransformResponse {
             content_index: 0,
             open_text_index: None,
             open_thinking_index: None,
-            open_tool_index: None,
-            tool_call_id: None,
-            tool_name: None,
+            open_tool_indices: HashSet::new(),
+            last_open_tool_index: None,
+            tool_index_by_output_index: HashMap::new(),
+            tool_index_by_item_id: HashMap::new(),
+            tool_index_by_call_id: HashMap::new(),
+            tool_args_by_index: HashMap::new(),
             saw_tool_call: false,
             sent_message_start: false,
             text_carryover: String::new(),
             pending_tool_text: String::new(),
-            accumulated_tool_args: String::new(),
             suppressing_cross_chunk_leak: false,
             in_markdown_bash: false,
             markdown_bash_buffer: String::new(),
@@ -501,8 +523,117 @@ impl TransformResponse {
         }
     }
 
+    fn has_open_tool_block(&self) -> bool {
+        !self.open_tool_indices.is_empty()
+    }
+
+    fn close_tool_block_by_index(&mut self, output: &mut Vec<String>, idx: usize) -> bool {
+        if !self.open_tool_indices.remove(&idx) {
+            return false;
+        }
+        output.push(format!(
+            "event: content_block_stop\ndata: {}\n\n",
+            json!({ "type": "content_block_stop", "index": idx })
+        ));
+        if self.last_open_tool_index == Some(idx) {
+            self.last_open_tool_index = self.open_tool_indices.iter().next().copied();
+        }
+        self.tool_index_by_output_index
+            .retain(|_, mapped| *mapped != idx);
+        self.tool_index_by_item_id
+            .retain(|_, mapped| *mapped != idx);
+        self.tool_index_by_call_id
+            .retain(|_, mapped| *mapped != idx);
+        self.tool_args_by_index.remove(&idx);
+        true
+    }
+
+    fn close_tool_block_by_metadata(
+        &mut self,
+        output: &mut Vec<String>,
+        output_index: Option<u64>,
+        item_id: Option<&str>,
+        call_id: Option<&str>,
+    ) -> bool {
+        let idx_from_output =
+            output_index.and_then(|idx| self.tool_index_by_output_index.remove(&idx));
+        let idx_from_item = item_id.and_then(|id| self.tool_index_by_item_id.remove(id));
+        let idx_from_call = call_id.and_then(|id| self.tool_index_by_call_id.remove(id));
+
+        let idx = idx_from_output
+            .or(idx_from_item)
+            .or(idx_from_call)
+            .or(self.last_open_tool_index);
+
+        if let Some(idx) = idx {
+            self.close_tool_block_by_index(output, idx)
+        } else {
+            false
+        }
+    }
+
+    fn find_tool_block_index(&self, data: &Value) -> Option<usize> {
+        if let Some(idx) = data
+            .get("output_index")
+            .and_then(|v| v.as_u64())
+            .and_then(|key| self.tool_index_by_output_index.get(&key))
+        {
+            return Some(*idx);
+        }
+
+        if let Some(idx) = data
+            .get("item_id")
+            .and_then(|v| v.as_str())
+            .and_then(|key| self.tool_index_by_item_id.get(key))
+        {
+            return Some(*idx);
+        }
+
+        if let Some(idx) = data
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .and_then(|key| self.tool_index_by_call_id.get(key))
+        {
+            return Some(*idx);
+        }
+
+        self.last_open_tool_index
+    }
+
+    fn apply_tool_arguments_snapshot(
+        &mut self,
+        output: &mut Vec<String>,
+        idx: usize,
+        full_arguments: &str,
+    ) {
+        let current = self
+            .tool_args_by_index
+            .get(&idx)
+            .cloned()
+            .unwrap_or_default();
+        if full_arguments.starts_with(current.as_str()) {
+            let suffix = &full_arguments[current.len()..];
+            if !suffix.is_empty() {
+                self.emit_tool_json_delta(output, idx, suffix.to_string());
+                self.tool_args_by_index
+                    .entry(idx)
+                    .or_default()
+                    .push_str(suffix);
+            }
+            return;
+        }
+
+        if current.starts_with(full_arguments) {
+            return;
+        }
+
+        self.emit_tool_json_delta(output, idx, full_arguments.to_string());
+        self.tool_args_by_index
+            .insert(idx, full_arguments.to_string());
+    }
+
     fn open_thinking_block_if_needed(&mut self, output: &mut Vec<String>) {
-        if self.open_tool_index.is_some() {
+        if self.has_open_tool_block() {
             return;
         }
 
@@ -613,7 +744,8 @@ impl TransformResponse {
                 // 找到结束标记，抑制到结束标记为止
                 let remaining = &fragment[end_pos + 3..];
                 self.suppressing_cross_chunk_leak = false;
-                self.logger.log_raw("[Info] Cross-chunk leak suppression ended");
+                self.logger
+                    .log_raw("[Info] Cross-chunk leak suppression ended");
 
                 // 检查剩余内容是否是可疑的尾巴噪声
                 if !remaining.is_empty() {
@@ -621,13 +753,15 @@ impl TransformResponse {
                     if !cleaned_remaining.is_empty() {
                         self.handle_text_fragment(output, &cleaned_remaining, emit_plain_text);
                     } else {
-                        self.logger.log_raw("[Info] Suppressed suspicious tail after cross-chunk leak");
+                        self.logger
+                            .log_raw("[Info] Suppressed suspicious tail after cross-chunk leak");
                     }
                 }
                 return;
             } else {
                 // 没有找到结束标记，继续抑制整个片段
-                self.logger.log_raw("[Info] Suppressing cross-chunk leak continuation");
+                self.logger
+                    .log_raw("[Info] Suppressing cross-chunk leak continuation");
                 return;
             }
         }
@@ -657,7 +791,7 @@ impl TransformResponse {
             let prefix_text = &combined[..marker_start];
             let after_marker = &combined[marker_start + marker_len..];
 
-            if emit_plain_text && self.open_tool_index.is_none() && !prefix_text.is_empty() {
+            if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
             }
             self.in_markdown_bash = true;
@@ -682,7 +816,7 @@ impl TransformResponse {
 
         if let Some(marker_start) = Self::find_potential_leaked_tool_marker_start(&combined) {
             let (prefix_text, leaked_fragment) = combined.split_at(marker_start);
-            if emit_plain_text && self.open_tool_index.is_none() && !prefix_text.is_empty() {
+            if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
             }
             self.pending_tool_text.push_str(leaked_fragment);
@@ -694,7 +828,7 @@ impl TransformResponse {
         // 将裸 JSON 片段送入 pending，按高置信规则分段抑制，仅保留前后安全文本。
         if let Some(raw_json_start) = Self::find_potential_raw_tool_json_start(&combined) {
             let (prefix_text, leaked_fragment) = combined.split_at(raw_json_start);
-            if emit_plain_text && self.open_tool_index.is_none() && !prefix_text.is_empty() {
+            if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
             }
             self.pending_tool_text.push_str(leaked_fragment);
@@ -704,19 +838,21 @@ impl TransformResponse {
 
         // 检查上下文 note-json 泄漏
         let context = format!("{}{}", self.text_carryover, &combined);
-        if let Some((prefix, _, _suffix, is_cross_chunk)) = Self::split_contextual_note_json_prefix_suffix(&combined, &context) {
+        if let Some((prefix, _, _suffix, is_cross_chunk)) =
+            Self::split_contextual_note_json_prefix_suffix(&combined, &context)
+        {
             // 对于上下文泄漏，只保留前缀中的安全部分，完全抑制 JSON 和可疑尾巴
             if is_cross_chunk {
                 self.suppressing_cross_chunk_leak = true;
             }
-            if emit_plain_text && self.open_tool_index.is_none() && !prefix.is_empty() {
+            if emit_plain_text && !self.has_open_tool_block() && !prefix.is_empty() {
                 self.emit_plain_text_fragment(output, &prefix);
             }
             // 注意：不处理 suffix，因为它包含可疑的尾巴噪声，应该被完全抑制
             return;
         }
 
-        if !emit_plain_text || self.open_tool_index.is_some() {
+        if !emit_plain_text || self.has_open_tool_block() {
             return;
         }
 
@@ -774,25 +910,20 @@ impl TransformResponse {
         ));
     }
 
-    fn open_tool_block_if_needed(
+    fn open_tool_block(
         &mut self,
         output: &mut Vec<String>,
         call_id: String,
         name: String,
-    ) {
+    ) -> usize {
         self.saw_tool_call = true;
         self.close_open_text_block(output);
 
-        if self.open_tool_index.is_some() {
-            return;
-        }
-
-        self.tool_call_id = Some(call_id.clone());
-        self.tool_name = Some(name.clone());
-
         let idx = self.content_index;
         self.content_index += 1;
-        self.open_tool_index = Some(idx);
+        self.open_tool_indices.insert(idx);
+        self.last_open_tool_index = Some(idx);
+        self.tool_index_by_call_id.insert(call_id.clone(), idx);
 
         output.push(format!(
             "event: content_block_start\ndata: {}\n\n",
@@ -807,19 +938,19 @@ impl TransformResponse {
                 }
             })
         ));
+
+        idx
     }
 
-    fn emit_tool_json_delta(&self, output: &mut Vec<String>, delta: String) {
-        if let Some(idx) = self.open_tool_index {
-            output.push(format!(
-                "event: content_block_delta\ndata: {}\n\n",
-                json!({
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": { "type": "input_json_delta", "partial_json": delta }
-                })
-            ));
-        }
+    fn emit_tool_json_delta(&self, output: &mut Vec<String>, idx: usize, delta: String) {
+        output.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "input_json_delta", "partial_json": delta }
+            })
+        ));
     }
 
     fn extract_first_json_object_fragment(line: &str) -> Option<String> {
@@ -901,17 +1032,9 @@ impl TransformResponse {
         let name = "Bash".to_string();
         let arguments = json!({ "command": script }).to_string();
 
-        self.open_tool_block_if_needed(output, call_id, name);
-        self.emit_tool_json_delta(output, arguments);
-
-        if let Some(block_idx) = self.open_tool_index.take() {
-            output.push(format!(
-                "event: content_block_stop\ndata: {}\n\n",
-                json!({ "type": "content_block_stop", "index": block_idx })
-            ));
-        }
-        self.tool_call_id = None;
-        self.tool_name = None;
+        let tool_idx = self.open_tool_block(output, call_id, name);
+        self.emit_tool_json_delta(output, tool_idx, arguments);
+        self.close_tool_block_by_index(output, tool_idx);
 
         if !leftover_text.is_empty() {
             self.text_carryover.push_str(&leftover_text);
@@ -931,7 +1054,7 @@ impl TransformResponse {
             let prefix_text = &carryover[..marker_start];
             let after_marker = &carryover[marker_start + marker_len..];
 
-            if self.open_tool_index.is_none() && !prefix_text.is_empty() {
+            if !self.has_open_tool_block() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
             }
             self.in_markdown_bash = true;
@@ -942,7 +1065,7 @@ impl TransformResponse {
 
         if let Some(marker_start) = Self::find_potential_leaked_tool_marker_start(&carryover) {
             let (prefix_text, leaked_fragment) = carryover.split_at(marker_start);
-            if self.open_tool_index.is_none() && !prefix_text.is_empty() {
+            if !self.has_open_tool_block() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
             }
             self.pending_tool_text.push_str(leaked_fragment);
@@ -954,7 +1077,7 @@ impl TransformResponse {
         if let Some((prefix, _, suffix)) = Self::split_tool_json_prefix_suffix(&carryover) {
             self.logger
                 .log_raw("[Warn] Dropping raw leaked tool json from carryover");
-            if self.open_tool_index.is_none() && !prefix.is_empty() {
+            if !self.has_open_tool_block() && !prefix.is_empty() {
                 self.emit_plain_text_fragment(output, &prefix);
             }
             if !suffix.is_empty() {
@@ -964,13 +1087,15 @@ impl TransformResponse {
         }
 
         // 检查上下文 note-json 泄漏（新增）
-        if let Some((prefix, _, suffix, is_cross_chunk)) = Self::split_contextual_note_json_prefix_suffix(&carryover, &carryover) {
+        if let Some((prefix, _, suffix, is_cross_chunk)) =
+            Self::split_contextual_note_json_prefix_suffix(&carryover, &carryover)
+        {
             self.logger
                 .log_raw("[Warn] Dropping contextual note-json leak from carryover");
             if is_cross_chunk {
                 self.suppressing_cross_chunk_leak = true;
             }
-            if self.open_tool_index.is_none() && !prefix.is_empty() {
+            if !self.has_open_tool_block() && !prefix.is_empty() {
                 self.emit_plain_text_fragment(output, &prefix);
             }
             if !suffix.is_empty() {
@@ -981,7 +1106,7 @@ impl TransformResponse {
 
         if let Some(raw_json_start) = Self::find_potential_raw_tool_json_start(&carryover) {
             let (prefix_text, leaked_fragment) = carryover.split_at(raw_json_start);
-            if self.open_tool_index.is_none() && !prefix_text.is_empty() {
+            if !self.has_open_tool_block() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
             }
             self.pending_tool_text.push_str(leaked_fragment);
@@ -989,7 +1114,7 @@ impl TransformResponse {
             return;
         }
 
-        if self.open_tool_index.is_none() {
+        if !self.has_open_tool_block() {
             self.emit_plain_text_fragment(output, &carryover);
         }
     }
@@ -1058,8 +1183,8 @@ impl TransformResponse {
                     self.close_open_thinking_block(&mut output);
                 }
                 if let Some(fragment) = Self::extract_content_part_text(&data) {
-                    if let Some(text) =
-                        self.dedupe_cross_source_fragment(TextEventSource::ContentPartAdded, fragment)
+                    if let Some(text) = self
+                        .dedupe_cross_source_fragment(TextEventSource::ContentPartAdded, fragment)
                     {
                         self.handle_text_fragment(&mut output, &text, true);
                     }
@@ -1145,7 +1270,26 @@ impl TransformResponse {
                                 .unwrap_or("unknown")
                                 .to_string();
 
-                            self.open_tool_block_if_needed(&mut output, call_id, name);
+                            let tool_idx = self.open_tool_block(&mut output, call_id.clone(), name);
+
+                            if let Some(idx) = data.get("output_index").and_then(|v| v.as_u64()) {
+                                self.tool_index_by_output_index.insert(idx, tool_idx);
+                            }
+                            if let Some(item_id) = item.get("id").and_then(|v| v.as_str()) {
+                                self.tool_index_by_item_id
+                                    .insert(item_id.to_string(), tool_idx);
+                            }
+
+                            if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str())
+                            {
+                                if !arguments.is_empty() {
+                                    self.apply_tool_arguments_snapshot(
+                                        &mut output,
+                                        tool_idx,
+                                        arguments,
+                                    );
+                                }
+                            }
                         }
                         "message" => {
                             self.saw_message_item_added = true;
@@ -1176,16 +1320,26 @@ impl TransformResponse {
                     .and_then(|d| d.as_str())
                     .unwrap_or("");
 
-                if !delta.is_empty() && self.open_tool_index.is_some() {
-                    self.accumulated_tool_args.push_str(delta);
-                    output.push(format!(
-                        "event: content_block_delta\ndata: {}\n\n",
-                        json!({
-                            "type": "content_block_delta",
-                            "index": self.open_tool_index,
-                            "delta": { "type": "input_json_delta", "partial_json": delta }
-                        })
-                    ));
+                if !delta.is_empty() {
+                    if let Some(tool_idx) = self.find_tool_block_index(&data) {
+                        self.emit_tool_json_delta(&mut output, tool_idx, delta.to_string());
+                        self.tool_args_by_index
+                            .entry(tool_idx)
+                            .or_default()
+                            .push_str(delta);
+                    }
+                }
+            }
+
+            // 参数完成事件（某些流只在 done 里给完整 arguments）
+            "response.function_call_arguments.done" | "response.function_call_arguments_done" => {
+                self.flush_text_carryover(&mut output);
+                self.flush_pending_tool_text(&mut output);
+                let full_arguments = data.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                if !full_arguments.is_empty() {
+                    if let Some(tool_idx) = self.find_tool_block_index(&data) {
+                        self.apply_tool_arguments_snapshot(&mut output, tool_idx, full_arguments);
+                    }
                 }
             }
 
@@ -1194,18 +1348,68 @@ impl TransformResponse {
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 self.close_open_thinking_block(&mut output);
-                // 重置 commentary 阶段标记
-                self.in_commentary_phase = false;
                 self.reset_text_dedupe_state();
-                if let Some(idx) = self.open_tool_index.take() {
-                    output.push(format!(
-                        "event: content_block_stop\ndata: {}\n\n",
-                        json!({ "type": "content_block_stop", "index": idx })
-                    ));
+
+                let output_index = data.get("output_index").and_then(|v| v.as_u64());
+                let item = data.get("item");
+                let item_type = item
+                    .and_then(|it| it.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let item_id = item.and_then(|it| it.get("id")).and_then(|v| v.as_str());
+
+                match item_type {
+                    "function_call" => {
+                        if let Some(full_arguments) = item
+                            .and_then(|it| it.get("arguments"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if let Some(tool_idx) = output_index
+                                .and_then(|idx| self.tool_index_by_output_index.get(&idx).copied())
+                                .or_else(|| {
+                                    item_id
+                                        .and_then(|id| self.tool_index_by_item_id.get(id).copied())
+                                })
+                                .or_else(|| {
+                                    item.and_then(|it| it.get("call_id"))
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|id| self.tool_index_by_call_id.get(id).copied())
+                                })
+                            {
+                                self.apply_tool_arguments_snapshot(
+                                    &mut output,
+                                    tool_idx,
+                                    full_arguments,
+                                );
+                            }
+                        }
+
+                        let call_id = item
+                            .and_then(|it| it.get("call_id"))
+                            .and_then(|v| v.as_str());
+                        self.close_tool_block_by_metadata(
+                            &mut output,
+                            output_index,
+                            item_id,
+                            call_id,
+                        );
+                    }
+                    "message" => {
+                        self.in_commentary_phase = false;
+                    }
+                    _ => {
+                        // 兼容旧流：没有 item 元数据时回退关闭最近打开的 tool block
+                        if item.is_none() {
+                            self.in_commentary_phase = false;
+                            self.close_tool_block_by_metadata(
+                                &mut output,
+                                output_index,
+                                item_id,
+                                None,
+                            );
+                        }
+                    }
                 }
-                self.tool_call_id = None;
-                self.tool_name = None;
-                self.accumulated_tool_args.clear();
             }
 
             // 响应完成 - 关键：确保完整的事件序列
@@ -1228,11 +1432,11 @@ impl TransformResponse {
                         json!({ "type": "content_block_stop", "index": idx })
                     ));
                 }
-                if let Some(idx) = self.open_tool_index.take() {
-                    output.push(format!(
-                        "event: content_block_stop\ndata: {}\n\n",
-                        json!({ "type": "content_block_stop", "index": idx })
-                    ));
+                let mut open_tool_indices: Vec<usize> =
+                    self.open_tool_indices.iter().copied().collect();
+                open_tool_indices.sort_unstable();
+                for idx in open_tool_indices {
+                    self.close_tool_block_by_index(&mut output, idx);
                 }
 
                 // 确定停止原因

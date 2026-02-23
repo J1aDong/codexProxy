@@ -169,8 +169,7 @@ fn raw_edit_json_without_tool_marker_is_suppressed() {
     let events = transformer.transform_sse_line(&line);
     let joined = events.join("");
     assert!(
-        joined.contains("\"type\":\"text_delta\"")
-            && joined.contains("Preparing edit. "),
+        joined.contains("\"type\":\"text_delta\"") && joined.contains("Preparing edit. "),
         "plain prefix should remain visible"
     );
     assert!(
@@ -255,6 +254,163 @@ fn structured_function_call_events_still_produce_tool_use() {
         joined.contains("\"type\":\"input_json_delta\"")
             && joined.contains("\\\"file_path\\\":\\\"/tmp/a.txt\\\""),
         "structured function_call arguments must be preserved"
+    );
+}
+
+#[test]
+fn function_call_arguments_done_without_delta_is_still_streamed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_done_only",
+                "name": "Edit"
+            }
+        })
+    );
+    let done_args_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"file_path\":\"/tmp/done-only.ts\"}"
+        })
+    );
+    let item_done_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_done_only",
+                "name": "Edit",
+                "arguments": "{\"file_path\":\"/tmp/done-only.ts\"}"
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&add_line);
+    events.extend(transformer.transform_sse_line(&done_args_line));
+    events.extend(transformer.transform_sse_line(&item_done_line));
+
+    let joined = events.join("");
+    assert!(
+        joined.contains("\"type\":\"tool_use\"") && joined.contains("\"id\":\"call_done_only\""),
+        "function call block should still be created"
+    );
+    assert!(
+        joined.contains("\"type\":\"input_json_delta\"") && joined.contains("done-only.ts"),
+        "arguments.done should still be converted into input_json_delta"
+    );
+}
+
+#[test]
+fn interleaved_parallel_function_calls_keep_separate_tool_blocks() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "item_fc_1",
+                "type": "function_call",
+                "call_id": "call_parallel_1",
+                "name": "Edit"
+            }
+        })
+    );
+    let delta_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "item_fc_1",
+            "delta": "{\"file_path\":\"/tmp/a.ts\"}"
+        })
+    );
+    let add_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "item_fc_2",
+                "type": "function_call",
+                "call_id": "call_parallel_2",
+                "name": "Edit"
+            }
+        })
+    );
+    let delta_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "item_fc_2",
+            "delta": "{\"file_path\":\"/tmp/b.ts\"}"
+        })
+    );
+    let done_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "item_fc_1",
+                "type": "function_call",
+                "call_id": "call_parallel_1",
+                "name": "Edit",
+                "arguments": "{\"file_path\":\"/tmp/a.ts\"}"
+            }
+        })
+    );
+    let done_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "item_fc_2",
+                "type": "function_call",
+                "call_id": "call_parallel_2",
+                "name": "Edit",
+                "arguments": "{\"file_path\":\"/tmp/b.ts\"}"
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&add_1);
+    events.extend(transformer.transform_sse_line(&delta_1));
+    events.extend(transformer.transform_sse_line(&add_2));
+    events.extend(transformer.transform_sse_line(&delta_2));
+    events.extend(transformer.transform_sse_line(&done_1));
+    events.extend(transformer.transform_sse_line(&done_2));
+
+    let joined = events.join("");
+    let tool_use_count = joined.matches("\"type\":\"tool_use\"").count();
+    assert_eq!(
+        tool_use_count, 2,
+        "parallel function calls should create separate tool_use blocks"
+    );
+    assert!(
+        joined.contains("\"id\":\"call_parallel_1\"")
+            && joined.contains("\"id\":\"call_parallel_2\""),
+        "both call ids should be preserved"
+    );
+    assert!(
+        joined.contains("a.ts") && joined.contains("b.ts"),
+        "arguments should not be merged across parallel calls"
     );
 }
 
@@ -358,8 +514,7 @@ fn log_sample_875_replay_suppresses_leaked_json_and_preserves_tool_pipeline() {
         "leaked raw tool json keys from log sample should not be visible"
     );
     assert!(
-        joined.contains("\"type\":\"tool_use\"")
-            && joined.contains("\"name\":\"Edit\""),
+        joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Edit\""),
         "structured function_call should still produce tool_use"
     );
     assert!(
@@ -515,5 +670,49 @@ fn markdown_bash_interception_still_works() {
         joined.contains("\"type\":\"text_delta\"")
             && joined.contains("\"text\":\"Let me run this.\\n\""),
         "prefix text before markdown block should remain visible"
+    );
+}
+
+#[test]
+fn user_reported_long_edit_payload_is_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let chunk1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Adding failing deep/standard assertions first****Adding failing deep/standard assertions first****{\"file_path\":\"/Users/mr.j/myRoom/code/ai/MyProj"
+        })
+    );
+    let chunk2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "ects/Proma/apps/electron/src/main/lib/plugins/tests/ai-indexing-service.test.ts\",\"new_string\":\"  it('builds index and supports incremental reuse', async () => {\\n    const pluginId = 'plugin-ai-index-test'\\n  }\",\"old_string\":\"x\",\"replace_all\":false}"
+        })
+    );
+    let done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.done",
+            "text": ""
+        })
+    );
+
+    let e1 = transformer.transform_sse_line(&chunk1);
+    let e2 = transformer.transform_sse_line(&chunk2);
+    let e3 = transformer.transform_sse_line(&done);
+    let joined = format!("{}{}{}", e1.join(""), e2.join(""), e3.join(""));
+
+    assert!(
+        joined.contains("Adding failing deep/standard assertions first"),
+        "natural language prefix should stay visible"
+    );
+    assert!(
+        !joined.contains("ai-indexing-service.test.ts")
+            && !joined.contains("\"new_string\"")
+            && !joined.contains("\"old_string\"")
+            && !joined.contains("\"replace_all\""),
+        "long leaked edit payload should be suppressed"
     );
 }

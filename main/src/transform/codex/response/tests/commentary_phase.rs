@@ -144,10 +144,7 @@ fn commentary_then_tool_call_produces_thinking_plus_tool_use() {
     let text_events = transformer.transform_sse_line(&text_delta);
 
     // 3. Commentary item done
-    let item_done = format!(
-        "data: {}",
-        json!({ "type": "response.output_item.done" })
-    );
+    let item_done = format!("data: {}", json!({ "type": "response.output_item.done" }));
     let done_events = transformer.transform_sse_line(&item_done);
 
     // 4. Function call item
@@ -222,10 +219,7 @@ fn commentary_phase_resets_after_item_done() {
     assert!(transformer.in_commentary_phase);
 
     // Item done resets
-    let item_done = format!(
-        "data: {}",
-        json!({ "type": "response.output_item.done" })
-    );
+    let item_done = format!("data: {}", json!({ "type": "response.output_item.done" }));
     transformer.transform_sse_line(&item_done);
     assert!(!transformer.in_commentary_phase);
 }

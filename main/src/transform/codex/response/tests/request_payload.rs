@@ -317,12 +317,10 @@ fn test_codex_input_strips_markerless_high_confidence_tool_json_tail() {
         "normal prefix text should be preserved"
     );
     assert!(
-        texts
-            .iter()
-            .all(|text| !text.contains("\"file_path\"")
-                && !text.contains("\"new_string\"")
-                && !text.contains("\"old_string\"")
-                && !text.contains("\"replace_all\"")),
+        texts.iter().all(|text| !text.contains("\"file_path\"")
+            && !text.contains("\"new_string\"")
+            && !text.contains("\"old_string\"")
+            && !text.contains("\"replace_all\"")),
         "high-confidence tool json tail should be stripped from outbound request"
     );
 }
@@ -354,7 +352,10 @@ fn test_codex_request_without_tools_uses_none_tool_choice_and_empty_tools() {
         .get("tools")
         .and_then(|v| v.as_array())
         .expect("tools should be an array");
-    assert!(tools.is_empty(), "tools should stay empty when request has no tools");
+    assert!(
+        tools.is_empty(),
+        "tools should stay empty when request has no tools"
+    );
     assert_eq!(
         body.get("tool_choice").and_then(|v| v.as_str()),
         Some("none"),

@@ -112,9 +112,7 @@ fn test_reasoning_summary_block_closes_before_output_text() {
             .transform_sse_line(&line_reasoning_delta)
             .join(""),
         transformer.transform_sse_line(&line_part_done).join(""),
-        transformer
-            .transform_sse_line(&line_message_item)
-            .join(""),
+        transformer.transform_sse_line(&line_message_item).join(""),
         transformer.transform_sse_line(&line_text_delta).join("")
     );
 
