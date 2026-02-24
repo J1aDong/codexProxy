@@ -412,6 +412,197 @@ fn interleaved_parallel_function_calls_keep_separate_tool_blocks() {
         joined.contains("a.ts") && joined.contains("b.ts"),
         "arguments should not be merged across parallel calls"
     );
+
+    let start_1 = joined
+        .find("\"id\":\"call_parallel_1\"")
+        .expect("call_parallel_1 start must exist");
+    let start_2 = joined
+        .find("\"id\":\"call_parallel_2\"")
+        .expect("call_parallel_2 start must exist");
+    assert!(
+        start_1 < start_2,
+        "tool blocks must be emitted in deterministic order"
+    );
+
+    let first_stop_after_1 = joined[start_1..]
+        .find("\"type\":\"content_block_stop\"")
+        .map(|pos| start_1 + pos)
+        .expect("first tool block stop must exist");
+    assert!(
+        first_stop_after_1 < start_2,
+        "call_parallel_1 block must be fully closed before call_parallel_2 starts"
+    );
+
+    let a_pos = joined.find("a.ts").expect("a.ts args must exist");
+    let b_pos = joined.find("b.ts").expect("b.ts args must exist");
+    assert!(
+        a_pos < start_2 && b_pos > start_2,
+        "arguments must not be interleaved across tool blocks"
+    );
+}
+
+#[test]
+fn out_of_order_done_events_wait_for_head_then_flush_in_order() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_head",
+                "type": "function_call",
+                "call_id": "call_head",
+                "name": "Edit"
+            }
+        })
+    );
+    let add_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_tail",
+                "type": "function_call",
+                "call_id": "call_tail",
+                "name": "Edit"
+            }
+        })
+    );
+    let delta_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_head",
+            "delta": "{\"file_path\":\"/tmp/head.ts\"}"
+        })
+    );
+    let delta_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_tail",
+            "delta": "{\"file_path\":\"/tmp/tail.ts\"}"
+        })
+    );
+    let done_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_tail",
+                "type": "function_call",
+                "call_id": "call_tail",
+                "name": "Edit",
+                "arguments": "{\"file_path\":\"/tmp/tail.ts\"}"
+            }
+        })
+    );
+    let done_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_head",
+                "type": "function_call",
+                "call_id": "call_head",
+                "name": "Edit",
+                "arguments": "{\"file_path\":\"/tmp/head.ts\"}"
+            }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add_1);
+    let _ = transformer.transform_sse_line(&add_2);
+    let _ = transformer.transform_sse_line(&delta_1);
+    let _ = transformer.transform_sse_line(&delta_2);
+
+    let done_2_events = transformer.transform_sse_line(&done_2).join("");
+    assert!(
+        !done_2_events.contains("\"type\":\"tool_use\""),
+        "tail completion must wait for head completion before flushing"
+    );
+
+    let done_1_events = transformer.transform_sse_line(&done_1).join("");
+    let tool_use_count = done_1_events.matches("\"type\":\"tool_use\"").count();
+    assert_eq!(
+        tool_use_count, 2,
+        "once head completes, both buffered calls should flush in order"
+    );
+    let head_pos = done_1_events
+        .find("\"id\":\"call_head\"")
+        .expect("head call should exist");
+    let tail_pos = done_1_events
+        .find("\"id\":\"call_tail\"")
+        .expect("tail call should exist");
+    assert!(
+        head_pos < tail_pos,
+        "buffer flush order must follow tool queue order"
+    );
+    assert!(
+        done_1_events.contains("head.ts") && done_1_events.contains("tail.ts"),
+        "buffered arguments must remain attached to their original calls"
+    );
+}
+
+#[test]
+fn completed_event_flushes_incomplete_buffered_tool_call() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_incomplete",
+                "type": "function_call",
+                "call_id": "call_incomplete",
+                "name": "Edit"
+            }
+        })
+    );
+    let delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_incomplete",
+            "delta": "{\"file_path\":\"/tmp/incomplete.ts\"}"
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": { "status": "completed" }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add);
+    let _ = transformer.transform_sse_line(&delta);
+    let completed_events = transformer.transform_sse_line(&completed).join("");
+
+    assert!(
+        completed_events.contains("\"type\":\"tool_use\"")
+            && completed_events.contains("\"id\":\"call_incomplete\""),
+        "response.completed must flush buffered tool_use blocks even if item.done is missing"
+    );
+    assert!(
+        completed_events.contains("\"type\":\"input_json_delta\"")
+            && completed_events.contains("incomplete.ts"),
+        "response.completed flush must preserve buffered arguments"
+    );
+    assert!(
+        completed_events.contains("\"type\":\"message_stop\""),
+        "stream should still terminate with message_stop"
+    );
 }
 
 #[test]

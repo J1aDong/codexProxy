@@ -1,12 +1,33 @@
 use crate::logger::AppLogger;
 use crate::transform::ResponseTransformer;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextEventSource {
     OutputTextDelta,
     ContentPartAdded,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamPhase {
+    AwaitingContent,
+    StreamingText,
+    StreamingThinking,
+    BufferingToolCalls,
+    Terminal,
+}
+
+#[derive(Clone)]
+struct BufferedToolCall {
+    order_key: u64,
+    arrival_seq: u64,
+    output_index: Option<u64>,
+    item_id: Option<String>,
+    call_id: String,
+    name: String,
+    arguments_buffer: String,
+    done_flag: bool,
 }
 
 /// 响应转换器 - Codex SSE -> Anthropic SSE
@@ -16,12 +37,14 @@ pub struct TransformResponse {
     content_index: usize,
     open_text_index: Option<usize>,
     open_thinking_index: Option<usize>,
-    open_tool_indices: HashSet<usize>,
-    last_open_tool_index: Option<usize>,
-    tool_index_by_output_index: HashMap<u64, usize>,
-    tool_index_by_item_id: HashMap<String, usize>,
-    tool_index_by_call_id: HashMap<String, usize>,
-    tool_args_by_index: HashMap<usize, String>,
+    phase: StreamPhase,
+    next_tool_order_key: u64,
+    next_tool_arrival_seq: u64,
+    buffered_tool_calls: Vec<BufferedToolCall>,
+    tool_order_by_output_index: HashMap<u64, u64>,
+    tool_order_by_item_id: HashMap<String, u64>,
+    tool_order_by_call_id: HashMap<String, u64>,
+    last_buffered_tool_order: Option<u64>,
     saw_tool_call: bool,
     sent_message_start: bool,
     text_carryover: String,
@@ -518,12 +541,14 @@ impl TransformResponse {
             content_index: 0,
             open_text_index: None,
             open_thinking_index: None,
-            open_tool_indices: HashSet::new(),
-            last_open_tool_index: None,
-            tool_index_by_output_index: HashMap::new(),
-            tool_index_by_item_id: HashMap::new(),
-            tool_index_by_call_id: HashMap::new(),
-            tool_args_by_index: HashMap::new(),
+            phase: StreamPhase::AwaitingContent,
+            next_tool_order_key: 0,
+            next_tool_arrival_seq: 0,
+            buffered_tool_calls: Vec::new(),
+            tool_order_by_output_index: HashMap::new(),
+            tool_order_by_item_id: HashMap::new(),
+            tool_order_by_call_id: HashMap::new(),
+            last_buffered_tool_order: None,
             saw_tool_call: false,
             sent_message_start: false,
             text_carryover: String::new(),
@@ -550,6 +575,7 @@ impl TransformResponse {
                 json!({ "type": "content_block_stop", "index": idx })
             ));
         }
+        self.sync_phase_from_runtime();
     }
 
     fn close_open_thinking_block(&mut self, output: &mut Vec<String>) {
@@ -559,115 +585,212 @@ impl TransformResponse {
                 json!({ "type": "content_block_stop", "index": idx })
             ));
         }
+        self.sync_phase_from_runtime();
+    }
+
+    fn transition_to(&mut self, next: StreamPhase) {
+        self.phase = next;
+    }
+
+    fn sync_phase_from_runtime(&mut self) {
+        if self.phase == StreamPhase::Terminal {
+            return;
+        }
+        if !self.buffered_tool_calls.is_empty() {
+            self.phase = StreamPhase::BufferingToolCalls;
+        } else if self.open_thinking_index.is_some() {
+            self.phase = StreamPhase::StreamingThinking;
+        } else if self.open_text_index.is_some() {
+            self.phase = StreamPhase::StreamingText;
+        } else {
+            self.phase = StreamPhase::AwaitingContent;
+        }
     }
 
     fn has_open_tool_block(&self) -> bool {
-        !self.open_tool_indices.is_empty()
+        !self.buffered_tool_calls.is_empty()
     }
 
-    fn close_tool_block_by_index(&mut self, output: &mut Vec<String>, idx: usize) -> bool {
-        if !self.open_tool_indices.remove(&idx) {
-            return false;
+    fn sort_buffered_tools(&mut self) {
+        self.buffered_tool_calls
+            .sort_by(|a, b| match (a.output_index, b.output_index) {
+                (Some(left), Some(right)) => left
+                    .cmp(&right)
+                    .then_with(|| a.arrival_seq.cmp(&b.arrival_seq)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.arrival_seq.cmp(&b.arrival_seq),
+            });
+    }
+
+    fn buffer_tool_call(
+        &mut self,
+        output_index: Option<u64>,
+        item_id: Option<String>,
+        call_id: String,
+        name: String,
+    ) {
+        let order_key = self.next_tool_order_key;
+        self.next_tool_order_key += 1;
+        let arrival_seq = self.next_tool_arrival_seq;
+        self.next_tool_arrival_seq += 1;
+
+        if let Some(idx) = output_index {
+            self.tool_order_by_output_index.insert(idx, order_key);
         }
+        if let Some(ref id) = item_id {
+            self.tool_order_by_item_id.insert(id.clone(), order_key);
+        }
+        self.tool_order_by_call_id
+            .insert(call_id.clone(), order_key);
+        self.last_buffered_tool_order = Some(order_key);
+
+        self.buffered_tool_calls.push(BufferedToolCall {
+            order_key,
+            arrival_seq,
+            output_index,
+            item_id,
+            call_id,
+            name,
+            arguments_buffer: String::new(),
+            done_flag: false,
+        });
+        self.sort_buffered_tools();
+        self.saw_tool_call = true;
+        self.transition_to(StreamPhase::BufferingToolCalls);
+    }
+
+    fn find_buffered_tool_order_from_metadata(
+        &self,
+        output_index: Option<u64>,
+        item_id: Option<&str>,
+        call_id: Option<&str>,
+    ) -> Option<u64> {
+        output_index
+            .and_then(|idx| self.tool_order_by_output_index.get(&idx).copied())
+            .or_else(|| item_id.and_then(|id| self.tool_order_by_item_id.get(id).copied()))
+            .or_else(|| call_id.and_then(|id| self.tool_order_by_call_id.get(id).copied()))
+            .or(self.last_buffered_tool_order)
+    }
+
+    fn find_buffered_tool_order(&self, data: &Value) -> Option<u64> {
+        let output_index = data.get("output_index").and_then(|v| v.as_u64());
+        let item_id = data.get("item_id").and_then(|v| v.as_str()).or_else(|| {
+            data.get("item")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+        });
+        let call_id = data.get("call_id").and_then(|v| v.as_str()).or_else(|| {
+            data.get("item")
+                .and_then(|v| v.get("call_id"))
+                .and_then(|v| v.as_str())
+        });
+        self.find_buffered_tool_order_from_metadata(output_index, item_id, call_id)
+    }
+
+    fn get_buffered_tool_mut(&mut self, order_key: u64) -> Option<&mut BufferedToolCall> {
+        self.buffered_tool_calls
+            .iter_mut()
+            .find(|tool| tool.order_key == order_key)
+    }
+
+    fn append_tool_arguments_delta(&mut self, order_key: u64, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Some(tool) = self.get_buffered_tool_mut(order_key) {
+            tool.arguments_buffer.push_str(delta);
+        }
+    }
+
+    fn apply_tool_arguments_snapshot(&mut self, order_key: u64, full_arguments: &str) {
+        if full_arguments.is_empty() {
+            return;
+        }
+        if let Some(tool) = self.get_buffered_tool_mut(order_key) {
+            if full_arguments.starts_with(tool.arguments_buffer.as_str()) {
+                let suffix = &full_arguments[tool.arguments_buffer.len()..];
+                if !suffix.is_empty() {
+                    tool.arguments_buffer.push_str(suffix);
+                }
+                return;
+            }
+
+            if tool.arguments_buffer.starts_with(full_arguments) {
+                return;
+            }
+
+            tool.arguments_buffer = full_arguments.to_string();
+        }
+    }
+
+    fn mark_buffered_tool_done(&mut self, order_key: u64) {
+        if let Some(tool) = self.get_buffered_tool_mut(order_key) {
+            tool.done_flag = true;
+        }
+    }
+
+    fn cleanup_tool_mappings(&mut self, tool: &BufferedToolCall) {
+        if let Some(idx) = tool.output_index {
+            self.tool_order_by_output_index.remove(&idx);
+        }
+        if let Some(ref item_id) = tool.item_id {
+            self.tool_order_by_item_id.remove(item_id);
+        }
+        self.tool_order_by_call_id.remove(&tool.call_id);
+        if self.last_buffered_tool_order == Some(tool.order_key) {
+            self.last_buffered_tool_order =
+                self.buffered_tool_calls.iter().map(|t| t.order_key).max();
+        }
+    }
+
+    fn emit_serialized_tool_call(&mut self, output: &mut Vec<String>, tool: &BufferedToolCall) {
+        self.close_open_text_block(output);
+        self.close_open_thinking_block(output);
+
+        let idx = self.content_index;
+        self.content_index += 1;
+
+        output.push(format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool.call_id.as_str(),
+                    "name": tool.name.as_str(),
+                    "input": {}
+                }
+            })
+        ));
+
+        if !tool.arguments_buffer.is_empty() {
+            self.emit_tool_json_delta(output, idx, tool.arguments_buffer.clone());
+        }
+
         output.push(format!(
             "event: content_block_stop\ndata: {}\n\n",
             json!({ "type": "content_block_stop", "index": idx })
         ));
-        if self.last_open_tool_index == Some(idx) {
-            self.last_open_tool_index = self.open_tool_indices.iter().next().copied();
-        }
-        self.tool_index_by_output_index
-            .retain(|_, mapped| *mapped != idx);
-        self.tool_index_by_item_id
-            .retain(|_, mapped| *mapped != idx);
-        self.tool_index_by_call_id
-            .retain(|_, mapped| *mapped != idx);
-        self.tool_args_by_index.remove(&idx);
-        true
     }
 
-    fn close_tool_block_by_metadata(
-        &mut self,
-        output: &mut Vec<String>,
-        output_index: Option<u64>,
-        item_id: Option<&str>,
-        call_id: Option<&str>,
-    ) -> bool {
-        let idx_from_output =
-            output_index.and_then(|idx| self.tool_index_by_output_index.remove(&idx));
-        let idx_from_item = item_id.and_then(|id| self.tool_index_by_item_id.remove(id));
-        let idx_from_call = call_id.and_then(|id| self.tool_index_by_call_id.remove(id));
-
-        let idx = idx_from_output
-            .or(idx_from_item)
-            .or(idx_from_call)
-            .or(self.last_open_tool_index);
-
-        if let Some(idx) = idx {
-            self.close_tool_block_by_index(output, idx)
-        } else {
-            false
-        }
-    }
-
-    fn find_tool_block_index(&self, data: &Value) -> Option<usize> {
-        if let Some(idx) = data
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .and_then(|key| self.tool_index_by_output_index.get(&key))
-        {
-            return Some(*idx);
-        }
-
-        if let Some(idx) = data
-            .get("item_id")
-            .and_then(|v| v.as_str())
-            .and_then(|key| self.tool_index_by_item_id.get(key))
-        {
-            return Some(*idx);
-        }
-
-        if let Some(idx) = data
-            .get("call_id")
-            .and_then(|v| v.as_str())
-            .and_then(|key| self.tool_index_by_call_id.get(key))
-        {
-            return Some(*idx);
-        }
-
-        self.last_open_tool_index
-    }
-
-    fn apply_tool_arguments_snapshot(
-        &mut self,
-        output: &mut Vec<String>,
-        idx: usize,
-        full_arguments: &str,
-    ) {
-        let current = self
-            .tool_args_by_index
-            .get(&idx)
-            .cloned()
-            .unwrap_or_default();
-        if full_arguments.starts_with(current.as_str()) {
-            let suffix = &full_arguments[current.len()..];
-            if !suffix.is_empty() {
-                self.emit_tool_json_delta(output, idx, suffix.to_string());
-                self.tool_args_by_index
-                    .entry(idx)
-                    .or_default()
-                    .push_str(suffix);
+    fn flush_serialized_tool_calls(&mut self, output: &mut Vec<String>, include_incomplete: bool) {
+        loop {
+            let should_flush_front = self
+                .buffered_tool_calls
+                .first()
+                .map(|tool| tool.done_flag || include_incomplete)
+                .unwrap_or(false);
+            if !should_flush_front {
+                break;
             }
-            return;
-        }
 
-        if current.starts_with(full_arguments) {
-            return;
+            let tool = self.buffered_tool_calls.remove(0);
+            self.emit_serialized_tool_call(output, &tool);
+            self.cleanup_tool_mappings(&tool);
         }
-
-        self.emit_tool_json_delta(output, idx, full_arguments.to_string());
-        self.tool_args_by_index
-            .insert(idx, full_arguments.to_string());
+        self.sync_phase_from_runtime();
     }
 
     fn open_thinking_block_if_needed(&mut self, output: &mut Vec<String>) {
@@ -684,6 +807,7 @@ impl TransformResponse {
         let idx = self.content_index;
         self.content_index += 1;
         self.open_thinking_index = Some(idx);
+        self.transition_to(StreamPhase::StreamingThinking);
         output.push(format!(
             "event: content_block_start\ndata: {}\n\n",
             json!({
@@ -952,38 +1076,7 @@ impl TransformResponse {
                 "delta": { "type": "text_delta", "text": fragment }
             })
         ));
-    }
-
-    fn open_tool_block(
-        &mut self,
-        output: &mut Vec<String>,
-        call_id: String,
-        name: String,
-    ) -> usize {
-        self.saw_tool_call = true;
-        self.close_open_text_block(output);
-
-        let idx = self.content_index;
-        self.content_index += 1;
-        self.open_tool_indices.insert(idx);
-        self.last_open_tool_index = Some(idx);
-        self.tool_index_by_call_id.insert(call_id.clone(), idx);
-
-        output.push(format!(
-            "event: content_block_start\ndata: {}\n\n",
-            json!({
-                "type": "content_block_start",
-                "index": idx,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": call_id,
-                    "name": name,
-                    "input": {}
-                }
-            })
-        ));
-
-        idx
+        self.transition_to(StreamPhase::StreamingText);
     }
 
     fn emit_tool_json_delta(&self, output: &mut Vec<String>, idx: usize, delta: String) {
@@ -1075,10 +1168,19 @@ impl TransformResponse {
         let call_id = format!("tool_{}", chrono::Utc::now().timestamp_millis());
         let name = "Bash".to_string();
         let arguments = json!({ "command": script }).to_string();
-
-        let tool_idx = self.open_tool_block(output, call_id, name);
-        self.emit_tool_json_delta(output, tool_idx, arguments);
-        self.close_tool_block_by_index(output, tool_idx);
+        let synthetic_tool = BufferedToolCall {
+            order_key: u64::MAX,
+            arrival_seq: u64::MAX,
+            output_index: None,
+            item_id: None,
+            call_id,
+            name,
+            arguments_buffer: arguments,
+            done_flag: true,
+        };
+        self.saw_tool_call = true;
+        self.emit_serialized_tool_call(output, &synthetic_tool);
+        self.sync_phase_from_runtime();
 
         if !leftover_text.is_empty() {
             self.text_carryover.push_str(&leftover_text);
@@ -1298,8 +1400,9 @@ impl TransformResponse {
 
                     match item_type {
                         "function_call" => {
-                            // 关闭文本块（如果有）
+                            // 进入工具缓冲状态：先收敛文本/thinking 边界，稍后按顺序串行下发 tool_use
                             self.close_open_text_block(&mut output);
+                            self.close_open_thinking_block(&mut output);
 
                             let call_id = item
                                 .get("call_id")
@@ -1313,25 +1416,26 @@ impl TransformResponse {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("unknown")
                                 .to_string();
+                            let output_index = data.get("output_index").and_then(|v| v.as_u64());
+                            let item_id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
 
-                            let tool_idx = self.open_tool_block(&mut output, call_id.clone(), name);
-
-                            if let Some(idx) = data.get("output_index").and_then(|v| v.as_u64()) {
-                                self.tool_index_by_output_index.insert(idx, tool_idx);
-                            }
-                            if let Some(item_id) = item.get("id").and_then(|v| v.as_str()) {
-                                self.tool_index_by_item_id
-                                    .insert(item_id.to_string(), tool_idx);
-                            }
+                            self.buffer_tool_call(output_index, item_id, call_id.clone(), name);
 
                             if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str())
                             {
                                 if !arguments.is_empty() {
-                                    self.apply_tool_arguments_snapshot(
-                                        &mut output,
-                                        tool_idx,
-                                        arguments,
-                                    );
+                                    if let Some(order_key) = self
+                                        .find_buffered_tool_order_from_metadata(
+                                            output_index,
+                                            item.get("id").and_then(|v| v.as_str()),
+                                            Some(call_id.as_str()),
+                                        )
+                                    {
+                                        self.apply_tool_arguments_snapshot(order_key, arguments);
+                                    }
                                 }
                             }
                         }
@@ -1365,12 +1469,8 @@ impl TransformResponse {
                     .unwrap_or("");
 
                 if !delta.is_empty() {
-                    if let Some(tool_idx) = self.find_tool_block_index(&data) {
-                        self.emit_tool_json_delta(&mut output, tool_idx, delta.to_string());
-                        self.tool_args_by_index
-                            .entry(tool_idx)
-                            .or_default()
-                            .push_str(delta);
+                    if let Some(order_key) = self.find_buffered_tool_order(&data) {
+                        self.append_tool_arguments_delta(order_key, delta);
                     }
                 }
             }
@@ -1381,8 +1481,8 @@ impl TransformResponse {
                 self.flush_pending_tool_text(&mut output);
                 let full_arguments = data.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
                 if !full_arguments.is_empty() {
-                    if let Some(tool_idx) = self.find_tool_block_index(&data) {
-                        self.apply_tool_arguments_snapshot(&mut output, tool_idx, full_arguments);
+                    if let Some(order_key) = self.find_buffered_tool_order(&data) {
+                        self.apply_tool_arguments_snapshot(order_key, full_arguments);
                     }
                 }
             }
@@ -1408,49 +1508,44 @@ impl TransformResponse {
                             .and_then(|it| it.get("arguments"))
                             .and_then(|v| v.as_str())
                         {
-                            if let Some(tool_idx) = output_index
-                                .and_then(|idx| self.tool_index_by_output_index.get(&idx).copied())
-                                .or_else(|| {
-                                    item_id
-                                        .and_then(|id| self.tool_index_by_item_id.get(id).copied())
-                                })
-                                .or_else(|| {
-                                    item.and_then(|it| it.get("call_id"))
-                                        .and_then(|v| v.as_str())
-                                        .and_then(|id| self.tool_index_by_call_id.get(id).copied())
-                                })
-                            {
-                                self.apply_tool_arguments_snapshot(
-                                    &mut output,
-                                    tool_idx,
-                                    full_arguments,
-                                );
+                            if let Some(order_key) = self.find_buffered_tool_order_from_metadata(
+                                output_index,
+                                item_id,
+                                item.and_then(|it| it.get("call_id"))
+                                    .and_then(|v| v.as_str()),
+                            ) {
+                                self.apply_tool_arguments_snapshot(order_key, full_arguments);
                             }
                         }
 
-                        let call_id = item
-                            .and_then(|it| it.get("call_id"))
-                            .and_then(|v| v.as_str());
-                        self.close_tool_block_by_metadata(
-                            &mut output,
+                        if let Some(order_key) = self.find_buffered_tool_order_from_metadata(
                             output_index,
                             item_id,
-                            call_id,
-                        );
+                            item.and_then(|it| it.get("call_id"))
+                                .and_then(|v| v.as_str()),
+                        ) {
+                            self.mark_buffered_tool_done(order_key);
+                        } else if let Some(order_key) = self.last_buffered_tool_order {
+                            // 兼容旧流：item 元数据缺失时回退到最近一个缓冲工具调用
+                            self.mark_buffered_tool_done(order_key);
+                        }
+                        self.flush_serialized_tool_calls(&mut output, false);
                     }
                     "message" => {
                         self.in_commentary_phase = false;
                     }
                     _ => {
-                        // 兼容旧流：没有 item 元数据时回退关闭最近打开的 tool block
+                        // 兼容旧流：没有 item 元数据时回退关闭最近缓冲的 tool call
                         if item.is_none() {
                             self.in_commentary_phase = false;
-                            self.close_tool_block_by_metadata(
-                                &mut output,
+                            if let Some(order_key) = self.find_buffered_tool_order_from_metadata(
                                 output_index,
                                 item_id,
                                 None,
-                            );
+                            ) {
+                                self.mark_buffered_tool_done(order_key);
+                            }
+                            self.flush_serialized_tool_calls(&mut output, false);
                         }
                     }
                 }
@@ -1464,24 +1559,9 @@ impl TransformResponse {
                 self.reset_text_dedupe_state();
 
                 // 关闭所有打开的块
-                if let Some(idx) = self.open_text_index.take() {
-                    output.push(format!(
-                        "event: content_block_stop\ndata: {}\n\n",
-                        json!({ "type": "content_block_stop", "index": idx })
-                    ));
-                }
-                if let Some(idx) = self.open_thinking_index.take() {
-                    output.push(format!(
-                        "event: content_block_stop\ndata: {}\n\n",
-                        json!({ "type": "content_block_stop", "index": idx })
-                    ));
-                }
-                let mut open_tool_indices: Vec<usize> =
-                    self.open_tool_indices.iter().copied().collect();
-                open_tool_indices.sort_unstable();
-                for idx in open_tool_indices {
-                    self.close_tool_block_by_index(&mut output, idx);
-                }
+                self.close_open_text_block(&mut output);
+                self.close_open_thinking_block(&mut output);
+                self.flush_serialized_tool_calls(&mut output, true);
 
                 // 确定停止原因
                 let stop_reason = if self.saw_tool_call {
@@ -1527,6 +1607,7 @@ impl TransformResponse {
                     "event: message_stop\ndata: {}\n\n",
                     json!({ "type": "message_stop" })
                 ));
+                self.transition_to(StreamPhase::Terminal);
             }
 
             // 忽略其他事件类型（如 response.created, response.in_progress 等）

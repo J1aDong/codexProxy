@@ -170,13 +170,27 @@ fn commentary_then_tool_call_produces_thinking_plus_tool_use() {
         })
     );
     let arg_events = transformer.transform_sse_line(&fc_args);
+    let fc_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_123",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"/tmp/a.txt\"}"
+            }
+        })
+    );
+    let done_tool_events = transformer.transform_sse_line(&fc_done);
 
     let all_joined = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         text_events.join(""),
         done_events.join(""),
         fc_events.join(""),
-        arg_events.join("")
+        arg_events.join(""),
+        done_tool_events.join("")
     );
 
     // Commentary should be thinking
@@ -420,13 +434,27 @@ fn fallback_commentary_then_tool_call_no_text_leak() {
         })
     );
     let arg_events = transformer.transform_sse_line(&fc_args);
+    let fc_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_456",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"/tmp/b.txt\"}"
+            }
+        })
+    );
+    let done_tool_events = transformer.transform_sse_line(&fc_done);
 
     let all = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         ev1.join(""),
         ev2.join(""),
         fc_events.join(""),
-        arg_events.join("")
+        arg_events.join(""),
+        done_tool_events.join("")
     );
 
     // Commentary redirected to thinking
