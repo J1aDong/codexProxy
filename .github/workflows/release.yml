@@ -158,6 +158,7 @@ jobs:
 
       - name: Build release body
         id: release-body
+        shell: bash
         run: |
           BODY=""
 
