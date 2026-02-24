@@ -71,13 +71,13 @@ jobs:
           OTHER_COMMITS=""
 
           while IFS= read -r line; do
-            if [[ "$line" =~ ^feat[:(] ]]; then
+            if [[ "$line" =~ ^feat(:|\() ]]; then
               FEAT_COMMITS="${FEAT_COMMITS}- ${line}"$'\n'
-            elif [[ "$line" =~ ^fix[:(] ]]; then
+            elif [[ "$line" =~ ^fix(:|\() ]]; then
               FIX_COMMITS="${FIX_COMMITS}- ${line}"$'\n'
-            elif [[ "$line" =~ ^chore[:(] ]]; then
+            elif [[ "$line" =~ ^chore(:|\() ]]; then
               CHORE_COMMITS="${CHORE_COMMITS}- ${line}"$'\n'
-            elif [[ "$line" =~ ^refactor[:(] ]]; then
+            elif [[ "$line" =~ ^refactor(:|\() ]]; then
               REFACTOR_COMMITS="${REFACTOR_COMMITS}- ${line}"$'\n'
             else
               OTHER_COMMITS="${OTHER_COMMITS}- ${line}"$'\n'
