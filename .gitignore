@@ -35,6 +35,7 @@ fronted-tauri/dist-ssr/
 
 # Rust
 main/target/
+fronted-tauri/src-tauri/Cargo.lock
 
 # IDE 和编辑器
 .vscode/
