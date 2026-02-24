@@ -588,7 +588,12 @@ const saveAdvancedSettings = async () => {
   form.allowExternalAccess = localAllowExternalAccess.value
   showAdvancedSettings.value = false
 
+  // 避免由字段联动 watch 引发重复保存
+  isSyncing.value = true
+  updateSelectedEndpointConfig()
   const config = buildProxyConfig()
+  isSyncing.value = false
+
   if (bindModeChanged && isRunning.value) {
     if (restartApplyTimer) {
       clearTimeout(restartApplyTimer)
@@ -708,6 +713,9 @@ const handleConfigImported = async () => {
         sonnet: savedConfig.geminiReasoningEffort.sonnet || DEFAULT_CONFIG.geminiReasoningEffort.sonnet,
         haiku: savedConfig.geminiReasoningEffort.haiku || DEFAULT_CONFIG.geminiReasoningEffort.haiku,
       }
+    }
+    if (savedConfig.codexEffortCapabilityMap) {
+      form.codexEffortCapabilityMap = normalizeCapabilityMap(savedConfig.codexEffortCapabilityMap)
     }
     if (savedConfig.geminiModelPreset && Array.isArray(savedConfig.geminiModelPreset)) {
       form.geminiModelPreset = savedConfig.geminiModelPreset

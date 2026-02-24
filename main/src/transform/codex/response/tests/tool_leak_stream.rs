@@ -561,6 +561,65 @@ fn contextual_note_json_leak_with_suspicious_tail_is_suppressed() {
 }
 
 #[test]
+fn contextual_running_prefix_note_json_is_suppressed_and_prefix_deduped() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "**Running build verification****Running build verification**```json\n{\"note\":\"Running build verification now.\"}```ರಣ "
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("**Running build verification**"),
+        "normal running prefix should remain visible"
+    );
+    assert!(
+        !joined.contains("**Running build verification****Running build verification**"),
+        "duplicated markdown bold prefix should be collapsed"
+    );
+    assert!(
+        !joined.contains("\"note\"") && !joined.contains("ರಣ"),
+        "contextual note-json and suspicious tail should be suppressed"
+    );
+}
+
+#[test]
+fn leaked_marker_suffix_running_note_json_is_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "assistant to=functions.exec_command {\"cmd\":\"npm run build:fe\"}\n**Running build verification****Running build verification**```json\n{\"note\":\"Running build verification now.\"}```ರಣ "
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("**Running build verification**"),
+        "suffix readable prefix should remain visible after leaked marker is removed"
+    );
+    assert!(
+        !joined.contains("assistant to=functions.exec_command")
+            && !joined.contains("\"note\"")
+            && !joined.contains("ರಣ"),
+        "leaked marker line and note-json/tail noise should be suppressed"
+    );
+    assert!(
+        !joined.contains("**Running build verification****Running build verification**"),
+        "suffix duplicated markdown bold prefix should be collapsed"
+    );
+}
+
+#[test]
 fn split_contextual_note_json_across_chunks_is_suppressed() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 

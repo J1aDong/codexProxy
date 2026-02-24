@@ -193,6 +193,53 @@ impl TransformResponse {
         result.trim_end().to_string()
     }
 
+    fn looks_like_contextual_running_prefix(prefix: &str) -> bool {
+        let lower = prefix.to_ascii_lowercase();
+        lower.contains("**re-running")
+            || lower.contains("**running")
+            || (lower.contains("running")
+                && (lower.contains("verify") || lower.contains("test") || lower.contains("build")))
+    }
+
+    fn collapse_adjacent_duplicate_markdown_bold(text: &str) -> String {
+        if !text.contains("****") {
+            return text.to_string();
+        }
+
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+
+        while i < text.len() {
+            let rest = &text[i..];
+            if let Some(token_start_rel) = rest.find("**") {
+                let token_start = i + token_start_rel;
+                out.push_str(&text[i..token_start]);
+
+                let token_rest = &text[token_start + 2..];
+                if let Some(token_end_rel) = token_rest.find("**") {
+                    let token_end = token_start + 2 + token_end_rel + 2;
+                    let token = &text[token_start..token_end];
+                    out.push_str(token);
+
+                    let mut next = token_end;
+                    while next < text.len() && text[next..].starts_with(token) {
+                        next += token.len();
+                    }
+                    i = next;
+                    continue;
+                }
+
+                out.push_str(&text[token_start..]);
+                return out;
+            }
+
+            out.push_str(rest);
+            break;
+        }
+
+        out
+    }
+
     fn looks_like_raw_tool_json_fragment(line: &str) -> bool {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('{') {
@@ -262,7 +309,7 @@ impl TransformResponse {
             }
 
             // 检查是否有前缀模式
-            if context[..json_start].contains("**Re-running") {
+            if Self::looks_like_contextual_running_prefix(&context[..json_start]) {
                 // 查找对应的结束标记 ```
                 if let Some(json_end) = context[json_content_start..].find("```") {
                     let json_end_pos = json_content_start + json_end;
@@ -290,31 +337,19 @@ impl TransformResponse {
                                     0
                                 };
 
-                            let fragment_after_json_end =
-                                if after_json_end >= context.len() - fragment.len() {
-                                    after_json_end - (context.len() - fragment.len())
-                                } else {
-                                    fragment.len()
-                                };
-
                             let prefix_in_fragment = if fragment_json_start > 0 {
                                 fragment[..fragment_json_start].to_string()
                             } else {
                                 String::new()
                             };
 
-                            let suffix_in_fragment = if fragment_after_json_end < fragment.len() {
-                                fragment[fragment_after_json_end..].to_string()
-                            } else {
-                                String::new()
-                            };
+                            let prefix_in_fragment =
+                                Self::collapse_adjacent_duplicate_markdown_bold(
+                                    &prefix_in_fragment,
+                                );
 
-                            return Some((
-                                prefix_in_fragment,
-                                String::new(),
-                                suffix_in_fragment,
-                                false,
-                            ));
+                            // 对于带可疑尾巴的泄漏，完全抑制 JSON 后缀（包含噪声）
+                            return Some((prefix_in_fragment, String::new(), String::new(), false));
                         }
                     }
                 } else {
@@ -393,7 +428,10 @@ impl TransformResponse {
                         .log_raw("[Warn] Dropping leaked tool marker fragment from visible text");
                     let suffix = &pending_for_tool_parse[newline_idx + 1..];
                     if !suffix.is_empty() {
-                        self.handle_text_fragment(output, suffix, true);
+                        let cleaned_suffix = Self::strip_suspicious_trailing_noise(suffix);
+                        if !cleaned_suffix.is_empty() {
+                            self.handle_text_fragment(output, &cleaned_suffix, true);
+                        }
                     }
                     return;
                 }
@@ -406,7 +444,10 @@ impl TransformResponse {
             if let Some(newline_idx) = pending_for_tool_parse.find('\n') {
                 let suffix = &pending_for_tool_parse[newline_idx + 1..];
                 if !suffix.is_empty() {
-                    self.handle_text_fragment(output, suffix, true);
+                    let cleaned_suffix = Self::strip_suspicious_trailing_noise(suffix);
+                    if !cleaned_suffix.is_empty() {
+                        self.handle_text_fragment(output, &cleaned_suffix, true);
+                    }
                 }
             }
             return;
@@ -427,7 +468,7 @@ impl TransformResponse {
 
         // 检查上下文 note-json 泄漏（新增）
         let context = format!("{}{}", self.text_carryover, &pending_raw);
-        if let Some((prefix, _, suffix, is_cross_chunk)) =
+        if let Some((prefix, _, _suffix, is_cross_chunk)) =
             Self::split_contextual_note_json_prefix_suffix(&pending_raw, &context)
         {
             self.logger
@@ -437,9 +478,6 @@ impl TransformResponse {
             }
             if !prefix.is_empty() {
                 self.emit_plain_text_fragment(output, &prefix);
-            }
-            if !suffix.is_empty() {
-                self.handle_text_fragment(output, &suffix, true);
             }
             return;
         }
@@ -874,6 +912,12 @@ impl TransformResponse {
         if fragment.is_empty() {
             return;
         }
+
+        let normalized_fragment = Self::collapse_adjacent_duplicate_markdown_bold(fragment);
+        if normalized_fragment.is_empty() {
+            return;
+        }
+        let fragment = normalized_fragment.as_str();
 
         // Commentary phase: redirect text to thinking blocks
         // Either explicit via phase field, or fallback when reasoning was seen

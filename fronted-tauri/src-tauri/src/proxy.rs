@@ -156,6 +156,9 @@ pub struct EndpointOption {
     #[serde(rename = "codexModelMapping", default)]
     pub codex_model_mapping: Option<CodexModelMappingConfig>,
 
+    #[serde(rename = "codexEffortCapabilityMap", default)]
+    pub codex_effort_capability_map: Option<std::collections::HashMap<String, Vec<String>>>,
+
     #[serde(rename = "geminiModelPreset", default)]
     pub gemini_model_preset: Option<Vec<String>>,
 
@@ -178,6 +181,7 @@ fn default_endpoint_options() -> Vec<EndpointOption> {
         converter: None,
         codex_model: None,
         codex_model_mapping: None,
+        codex_effort_capability_map: None,
         gemini_model_preset: None,
         anthropic_model_mapping: None,
         reasoning_effort: None,
@@ -234,6 +238,9 @@ pub struct ProxyConfig {
         default = "default_anthropic_model_mapping"
     )]
     pub anthropic_model_mapping: AnthropicModelMappingConfig,
+
+    #[serde(rename = "codexEffortCapabilityMap", default)]
+    pub codex_effort_capability_map: Option<std::collections::HashMap<String, Vec<String>>>,
 
     #[serde(rename = "geminiModelPreset", default = "default_gemini_model_preset")]
     pub gemini_model_preset: Vec<String>,

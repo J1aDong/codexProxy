@@ -398,11 +398,7 @@ mod tests {
 
     #[test]
     fn trim_keeps_content_when_requests_under_limit() {
-        let input = concat!(
-            "boot\n",
-            "[a] 🆕 NEW REQUEST - Session: s1\n",
-            "s1-out\n"
-        );
+        let input = concat!("boot\n", "[a] 🆕 NEW REQUEST - Session: s1\n", "s1-out\n");
 
         let out = AppLogger::trim_log_content_by_requests(input, 200);
         assert_eq!(out, input);
