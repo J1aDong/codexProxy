@@ -9,16 +9,120 @@ permissions:
   contents: write
 
 jobs:
+  generate-changelog:
+    runs-on: ubuntu-22.04
+    outputs:
+      changelog: ${{ steps.changelog.outputs.changelog }}
+      manual-notes: ${{ steps.manual-notes.outputs.notes }}
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get previous tag
+        id: prev_tag
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+          # 获取上一个 tag（按创建时间排序）
+          PREV_TAG=$(git tag --sort=-creatordate | grep -A1 "$CURRENT_TAG" | tail -n1)
+          # 如果是第一个 tag，则获取所有 tag 的第一个
+          if [ "$PREV_TAG" = "$CURRENT_TAG" ] || [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git tag --sort=creatordate | head -n1)
+          fi
+          echo "previous_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+          echo "Previous tag: $PREV_TAG"
+          echo "Current tag: $CURRENT_TAG"
+
+      - name: Extract manual changelog from commit body
+        id: manual-notes
+        run: |
+          PREV_TAG="${{ steps.prev_tag.outputs.previous_tag }}"
+          CURRENT_TAG="${{ github.ref_name }}"
+
+          # 获取 commits 中的更新说明（## 更新说明 之后的内容）
+          NOTES=""
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              if [ -n "$NOTES" ]; then
+                NOTES="${NOTES}"$'\n'"${line}"
+              else
+                NOTES="${line}"
+              fi
+            fi
+          done < <(git log "$PREV_TAG".."$CURRENT_TAG" --pretty=format:"%b" | grep -A100 "^## 更新说明" | tail -n +2 | grep "^-" || true)
+
+          # 输出结果（多行处理）
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog from commits
+        id: changelog
+        run: |
+          PREV_TAG="${{ steps.prev_tag.outputs.previous_tag }}"
+          CURRENT_TAG="${{ github.ref_name }}"
+
+          # 按类型分组 commits
+          FEAT_COMMITS=""
+          FIX_COMMITS=""
+          CHORE_COMMITS=""
+          REFACTOR_COMMITS=""
+          OTHER_COMMITS=""
+
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^feat[:(] ]]; then
+              FEAT_COMMITS="${FEAT_COMMITS}- ${line}"$'\n'
+            elif [[ "$line" =~ ^fix[:(] ]]; then
+              FIX_COMMITS="${FIX_COMMITS}- ${line}"$'\n'
+            elif [[ "$line" =~ ^chore[:(] ]]; then
+              CHORE_COMMITS="${CHORE_COMMITS}- ${line}"$'\n'
+            elif [[ "$line" =~ ^refactor[:(] ]]; then
+              REFACTOR_COMMITS="${REFACTOR_COMMITS}- ${line}"$'\n'
+            else
+              OTHER_COMMITS="${OTHER_COMMITS}- ${line}"$'\n'
+            fi
+          done < <(git log "$PREV_TAG".."$CURRENT_TAG" --pretty=format:"%s" --reverse | grep -v "^## 更新说明" | grep -v "^-" || true)
+
+          # 构建 changelog
+          CHANGELOG=""
+
+          if [ -n "$FEAT_COMMITS" ]; then
+            CHANGELOG="${CHANGELOG}### ✨ 新功能"$'\n\n'"${FEAT_COMMITS}"$'\n'
+          fi
+
+          if [ -n "$FIX_COMMITS" ]; then
+            CHANGELOG="${CHANGELOG}### 🐛 Bug 修复"$'\n\n'"${FIX_COMMITS}"$'\n'
+          fi
+
+          if [ -n "$REFACTOR_COMMITS" ]; then
+            CHANGELOG="${CHANGELOG}### ♻️ 重构"$'\n\n'"${REFACTOR_COMMITS}"$'\n'
+          fi
+
+          if [ -n "$CHORE_COMMITS" ]; then
+            CHANGELOG="${CHANGELOG}### 📦 其他"$'\n\n'"${CHORE_COMMITS}"$'\n'
+          fi
+
+          if [ -n "$OTHER_COMMITS" ]; then
+            CHANGELOG="${CHANGELOG}### 📝 其他变更"$'\n\n'"${OTHER_COMMITS}"$'\n'
+          fi
+
+          # 输出结果
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
   release:
+    needs: [generate-changelog]
     runs-on: ${{ matrix.os }}
-    
+
     strategy:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-22.04]
 
     steps:
       - name: Check out git repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Node.js
         uses: actions/setup-node@v3
@@ -52,6 +156,31 @@ jobs:
         working-directory: fronted-tauri
         run: npm install
 
+      - name: Build release body
+        id: release-body
+        run: |
+          BODY=""
+
+          # 1. 优先显示手动输入的更新说明
+          MANUAL_NOTES="${{ needs.generate-changelog.outputs.manual-notes }}"
+          if [ -n "$MANUAL_NOTES" ]; then
+            BODY="## 📢 更新亮点"$'\n\n'"${MANUAL_NOTES}"$'\n\n'
+          fi
+
+          # 2. 自动生成的 changelog
+          AUTO_CHANGELOG="${{ needs.generate-changelog.outputs.changelog }}"
+          if [ -n "$AUTO_CHANGELOG" ]; then
+            BODY="${BODY}## 📋 详细变更"$'\n\n'"${AUTO_CHANGELOG}"
+          fi
+
+          # 如果没有内容，使用默认文本
+          if [ -z "$BODY" ]; then
+            BODY="See the assets to download and install this version."
+          fi
+
+          # 输出到文件（避免多行问题）
+          echo "$BODY" > release-body.md
+
       - name: Build and Release Tauri App (macOS/Windows)
         if: matrix.os != 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@v0
@@ -61,7 +190,7 @@ jobs:
           projectPath: fronted-tauri
           tagName: ${{ github.ref_name }}
           releaseName: "Codex Proxy ${{ github.ref_name }}"
-          releaseBody: "See the assets to download and install this version."
+          releaseBodyPath: release-body.md
 
       - name: Build and Release Tauri App (Linux)
         if: matrix.os == 'ubuntu-22.04'
@@ -72,5 +201,5 @@ jobs:
           projectPath: fronted-tauri
           tagName: ${{ github.ref_name }}
           releaseName: "Codex Proxy ${{ github.ref_name }}"
-          releaseBody: "See the assets to download and install this version."
+          releaseBodyPath: release-body.md
           args: --bundles appimage,deb,rpm

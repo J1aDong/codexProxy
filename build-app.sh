@@ -82,11 +82,35 @@ if [ "$MAIN_CHOICE" == "2" ]; then
     echo "☁️  准备推送到 GitHub..."
     TAG_NAME="v$NEW_VERSION"
 
+    # 输入本次更新的 changelog
+    echo ""
+    echo "📝 请输入本次更新的主要内容 (用于 GitHub Release Notes):"
+    echo "   - 每行一个更新点，以 '-' 开头"
+    echo "   - 直接回车跳过 (将仅基于 commit 历史自动生成)"
+    echo "   - 输入 'END' 结束输入"
+    CHANGELOG_INPUT=""
+    while true; do
+        read -p "> " changelog_line
+        if [ "$changelog_line" = "END" ] || [ -z "$changelog_line" ]; then
+            break
+        fi
+        if [ -n "$CHANGELOG_INPUT" ]; then
+            CHANGELOG_INPUT="${CHANGELOG_INPUT}"$'\n'"${changelog_line}"
+        else
+            CHANGELOG_INPUT="${changelog_line}"
+        fi
+    done
+
     echo "📦 暂存全部变更..."
     git add -A
 
     echo "💾 正在提交变更..."
-    git commit -m "chore: bump version to $NEW_VERSION" || echo "⚠️  没有需要提交的内容"
+    # 构建 commit message：如果有手动输入的 changelog，则添加到 commit body
+    if [ -n "$CHANGELOG_INPUT" ]; then
+        git commit -m "chore: bump version to $NEW_VERSION" -m "## 更新说明"$'\n'"${CHANGELOG_INPUT}" || echo "⚠️  没有需要提交的内容"
+    else
+        git commit -m "chore: bump version to $NEW_VERSION" || echo "⚠️  没有需要提交的内容"
+    fi
 
     # 处理标签冲突
     if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
