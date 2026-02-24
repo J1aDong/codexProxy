@@ -2159,7 +2159,7 @@ impl ProxyServer {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         // 初始化全局日志记录器
-        let logger = AppLogger::init(Some("logs"));
+        let logger = AppLogger::init(None);
         logger.log("=== Codex Proxy Started ===");
 
         let addr = if self.allow_external_access {
