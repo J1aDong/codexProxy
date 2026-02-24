@@ -13,6 +13,29 @@ echo "=========================================="
 echo "   🚀 Codex Proxy 构建与发布工具 (Tauri)  "
 echo "=========================================="
 
+# 统一读取输入：交互式终端开启 readline，改善中文输入回删体验
+prompt_read() {
+    local __var_name="$1"
+    local __prompt="$2"
+    local __value=""
+    PROMPT_READ_EOF=0
+
+    if [ -t 0 ] && [ -t 1 ]; then
+        if ! read -e -r -p "$__prompt" __value; then
+            __value=""
+            PROMPT_READ_EOF=1
+        fi
+    else
+        if ! read -r __value; then
+            __value=""
+            PROMPT_READ_EOF=1
+        fi
+    fi
+
+    printf -v "$__var_name" '%s' "$__value"
+    return 0
+}
+
 # 1. 检查目录
 if [ ! -d "$FRONTED_DIR" ]; then
     echo "❌ 错误: 未找到 'fronted-tauri' 目录。"
@@ -23,7 +46,7 @@ fi
 echo "请选择操作类型:"
 echo "  1) 仅本地构建 (生成安装包，不推送 Git)"
 echo "  2) 发布到 GitHub (提交、打标签并推送，触发 Actions)"
-read -p "选择 [1/2, 默认 1]: " MAIN_CHOICE
+prompt_read MAIN_CHOICE "选择 [1/2, 默认 1]: "
 MAIN_CHOICE="${MAIN_CHOICE:-1}"
 
 # 3. 版本处理逻辑
@@ -38,11 +61,11 @@ echo ""
 echo "📌 当前版本: $CURRENT_VERSION"
 
 if [ "$MAIN_CHOICE" == "2" ]; then
-    read -p "🖊️  输入新版本号 (直接回车使用 $DEFAULT_NEXT_VERSION): " INPUT_VERSION
+    prompt_read INPUT_VERSION "🖊️  输入新版本号 (直接回车使用 $DEFAULT_NEXT_VERSION): "
     NEW_VERSION="${INPUT_VERSION:-$DEFAULT_NEXT_VERSION}"
 else
     echo "💡 本地构建建议保持版本号不变或仅做本地调整。"
-    read -p "🖊️  是否修改版本号? (输入新版本号，直接回车保持 $CURRENT_VERSION): " INPUT_VERSION
+    prompt_read INPUT_VERSION "🖊️  是否修改版本号? (输入新版本号，直接回车保持 $CURRENT_VERSION): "
     NEW_VERSION="${INPUT_VERSION:-$CURRENT_VERSION}"
 fi
 
@@ -86,19 +109,31 @@ if [ "$MAIN_CHOICE" == "2" ]; then
     echo ""
     echo "📝 请输入本次更新的主要内容 (用于 GitHub Release Notes):"
     echo "   - 每行一个更新点，以 '-' 开头"
-    echo "   - 直接回车跳过 (将仅基于 commit 历史自动生成)"
-    echo "   - 输入 'END' 结束输入"
+    echo "   - 首行直接回车：跳过 (将仅基于 commit 历史自动生成)"
+    echo "   - 回车可继续换行输入"
+    echo "   - 输入完成后按 Ctrl+D 结束"
     CHANGELOG_INPUT=""
+    CHANGELOG_LINE_COUNT=0
     while true; do
-        read -p "> " changelog_line
-        if [ "$changelog_line" = "END" ] || [ -z "$changelog_line" ]; then
+        prompt_read changelog_line "> "
+
+        # Ctrl+D / EOF: 结束输入
+        if [ "${PROMPT_READ_EOF:-0}" = "1" ]; then
+            echo ""
             break
         fi
+
+        # 首行直接回车：跳过 changelog
+        if [ "$CHANGELOG_LINE_COUNT" -eq 0 ] && [ -z "$changelog_line" ]; then
+            break
+        fi
+
         if [ -n "$CHANGELOG_INPUT" ]; then
             CHANGELOG_INPUT="${CHANGELOG_INPUT}"$'\n'"${changelog_line}"
         else
             CHANGELOG_INPUT="${changelog_line}"
         fi
+        CHANGELOG_LINE_COUNT=$((CHANGELOG_LINE_COUNT + 1))
     done
 
     echo "📦 暂存全部变更..."
@@ -115,7 +150,7 @@ if [ "$MAIN_CHOICE" == "2" ]; then
     # 处理标签冲突
     if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
         echo "⚠️  本地已存在标签 '$TAG_NAME'。"
-        read -p "🔄 是否删除旧标签并重新创建? (y/N): " DELETE_TAG
+        prompt_read DELETE_TAG "🔄 是否删除旧标签并重新创建? (y/N): "
         if [[ "$DELETE_TAG" =~ ^[Yy]$ ]]; then
             git tag -d "$TAG_NAME"
             echo "🗑️  本地旧标签已删除。"
@@ -157,12 +192,12 @@ if [ "$OS_NAME" = "Darwin" ]; then
     echo "  3) macOS (仅 Apple Silicon)"
     echo "  4) macOS (仅 Intel)"
     echo "  5) Linux (AppImage + DEB + RPM) [需要 Linux 环境]"
-    read -p "选择 [1-5, 默认 1]: " PLATFORM_CHOICE
+    prompt_read PLATFORM_CHOICE "选择 [1-5, 默认 1]: "
 elif [ "$OS_NAME" = "Linux" ]; then
     echo "  2) Linux (AppImage + DEB + RPM)"
-    read -p "选择 [1-2, 默认 1]: " PLATFORM_CHOICE
+    prompt_read PLATFORM_CHOICE "选择 [1-2, 默认 1]: "
 else
-    read -p "选择 [1, 默认 1]: " PLATFORM_CHOICE
+    prompt_read PLATFORM_CHOICE "选择 [1, 默认 1]: "
 fi
 
 case $PLATFORM_CHOICE in
