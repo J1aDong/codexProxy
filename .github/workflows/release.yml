@@ -179,8 +179,10 @@ jobs:
             BODY="See the assets to download and install this version."
           fi
 
-          # 输出到文件（避免多行问题）
-          echo "$BODY" > release-body.md
+          # 输出到 step output（支持多行）
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Build and Release Tauri App (macOS/Windows)
         if: matrix.os != 'ubuntu-22.04'
@@ -191,7 +193,7 @@ jobs:
           projectPath: fronted-tauri
           tagName: ${{ github.ref_name }}
           releaseName: "Codex Proxy ${{ github.ref_name }}"
-          releaseBodyPath: release-body.md
+          releaseBody: ${{ steps.release-body.outputs.body }}
 
       - name: Build and Release Tauri App (Linux)
         if: matrix.os == 'ubuntu-22.04'
@@ -202,5 +204,5 @@ jobs:
           projectPath: fronted-tauri
           tagName: ${{ github.ref_name }}
           releaseName: "Codex Proxy ${{ github.ref_name }}"
-          releaseBodyPath: release-body.md
+          releaseBody: ${{ steps.release-body.outputs.body }}
           args: --bundles appimage,deb,rpm
