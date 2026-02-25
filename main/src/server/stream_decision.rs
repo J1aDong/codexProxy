@@ -24,6 +24,9 @@ pub(crate) struct StreamDecisionState {
     pub incomplete_stream_retry_attempts: u32,
     pub incomplete_stream_retry_succeeded: bool,
     pub sibling_tool_error_retry_attempted: bool,
+    pub upstream_error_event_type: Option<String>,
+    pub upstream_error_message: Option<String>,
+    pub upstream_error_code: Option<String>,
     pub emitted_empty_completion_fallback_notice: bool,
     pub fallback_completion_injected: bool,
     pub logged_premature_stop_suppression: bool,
@@ -70,6 +73,9 @@ impl StreamDecisionState {
         self.saw_response_failed = false;
         self.saw_sibling_tool_call_error = false;
         self.saw_message_stop = false;
+        self.upstream_error_event_type = None;
+        self.upstream_error_message = None;
+        self.upstream_error_code = None;
     }
 
     pub fn allow_sibling_tool_retry(&self, has_serial_fallback: bool) -> bool {

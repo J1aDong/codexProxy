@@ -9,3 +9,4 @@ mod request_payload;
 mod text_hygiene;
 mod thinking_stream;
 mod tool_leak_stream;
+mod upstream_event_compat;

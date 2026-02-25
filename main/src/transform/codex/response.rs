@@ -46,6 +46,8 @@ pub struct TransformResponse {
     tool_order_by_call_id: HashMap<String, u64>,
     last_buffered_tool_order: Option<u64>,
     saw_tool_call: bool,
+    saw_refusal: bool,
+    refusal_text_buffer: String,
     sent_message_start: bool,
     text_carryover: String,
     pending_tool_text: String,
@@ -648,6 +650,8 @@ impl TransformResponse {
             tool_order_by_call_id: HashMap::new(),
             last_buffered_tool_order: None,
             saw_tool_call: false,
+            saw_refusal: false,
+            refusal_text_buffer: String::new(),
             sent_message_start: false,
             text_carryover: String::new(),
             pending_tool_text: String::new(),
@@ -1152,6 +1156,14 @@ impl TransformResponse {
             return;
         }
 
+        self.emit_visible_text_fragment(output, fragment);
+    }
+
+    fn emit_visible_text_fragment(&mut self, output: &mut Vec<String>, fragment: &str) {
+        if fragment.is_empty() {
+            return;
+        }
+
         if self.open_text_index.is_none() {
             let idx = self.content_index;
             self.content_index += 1;
@@ -1175,6 +1187,53 @@ impl TransformResponse {
             })
         ));
         self.transition_to(StreamPhase::StreamingText);
+    }
+
+    fn extract_refusal_text<'a>(data: &'a Value) -> Option<&'a str> {
+        fn value_to_text(value: &Value) -> Option<&str> {
+            value
+                .as_str()
+                .or_else(|| value.get("text").and_then(|v| v.as_str()))
+                .or_else(|| value.get("delta").and_then(|v| v.as_str()))
+        }
+
+        data.get("delta")
+            .and_then(value_to_text)
+            .or_else(|| data.get("refusal").and_then(value_to_text))
+            .or_else(|| data.get("text").and_then(|v| v.as_str()))
+    }
+
+    fn emit_refusal_delta(&mut self, output: &mut Vec<String>, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.saw_refusal = true;
+        self.in_commentary_phase = false;
+        self.close_open_thinking_block(output);
+        self.emit_visible_text_fragment(output, delta);
+        self.refusal_text_buffer.push_str(delta);
+    }
+
+    fn emit_refusal_done(&mut self, output: &mut Vec<String>, full_text: &str) {
+        if full_text.is_empty() {
+            return;
+        }
+        self.saw_refusal = true;
+        self.in_commentary_phase = false;
+        self.close_open_thinking_block(output);
+
+        let suffix = if full_text.starts_with(self.refusal_text_buffer.as_str()) {
+            &full_text[self.refusal_text_buffer.len()..]
+        } else if self.refusal_text_buffer.starts_with(full_text) {
+            ""
+        } else {
+            full_text
+        };
+
+        if !suffix.is_empty() {
+            self.emit_visible_text_fragment(output, suffix);
+        }
+        self.refusal_text_buffer = full_text.to_string();
     }
 
     fn emit_tool_json_delta(&self, output: &mut Vec<String>, idx: usize, delta: String) {
@@ -1367,6 +1426,121 @@ impl TransformResponse {
         self.process_pending_tool_text(output, true);
     }
 
+    fn map_incomplete_reason_to_stop_reason(
+        reason: Option<&str>,
+        force_incomplete: bool,
+    ) -> &'static str {
+        let normalized = reason
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if normalized == "pause_turn" {
+            return "pause_turn";
+        }
+        if normalized == "stop_sequence" {
+            return "stop_sequence";
+        }
+        if normalized == "model_context_window_exceeded" || normalized == "context_window_exceeded"
+        {
+            return "model_context_window_exceeded";
+        }
+        if normalized == "refusal" || normalized == "content_filter" || normalized == "safety" {
+            return "refusal";
+        }
+        if force_incomplete
+            || normalized == "max_output_tokens"
+            || normalized == "max_tokens"
+            || normalized == "length"
+        {
+            return "max_tokens";
+        }
+        "end_turn"
+    }
+
+    fn determine_stop_reason(&self, data: &Value, force_incomplete: bool) -> &'static str {
+        if self.saw_tool_call {
+            return "tool_use";
+        }
+        if self.saw_refusal {
+            return "refusal";
+        }
+
+        let response = data.get("response");
+        let status = response
+            .and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str());
+        let incomplete_reason = response
+            .and_then(|r| r.pointer("/incomplete_details/reason"))
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                response
+                    .and_then(|r| r.get("reason"))
+                    .and_then(|value| value.as_str())
+            })
+            .or_else(|| {
+                data.pointer("/incomplete_details/reason")
+                    .and_then(|value| value.as_str())
+            })
+            .or_else(|| data.get("reason").and_then(|value| value.as_str()));
+
+        if status == Some("incomplete") {
+            return Self::map_incomplete_reason_to_stop_reason(incomplete_reason, true);
+        }
+
+        Self::map_incomplete_reason_to_stop_reason(incomplete_reason, force_incomplete)
+    }
+
+    fn emit_terminal_events(
+        &mut self,
+        output: &mut Vec<String>,
+        data: &Value,
+        force_incomplete: bool,
+    ) {
+        if self.phase == StreamPhase::Terminal {
+            return;
+        }
+
+        self.flush_text_carryover(output);
+        self.flush_pending_tool_text(output);
+        self.flush_markdown_bash(output);
+        self.reset_text_dedupe_state();
+
+        self.close_open_text_block(output);
+        self.close_open_thinking_block(output);
+        self.flush_serialized_tool_calls(output, true);
+
+        let stop_reason = self.determine_stop_reason(data, force_incomplete);
+
+        let usage = data
+            .get("response")
+            .and_then(|r| r.get("usage"))
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "input_tokens": 0,
+                    "output_tokens": 0
+                })
+            });
+
+        output.push(format!(
+            "event: message_delta\ndata: {}\n\n",
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": stop_reason },
+                "usage": {
+                    "input_tokens": usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                    "output_tokens": usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0)
+                }
+            })
+        ));
+
+        output.push(format!(
+            "event: message_stop\ndata: {}\n\n",
+            json!({ "type": "message_stop" })
+        ));
+        self.transition_to(StreamPhase::Terminal);
+    }
+
     pub fn transform_sse_line(&mut self, line: &str) -> Vec<String> {
         let mut output = Vec::new();
 
@@ -1486,6 +1660,22 @@ impl TransformResponse {
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 self.close_open_thinking_block(&mut output);
+            }
+
+            "response.refusal.delta" => {
+                self.flush_text_carryover(&mut output);
+                self.flush_pending_tool_text(&mut output);
+                if let Some(delta) = Self::extract_refusal_text(&data) {
+                    self.emit_refusal_delta(&mut output, delta);
+                }
+            }
+
+            "response.refusal.done" => {
+                self.flush_text_carryover(&mut output);
+                self.flush_pending_tool_text(&mut output);
+                if let Some(full_text) = Self::extract_refusal_text(&data) {
+                    self.emit_refusal_done(&mut output, full_text);
+                }
             }
 
             // 工具调用开始 / 消息项开始 - 严格按照 OpenAI Responses 格式解析
@@ -1651,61 +1841,12 @@ impl TransformResponse {
 
             // 响应完成 - 关键：确保完整的事件序列
             "response.completed" => {
-                self.flush_text_carryover(&mut output);
-                self.flush_pending_tool_text(&mut output);
-                self.flush_markdown_bash(&mut output);
-                self.reset_text_dedupe_state();
+                self.emit_terminal_events(&mut output, &data, false);
+            }
 
-                // 关闭所有打开的块
-                self.close_open_text_block(&mut output);
-                self.close_open_thinking_block(&mut output);
-                self.flush_serialized_tool_calls(&mut output, true);
-
-                // 确定停止原因
-                let stop_reason = if self.saw_tool_call {
-                    "tool_use"
-                } else if data
-                    .get("response")
-                    .and_then(|r| r.get("status"))
-                    .and_then(|s| s.as_str())
-                    == Some("incomplete")
-                {
-                    "max_tokens"
-                } else {
-                    "end_turn"
-                };
-
-                // 提取使用统计
-                let usage = data
-                    .get("response")
-                    .and_then(|r| r.get("usage"))
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        json!({
-                            "input_tokens": 0,
-                            "output_tokens": 0
-                        })
-                    });
-
-                // 发送 message_delta（包含停止原因和使用统计）
-                output.push(format!(
-                    "event: message_delta\ndata: {}\n\n",
-                    json!({
-                        "type": "message_delta",
-                        "delta": { "stop_reason": stop_reason },
-                        "usage": {
-                            "input_tokens": usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-                            "output_tokens": usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0)
-                        }
-                    })
-                ));
-
-                // 发送 message_stop（完成流式响应）
-                output.push(format!(
-                    "event: message_stop\ndata: {}\n\n",
-                    json!({ "type": "message_stop" })
-                ));
-                self.transition_to(StreamPhase::Terminal);
+            // 响应不完整但已终止（例如 max_output_tokens / context limit）
+            "response.incomplete" => {
+                self.emit_terminal_events(&mut output, &data, true);
             }
 
             // 忽略其他事件类型（如 response.created, response.in_progress 等）

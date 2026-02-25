@@ -512,6 +512,7 @@ struct StreamEventCounters {
     upstream_chunks: u64,
     upstream_frames: u64,
     upstream_response_completed: u64,
+    upstream_response_incomplete: u64,
     upstream_response_failed: u64,
     downstream_message_start: u64,
     downstream_message_delta: u64,
@@ -537,6 +538,10 @@ impl StreamEventCounters {
 
     fn mark_response_completed(&mut self) {
         self.upstream_response_completed += 1;
+    }
+
+    fn mark_response_incomplete(&mut self) {
+        self.upstream_response_incomplete += 1;
     }
 
     fn mark_response_failed(&mut self) {
@@ -597,6 +602,9 @@ fn observe_upstream_chunk_events(
     saw_response_completed: &mut bool,
     saw_response_failed: &mut bool,
     saw_sibling_tool_call_error: &mut bool,
+    upstream_error_event_type: &mut Option<String>,
+    upstream_error_message: &mut Option<String>,
+    upstream_error_code: &mut Option<String>,
     counters: &mut StreamEventCounters,
 ) {
     counters.mark_upstream_frame();
@@ -606,12 +614,38 @@ fn observe_upstream_chunk_events(
         *saw_response_completed = true;
         counters.mark_response_completed();
     }
-    if upstream_chunk_contains_event(chunk, "response.failed") {
+    if upstream_chunk_contains_event(chunk, "response.incomplete") {
+        *saw_response_completed = true;
+        counters.mark_response_incomplete();
+    }
+
+    let saw_failed_event = upstream_chunk_contains_event(chunk, "response.failed");
+    let saw_error_event = upstream_chunk_contains_event(chunk, "error");
+    if saw_failed_event || saw_error_event {
         *saw_response_failed = true;
         counters.mark_response_failed();
-        if chunk_contains_sibling_tool_call_error(chunk) {
+        if saw_failed_event {
+            *upstream_error_event_type = Some("response.failed".to_string());
+        } else if saw_error_event {
+            *upstream_error_event_type = Some("error".to_string());
+        }
+    }
+
+    if let Some((event_type, message, code)) = extract_upstream_error_details(chunk) {
+        *upstream_error_event_type = Some(event_type.clone());
+        if let Some(message) = message {
+            if event_type == "response.failed" && is_sibling_tool_call_error_message(&message) {
+                *saw_sibling_tool_call_error = true;
+            }
+            *upstream_error_message = Some(message);
+        } else if event_type == "response.failed" && chunk_contains_sibling_tool_call_error(chunk) {
             *saw_sibling_tool_call_error = true;
         }
+        if let Some(code) = code {
+            *upstream_error_code = Some(code);
+        }
+    } else if saw_failed_event && chunk_contains_sibling_tool_call_error(chunk) {
+        *saw_sibling_tool_call_error = true;
     }
 }
 
@@ -666,6 +700,7 @@ fn emit_stream_terminal_summary(
             "upstream_chunks": counters.upstream_chunks,
             "upstream_frames": counters.upstream_frames,
             "upstream_response_completed": counters.upstream_response_completed,
+            "upstream_response_incomplete": counters.upstream_response_incomplete,
             "upstream_response_failed": counters.upstream_response_failed,
             "downstream_message_start": counters.downstream_message_start,
             "downstream_message_delta": counters.downstream_message_delta,
@@ -1288,6 +1323,59 @@ fn disable_parallel_tool_calls_in_upstream_body(body: &Value) -> Option<Value> {
     }
     obj.insert("parallel_tool_calls".to_string(), json!(false));
     Some(next)
+}
+
+fn extract_upstream_error_details(chunk: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let mut event_name: Option<String> = None;
+
+    for line in chunk.lines() {
+        if let Some(event) = line.strip_prefix("event: ") {
+            event_name = Some(event.trim().to_string());
+            continue;
+        }
+
+        let Some(data_line) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(data_line) else {
+            continue;
+        };
+
+        let payload_type = parsed
+            .get("type")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim());
+        let event_type = match (payload_type, event_name.as_deref()) {
+            (Some("response.failed"), _) => "response.failed",
+            (Some("error"), _) => "error",
+            (_, Some("response.failed")) => "response.failed",
+            (_, Some("error")) => "error",
+            _ => continue,
+        };
+
+        let message = parsed
+            .pointer("/response/error/message")
+            .or_else(|| parsed.pointer("/error/message"))
+            .or_else(|| parsed.pointer("/message"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let code = parsed
+            .pointer("/response/error/code")
+            .or_else(|| parsed.pointer("/error/code"))
+            .or_else(|| parsed.pointer("/response/error/type"))
+            .or_else(|| parsed.pointer("/error/type"))
+            .or_else(|| parsed.pointer("/code"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        return Some((event_type.to_string(), message, code));
+    }
+
+    None
 }
 
 fn extract_response_failed_error_message(chunk: &str) -> Option<String> {
@@ -3599,6 +3687,9 @@ async fn handle_request(
                                         &mut decision.saw_response_completed,
                                         &mut decision.saw_response_failed,
                                         &mut decision.saw_sibling_tool_call_error,
+                                        &mut decision.upstream_error_event_type,
+                                        &mut decision.upstream_error_message,
+                                        &mut decision.upstream_error_code,
                                         &mut event_counters,
                                     );
 
@@ -3677,6 +3768,9 @@ async fn handle_request(
                                         &mut decision.saw_response_completed,
                                         &mut decision.saw_response_failed,
                                         &mut decision.saw_sibling_tool_call_error,
+                                        &mut decision.upstream_error_event_type,
+                                        &mut decision.upstream_error_message,
+                                        &mut decision.upstream_error_code,
                                         &mut event_counters,
                                     );
 
@@ -3855,6 +3949,9 @@ async fn handle_request(
                         &mut decision.saw_response_completed,
                         &mut decision.saw_response_failed,
                         &mut decision.saw_sibling_tool_call_error,
+                        &mut decision.upstream_error_event_type,
+                        &mut decision.upstream_error_message,
+                        &mut decision.upstream_error_code,
                         &mut event_counters,
                     );
 
@@ -3904,6 +4001,9 @@ async fn handle_request(
                     &mut decision.saw_response_completed,
                     &mut decision.saw_response_failed,
                     &mut decision.saw_sibling_tool_call_error,
+                    &mut decision.upstream_error_event_type,
+                    &mut decision.upstream_error_message,
+                    &mut decision.upstream_error_code,
                     &mut event_counters,
                 );
 
@@ -4264,19 +4364,34 @@ async fn handle_request(
                 &log_tx_clone,
                 &logger_for_stream,
                 format!(
-                    "[Stream] #{} response_failed_fallback_error_emitted",
-                    request_id_for_stream
+                    "[Stream] #{} response_failed_fallback_error_emitted event_type={} code={} message={}",
+                    request_id_for_stream,
+                    decision
+                        .upstream_error_event_type
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    decision.upstream_error_code.as_deref().unwrap_or("-"),
+                    decision.upstream_error_message.as_deref().unwrap_or("-")
                 ),
             );
 
             let fallback_error_message = if decision.saw_sibling_tool_call_error {
                 if decision.sibling_tool_error_retry_attempted {
-                    "上游返回 response.failed（Sibling tool call errored），已自动降级串行重试 1 次仍失败，请直接重试。"
+                    "上游返回 response.failed（Sibling tool call errored），已自动降级串行重试 1 次仍失败，请直接重试。".to_string()
                 } else {
-                    "上游返回 response.failed（Sibling tool call errored），建议直接重试；若持续失败，可暂时降低并行工具调用。"
+                    "上游返回 response.failed（Sibling tool call errored），建议直接重试；若持续失败，可暂时降低并行工具调用。".to_string()
                 }
+            } else if let Some(message) = decision.upstream_error_message.as_deref() {
+                let code_suffix = decision
+                    .upstream_error_code
+                    .as_deref()
+                    .map(|code| format!("（{}）", code))
+                    .unwrap_or_default();
+                format!("上游返回错误{}：{}。请直接重试。", code_suffix, message)
+            } else if let Some(event_type) = decision.upstream_error_event_type.as_deref() {
+                format!("上游返回 {}，已终止本次流式输出，请直接重试。", event_type)
             } else {
-                "上游返回 response.failed，已终止本次流式输出，请直接重试。"
+                "上游返回 response.failed，已终止本次流式输出，请直接重试。".to_string()
             };
 
             let error_event = format!(
@@ -4642,13 +4757,13 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_sibling_tool_error_retry,
-        chunk_contains_sibling_tool_call_error, classify_connection_error,
-        derive_stream_close_cause, disable_parallel_tool_calls_in_upstream_body,
-        is_business_stream_output, observe_upstream_chunk_events, resolve_effective_stream,
-        resolve_upstream_url, should_suppress_premature_message_stop,
-        sibling_tool_error_retry_skip_reason, ConnErrorClass, SseFrameParser,
-        StreamEventCounters, StreamRuntimeOptions, UpstreamOperation,
+        allow_sibling_tool_error_retry, chunk_contains_sibling_tool_call_error,
+        classify_connection_error, derive_stream_close_cause,
+        disable_parallel_tool_calls_in_upstream_body, is_business_stream_output,
+        observe_upstream_chunk_events, resolve_effective_stream, resolve_upstream_url,
+        should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
+        ConnErrorClass, SseFrameParser, StreamEventCounters, StreamRuntimeOptions,
+        UpstreamOperation,
     };
     use serde_json::json;
 
@@ -4824,11 +4939,7 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
 
         let mut opts_disabled = stream_opts();
         opts_disabled.enable_sibling_tool_error_retry = false;
-        assert!(!allow_sibling_tool_error_retry(
-            &state,
-            opts_disabled,
-            true
-        ));
+        assert!(!allow_sibling_tool_error_retry(&state, opts_disabled, true));
     }
 
     #[test]
@@ -4893,6 +5004,9 @@ data: {"type": "ping"}
         let mut saw_completed = false;
         let mut saw_failed = false;
         let mut saw_sibling = false;
+        let mut upstream_error_event_type = None;
+        let mut upstream_error_message = None;
+        let mut upstream_error_code = None;
         let mut counters = StreamEventCounters::default();
         let chunk = r#"event: response.failed
 data: {"type":"response.failed","response":{"error":{"message":"Sibling tool call errored: Invalid tool parameters"}}}
@@ -4904,12 +5018,24 @@ data: {"type":"response.failed","response":{"error":{"message":"Sibling tool cal
             &mut saw_completed,
             &mut saw_failed,
             &mut saw_sibling,
+            &mut upstream_error_event_type,
+            &mut upstream_error_message,
+            &mut upstream_error_code,
             &mut counters,
         );
 
         assert!(!saw_completed);
         assert!(saw_failed);
         assert!(saw_sibling);
+        assert_eq!(
+            upstream_error_event_type.as_deref(),
+            Some("response.failed")
+        );
+        assert_eq!(
+            upstream_error_message.as_deref(),
+            Some("Sibling tool call errored: Invalid tool parameters")
+        );
+        assert_eq!(upstream_error_code, None);
         assert_eq!(counters.upstream_frames, 1);
         assert_eq!(counters.upstream_response_failed, 1);
     }
@@ -4919,6 +5045,9 @@ data: {"type":"response.failed","response":{"error":{"message":"Sibling tool cal
         let mut saw_completed = false;
         let mut saw_failed = false;
         let mut saw_sibling = false;
+        let mut upstream_error_event_type = None;
+        let mut upstream_error_message = None;
+        let mut upstream_error_code = None;
         let mut counters = StreamEventCounters::default();
         let chunk = r#"event: done
 data: [DONE]
@@ -4930,13 +5059,91 @@ data: [DONE]
             &mut saw_completed,
             &mut saw_failed,
             &mut saw_sibling,
+            &mut upstream_error_event_type,
+            &mut upstream_error_message,
+            &mut upstream_error_code,
             &mut counters,
         );
 
         assert!(saw_completed);
         assert!(!saw_failed);
         assert!(!saw_sibling);
+        assert_eq!(upstream_error_event_type, None);
+        assert_eq!(upstream_error_message, None);
+        assert_eq!(upstream_error_code, None);
         assert_eq!(counters.upstream_response_completed, 1);
+    }
+
+    #[test]
+    fn test_observe_upstream_chunk_events_marks_incomplete_as_completed() {
+        let mut saw_completed = false;
+        let mut saw_failed = false;
+        let mut saw_sibling = false;
+        let mut upstream_error_event_type = None;
+        let mut upstream_error_message = None;
+        let mut upstream_error_code = None;
+        let mut counters = StreamEventCounters::default();
+        let chunk = r#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}
+
+"#;
+
+        observe_upstream_chunk_events(
+            chunk,
+            &mut saw_completed,
+            &mut saw_failed,
+            &mut saw_sibling,
+            &mut upstream_error_event_type,
+            &mut upstream_error_message,
+            &mut upstream_error_code,
+            &mut counters,
+        );
+
+        assert!(saw_completed);
+        assert!(!saw_failed);
+        assert!(!saw_sibling);
+        assert_eq!(upstream_error_event_type, None);
+        assert_eq!(upstream_error_message, None);
+        assert_eq!(upstream_error_code, None);
+        assert_eq!(counters.upstream_response_incomplete, 1);
+        assert_eq!(counters.upstream_response_completed, 0);
+    }
+
+    #[test]
+    fn test_observe_upstream_chunk_events_captures_error_event_message_and_code() {
+        let mut saw_completed = false;
+        let mut saw_failed = false;
+        let mut saw_sibling = false;
+        let mut upstream_error_event_type = None;
+        let mut upstream_error_message = None;
+        let mut upstream_error_code = None;
+        let mut counters = StreamEventCounters::default();
+        let chunk = r#"event: error
+data: {"type":"error","error":{"message":"Rate limit exceeded","code":"rate_limit_exceeded"}}
+
+"#;
+
+        observe_upstream_chunk_events(
+            chunk,
+            &mut saw_completed,
+            &mut saw_failed,
+            &mut saw_sibling,
+            &mut upstream_error_event_type,
+            &mut upstream_error_message,
+            &mut upstream_error_code,
+            &mut counters,
+        );
+
+        assert!(!saw_completed);
+        assert!(saw_failed);
+        assert!(!saw_sibling);
+        assert_eq!(upstream_error_event_type.as_deref(), Some("error"));
+        assert_eq!(
+            upstream_error_message.as_deref(),
+            Some("Rate limit exceeded")
+        );
+        assert_eq!(upstream_error_code.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(counters.upstream_response_failed, 1);
     }
 
     #[test]
