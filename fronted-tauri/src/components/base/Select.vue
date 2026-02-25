@@ -1,5 +1,5 @@
 <template>
-  <div class="relative">
+  <div ref="rootRef" class="relative">
     <label v-if="label" class="block text-sm font-medium text-apple-text-primary dark:text-dark-text-primary mb-1">
       {{ label }}
     </label>
@@ -33,7 +33,6 @@
       <div
         v-if="isOpen"
         class="absolute z-50 w-full mt-1 bg-white dark:bg-slate-800 rounded-lg shadow-lg border border-gray-200 dark:border-slate-600 max-h-60 overflow-y-auto"
-        @click.outside="closeDropdown"
       >
         <div
           v-for="option in options"
@@ -93,6 +92,7 @@ const props = defineProps({
 const emit = defineEmits(['update:modelValue', 'change'])
 
 const isOpen = ref(false)
+const rootRef = ref<HTMLElement | null>(null)
 const labelRef = ref<HTMLSpanElement | null>(null)
 let fittyInstance: FittyInstance | null = null
 
@@ -108,6 +108,23 @@ const toggleDropdown = () => {
 
 const closeDropdown = () => {
   isOpen.value = false
+}
+
+const isEventInsideRoot = (event: Event) => {
+  const root = rootRef.value
+  if (!root) return false
+
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : []
+  if (path.includes(root)) return true
+
+  const target = event.target as Node | null
+  return !!target && root.contains(target)
+}
+
+const onDocumentPointerDown = (event: PointerEvent) => {
+  if (!isOpen.value) return
+  if (isEventInsideRoot(event)) return
+  closeDropdown()
 }
 
 const selectOption = (option: Option) => {
@@ -130,6 +147,8 @@ watch(
 )
 
 onMounted(() => {
+  document.addEventListener('pointerdown', onDocumentPointerDown, true)
+
   if (labelRef.value) {
     fittyInstance = fitty(labelRef.value, {
       minSize: 11,
@@ -147,6 +166,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  document.removeEventListener('pointerdown', onDocumentPointerDown, true)
+
   if (fittyInstance) {
     fittyInstance.unsubscribe()
     fittyInstance = null

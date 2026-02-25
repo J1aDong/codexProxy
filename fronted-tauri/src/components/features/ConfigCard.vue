@@ -356,7 +356,7 @@
                   </div>
                 </div>
 
-                <div class="relative inline-block">
+                <div class="relative inline-block lb-add-menu-container">
                   <Button
                     size="small"
                     type="primary"
@@ -369,7 +369,6 @@
                     v-if="openAddMenuSlot === slot"
                     class="absolute left-0 top-full mt-2 w-72 rounded-lg border shadow-lg z-50 overflow-hidden"
                     :class="isDarkMode ? 'bg-slate-800 border-slate-600' : 'bg-white border-gray-200'"
-                    @click.outside="closeAddMenu"
                   >
                     <div
                       class="px-3 py-2 text-xs border-b"
@@ -456,7 +455,7 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Button from '../base/Button.vue'
 import Dialog from '../base/Dialog.vue'
@@ -821,10 +820,25 @@ const closeAddMenu = () => {
   openAddMenuSlot.value = null
 }
 
+const onDocumentPointerDown = (event: PointerEvent) => {
+  if (!openAddMenuSlot.value) return
+  const target = event.target as HTMLElement | null
+  if (target?.closest('.lb-add-menu-container')) return
+  closeAddMenu()
+}
+
 const toggleAddMenu = (slot: ModelSlot) => {
   if (endpointOptionsForSelect.value.length === 0) return
   openAddMenuSlot.value = openAddMenuSlot.value === slot ? null : slot
 }
+
+onMounted(() => {
+  document.addEventListener('pointerdown', onDocumentPointerDown, true)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('pointerdown', onDocumentPointerDown, true)
+})
 
 const currentLbProfile = computed(() => {
   const selectedId = props.form.loadBalancer.selectedLbProfileId
