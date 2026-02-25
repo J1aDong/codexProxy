@@ -236,12 +236,16 @@ impl TransformResponse {
             return false;
         }
 
+        let has_task_output_payload = trimmed.contains("\"task_id\"")
+            && (trimmed.contains("\"block\"") || trimmed.contains("\"timeout\""));
+
         trimmed.contains("\"tool_uses\"")
             || trimmed.contains("\"recipient_name\"")
             || trimmed.contains("\"file_path\"")
             || trimmed.contains("\"old_string\"")
             || trimmed.contains("\"new_string\"")
             || trimmed.contains("\"replace_all\"")
+            || has_task_output_payload
             || ((trimmed.contains("\"command\"") || trimmed.contains("\"cmd\""))
                 && (trimmed.contains("\"description\"")
                     || trimmed.contains("\"timeout\"")
@@ -450,6 +454,53 @@ impl TransformResponse {
             || obj.contains_key("shell")
     }
 
+    fn looks_like_task_output_payload_fragment(line: &str) -> bool {
+        let Ok(parsed) = serde_json::from_str::<Value>(line.trim()) else {
+            return false;
+        };
+        let Some(obj) = parsed.as_object() else {
+            return false;
+        };
+
+        let has_task_id = obj
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !has_task_id {
+            return false;
+        }
+
+        let has_control_fields = obj.contains_key("block") || obj.contains_key("timeout");
+        if !has_control_fields {
+            return false;
+        }
+
+        obj.keys()
+            .all(|key| matches!(key.as_str(), "task_id" | "block" | "timeout"))
+    }
+
+    fn strip_known_leak_suffix_noise(text: &str) -> String {
+        let trimmed = text.trim_end_matches(char::is_whitespace);
+        let noise_patterns = [
+            "assistantuser",
+            "numeroususer",
+            "numerusform",
+            "天天中彩票user",
+            "天天中彩票",
+            " +#+#+#+#+#+",
+        ];
+
+        for pattern in noise_patterns {
+            if trimmed.ends_with(pattern) {
+                let cut = trimmed.len().saturating_sub(pattern.len());
+                return trimmed[..cut].to_string();
+            }
+        }
+
+        text.to_string()
+    }
+
     fn looks_like_raw_tool_json_fragment(line: &str) -> bool {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('{') {
@@ -491,6 +542,10 @@ impl TransformResponse {
                 || trimmed.contains("\"pattern\"")
                 || trimmed.contains("\"command\""));
         if has_basic_tool_call_shape {
+            return true;
+        }
+
+        if Self::looks_like_task_output_payload_fragment(trimmed) {
             return true;
         }
 
@@ -672,7 +727,10 @@ impl TransformResponse {
             self.logger
                 .log_raw("[Warn] Dropping raw leaked tool json fragment");
             if !prefix.is_empty() {
-                self.emit_plain_text_fragment(output, &prefix);
+                let cleaned_prefix = Self::strip_known_leak_suffix_noise(&prefix);
+                if !cleaned_prefix.is_empty() {
+                    self.emit_plain_text_fragment(output, &cleaned_prefix);
+                }
             }
             if !suffix.is_empty() {
                 self.handle_text_fragment(output, &suffix, true);
@@ -1345,7 +1403,10 @@ impl TransformResponse {
         if let Some(raw_json_start) = Self::find_potential_raw_tool_json_start(&combined) {
             let (prefix_text, leaked_fragment) = combined.split_at(raw_json_start);
             if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
-                self.emit_plain_text_fragment(output, prefix_text);
+                let cleaned_prefix = Self::strip_known_leak_suffix_noise(prefix_text);
+                if !cleaned_prefix.is_empty() {
+                    self.emit_plain_text_fragment(output, &cleaned_prefix);
+                }
             }
             self.pending_tool_text.push_str(leaked_fragment);
             self.process_pending_tool_text(output, !emit_plain_text);
@@ -1662,7 +1723,10 @@ impl TransformResponse {
         if let Some(raw_json_start) = Self::find_potential_raw_tool_json_start(&carryover) {
             let (prefix_text, leaked_fragment) = carryover.split_at(raw_json_start);
             if !self.has_open_tool_block() && !prefix_text.is_empty() {
-                self.emit_plain_text_fragment(output, prefix_text);
+                let cleaned_prefix = Self::strip_known_leak_suffix_noise(prefix_text);
+                if !cleaned_prefix.is_empty() {
+                    self.emit_plain_text_fragment(output, &cleaned_prefix);
+                }
             }
             self.pending_tool_text.push_str(leaked_fragment);
             self.process_pending_tool_text(output, true);

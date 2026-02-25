@@ -592,3 +592,164 @@ fn test_codex_input_strips_system_reminder_from_function_call_output() {
         "system reminder block should be removed from tool output replay"
     );
 }
+
+#[test]
+fn test_codex_input_keeps_empty_function_call_output() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_empty_output".to_string()),
+                    name: "Bash".to_string(),
+                    input: json!({
+                        "command": "sqlite3 /tmp/demo.db \"select 1 where 1=0\""
+                    }),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_empty_output".to_string()),
+                    id: Some("result_empty".to_string()),
+                    content: Some(json!("")),
+                }])),
+            },
+        ],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+
+    let function_call_output = input
+        .iter()
+        .find(|item| {
+            item.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
+                && item.get("call_id").and_then(|v| v.as_str()) == Some("call_empty_output")
+        })
+        .expect("empty function_call_output should be retained for tool-call pairing");
+
+    assert_eq!(
+        function_call_output
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<missing>"),
+        "(No output)",
+        "empty tool output should be replaced with explicit placeholder text"
+    );
+}
+
+#[test]
+fn test_codex_input_strips_markerless_taskoutput_json_tail() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![Message {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "**Checking debug output for failing path**numerusform{\"block\":true,\"task_id\":\"bf6ea6d\",\"timeout\":20000}".to_string(),
+            }])),
+        }],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+
+    let text_blocks: Vec<&str> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter_map(|msg| msg.get("content").and_then(|v| v.as_array()))
+        .flat_map(|content| content.iter())
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect();
+
+    assert!(
+        text_blocks
+            .iter()
+            .any(|text| text.contains("Checking debug output for failing path")),
+        "normal human-readable prefix text should remain"
+    );
+    assert!(
+        text_blocks.iter().all(|text| !text.contains("\"task_id\"") && !text.contains("\"timeout\"")),
+        "markerless task-output args json tail should be stripped from outbound message text"
+    );
+    assert!(
+        text_blocks.iter().all(|text| !text.contains("numerusform")),
+        "known connector noise should be removed after stripping leaked json tail"
+    );
+}
+
+#[test]
+fn test_codex_input_injects_missing_function_call_output_placeholder() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![Message {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: Some("call_missing_result".to_string()),
+                name: "Bash".to_string(),
+                input: json!({
+                    "command": "echo hello"
+                }),
+                signature: None,
+            }])),
+        }],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+
+    let synthesized_output = input
+        .iter()
+        .find(|item| {
+            item.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
+                && item.get("call_id").and_then(|v| v.as_str()) == Some("call_missing_result")
+        })
+        .expect("missing function_call_output should be synthesized");
+
+    assert_eq!(
+        synthesized_output
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<missing>"),
+        "(No output)",
+        "synthesized function_call_output should use stable placeholder text"
+    );
+}

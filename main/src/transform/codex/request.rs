@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -7,6 +8,7 @@ use crate::models::{get_reasoning_effort, AnthropicRequest, ReasoningEffortMappi
 use crate::transform::MessageProcessor;
 
 const CODEX_INSTRUCTIONS: &str = include_str!("../../instructions.txt");
+const EMPTY_TOOL_OUTPUT_PLACEHOLDER: &str = "(No output)";
 
 fn sanitize_function_call_name_for_codex(name: &str) -> String {
     let mut normalized = String::with_capacity(name.len());
@@ -67,6 +69,32 @@ fn looks_like_high_confidence_tool_json_object(json: &str) -> bool {
             || trimmed.contains("\"pattern\"")
             || trimmed.contains("\"command\""));
     if is_basic_tool_envelope {
+        return true;
+    }
+
+    let is_task_output_payload = serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .map(|obj| {
+            let has_task_id = obj
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_task_id {
+                return false;
+            }
+
+            let has_controls = obj.contains_key("block") || obj.contains_key("timeout");
+            if !has_controls {
+                return false;
+            }
+
+            obj.keys()
+                .all(|key| matches!(key.as_str(), "task_id" | "block" | "timeout"))
+        })
+        .unwrap_or(false);
+    if is_task_output_payload {
         return true;
     }
 
@@ -306,9 +334,49 @@ fn sanitize_function_call_output_for_codex(output: &str) -> Option<String> {
     let sanitized = strip_system_reminder_blocks(output);
     let trimmed = sanitized.trim_end().to_string();
     if trimmed.trim().is_empty() {
-        None
+        Some(EMPTY_TOOL_OUTPUT_PLACEHOLDER.to_string())
     } else {
         Some(trimmed)
+    }
+}
+
+fn reconcile_function_call_pairs(input: &mut Vec<Value>) {
+    let mut open_calls: HashSet<String> = HashSet::new();
+    let mut call_order: Vec<String> = Vec::new();
+
+    for item in input.iter() {
+        let Some(item_type) = item.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        match item_type {
+            "function_call" => {
+                if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
+                    let normalized = call_id.trim();
+                    if !normalized.is_empty() && open_calls.insert(normalized.to_string()) {
+                        call_order.push(normalized.to_string());
+                    }
+                }
+            }
+            "function_call_output" => {
+                if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
+                    open_calls.remove(call_id.trim());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for call_id in call_order {
+        if !open_calls.contains(call_id.as_str()) {
+            continue;
+        }
+
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": EMPTY_TOOL_OUTPUT_PLACEHOLDER
+        }));
     }
 }
 
@@ -437,6 +505,7 @@ impl TransformRequest {
         // 追加对话历史
         final_input.extend(chat_messages);
         Self::sanitize_input_for_codex(&mut final_input);
+        reconcile_function_call_pairs(&mut final_input);
 
         // 转换工具
         let transformed_tools = Self::transform_tools(anthropic_body.tools.as_ref(), log_tx);
@@ -590,10 +659,10 @@ impl TransformRequest {
                     .map(|blocks| !blocks.is_empty())
                     .unwrap_or(false),
                 "function_call_output" => obj
-                    .get("output")
+                    .get("call_id")
                     .and_then(|v| v.as_str())
-                    .map(|text| !text.trim().is_empty())
-                    .unwrap_or(true),
+                    .map(|call_id| !call_id.trim().is_empty())
+                    .unwrap_or(false),
                 _ => true,
             }
         });

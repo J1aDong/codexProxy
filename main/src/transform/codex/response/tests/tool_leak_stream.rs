@@ -215,6 +215,36 @@ fn raw_exec_command_json_without_marker_is_suppressed() {
 }
 
 #[test]
+fn raw_taskoutput_json_without_marker_is_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "**Checking debug output for failing path**numerusform{\"block\":true,\"task_id\":\"bf6ea6d\",\"timeout\":20000}{\"block\":true,\"task_id\":\"bf6ea6d\",\"timeout\":20000}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("Checking debug output for failing path"),
+        "normal prefix text should remain visible"
+    );
+    assert!(
+        !joined.contains("\\\"task_id\\\"")
+            && !joined.contains("\\\"timeout\\\"")
+            && !joined.contains("numerusform"),
+        "raw task-output args json tail and connector noise should be suppressed"
+    );
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "suppressed task-output args json must not create tool_use blocks"
+    );
+}
+
+#[test]
 fn same_chunk_natural_language_json_and_suffix_only_suppresses_tool_json() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(
