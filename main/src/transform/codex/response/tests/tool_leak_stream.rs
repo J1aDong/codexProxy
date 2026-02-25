@@ -182,6 +182,39 @@ fn raw_edit_json_without_tool_marker_is_suppressed() {
 }
 
 #[test]
+fn raw_exec_command_json_without_marker_is_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Rebuilding Tailwind and verifying border****Rebuilding Tailwind and verifying border ####json {\"command\":\"npx --prefix /tmp/demo tailwindcss -i /tmp/in.css -o /tmp/out.css\",\"description\":\"Rebuild Tailwind CSS\",\"timeout\":600000}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    let visible_repeat_count = joined
+        .matches("Rebuilding Tailwind and verifying border")
+        .count();
+    assert_eq!(
+        visible_repeat_count, 1,
+        "duplicated stitched prefix should collapse into a single readable sentence"
+    );
+    assert!(
+        !joined.contains("\\\"command\\\"")
+            && !joined.contains("\\\"description\\\"")
+            && !joined.contains("\\\"timeout\\\""),
+        "raw exec-command tool args json should be suppressed from visible text"
+    );
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "suppressed leaked exec-command json must not create tool_use blocks"
+    );
+}
+
+#[test]
 fn same_chunk_natural_language_json_and_suffix_only_suppresses_tool_json() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(

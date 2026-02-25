@@ -326,6 +326,59 @@ fn test_codex_input_strips_markerless_high_confidence_tool_json_tail() {
 }
 
 #[test]
+fn test_codex_input_strips_markerless_exec_command_json_tail() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![Message {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "继续执行。 {\"command\":\"npm run lint\",\"description\":\"Run lint\",\"timeout\":600000}".to_string(),
+            }])),
+        }],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+
+    let texts: Vec<String> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
+        .flat_map(|content| content.iter())
+        .filter_map(|block| {
+            block
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    assert!(
+        texts.iter().any(|text| text.contains("继续执行。")),
+        "normal prefix text should be preserved"
+    );
+    assert!(
+        texts.iter().all(|text| !text.contains("\"command\"")
+            && !text.contains("\"description\"")
+            && !text.contains("\"timeout\"")),
+        "markerless exec-command json tail should be stripped from outbound request"
+    );
+}
+
+#[test]
 fn test_codex_request_without_tools_uses_none_tool_choice_and_empty_tools() {
     let request = AnthropicRequest {
         model: Some("claude-sonnet-4-5-20250929".to_string()),

@@ -4,12 +4,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::SystemTime;
 
 /// 日志目录
 const LOG_DIR: &str = "logs";
-/// 日志保留天数
-const LOG_RETENTION_DAYS: u64 = 3;
+/// 最多保留的日志文件数量（按修改时间排序）
+const LOG_MAX_FILES: usize = 3;
 /// 单个日志文件最大请求交互数
 const LOG_MAX_REQUESTS: usize = 200;
 /// 运行时每隔多少个请求触发一次裁剪
@@ -63,11 +63,12 @@ impl AppLogger {
     }
 
     fn cleanup_log_dir(log_dir: &Path) {
-        let retention = Duration::from_secs(LOG_RETENTION_DAYS * 24 * 60 * 60);
         let entries = match fs::read_dir(log_dir) {
             Ok(entries) => entries,
             Err(_) => return,
         };
+
+        let mut log_entries: Vec<(PathBuf, SystemTime)> = Vec::new();
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -85,19 +86,22 @@ impl AppLogger {
                 _ => continue,
             };
 
-            let is_expired = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .map(|elapsed| elapsed > retention)
-                .unwrap_or(false);
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            log_entries.push((path, modified));
+        }
 
-            if is_expired {
-                let _ = fs::remove_file(&path);
-                continue;
+        log_entries.sort_by(|(left_path, left_time), (right_path, right_time)| {
+            right_time
+                .cmp(left_time)
+                .then_with(|| left_path.cmp(right_path))
+        });
+
+        for (idx, (path, _)) in log_entries.into_iter().enumerate() {
+            if idx < LOG_MAX_FILES {
+                let _ = Self::trim_file_requests(&path, LOG_MAX_REQUESTS);
+            } else {
+                let _ = fs::remove_file(path);
             }
-
-            let _ = Self::trim_file_requests(&path, LOG_MAX_REQUESTS);
         }
     }
 

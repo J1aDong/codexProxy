@@ -174,6 +174,7 @@ mod tests {
             empty_completion_retry_max_attempts: 1,
             enable_incomplete_stream_retry: true,
             incomplete_stream_retry_max_attempts: 1,
+            enable_sibling_tool_error_retry: true,
         }
     }
 

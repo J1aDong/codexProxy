@@ -149,6 +149,12 @@ impl TransformResponse {
             || trimmed.contains("\"old_string\"")
             || trimmed.contains("\"new_string\"")
             || trimmed.contains("\"replace_all\"")
+            || ((trimmed.contains("\"command\"") || trimmed.contains("\"cmd\""))
+                && (trimmed.contains("\"description\"")
+                    || trimmed.contains("\"timeout\"")
+                    || trimmed.contains("\"yield_time_ms\"")
+                    || trimmed.contains("\"max_output_tokens\"")
+                    || trimmed.contains("\"sandbox_permissions\"")))
             || (trimmed.contains("\"pattern\"")
                 && (trimmed.contains("\"output_mode\"")
                     || trimmed.contains("\"glob\"")
@@ -260,7 +266,95 @@ impl TransformResponse {
             break;
         }
 
-        out
+        Self::collapse_duplicate_bridge_overlap(&out)
+    }
+
+    fn collapse_duplicate_bridge_overlap(text: &str) -> String {
+        if !text.contains("****") {
+            return text.to_string();
+        }
+
+        let mut current = text.to_string();
+        let mut guard = 0u8;
+
+        while let Some(bridge_pos) = current.find("****") {
+            if guard > 8 {
+                break;
+            }
+            guard += 1;
+
+            let left = &current[..bridge_pos];
+            let right = &current[bridge_pos + 4..];
+            let overlap = Self::longest_suffix_prefix_overlap(left, right);
+            if overlap < 16 {
+                break;
+            }
+
+            let overlap_prefix = &right[..overlap];
+            if !overlap_prefix.chars().any(|c| c.is_whitespace()) {
+                break;
+            }
+
+            current = format!("{}{}", left, &right[overlap..]);
+        }
+
+        current
+    }
+
+    fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
+        let max_len = left.len().min(right.len());
+        if max_len == 0 {
+            return 0;
+        }
+
+        let mut boundaries = Vec::new();
+        for (idx, _) in right.char_indices() {
+            boundaries.push(idx);
+        }
+        boundaries.push(right.len());
+
+        for len in boundaries.into_iter().rev() {
+            if len == 0 || len > max_len {
+                continue;
+            }
+            if !left.is_char_boundary(left.len().saturating_sub(len)) {
+                continue;
+            }
+            if left[left.len() - len..] == right[..len] {
+                return len;
+            }
+        }
+
+        0
+    }
+
+    fn looks_like_exec_command_payload_fragment(line: &str) -> bool {
+        let Ok(parsed) = serde_json::from_str::<Value>(line.trim()) else {
+            return false;
+        };
+        let Some(obj) = parsed.as_object() else {
+            return false;
+        };
+
+        let has_command = obj
+            .get("command")
+            .or_else(|| obj.get("cmd"))
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_command {
+            return false;
+        }
+
+        obj.contains_key("description")
+            || obj.contains_key("timeout")
+            || obj.contains_key("yield_time_ms")
+            || obj.contains_key("max_output_tokens")
+            || obj.contains_key("sandbox_permissions")
+            || obj.contains_key("justification")
+            || obj.contains_key("prefix_rule")
+            || obj.contains_key("workdir")
+            || obj.contains_key("shell")
     }
 
     fn looks_like_raw_tool_json_fragment(line: &str) -> bool {
@@ -303,7 +397,11 @@ impl TransformResponse {
             && (trimmed.contains("\"file_path\"")
                 || trimmed.contains("\"pattern\"")
                 || trimmed.contains("\"command\""));
-        has_basic_tool_call_shape
+        if has_basic_tool_call_shape {
+            return true;
+        }
+
+        Self::looks_like_exec_command_payload_fragment(trimmed)
     }
 
     fn split_tool_json_prefix_suffix(fragment: &str) -> Option<(String, String, String)> {

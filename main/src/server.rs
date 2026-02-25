@@ -64,6 +64,7 @@ pub struct ProxyServer {
     empty_completion_retry_max_attempts: u32,
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
+    enable_sibling_tool_error_retry: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -93,6 +94,7 @@ pub struct RuntimeConfigUpdate {
     pub empty_completion_retry_max_attempts: u32,
     pub enable_incomplete_stream_retry: bool,
     pub incomplete_stream_retry_max_attempts: u32,
+    pub enable_sibling_tool_error_retry: bool,
     pub load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -119,6 +121,7 @@ struct RuntimeConfigState {
     empty_completion_retry_max_attempts: u32,
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
+    enable_sibling_tool_error_retry: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -146,6 +149,7 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             empty_completion_retry_max_attempts: value.empty_completion_retry_max_attempts,
             enable_incomplete_stream_retry: value.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: value.incomplete_stream_retry_max_attempts,
+            enable_sibling_tool_error_retry: value.enable_sibling_tool_error_retry,
             load_balancer_runtime: value.load_balancer_runtime,
         }
     }
@@ -373,6 +377,7 @@ struct StreamRuntimeOptions {
     empty_completion_retry_max_attempts: u32,
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
+    enable_sibling_tool_error_retry: bool,
 }
 
 impl StreamRuntimeOptions {
@@ -394,6 +399,7 @@ impl StreamRuntimeOptions {
             empty_completion_retry_max_attempts: state.empty_completion_retry_max_attempts,
             enable_incomplete_stream_retry: state.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: state.incomplete_stream_retry_max_attempts,
+            enable_sibling_tool_error_retry: state.enable_sibling_tool_error_retry,
         }
     }
 }
@@ -1333,6 +1339,45 @@ fn chunk_contains_sibling_tool_call_error(chunk: &str) -> bool {
         .contains("sibling tool call errored")
 }
 
+fn allow_sibling_tool_error_retry(
+    decision: &StreamDecisionState,
+    opts: StreamRuntimeOptions,
+    has_serial_fallback: bool,
+) -> bool {
+    opts.enable_sibling_tool_error_retry && decision.allow_sibling_tool_retry(has_serial_fallback)
+}
+
+fn sibling_tool_error_retry_skip_reason(
+    decision: &StreamDecisionState,
+    opts: StreamRuntimeOptions,
+    has_serial_fallback: bool,
+) -> Option<&'static str> {
+    if !decision.saw_response_failed || !decision.saw_sibling_tool_call_error {
+        return None;
+    }
+    if allow_sibling_tool_error_retry(decision, opts, has_serial_fallback) {
+        return None;
+    }
+
+    if !opts.enable_sibling_tool_error_retry {
+        return Some("feature_disabled");
+    }
+    if decision.saw_message_stop {
+        return Some("message_stop_seen");
+    }
+    if decision.emitted_business_event {
+        return Some("business_event_emitted");
+    }
+    if decision.sibling_tool_error_retry_attempted {
+        return Some("already_attempted");
+    }
+    if !has_serial_fallback {
+        return Some("serial_fallback_unavailable");
+    }
+
+    Some("guard_blocked")
+}
+
 fn extract_message_text(message: &Message) -> Option<String> {
     match &message.content {
         Some(MessageContent::Text(text)) => Some(text.clone()),
@@ -1948,6 +1993,7 @@ impl ProxyServer {
             empty_completion_retry_max_attempts: 0,
             enable_incomplete_stream_retry: true,
             incomplete_stream_retry_max_attempts: 5,
+            enable_sibling_tool_error_retry: true,
             load_balancer_runtime: None,
         }
     }
@@ -2102,6 +2148,11 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_enable_sibling_tool_error_retry(mut self, enable: bool) -> Self {
+        self.enable_sibling_tool_error_retry = enable;
+        self
+    }
+
     pub fn with_load_balancer_runtime(mut self, runtime: LoadBalancerRuntime) -> Self {
         self.load_balancer_runtime = Some(runtime);
         self
@@ -2141,6 +2192,7 @@ impl ProxyServer {
             empty_completion_retry_max_attempts: self.empty_completion_retry_max_attempts,
             enable_incomplete_stream_retry: self.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: self.incomplete_stream_retry_max_attempts,
+            enable_sibling_tool_error_retry: self.enable_sibling_tool_error_retry,
             load_balancer_runtime: self.load_balancer_runtime.clone(),
         }
     }
@@ -3889,11 +3941,27 @@ async fn handle_request(
                 }
             }
 
-            // V2 alignment: retry policy is unified and no longer has a separate
-            // sibling-tool fallback branch.
-            let sibling_tool_error_retry_allowed = false
-                && decision
-                    .allow_sibling_tool_retry(serial_fallback_upstream_body_for_stream.is_some());
+            let has_serial_fallback = serial_fallback_upstream_body_for_stream.is_some();
+            let sibling_tool_error_retry_allowed = allow_sibling_tool_error_retry(
+                &decision,
+                stream_opts_for_task,
+                has_serial_fallback,
+            );
+
+            if let Some(skip_reason) = sibling_tool_error_retry_skip_reason(
+                &decision,
+                stream_opts_for_task,
+                has_serial_fallback,
+            ) {
+                emit_stream_diag(
+                    &log_tx_clone,
+                    &logger_for_stream,
+                    format!(
+                        "[Stream] #{} sibling_tool_error_retry_skipped reason={}",
+                        request_id_for_stream, skip_reason
+                    ),
+                );
+            }
 
             if sibling_tool_error_retry_allowed {
                 decision.sibling_tool_error_retry_attempted = true;
@@ -4574,11 +4642,13 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 #[cfg(test)]
 mod tests {
     use super::{
+        allow_sibling_tool_error_retry,
         chunk_contains_sibling_tool_call_error, classify_connection_error,
         derive_stream_close_cause, disable_parallel_tool_calls_in_upstream_body,
         is_business_stream_output, observe_upstream_chunk_events, resolve_effective_stream,
-        resolve_upstream_url, should_suppress_premature_message_stop, ConnErrorClass,
-        SseFrameParser, StreamEventCounters, StreamRuntimeOptions, UpstreamOperation,
+        resolve_upstream_url, should_suppress_premature_message_stop,
+        sibling_tool_error_retry_skip_reason, ConnErrorClass, SseFrameParser,
+        StreamEventCounters, StreamRuntimeOptions, UpstreamOperation,
     };
     use serde_json::json;
 
@@ -4600,6 +4670,7 @@ mod tests {
             empty_completion_retry_max_attempts: 1,
             enable_incomplete_stream_retry: true,
             incomplete_stream_retry_max_attempts: 1,
+            enable_sibling_tool_error_retry: true,
         }
     }
 
@@ -4738,6 +4809,42 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
 
 "#;
         assert!(!chunk_contains_sibling_tool_call_error(chunk));
+    }
+
+    #[test]
+    fn test_allow_sibling_tool_error_retry_honors_runtime_switch() {
+        let state = super::StreamDecisionState {
+            saw_response_failed: true,
+            saw_sibling_tool_call_error: true,
+            ..Default::default()
+        };
+
+        let opts_enabled = stream_opts();
+        assert!(allow_sibling_tool_error_retry(&state, opts_enabled, true));
+
+        let mut opts_disabled = stream_opts();
+        opts_disabled.enable_sibling_tool_error_retry = false;
+        assert!(!allow_sibling_tool_error_retry(
+            &state,
+            opts_disabled,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_sibling_tool_error_retry_skip_reason_reports_feature_disabled() {
+        let state = super::StreamDecisionState {
+            saw_response_failed: true,
+            saw_sibling_tool_call_error: true,
+            ..Default::default()
+        };
+        let mut opts = stream_opts();
+        opts.enable_sibling_tool_error_retry = false;
+
+        assert_eq!(
+            sibling_tool_error_retry_skip_reason(&state, opts, true),
+            Some("feature_disabled")
+        );
     }
 
     #[test]

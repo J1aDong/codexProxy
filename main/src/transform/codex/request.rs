@@ -66,7 +66,37 @@ fn looks_like_high_confidence_tool_json_object(json: &str) -> bool {
         && (trimmed.contains("\"file_path\"")
             || trimmed.contains("\"pattern\"")
             || trimmed.contains("\"command\""));
-    is_basic_tool_envelope
+    if is_basic_tool_envelope {
+        return true;
+    }
+
+    let is_exec_command_payload = serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .map(|obj| {
+            let has_command = obj
+                .get("command")
+                .or_else(|| obj.get("cmd"))
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_command {
+                return false;
+            }
+
+            obj.contains_key("description")
+                || obj.contains_key("timeout")
+                || obj.contains_key("yield_time_ms")
+                || obj.contains_key("max_output_tokens")
+                || obj.contains_key("sandbox_permissions")
+                || obj.contains_key("justification")
+                || obj.contains_key("prefix_rule")
+                || obj.contains_key("workdir")
+                || obj.contains_key("shell")
+        })
+        .unwrap_or(false);
+
+    is_exec_command_payload
 }
 
 fn extract_first_json_object_fragment(line: &str) -> Option<String> {
