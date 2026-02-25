@@ -60,16 +60,23 @@
                   @change="handleEndpointChange"
                 >
                   <template #option="{ option }">
-                    <span>{{ option.label }}</span>
-                    <button
-                      class="text-gray-400 hover:text-apple-blue opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-blue-50 focus:outline-none dark:text-dark-text-tertiary dark:hover:text-blue-400 dark:hover:bg-blue-500/20"
-                      @click.stop="handleEditEndpoint(option.value)"
-                      :title="t('edit')"
-                    >
-                      <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
-                      </svg>
-                    </button>
+                    <div class="flex items-center justify-between w-full gap-2 min-w-0">
+                      <span class="min-w-0 flex-1 truncate">{{ option.label }}</span>
+                      <div class="shrink-0 flex items-center gap-2">
+                        <span class="inline-flex items-center rounded-md bg-red-500 text-white text-[11px] leading-none px-2 py-0.5 font-medium">
+                          {{ getEndpointOptionConverterTag(option) }}
+                        </span>
+                        <button
+                          class="text-gray-400 hover:text-apple-blue opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-blue-50 focus:outline-none dark:text-dark-text-tertiary dark:hover:text-blue-400 dark:hover:bg-blue-500/20"
+                          @click.stop="handleEditEndpoint(option.value)"
+                          :title="t('edit')"
+                        >
+                          <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
                   </template>
                 </Select>
               </div>
@@ -493,6 +500,12 @@ interface EndpointOption {
   }
   codexEffortCapabilityMap?: Record<string, string[]>
   geminiModelPreset?: string[]
+}
+
+interface EndpointSelectOption {
+  value: string
+  label: string
+  converterTag: 'codex' | 'gemini' | 'anthropic'
 }
 
 interface FormData {
@@ -1223,12 +1236,21 @@ watch(
   },
 )
 
-const endpointSelectOptions = computed(() => {
+const endpointSelectOptions = computed<EndpointSelectOption[]>(() => {
   return props.form.endpointOptions.map(option => ({
     value: option.id,
     label: option.alias,
+    converterTag: toLbConverter(option.converter || props.form.converter),
   }))
 })
+
+const getEndpointOptionConverterTag = (
+  option: { value: string | number; converterTag?: EndpointSelectOption['converterTag'] },
+): EndpointSelectOption['converterTag'] => {
+  if (option.converterTag) return option.converterTag
+  const endpoint = props.form.endpointOptions.find((item) => item.id === String(option.value))
+  return toLbConverter(endpoint?.converter || props.form.converter)
+}
 
 const handlePortChange = () => {
   const port = Number(localPort.value)
