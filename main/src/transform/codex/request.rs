@@ -189,6 +189,129 @@ fn strip_leaked_tool_suffix_from_text(text: &str) -> Option<String> {
     Some(text.to_string())
 }
 
+fn strip_system_reminder_blocks(text: &str) -> String {
+    const START: &str = "<system-reminder>";
+    const END: &str = "</system-reminder>";
+
+    let mut remaining = text;
+    let mut sanitized = String::with_capacity(text.len());
+
+    loop {
+        let Some(start_idx) = remaining.find(START) else {
+            sanitized.push_str(remaining);
+            break;
+        };
+
+        sanitized.push_str(&remaining[..start_idx]);
+        let after_start = &remaining[start_idx + START.len()..];
+        let Some(end_rel) = after_start.find(END) else {
+            break;
+        };
+        remaining = &after_start[end_rel + END.len()..];
+    }
+
+    sanitized
+}
+
+fn looks_like_suggestion_mode_prompt(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    upper.contains("[SUGGESTION MODE:")
+        && upper.contains("REPLY WITH ONLY THE SUGGESTION")
+        && upper.contains("WHAT THE USER MIGHT NATURALLY TYPE NEXT")
+}
+
+fn collapse_adjacent_duplicate_markdown_bold(text: &str) -> String {
+    if !text.contains("****") {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+
+    while i < text.len() {
+        let rest = &text[i..];
+        if let Some(token_start_rel) = rest.find("**") {
+            let token_start = i + token_start_rel;
+            out.push_str(&text[i..token_start]);
+
+            let token_rest = &text[token_start + 2..];
+            if let Some(token_end_rel) = token_rest.find("**") {
+                let token_end = token_start + 2 + token_end_rel + 2;
+                let token = &text[token_start..token_end];
+                out.push_str(token);
+
+                let mut next = token_end;
+                while next < text.len() && text[next..].starts_with(token) {
+                    next += token.len();
+                }
+                i = next;
+                continue;
+            }
+
+            out.push_str(&text[token_start..]);
+            return out;
+        }
+
+        out.push_str(rest);
+        break;
+    }
+
+    out
+}
+
+fn strip_known_trailing_noise(text: &str) -> String {
+    let mut result = text.trim_end().to_string();
+    let noise_patterns = [
+        "assistantuser",
+        "numeroususer",
+        "numerusform",
+        "天天中彩票user",
+        "天天中彩票",
+        " +#+#+#+#+#+",
+    ];
+
+    for pattern in noise_patterns {
+        if result.ends_with(pattern) {
+            result.truncate(result.len().saturating_sub(pattern.len()));
+            return result.trim_end().to_string();
+        }
+    }
+
+    result
+}
+
+fn sanitize_message_text_for_codex(text: &str) -> Option<String> {
+    let without_reminder = strip_system_reminder_blocks(text);
+    if without_reminder.trim().is_empty() {
+        return None;
+    }
+
+    if looks_like_suggestion_mode_prompt(&without_reminder) {
+        return None;
+    }
+
+    let stripped = strip_leaked_tool_suffix_from_text(&without_reminder)?;
+    let collapsed = collapse_adjacent_duplicate_markdown_bold(&stripped);
+    let cleaned = strip_known_trailing_noise(&collapsed);
+    let final_text = cleaned.trim_end().to_string();
+
+    if final_text.trim().is_empty() {
+        None
+    } else {
+        Some(final_text)
+    }
+}
+
+fn sanitize_function_call_output_for_codex(output: &str) -> Option<String> {
+    let sanitized = strip_system_reminder_blocks(output);
+    let trimmed = sanitized.trim_end().to_string();
+    if trimmed.trim().is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 /// 请求转换器 - Anthropic -> Codex
 pub struct TransformRequest;
 
@@ -348,7 +471,7 @@ impl TransformRequest {
         (body, session_id.clone())
     }
 
-    fn sanitize_input_for_codex(input: &mut [Value]) {
+    fn sanitize_input_for_codex(input: &mut Vec<Value>) {
         for item in input.iter_mut() {
             let Some(obj) = item.as_object_mut() else {
                 continue;
@@ -411,7 +534,7 @@ impl TransformRequest {
                                 .get("text")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default();
-                            if let Some(sanitized_text) = strip_leaked_tool_suffix_from_text(text) {
+                            if let Some(sanitized_text) = sanitize_message_text_for_codex(text) {
                                 block_obj.insert("text".to_string(), json!(sanitized_text));
                             } else {
                                 block_obj.insert("text".to_string(), json!(""));
@@ -439,7 +562,41 @@ impl TransformRequest {
                     });
                 }
             }
+
+            if item_type.as_deref() == Some("function_call_output")
+                && obj.get("output").and_then(|v| v.as_str()).is_some()
+            {
+                let output = obj
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if let Some(sanitized_output) = sanitize_function_call_output_for_codex(output) {
+                    obj.insert("output".to_string(), json!(sanitized_output));
+                } else {
+                    obj.insert("output".to_string(), json!(""));
+                }
+            }
         }
+
+        input.retain(|item| {
+            let Some(obj) = item.as_object() else {
+                return true;
+            };
+
+            match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "message" => obj
+                    .get("content")
+                    .and_then(|v| v.as_array())
+                    .map(|blocks| !blocks.is_empty())
+                    .unwrap_or(false),
+                "function_call_output" => obj
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(true),
+                _ => true,
+            }
+        });
     }
 
     fn transform_tools(

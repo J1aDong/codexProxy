@@ -144,6 +144,7 @@ pub struct TransformResponse {
 
     // Cross-chunk leak suppression state
     suppressing_cross_chunk_leak: bool,
+    suppressing_suggestion_mode_prompt: bool,
 
     // Markdown Base Interception
     in_markdown_bash: bool,
@@ -164,6 +165,9 @@ impl TransformResponse {
         ["assistant to=", "to=functions", "to=multi_tool_use"];
 
     const MARKDOWN_BASH_MARKERS: [&'static str; 3] = ["```bash", "```sh", "```shell"];
+    const SUGGESTION_MODE_START_MARKER: &'static str = "[SUGGESTION MODE:";
+    const SUGGESTION_MODE_END_MARKER: &'static str =
+        "Reply with ONLY the suggestion, no quotes or explanation.";
 
     fn find_potential_leaked_tool_marker_start(line: &str) -> Option<usize> {
         Self::LEAKED_TOOL_MARKERS
@@ -748,6 +752,7 @@ impl TransformResponse {
             text_carryover: String::new(),
             pending_tool_text: String::new(),
             suppressing_cross_chunk_leak: false,
+            suppressing_suggestion_mode_prompt: false,
             in_markdown_bash: false,
             markdown_bash_buffer: String::new(),
             in_commentary_phase: false,
@@ -1210,6 +1215,41 @@ impl TransformResponse {
         emit_plain_text: bool,
     ) {
         if fragment.is_empty() {
+            return;
+        }
+
+        if self.suppressing_suggestion_mode_prompt {
+            if let Some(end_idx) = fragment.find(Self::SUGGESTION_MODE_END_MARKER) {
+                let suffix = &fragment[end_idx + Self::SUGGESTION_MODE_END_MARKER.len()..];
+                self.suppressing_suggestion_mode_prompt = false;
+                self.logger
+                    .log_raw("[Info] Suggestion-mode prompt suppression ended");
+                if !suffix.is_empty() {
+                    self.handle_text_fragment(output, suffix, emit_plain_text);
+                }
+            }
+            return;
+        }
+
+        if let Some(start_idx) = fragment.find(Self::SUGGESTION_MODE_START_MARKER) {
+            let prefix = &fragment[..start_idx];
+            if emit_plain_text && !self.has_open_tool_block() && !prefix.is_empty() {
+                self.emit_plain_text_fragment(output, prefix);
+            }
+
+            let after_start = &fragment[start_idx..];
+            if let Some(end_rel) = after_start.find(Self::SUGGESTION_MODE_END_MARKER) {
+                let suffix = &after_start[end_rel + Self::SUGGESTION_MODE_END_MARKER.len()..];
+                self.logger
+                    .log_raw("[Warn] Dropping suggestion-mode prompt leak from visible text");
+                if !suffix.is_empty() {
+                    self.handle_text_fragment(output, suffix, emit_plain_text);
+                }
+            } else {
+                self.suppressing_suggestion_mode_prompt = true;
+                self.logger
+                    .log_raw("[Warn] Dropping suggestion-mode prompt leak from visible text");
+            }
             return;
         }
 
@@ -1716,6 +1756,7 @@ impl TransformResponse {
         self.flush_pending_tool_text(output);
         self.flush_markdown_bash(output);
         self.reset_text_dedupe_state();
+        self.suppressing_suggestion_mode_prompt = false;
 
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);

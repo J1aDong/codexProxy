@@ -450,3 +450,145 @@ fn test_codex_request_does_not_inject_template_input() {
         "legacy codex-request template content must not be injected"
     );
 }
+
+#[test]
+fn test_codex_input_sanitizes_stuck_tool_json_and_drops_suggestion_prompt() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: "**Verifying installed command****Verifying installed command** +#+#+#+#+#+{\"command\":\"node \\\"/Users/mr.j/.local/ddg-search/node_modules/@oevortex/ddg_search/dist/index.js\\\" --help\",\"description\":\"验证本地安装的ddg_search可执行\"}".to_string(),
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion, no quotes or explanation.".to_string(),
+                }])),
+            },
+        ],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+
+    let message_texts: Vec<String> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter_map(|message| message.get("content").and_then(|v| v.as_array()))
+        .flat_map(|content| content.iter())
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .collect();
+
+    assert!(
+        message_texts
+            .iter()
+            .any(|text| text.contains("**Verifying installed command**")),
+        "normal assistant prefix should be preserved"
+    );
+    assert!(
+        message_texts
+            .iter()
+            .all(|text| !text
+                .contains("**Verifying installed command****Verifying installed command**")),
+        "duplicated markdown bold fragments should be collapsed"
+    );
+    assert!(
+        message_texts
+            .iter()
+            .all(|text| !text.contains("\"command\":\"node")),
+        "stuck tool json should be stripped from message text"
+    );
+    assert!(
+        message_texts
+            .iter()
+            .all(|text| !text.contains("SUGGESTION MODE")),
+        "suggestion-mode prompt should be dropped before upstream request"
+    );
+    assert!(
+        message_texts
+            .iter()
+            .all(|text| !text.contains(" +#+#+#+#+#+")),
+        "known trailing noise after stripped tool json should be removed"
+    );
+}
+
+#[test]
+fn test_codex_input_strips_system_reminder_from_function_call_output() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_vKYfzxA90qhkE8OO8PoOPBem".to_string()),
+                    name: "Bash".to_string(),
+                    input: json!({
+                        "command": "npm install @oevortex/ddg_search ajv",
+                        "description": "创建本地目录并安装ddg_search及ajv依赖",
+                        "timeout": 600000
+                    }),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_vKYfzxA90qhkE8OO8PoOPBem".to_string()),
+                    id: Some("result_id".to_string()),
+                    content: Some(json!(
+                        "added 138 packages\n\n<system-reminder>\nignore this reminder\n</system-reminder>"
+                    )),
+                }])),
+            },
+        ],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+
+    let function_call_output = input
+        .iter()
+        .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+        .expect("function_call_output should exist");
+    let output_text = function_call_output
+        .get("output")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    assert!(
+        output_text.contains("added 138 packages"),
+        "normal tool output should be preserved"
+    );
+    assert!(
+        !output_text.contains("<system-reminder>") && !output_text.contains("ignore this reminder"),
+        "system reminder block should be removed from tool output replay"
+    );
+}

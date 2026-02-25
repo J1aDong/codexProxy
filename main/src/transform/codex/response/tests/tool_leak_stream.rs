@@ -1157,3 +1157,57 @@ fn ambiguous_parallel_delta_without_metadata_is_not_attached() {
         "delta without routing metadata must not stick to the wrong parallel call"
     );
 }
+
+#[test]
+fn suggestion_mode_prompt_is_suppressed_from_visible_text() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion, no quotes or explanation."
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&line).join("");
+    assert!(
+        !joined.contains("SUGGESTION MODE"),
+        "suggestion-mode prompt should be suppressed from visible output"
+    );
+    assert!(
+        !joined.contains("\"type\":\"text_delta\""),
+        "suppressed suggestion prompt should not emit text deltas"
+    );
+}
+
+#[test]
+fn split_suggestion_mode_prompt_across_chunks_is_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let chunk1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]"
+        })
+    );
+    let chunk2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "\n\nReply with ONLY the suggestion, no quotes or explanation.\n正常内容"
+        })
+    );
+
+    let events1 = transformer.transform_sse_line(&chunk1);
+    let events2 = transformer.transform_sse_line(&chunk2);
+    let joined = format!("{}{}", events1.join(""), events2.join(""));
+
+    assert!(
+        !joined.contains("SUGGESTION MODE"),
+        "split suggestion-mode prompt chunks should be suppressed"
+    );
+    assert!(
+        joined.contains("正常内容"),
+        "text after suggestion-mode prompt should continue streaming"
+    );
+}
