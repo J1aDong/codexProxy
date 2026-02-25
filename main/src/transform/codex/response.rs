@@ -1,7 +1,7 @@
 use crate::logger::AppLogger;
 use crate::transform::ResponseTransformer;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextEventSource {
@@ -16,6 +16,91 @@ enum StreamPhase {
     StreamingThinking,
     BufferingToolCalls,
     Terminal,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpstreamItemKind {
+    Message,
+    FunctionCall,
+    Reasoning,
+    Unknown,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+struct EventPartKey {
+    output_index: Option<u64>,
+    item_id: Option<String>,
+    content_index: Option<u64>,
+}
+
+impl EventPartKey {
+    fn is_empty(&self) -> bool {
+        self.output_index.is_none() && self.item_id.is_none() && self.content_index.is_none()
+    }
+
+    fn matches_item(&self, output_index: Option<u64>, item_id: Option<&str>) -> bool {
+        let output_match = output_index
+            .map(|idx| self.output_index == Some(idx))
+            .unwrap_or(false);
+        let item_match = item_id
+            .map(|id| self.item_id.as_deref() == Some(id))
+            .unwrap_or(false);
+        output_match || item_match
+    }
+}
+
+#[derive(Default)]
+struct EventMetadata {
+    output_index: Option<u64>,
+    item_id: Option<String>,
+    call_id: Option<String>,
+    content_index: Option<u64>,
+}
+
+impl EventMetadata {
+    fn from_data(data: &Value) -> Self {
+        let output_index = data.get("output_index").and_then(|v| v.as_u64());
+        let item_id = data
+            .get("item_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                data.get("item")
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        let call_id = data
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                data.get("item")
+                    .and_then(|v| v.get("call_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        let content_index = data.get("content_index").and_then(|v| v.as_u64());
+
+        Self {
+            output_index,
+            item_id,
+            call_id,
+            content_index,
+        }
+    }
+
+    fn has_routing_hint(&self) -> bool {
+        self.output_index.is_some() || self.item_id.is_some() || self.call_id.is_some()
+    }
+
+    fn part_key(&self) -> EventPartKey {
+        EventPartKey {
+            output_index: self.output_index,
+            item_id: self.item_id.clone(),
+            content_index: self.content_index,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -45,6 +130,11 @@ pub struct TransformResponse {
     tool_order_by_item_id: HashMap<String, u64>,
     tool_order_by_call_id: HashMap<String, u64>,
     last_buffered_tool_order: Option<u64>,
+    item_kind_by_output_index: HashMap<u64, UpstreamItemKind>,
+    item_kind_by_item_id: HashMap<String, UpstreamItemKind>,
+    item_kind_by_call_id: HashMap<String, UpstreamItemKind>,
+    active_text_parts: HashSet<EventPartKey>,
+    text_dedupe_by_part: HashMap<EventPartKey, (TextEventSource, String)>,
     saw_tool_call: bool,
     saw_refusal: bool,
     refusal_text_buffer: String,
@@ -65,9 +155,6 @@ pub struct TransformResponse {
     had_reasoning_in_response: bool,
     // Track if we've seen a message-type output_item.added (means phase detection is explicit)
     saw_message_item_added: bool,
-    // Deduplicate overlapping text between output_text.delta and content_part.added
-    last_text_source: Option<TextEventSource>,
-    last_text_fragment: String,
 
     logger: std::sync::Arc<AppLogger>,
 }
@@ -649,6 +736,11 @@ impl TransformResponse {
             tool_order_by_item_id: HashMap::new(),
             tool_order_by_call_id: HashMap::new(),
             last_buffered_tool_order: None,
+            item_kind_by_output_index: HashMap::new(),
+            item_kind_by_item_id: HashMap::new(),
+            item_kind_by_call_id: HashMap::new(),
+            active_text_parts: HashSet::new(),
+            text_dedupe_by_part: HashMap::new(),
             saw_tool_call: false,
             saw_refusal: false,
             refusal_text_buffer: String::new(),
@@ -661,8 +753,6 @@ impl TransformResponse {
             in_commentary_phase: false,
             had_reasoning_in_response: false,
             saw_message_item_added: false,
-            last_text_source: None,
-            last_text_fragment: String::new(),
             logger: AppLogger::get().unwrap_or_else(|| {
                 // 如果全局 logger 未初始化，创建一个临时的
                 AppLogger::init(None)
@@ -706,6 +796,109 @@ impl TransformResponse {
             self.phase = StreamPhase::StreamingText;
         } else {
             self.phase = StreamPhase::AwaitingContent;
+        }
+    }
+
+    fn upstream_item_kind_from_type(item_type: &str) -> UpstreamItemKind {
+        match item_type {
+            "message" => UpstreamItemKind::Message,
+            "function_call" => UpstreamItemKind::FunctionCall,
+            "reasoning" | "reasoning_summary" => UpstreamItemKind::Reasoning,
+            _ => UpstreamItemKind::Unknown,
+        }
+    }
+
+    fn register_output_item_kind(
+        &mut self,
+        output_index: Option<u64>,
+        item_id: Option<&str>,
+        call_id: Option<&str>,
+        item_type: &str,
+    ) -> UpstreamItemKind {
+        let kind = Self::upstream_item_kind_from_type(item_type);
+
+        if let Some(idx) = output_index {
+            self.item_kind_by_output_index.insert(idx, kind);
+        }
+        if let Some(id) = item_id {
+            self.item_kind_by_item_id.insert(id.to_string(), kind);
+        }
+        if let Some(cid) = call_id {
+            self.item_kind_by_call_id.insert(cid.to_string(), kind);
+        }
+
+        kind
+    }
+
+    fn clear_text_state_for_item(&mut self, output_index: Option<u64>, item_id: Option<&str>) {
+        self.active_text_parts
+            .retain(|key| !key.matches_item(output_index, item_id));
+        self.text_dedupe_by_part
+            .retain(|key, _| !key.matches_item(output_index, item_id));
+    }
+
+    fn clear_output_item_kind(
+        &mut self,
+        output_index: Option<u64>,
+        item_id: Option<&str>,
+        call_id: Option<&str>,
+    ) {
+        if let Some(idx) = output_index {
+            self.item_kind_by_output_index.remove(&idx);
+        }
+        if let Some(id) = item_id {
+            self.item_kind_by_item_id.remove(id);
+        }
+        if let Some(cid) = call_id {
+            self.item_kind_by_call_id.remove(cid);
+        }
+
+        self.clear_text_state_for_item(output_index, item_id);
+    }
+
+    fn lookup_item_kind(&self, metadata: &EventMetadata) -> Option<UpstreamItemKind> {
+        metadata
+            .item_id
+            .as_deref()
+            .and_then(|id| self.item_kind_by_item_id.get(id).copied())
+            .or_else(|| {
+                metadata
+                    .output_index
+                    .and_then(|idx| self.item_kind_by_output_index.get(&idx).copied())
+            })
+            .or_else(|| {
+                metadata
+                    .call_id
+                    .as_deref()
+                    .and_then(|cid| self.item_kind_by_call_id.get(cid).copied())
+            })
+    }
+
+    fn register_text_part_if_scoped(&mut self, part_key: &EventPartKey) {
+        if part_key.is_empty() {
+            return;
+        }
+        self.active_text_parts.insert(part_key.clone());
+    }
+
+    fn finish_text_part(&mut self, part_key: &EventPartKey) -> bool {
+        if part_key.is_empty() {
+            self.text_dedupe_by_part.remove(part_key);
+            return true;
+        }
+
+        self.text_dedupe_by_part.remove(part_key);
+        self.active_text_parts.remove(part_key)
+    }
+
+    fn should_emit_text_for_event(&self, metadata: &EventMetadata) -> bool {
+        match self.lookup_item_kind(metadata) {
+            Some(UpstreamItemKind::FunctionCall) => false,
+            Some(UpstreamItemKind::Reasoning) => false,
+            Some(UpstreamItemKind::Message) => true,
+            Some(UpstreamItemKind::Unknown) | None => {
+                !(metadata.has_routing_hint() && self.has_open_tool_block())
+            }
         }
     }
 
@@ -772,7 +965,13 @@ impl TransformResponse {
             .and_then(|idx| self.tool_order_by_output_index.get(&idx).copied())
             .or_else(|| item_id.and_then(|id| self.tool_order_by_item_id.get(id).copied()))
             .or_else(|| call_id.and_then(|id| self.tool_order_by_call_id.get(id).copied()))
-            .or(self.last_buffered_tool_order)
+            .or_else(|| {
+                if self.buffered_tool_calls.len() == 1 {
+                    self.buffered_tool_calls.first().map(|tool| tool.order_key)
+                } else {
+                    None
+                }
+            })
     }
 
     fn find_buffered_tool_order(&self, data: &Value) -> Option<u64> {
@@ -952,8 +1151,17 @@ impl TransformResponse {
             .or_else(|| data.get("delta").and_then(|v| v.as_str()))
     }
 
+    fn is_text_content_part(data: &Value) -> bool {
+        let Some(part) = data.get("part") else {
+            return true;
+        };
+        let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        part_type == "output_text" || part_type == "text" || part_type.is_empty()
+    }
+
     fn dedupe_cross_source_fragment(
         &mut self,
+        part_key: &EventPartKey,
         source: TextEventSource,
         fragment: &str,
     ) -> Option<String> {
@@ -961,16 +1169,21 @@ impl TransformResponse {
             return None;
         }
 
+        let state = self
+            .text_dedupe_by_part
+            .entry(part_key.clone())
+            .or_insert_with(|| (source, String::new()));
+
         let mut deduped = fragment;
-        if let Some(last_source) = self.last_text_source {
+        let last_source = state.0;
+        let last_fragment = state.1.as_str();
+        if !last_fragment.is_empty() {
             if last_source != source {
-                if fragment == self.last_text_fragment {
+                if fragment == last_fragment {
                     return None;
                 }
-                if !self.last_text_fragment.is_empty()
-                    && fragment.starts_with(&self.last_text_fragment)
-                {
-                    deduped = &fragment[self.last_text_fragment.len()..];
+                if fragment.starts_with(last_fragment) {
+                    deduped = &fragment[last_fragment.len()..];
                 }
             }
         }
@@ -979,16 +1192,15 @@ impl TransformResponse {
             return None;
         }
 
-        let deduped_owned = deduped.to_string();
-        self.last_text_source = Some(source);
-        self.last_text_fragment.clear();
-        self.last_text_fragment.push_str(&deduped_owned);
-        Some(deduped_owned)
+        state.0 = source;
+        state.1.clear();
+        state.1.push_str(deduped);
+        Some(deduped.to_string())
     }
 
     fn reset_text_dedupe_state(&mut self) {
-        self.last_text_source = None;
-        self.last_text_fragment.clear();
+        self.text_dedupe_by_part.clear();
+        self.active_text_parts.clear();
     }
 
     fn handle_text_fragment(
@@ -1577,10 +1789,20 @@ impl TransformResponse {
         match event_type {
             // 纯文本输出 - 严格控制，只在非工具场景下开启文本块
             "response.output_text.delta" => {
+                let metadata = EventMetadata::from_data(&data);
+                let part_key = metadata.part_key();
+                self.register_text_part_if_scoped(&part_key);
+
+                if !self.should_emit_text_for_event(&metadata) {
+                    return output;
+                }
+
                 let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                let Some(delta) =
-                    self.dedupe_cross_source_fragment(TextEventSource::OutputTextDelta, delta)
-                else {
+                let Some(delta) = self.dedupe_cross_source_fragment(
+                    &part_key,
+                    TextEventSource::OutputTextDelta,
+                    delta,
+                ) else {
                     return output;
                 };
                 // Only close thinking block if text will NOT be redirected to thinking
@@ -1595,15 +1817,24 @@ impl TransformResponse {
 
             // 新版事件：内容分片直接挂在 content_part.added
             "response.content_part.added" => {
-                let redirect_to_thinking = self.in_commentary_phase
-                    || (self.had_reasoning_in_response && !self.saw_message_item_added);
-                if !redirect_to_thinking {
-                    self.close_open_thinking_block(&mut output);
-                }
+                let metadata = EventMetadata::from_data(&data);
+                let part_key = metadata.part_key();
                 if let Some(fragment) = Self::extract_content_part_text(&data) {
-                    if let Some(text) = self
-                        .dedupe_cross_source_fragment(TextEventSource::ContentPartAdded, fragment)
-                    {
+                    self.register_text_part_if_scoped(&part_key);
+                    if !self.should_emit_text_for_event(&metadata) {
+                        return output;
+                    }
+
+                    let redirect_to_thinking = self.in_commentary_phase
+                        || (self.had_reasoning_in_response && !self.saw_message_item_added);
+                    if !redirect_to_thinking {
+                        self.close_open_thinking_block(&mut output);
+                    }
+                    if let Some(text) = self.dedupe_cross_source_fragment(
+                        &part_key,
+                        TextEventSource::ContentPartAdded,
+                        fragment,
+                    ) {
                         self.handle_text_fragment(&mut output, &text, true);
                     }
                 }
@@ -1611,22 +1842,36 @@ impl TransformResponse {
 
             // 文本分片结束：如果 pending 里还有疑似工具泄露，立即按边界强制 flush
             "response.output_text.done" => {
+                let metadata = EventMetadata::from_data(&data);
+                let part_key = metadata.part_key();
                 self.flush_text_carryover(&mut output);
-                if let Some(done_text) = data.get("text").and_then(|t| t.as_str()) {
-                    self.handle_text_fragment(&mut output, done_text, false);
+                if self.should_emit_text_for_event(&metadata) {
+                    if let Some(done_text) = data.get("text").and_then(|t| t.as_str()) {
+                        self.handle_text_fragment(&mut output, done_text, false);
+                    }
                 }
                 if !self.pending_tool_text.is_empty() {
                     self.flush_pending_tool_text(&mut output);
                 }
-                self.reset_text_dedupe_state();
+
+                if self.finish_text_part(&part_key) && self.active_text_parts.is_empty() {
+                    self.close_open_text_block(&mut output);
+                }
             }
 
             "response.content_part.done" => {
+                let metadata = EventMetadata::from_data(&data);
+                let part_key = metadata.part_key();
                 self.flush_text_carryover(&mut output);
                 if !self.pending_tool_text.is_empty() {
                     self.flush_pending_tool_text(&mut output);
                 }
-                self.reset_text_dedupe_state();
+                if Self::is_text_content_part(&data)
+                    && self.finish_text_part(&part_key)
+                    && self.active_text_parts.is_empty()
+                {
+                    self.close_open_text_block(&mut output);
+                }
             }
 
             // 推理摘要分片：映射为 Anthropic thinking 增量事件，避免长阶段无可见流输出
@@ -1685,6 +1930,10 @@ impl TransformResponse {
                 self.close_open_thinking_block(&mut output);
                 if let Some(item) = data.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let output_index = data.get("output_index").and_then(|v| v.as_u64());
+                    let item_id = item.get("id").and_then(|v| v.as_str());
+                    let call_id = item.get("call_id").and_then(|v| v.as_str());
+                    self.register_output_item_kind(output_index, item_id, call_id, item_type);
 
                     match item_type {
                         "function_call" => {
@@ -1704,7 +1953,6 @@ impl TransformResponse {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("unknown")
                                 .to_string();
-                            let output_index = data.get("output_index").and_then(|v| v.as_u64());
                             let item_id = item
                                 .get("id")
                                 .and_then(|v| v.as_str())
@@ -1780,7 +2028,6 @@ impl TransformResponse {
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 self.close_open_thinking_block(&mut output);
-                self.reset_text_dedupe_state();
 
                 let output_index = data.get("output_index").and_then(|v| v.as_u64());
                 let item = data.get("item");
@@ -1789,6 +2036,14 @@ impl TransformResponse {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let item_id = item.and_then(|it| it.get("id")).and_then(|v| v.as_str());
+                let call_id = item
+                    .and_then(|it| it.get("call_id"))
+                    .and_then(|v| v.as_str());
+
+                self.clear_output_item_kind(output_index, item_id, call_id);
+                if self.active_text_parts.is_empty() {
+                    self.close_open_text_block(&mut output);
+                }
 
                 match item_type {
                     "function_call" => {
@@ -1799,8 +2054,7 @@ impl TransformResponse {
                             if let Some(order_key) = self.find_buffered_tool_order_from_metadata(
                                 output_index,
                                 item_id,
-                                item.and_then(|it| it.get("call_id"))
-                                    .and_then(|v| v.as_str()),
+                                call_id,
                             ) {
                                 self.apply_tool_arguments_snapshot(order_key, full_arguments);
                             }
@@ -1809,12 +2063,12 @@ impl TransformResponse {
                         if let Some(order_key) = self.find_buffered_tool_order_from_metadata(
                             output_index,
                             item_id,
-                            item.and_then(|it| it.get("call_id"))
-                                .and_then(|v| v.as_str()),
+                            call_id,
                         ) {
                             self.mark_buffered_tool_done(order_key);
-                        } else if let Some(order_key) = self.last_buffered_tool_order {
-                            // 兼容旧流：item 元数据缺失时回退到最近一个缓冲工具调用
+                        } else if self.buffered_tool_calls.len() == 1 {
+                            // 兼容旧流：item 元数据缺失时仅在唯一候选时回退，避免并行调用参数串线
+                            let order_key = self.buffered_tool_calls[0].order_key;
                             self.mark_buffered_tool_done(order_key);
                         }
                         self.flush_serialized_tool_calls(&mut output, false);

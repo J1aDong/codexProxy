@@ -999,3 +999,161 @@ fn user_reported_long_edit_payload_is_suppressed() {
         "long leaked edit payload should be suppressed"
     );
 }
+
+#[test]
+fn text_delta_bound_to_function_call_item_is_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_suppressed_text",
+                "type": "function_call",
+                "call_id": "call_suppressed_text",
+                "name": "Edit"
+            }
+        })
+    );
+    let leaked_text = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "fc_suppressed_text",
+            "delta": "SHOULD_NOT_LEAK"
+        })
+    );
+    let delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_suppressed_text",
+            "delta": "{\"file_path\":\"/tmp/safe.ts\"}"
+        })
+    );
+    let done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_suppressed_text",
+                "type": "function_call",
+                "call_id": "call_suppressed_text",
+                "name": "Edit"
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&add);
+    events.extend(transformer.transform_sse_line(&leaked_text));
+    events.extend(transformer.transform_sse_line(&delta));
+    events.extend(transformer.transform_sse_line(&done));
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("\"type\":\"tool_use\""),
+        "function call should still be converted to tool_use"
+    );
+    assert!(
+        !joined.contains("SHOULD_NOT_LEAK"),
+        "text chunks scoped to function_call items must stay hidden"
+    );
+    assert!(
+        joined.contains("safe.ts"),
+        "tool arguments should still flow through the tool channel"
+    );
+}
+
+#[test]
+fn ambiguous_parallel_delta_without_metadata_is_not_attached() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_first",
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "Edit"
+            }
+        })
+    );
+    let add_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_second",
+                "type": "function_call",
+                "call_id": "call_second",
+                "name": "Edit"
+            }
+        })
+    );
+    let ambiguous_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "delta": "{\"file_path\":\"/tmp/ambiguous.ts\"}"
+        })
+    );
+    let done_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_first",
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "Edit"
+            }
+        })
+    );
+    let done_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_second",
+                "type": "function_call",
+                "call_id": "call_second",
+                "name": "Edit"
+            }
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": { "status": "completed" }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add_1);
+    let _ = transformer.transform_sse_line(&add_2);
+    let _ = transformer.transform_sse_line(&ambiguous_delta);
+    let mut events = transformer.transform_sse_line(&done_1);
+    events.extend(transformer.transform_sse_line(&done_2));
+    events.extend(transformer.transform_sse_line(&completed));
+
+    let joined = events.join("");
+    assert!(
+        joined.contains("\"id\":\"call_first\"") && joined.contains("\"id\":\"call_second\""),
+        "both tool calls should still complete"
+    );
+    assert!(
+        !joined.contains("ambiguous.ts"),
+        "delta without routing metadata must not stick to the wrong parallel call"
+    );
+}
