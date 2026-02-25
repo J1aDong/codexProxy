@@ -62,7 +62,7 @@ impl AppLogger {
         PathBuf::from(LOG_DIR)
     }
 
-    fn cleanup_log_dir(log_dir: &Path) {
+    fn cleanup_log_dir(log_dir: &Path, reserve_slot_for_new_log: bool) {
         let entries = match fs::read_dir(log_dir) {
             Ok(entries) => entries,
             Err(_) => return,
@@ -96,8 +96,16 @@ impl AppLogger {
                 .then_with(|| left_path.cmp(right_path))
         });
 
+        // During startup we prune first, then create the new session log file.
+        // Reserve one slot so total files after creation still stay within LOG_MAX_FILES.
+        let keep_limit = if reserve_slot_for_new_log {
+            LOG_MAX_FILES.saturating_sub(1)
+        } else {
+            LOG_MAX_FILES
+        };
+
         for (idx, (path, _)) in log_entries.into_iter().enumerate() {
-            if idx < LOG_MAX_FILES {
+            if idx < keep_limit {
                 let _ = Self::trim_file_requests(&path, LOG_MAX_REQUESTS);
             } else {
                 let _ = fs::remove_file(path);
@@ -192,7 +200,7 @@ impl AppLogger {
                     .map(PathBuf::from)
                     .unwrap_or_else(Self::default_log_dir);
                 let _ = fs::create_dir_all(&dir);
-                Self::cleanup_log_dir(&dir);
+                Self::cleanup_log_dir(&dir, true);
 
                 let start_time = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
                 let log_path = dir.join(format!("proxy_{}.log", start_time));
@@ -379,6 +387,7 @@ impl AppLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn trim_keeps_last_request_blocks() {
@@ -406,5 +415,38 @@ mod tests {
 
         let out = AppLogger::trim_log_content_by_requests(input, 200);
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn cleanup_reserves_one_slot_for_new_log_on_startup() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codex_proxy_logs_{}", unique));
+        fs::create_dir_all(&dir).expect("create temp log dir");
+
+        for idx in 0..3 {
+            let path = dir.join(format!("proxy_test_{}.log", idx));
+            fs::write(path, format!("log-{idx}")).expect("create log file");
+        }
+
+        AppLogger::cleanup_log_dir(&dir, true);
+
+        let retained_logs = fs::read_dir(&dir)
+            .expect("read temp log dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("log"))
+                    .unwrap_or(false)
+            })
+            .count();
+
+        assert_eq!(retained_logs, LOG_MAX_FILES - 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
