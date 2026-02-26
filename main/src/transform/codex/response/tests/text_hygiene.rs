@@ -118,8 +118,10 @@ fn test_log_sample_overflow_text_is_safely_suppressed() {
         "log-derived leaked tool json tail must be suppressed while keeping readable prefix"
     );
     assert!(
-        !joined.contains("\"type\":\"tool_use\""),
-        "log-derived leaked payload must not become tool_use"
+        joined.contains("\"type\":\"tool_use\"")
+            && joined.contains("\"name\":\"AskUserQuestion\"")
+            && !joined.contains("\"name\":\"Edit\""),
+        "high-risk log-derived leaked payload should emit AskUserQuestion and keep real tool blocked"
     );
 }
 

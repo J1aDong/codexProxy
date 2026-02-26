@@ -24,6 +24,60 @@ fn leaked_tool_text_is_suppressed_not_promoted() {
 }
 
 #[test]
+fn marker_prefixed_readonly_tool_json_is_recovered() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "assistant to=multi_tool_use.parallel {\"tool_uses\":[{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/tmp/a.txt\"}}]}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+    assert!(
+        joined.contains("\"type\":\"tool_use\"")
+            && joined.contains("\"name\":\"Read\"")
+            && joined.contains("a.txt"),
+        "marker-prefixed readonly tool json should recover into synthetic tool_use"
+    );
+    assert!(
+        !joined.contains("assistant to=multi_tool_use.parallel")
+            && !joined.contains("\"tool_uses\"")
+            && !joined.contains("\"recipient_name\""),
+        "leaked marker envelope should not be visible after recovery"
+    );
+}
+
+#[test]
+fn marker_prefixed_high_risk_tool_json_emits_confirmation_and_stays_blocked() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "assistant to=functions.Edit {\"file_path\":\"/tmp/a.ts\",\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":false}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+    assert!(
+        joined.contains("\"type\":\"tool_use\"")
+            && joined.contains("\"name\":\"AskUserQuestion\"")
+            && joined.contains("高风险工具参数泄露"),
+        "high-risk marker leak should emit AskUserQuestion tool_use"
+    );
+    assert!(
+        !joined.contains("\"old_string\"")
+            && !joined.contains("\"new_string\"")
+            && !joined.contains("\"name\":\"Edit\""),
+        "high-risk leaked payload must remain blocked"
+    );
+}
+
+#[test]
 fn leaked_tool_suffix_keeps_prefix_text_visible() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(
@@ -156,17 +210,17 @@ fn raw_multi_tool_uses_with_non_readonly_tool_is_still_suppressed() {
         "normal prefix text should remain visible"
     );
     assert!(
-        joined.contains("安全确认")
-            && joined.contains("高风险操作已拦截")
-            && joined.contains("是否继续"),
-        "high-risk leak suppression should emit explicit confirmation question"
+        joined.contains("\"type\":\"tool_use\"")
+            && joined.contains("\"name\":\"AskUserQuestion\"")
+            && joined.contains("高风险工具参数泄露"),
+        "high-risk leak suppression should emit AskUserQuestion tool_use"
     );
     assert!(
         !joined.contains("\"tool_uses\"")
             && !joined.contains("\"recipient_name\"")
             && !joined.contains("\"old_string\"")
             && !joined.contains("\"new_string\"")
-            && !joined.contains("\"type\":\"tool_use\""),
+            && !joined.contains("\"name\":\"Edit\""),
         "non-readonly leaked tool payload must stay suppressed"
     );
 }
@@ -193,13 +247,13 @@ fn high_risk_leak_confirmation_question_is_emitted_once_per_response() {
     let e2 = transformer.transform_sse_line(&line_2);
     let joined = format!("{}{}", e1.join(""), e2.join(""));
 
-    let question_count = joined.matches("安全确认（高风险操作已拦截）").count();
+    let question_count = joined.matches("\"name\":\"AskUserQuestion\"").count();
     assert_eq!(
         question_count, 1,
         "confirmation question should be emitted once per response"
     );
     assert!(
-        !joined.contains("\"type\":\"tool_use\""),
+        !joined.contains("\"name\":\"Edit\""),
         "high-risk leaked payloads should remain suppressed"
     );
 }
@@ -304,14 +358,16 @@ fn raw_exec_command_json_without_marker_is_suppressed() {
         "duplicated stitched prefix should collapse into a single readable sentence"
     );
     assert!(
-        !joined.contains("\\\"command\\\"")
-            && !joined.contains("\\\"description\\\"")
-            && !joined.contains("\\\"timeout\\\""),
+        !joined.contains("tailwindcss -i /tmp/in.css -o /tmp/out.css")
+            && !joined.contains("Rebuild Tailwind CSS")
+            && !joined.contains("600000"),
         "raw exec-command tool args json should be suppressed from visible text"
     );
     assert!(
-        !joined.contains("\"type\":\"tool_use\""),
-        "suppressed leaked exec-command json must not create tool_use blocks"
+        joined.contains("\"type\":\"tool_use\"")
+            && joined.contains("\"name\":\"AskUserQuestion\"")
+            && !joined.contains("\"name\":\"Bash\""),
+        "high-risk leaked exec-command json should emit AskUserQuestion and keep real tool blocked"
     );
 }
 

@@ -722,11 +722,47 @@ impl TransformResponse {
         }
         self.high_risk_leak_question_emitted = true;
         self.diagnostics.emitted_high_risk_leak_questions += 1;
-        self.close_open_thinking_block(output);
-        self.emit_visible_text_fragment(
-            output,
-            "\n\n⚠️ **安全确认（高风险操作已拦截）**\n检测到疑似高风险工具参数泄露，系统已拦截且未自动执行。是否继续由我在安全模式下重试？请回复“继续”或“取消”。\n\n",
+        self.logger.log_raw(
+            "[Warn] Emitting synthetic AskUserQuestion tool_use for high-risk leak confirmation",
         );
+        self.emit_high_risk_leak_ask_user_question_tool(output);
+    }
+
+    fn emit_high_risk_leak_ask_user_question_tool(&mut self, output: &mut Vec<String>) {
+        let seq = self.next_tool_arrival_seq;
+        self.next_tool_arrival_seq = self.next_tool_arrival_seq.saturating_add(1);
+
+        let input = json!({
+            "questions": [
+                {
+                    "header": "安全确认",
+                    "question": "检测到疑似高风险工具参数泄露，系统已拦截且未自动执行。是否继续由我在安全模式下重试？",
+                    "multiSelect": false,
+                    "options": [
+                        {
+                            "label": "继续（推荐）",
+                            "description": "仅在安全模式下重试，不会自动执行高风险工具操作。"
+                        },
+                        {
+                            "label": "取消",
+                            "description": "保持拦截并结束当前高风险操作。"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let tool = BufferedToolCall {
+            order_key: 0,
+            arrival_seq: seq,
+            output_index: None,
+            item_id: None,
+            call_id: format!("call_high_risk_leak_question_{}", seq),
+            name: "AskUserQuestion".to_string(),
+            arguments_buffer: input.to_string(),
+            done_flag: true,
+        };
+        self.emit_serialized_tool_call(output, &tool);
     }
 
     fn normalize_recipient_tool_name(recipient_name: &str) -> Option<&str> {
@@ -984,7 +1020,16 @@ impl TransformResponse {
                 Self::split_tool_json_prefix_suffix(pending_for_tool_parse)
             {
                 self.diagnostics.dropped_leaked_marker_fragments += 1;
-                if Self::is_high_risk_raw_tool_json(&raw_json) {
+                if let Some(recovered_calls) =
+                    self.try_recover_readonly_tool_uses_from_raw_json(output, &raw_json)
+                {
+                    self.diagnostics.recovered_readonly_leaked_tool_payloads += 1;
+                    self.diagnostics.recovered_readonly_leaked_tool_calls += recovered_calls as u64;
+                    self.logger.log_raw(&format!(
+                        "[Warn] Recovered leaked marker+json readonly tool_uses payload into synthetic tool_use events count={}",
+                        recovered_calls
+                    ));
+                } else if Self::is_high_risk_raw_tool_json(&raw_json) {
                     self.diagnostics.dropped_high_risk_raw_tool_json_fragments += 1;
                     self.logger.log_raw(
                         "[Warn] Dropping high-risk leaked tool marker + json fragment from visible text",
