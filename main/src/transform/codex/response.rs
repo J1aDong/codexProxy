@@ -480,6 +480,32 @@ impl TransformResponse {
             .all(|key| matches!(key.as_str(), "task_id" | "block" | "timeout"))
     }
 
+    fn looks_like_read_payload_fragment(line: &str) -> bool {
+        let Ok(parsed) = serde_json::from_str::<Value>(line.trim()) else {
+            return false;
+        };
+        let Some(obj) = parsed.as_object() else {
+            return false;
+        };
+
+        let has_file_path = obj
+            .get("file_path")
+            .and_then(|value| value.as_str())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !has_file_path {
+            return false;
+        }
+
+        let has_window = obj.contains_key("offset") || obj.contains_key("limit");
+        if !has_window {
+            return false;
+        }
+
+        obj.keys()
+            .all(|key| matches!(key.as_str(), "file_path" | "offset" | "limit"))
+    }
+
     fn strip_known_leak_suffix_noise(text: &str) -> String {
         let trimmed = text.trim_end_matches(char::is_whitespace);
         let noise_patterns = [
@@ -546,6 +572,10 @@ impl TransformResponse {
         }
 
         if Self::looks_like_task_output_payload_fragment(trimmed) {
+            return true;
+        }
+
+        if Self::looks_like_read_payload_fragment(trimmed) {
             return true;
         }
 

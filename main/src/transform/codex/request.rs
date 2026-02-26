@@ -98,6 +98,32 @@ fn looks_like_high_confidence_tool_json_object(json: &str) -> bool {
         return true;
     }
 
+    let is_read_payload = serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .map(|obj| {
+            let has_file_path = obj
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_file_path {
+                return false;
+            }
+
+            let has_window = obj.contains_key("offset") || obj.contains_key("limit");
+            if !has_window {
+                return false;
+            }
+
+            obj.keys()
+                .all(|key| matches!(key.as_str(), "file_path" | "offset" | "limit"))
+        })
+        .unwrap_or(false);
+    if is_read_payload {
+        return true;
+    }
+
     let is_exec_command_payload = serde_json::from_str::<Value>(trimmed)
         .ok()
         .and_then(|v| v.as_object().cloned())

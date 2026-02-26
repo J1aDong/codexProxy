@@ -705,6 +705,57 @@ fn test_codex_input_strips_markerless_taskoutput_json_tail() {
 }
 
 #[test]
+fn test_codex_input_strips_markerless_read_json_tail() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![Message {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "Removing obsolete payload branch +#+#+#+#+#+{\"file_path\":\"/Users/mr.j/myRoom/YAT/yat_commad_check/index.html\",\"offset\":260,\"limit\":220}".to_string(),
+            }])),
+        }],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+
+    let text_blocks: Vec<&str> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter_map(|msg| msg.get("content").and_then(|v| v.as_array()))
+        .flat_map(|content| content.iter())
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect();
+
+    assert!(
+        text_blocks
+            .iter()
+            .any(|text| text.contains("Removing obsolete payload branch")),
+        "normal readable prefix should remain"
+    );
+    assert!(
+        text_blocks.iter().all(|text| {
+            !text.contains("\"file_path\"")
+                && !text.contains("\"offset\"")
+                && !text.contains("\"limit\"")
+        }),
+        "markerless read-args json tail should be stripped from outbound message text"
+    );
+}
+
+#[test]
 fn test_codex_input_injects_missing_function_call_output_placeholder() {
     let request = AnthropicRequest {
         model: Some("claude-sonnet-4-5-20250929".to_string()),

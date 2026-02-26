@@ -245,6 +245,36 @@ fn raw_taskoutput_json_without_marker_is_suppressed() {
 }
 
 #[test]
+fn raw_read_json_without_marker_is_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Removing obsolete payload branch +#+#+#+#+#+{\"file_path\":\"/Users/mr.j/myRoom/YAT/yat_commad_check/index.html\",\"offset\":260,\"limit\":220}{\"file_path\":\"/Users/mr.j/myRoom/YAT/yat_commad_check/index.html\",\"offset\":260,\"limit\":220}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("Removing obsolete payload branch"),
+        "normal prefix text should remain visible"
+    );
+    assert!(
+        !joined.contains("\\\"file_path\\\"")
+            && !joined.contains("\\\"offset\\\"")
+            && !joined.contains("\\\"limit\\\""),
+        "raw read-args json tail should be suppressed from visible text"
+    );
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "suppressed read-args json must not create tool_use blocks"
+    );
+}
+
+#[test]
 fn same_chunk_natural_language_json_and_suffix_only_suppresses_tool_json() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(
