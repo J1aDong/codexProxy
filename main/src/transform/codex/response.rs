@@ -33,6 +33,47 @@ enum TextRoutingDecision {
     DeferUntilToolWindowCloses,
 }
 
+#[derive(Default)]
+struct TransformDiagnostics {
+    deferred_unscoped_text_chunks: u64,
+    deferred_unscoped_text_flushes: u64,
+    dropped_leaked_marker_fragments: u64,
+    dropped_raw_tool_json_fragments: u64,
+    dropped_contextual_note_json_fragments: u64,
+    dropped_incomplete_tool_json_fragments: u64,
+    queued_orphan_tool_argument_updates: u64,
+    applied_orphan_tool_argument_updates: u64,
+    dropped_orphan_tool_argument_updates_no_hint: u64,
+    dropped_orphan_tool_argument_updates_closed_call: u64,
+    dropped_pending_tool_argument_updates_closed_call: u64,
+    duplicate_active_call_items: u64,
+    dropped_reused_closed_call_items: u64,
+    binding_conflicts_output_index: u64,
+    binding_conflicts_item_id: u64,
+    pending_tool_backlog_trimmed: u64,
+}
+
+impl TransformDiagnostics {
+    fn has_activity(&self) -> bool {
+        self.deferred_unscoped_text_chunks > 0
+            || self.deferred_unscoped_text_flushes > 0
+            || self.dropped_leaked_marker_fragments > 0
+            || self.dropped_raw_tool_json_fragments > 0
+            || self.dropped_contextual_note_json_fragments > 0
+            || self.dropped_incomplete_tool_json_fragments > 0
+            || self.queued_orphan_tool_argument_updates > 0
+            || self.applied_orphan_tool_argument_updates > 0
+            || self.dropped_orphan_tool_argument_updates_no_hint > 0
+            || self.dropped_orphan_tool_argument_updates_closed_call > 0
+            || self.dropped_pending_tool_argument_updates_closed_call > 0
+            || self.duplicate_active_call_items > 0
+            || self.dropped_reused_closed_call_items > 0
+            || self.binding_conflicts_output_index > 0
+            || self.binding_conflicts_item_id > 0
+            || self.pending_tool_backlog_trimmed > 0
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 struct EventPartKey {
     output_index: Option<u64>,
@@ -178,6 +219,7 @@ pub struct TransformResponse {
     had_reasoning_in_response: bool,
     // Track if we've seen a message-type output_item.added (means phase detection is explicit)
     saw_message_item_added: bool,
+    diagnostics: TransformDiagnostics,
 
     logger: std::sync::Arc<AppLogger>,
 }
@@ -734,6 +776,7 @@ impl TransformResponse {
             if let Some((_, _, suffix)) =
                 Self::split_tool_json_prefix_suffix(pending_for_tool_parse)
             {
+                self.diagnostics.dropped_leaked_marker_fragments += 1;
                 self.logger.log_raw(
                     "[Warn] Dropping leaked tool marker + json fragment from visible text",
                 );
@@ -745,6 +788,7 @@ impl TransformResponse {
 
             if !force_flush {
                 if let Some(newline_idx) = pending_for_tool_parse.find('\n') {
+                    self.diagnostics.dropped_leaked_marker_fragments += 1;
                     self.logger
                         .log_raw("[Warn] Dropping leaked tool marker fragment from visible text");
                     let suffix = &pending_for_tool_parse[newline_idx + 1..];
@@ -760,6 +804,7 @@ impl TransformResponse {
                 return;
             }
 
+            self.diagnostics.dropped_leaked_marker_fragments += 1;
             self.logger
                 .log_raw("[Warn] Dropping leaked tool marker fragment from visible text");
             if let Some(newline_idx) = pending_for_tool_parse.find('\n') {
@@ -776,6 +821,7 @@ impl TransformResponse {
 
         // 检查高置信工具参数泄漏
         if let Some((prefix, _, suffix)) = Self::split_tool_json_prefix_suffix(&pending_raw) {
+            self.diagnostics.dropped_raw_tool_json_fragments += 1;
             self.logger
                 .log_raw("[Warn] Dropping raw leaked tool json fragment");
             if !prefix.is_empty() {
@@ -795,6 +841,7 @@ impl TransformResponse {
         if let Some((prefix, _, _suffix, is_cross_chunk)) =
             Self::split_contextual_note_json_prefix_suffix(&pending_raw, &context)
         {
+            self.diagnostics.dropped_contextual_note_json_fragments += 1;
             self.logger
                 .log_raw("[Warn] Dropping contextual note-json leak from visible text");
             if is_cross_chunk {
@@ -816,6 +863,7 @@ impl TransformResponse {
                     return;
                 }
 
+                self.diagnostics.dropped_incomplete_tool_json_fragments += 1;
                 self.logger
                     .log_raw("[Warn] Dropping incomplete potential raw tool json fragment");
                 let prefix = &pending_raw[..raw_json_start];
@@ -871,6 +919,7 @@ impl TransformResponse {
             in_commentary_phase: false,
             had_reasoning_in_response: false,
             saw_message_item_added: false,
+            diagnostics: TransformDiagnostics::default(),
             logger: AppLogger::get().unwrap_or_else(|| {
                 // 如果全局 logger 未初始化，创建一个临时的
                 AppLogger::init(None)
@@ -1048,6 +1097,7 @@ impl TransformResponse {
     fn upsert_output_index_binding(&mut self, output_index: u64, order_key: u64) -> bool {
         if let Some(existing) = self.tool_order_by_output_index.get(&output_index).copied() {
             if existing != order_key {
+                self.diagnostics.binding_conflicts_output_index += 1;
                 self.logger
                     .log_raw("[Warn] Ignoring conflicting function_call output_index binding");
                 return false;
@@ -1062,6 +1112,7 @@ impl TransformResponse {
     fn upsert_item_id_binding(&mut self, item_id: &str, order_key: u64) -> bool {
         if let Some(existing) = self.tool_order_by_item_id.get(item_id).copied() {
             if existing != order_key {
+                self.diagnostics.binding_conflicts_item_id += 1;
                 self.logger
                     .log_raw("[Warn] Ignoring conflicting function_call item_id binding");
                 return false;
@@ -1108,6 +1159,7 @@ impl TransformResponse {
         name: String,
     ) {
         if let Some(existing_order) = self.tool_order_by_call_id.get(&call_id).copied() {
+            self.diagnostics.duplicate_active_call_items += 1;
             self.logger.log_raw(
                 "[Warn] Duplicate function_call item for active call_id; reusing existing buffered call",
             );
@@ -1116,6 +1168,7 @@ impl TransformResponse {
         }
 
         if self.closed_tool_call_ids.contains(call_id.as_str()) {
+            self.diagnostics.dropped_reused_closed_call_items += 1;
             self.logger.log_raw(
                 "[Warn] Dropping function_call item because call_id was already closed in this response",
             );
@@ -1203,6 +1256,8 @@ impl TransformResponse {
     ) {
         let metadata = EventMetadata::from_data(data);
         if !metadata.has_routing_hint() {
+            self.diagnostics
+                .dropped_orphan_tool_argument_updates_no_hint += 1;
             self.logger
                 .log_raw("[Warn] Dropping orphan tool arguments event without routing hints");
             return;
@@ -1210,6 +1265,8 @@ impl TransformResponse {
 
         if let Some(call_id) = metadata.call_id.as_deref() {
             if self.closed_tool_call_ids.contains(call_id) {
+                self.diagnostics
+                    .dropped_orphan_tool_argument_updates_closed_call += 1;
                 self.logger.log_raw(
                     "[Warn] Dropping orphan tool arguments event for already-closed call_id",
                 );
@@ -1219,6 +1276,7 @@ impl TransformResponse {
 
         if self.pending_tool_argument_updates.len() >= 64 {
             self.pending_tool_argument_updates.remove(0);
+            self.diagnostics.pending_tool_backlog_trimmed += 1;
             self.logger
                 .log_raw("[Warn] Trimming pending tool-argument update backlog");
         }
@@ -1230,6 +1288,7 @@ impl TransformResponse {
                 call_id: metadata.call_id,
                 kind,
             });
+        self.diagnostics.queued_orphan_tool_argument_updates += 1;
         self.logger
             .log_raw("[Info] Queued orphan tool arguments event waiting for function_call item");
     }
@@ -1243,6 +1302,8 @@ impl TransformResponse {
         for pending in std::mem::take(&mut self.pending_tool_argument_updates) {
             if let Some(call_id) = pending.call_id.as_deref() {
                 if self.closed_tool_call_ids.contains(call_id) {
+                    self.diagnostics
+                        .dropped_pending_tool_argument_updates_closed_call += 1;
                     self.logger.log_raw(
                         "[Warn] Dropping pending tool-argument update for already-closed call_id",
                     );
@@ -1258,9 +1319,11 @@ impl TransformResponse {
                 match pending.kind {
                     PendingToolArgumentUpdateKind::Delta(delta) => {
                         self.append_tool_arguments_delta(order_key, &delta);
+                        self.diagnostics.applied_orphan_tool_argument_updates += 1;
                     }
                     PendingToolArgumentUpdateKind::Snapshot(arguments) => {
                         self.apply_tool_arguments_snapshot(order_key, &arguments);
+                        self.diagnostics.applied_orphan_tool_argument_updates += 1;
                     }
                 }
             } else {
@@ -1390,6 +1453,7 @@ impl TransformResponse {
         if fragment.is_empty() {
             return;
         }
+        self.diagnostics.deferred_unscoped_text_chunks += 1;
         self.deferred_unscoped_text.push_str(fragment);
     }
 
@@ -1402,6 +1466,7 @@ impl TransformResponse {
         }
 
         let deferred = std::mem::take(&mut self.deferred_unscoped_text);
+        self.diagnostics.deferred_unscoped_text_flushes += 1;
         self.logger
             .log_raw("[Info] Flushing deferred unscoped text after tool window");
         self.handle_text_fragment(output, &deferred, true);
@@ -1941,6 +2006,7 @@ impl TransformResponse {
 
         // 检查高置信工具参数泄漏
         if let Some((prefix, _, suffix)) = Self::split_tool_json_prefix_suffix(&carryover) {
+            self.diagnostics.dropped_raw_tool_json_fragments += 1;
             self.logger
                 .log_raw("[Warn] Dropping raw leaked tool json from carryover");
             if !self.has_open_tool_block() && !prefix.is_empty() {
@@ -1956,6 +2022,7 @@ impl TransformResponse {
         if let Some((prefix, _, suffix, is_cross_chunk)) =
             Self::split_contextual_note_json_prefix_suffix(&carryover, &carryover)
         {
+            self.diagnostics.dropped_contextual_note_json_fragments += 1;
             self.logger
                 .log_raw("[Warn] Dropping contextual note-json leak from carryover");
             if is_cross_chunk {
@@ -1990,6 +2057,34 @@ impl TransformResponse {
 
     fn flush_pending_tool_text(&mut self, output: &mut Vec<String>) {
         self.process_pending_tool_text(output, true);
+    }
+
+    fn log_diagnostics_summary(&self, terminal_event: &str) {
+        if !self.diagnostics.has_activity() {
+            return;
+        }
+
+        self.logger.log_raw(&format!(
+            "[Diag] codex_response_transform_summary terminal_event={} deferred_chunks={} deferred_flushes={} dropped_leaked_marker={} dropped_raw_tool_json={} dropped_contextual_note_json={} dropped_incomplete_tool_json={} orphan_queued={} orphan_applied={} orphan_dropped_no_hint={} orphan_dropped_closed_call={} pending_dropped_closed_call={} duplicate_active_call_items={} dropped_reused_closed_call_items={} binding_conflicts_output_index={} binding_conflicts_item_id={} pending_backlog_trimmed={} pending_orphan_updates={}",
+            terminal_event,
+            self.diagnostics.deferred_unscoped_text_chunks,
+            self.diagnostics.deferred_unscoped_text_flushes,
+            self.diagnostics.dropped_leaked_marker_fragments,
+            self.diagnostics.dropped_raw_tool_json_fragments,
+            self.diagnostics.dropped_contextual_note_json_fragments,
+            self.diagnostics.dropped_incomplete_tool_json_fragments,
+            self.diagnostics.queued_orphan_tool_argument_updates,
+            self.diagnostics.applied_orphan_tool_argument_updates,
+            self.diagnostics.dropped_orphan_tool_argument_updates_no_hint,
+            self.diagnostics.dropped_orphan_tool_argument_updates_closed_call,
+            self.diagnostics.dropped_pending_tool_argument_updates_closed_call,
+            self.diagnostics.duplicate_active_call_items,
+            self.diagnostics.dropped_reused_closed_call_items,
+            self.diagnostics.binding_conflicts_output_index,
+            self.diagnostics.binding_conflicts_item_id,
+            self.diagnostics.pending_tool_backlog_trimmed,
+            self.pending_tool_argument_updates.len()
+        ));
     }
 
     fn map_incomplete_reason_to_stop_reason(
@@ -2108,6 +2203,11 @@ impl TransformResponse {
             "event: message_stop\ndata: {}\n\n",
             json!({ "type": "message_stop" })
         ));
+        self.log_diagnostics_summary(if force_incomplete {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        });
         self.transition_to(StreamPhase::Terminal);
     }
 
@@ -2178,6 +2278,7 @@ impl TransformResponse {
             "event: message_stop\ndata: {}\n\n",
             json!({ "type": "message_stop" })
         ));
+        self.log_diagnostics_summary("response.failed_or_error");
         self.transition_to(StreamPhase::Terminal);
     }
 

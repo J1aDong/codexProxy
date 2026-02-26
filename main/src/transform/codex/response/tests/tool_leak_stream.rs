@@ -818,6 +818,136 @@ fn call_id_reuse_after_close_is_dropped_in_same_response() {
 }
 
 #[test]
+fn diagnostics_counters_track_defer_and_quarantine_paths() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_text_gate = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_diag_gate",
+                "type": "function_call",
+                "call_id": "call_diag_gate",
+                "name": "Edit"
+            }
+        })
+    );
+    let unscoped_text = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "this text should be deferred while tool window is open"
+        })
+    );
+    let done_text_gate = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_diag_gate",
+                "type": "function_call",
+                "call_id": "call_diag_gate",
+                "name": "Edit"
+            }
+        })
+    );
+    let raw_leak = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Preparing edit. {\"file_path\":\"/tmp/mod.ts\",\"new_string\":\"a\",\"old_string\":\"b\",\"replace_all\":false}"
+        })
+    );
+    let orphan_no_hint = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "delta": "{\"file_path\":\"/tmp/no-hint.ts\"}"
+        })
+    );
+    let orphan_with_hint = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 9,
+            "item_id": "fc_diag_orphan",
+            "call_id": "call_diag_orphan",
+            "delta": "{\"file_path\":\"/tmp/orphan.ts\"}"
+        })
+    );
+    let add_orphan_binding = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 9,
+            "item": {
+                "id": "fc_diag_orphan",
+                "type": "function_call",
+                "call_id": "call_diag_orphan",
+                "name": "Read"
+            }
+        })
+    );
+    let done_orphan_binding = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 9,
+            "item": {
+                "id": "fc_diag_orphan",
+                "type": "function_call",
+                "call_id": "call_diag_orphan",
+                "name": "Read"
+            }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add_text_gate);
+    let _ = transformer.transform_sse_line(&unscoped_text);
+    let _ = transformer.transform_sse_line(&done_text_gate);
+    let _ = transformer.transform_sse_line(&raw_leak);
+    let _ = transformer.transform_sse_line(&orphan_no_hint);
+    let _ = transformer.transform_sse_line(&orphan_with_hint);
+    let _ = transformer.transform_sse_line(&add_orphan_binding);
+    let _ = transformer.transform_sse_line(&done_orphan_binding);
+
+    assert!(
+        transformer.diagnostics.deferred_unscoped_text_chunks >= 1,
+        "deferred text chunks should be counted"
+    );
+    assert!(
+        transformer.diagnostics.deferred_unscoped_text_flushes >= 1,
+        "deferred text flushes should be counted"
+    );
+    assert!(
+        transformer.diagnostics.dropped_raw_tool_json_fragments >= 1,
+        "raw leaked tool json drops should be counted"
+    );
+    assert_eq!(
+        transformer
+            .diagnostics
+            .dropped_orphan_tool_argument_updates_no_hint,
+        1,
+        "orphan tool-arg updates without routing hints should be counted"
+    );
+    assert!(
+        transformer.diagnostics.queued_orphan_tool_argument_updates >= 1,
+        "orphan tool-arg updates with routing hints should be queued"
+    );
+    assert!(
+        transformer.diagnostics.applied_orphan_tool_argument_updates >= 1,
+        "queued orphan tool-arg updates should be applied after binding appears"
+    );
+    assert!(
+        transformer.diagnostics.has_activity(),
+        "diagnostics summary should report non-zero activity"
+    );
+}
+
+#[test]
 fn interleaved_parallel_function_calls_keep_separate_tool_blocks() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
