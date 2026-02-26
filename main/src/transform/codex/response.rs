@@ -2064,27 +2064,34 @@ impl TransformResponse {
             return;
         }
 
-        self.logger.log_raw(&format!(
-            "[Diag] codex_response_transform_summary terminal_event={} deferred_chunks={} deferred_flushes={} dropped_leaked_marker={} dropped_raw_tool_json={} dropped_contextual_note_json={} dropped_incomplete_tool_json={} orphan_queued={} orphan_applied={} orphan_dropped_no_hint={} orphan_dropped_closed_call={} pending_dropped_closed_call={} duplicate_active_call_items={} dropped_reused_closed_call_items={} binding_conflicts_output_index={} binding_conflicts_item_id={} pending_backlog_trimmed={} pending_orphan_updates={}",
-            terminal_event,
-            self.diagnostics.deferred_unscoped_text_chunks,
-            self.diagnostics.deferred_unscoped_text_flushes,
-            self.diagnostics.dropped_leaked_marker_fragments,
-            self.diagnostics.dropped_raw_tool_json_fragments,
-            self.diagnostics.dropped_contextual_note_json_fragments,
-            self.diagnostics.dropped_incomplete_tool_json_fragments,
-            self.diagnostics.queued_orphan_tool_argument_updates,
-            self.diagnostics.applied_orphan_tool_argument_updates,
-            self.diagnostics.dropped_orphan_tool_argument_updates_no_hint,
-            self.diagnostics.dropped_orphan_tool_argument_updates_closed_call,
-            self.diagnostics.dropped_pending_tool_argument_updates_closed_call,
-            self.diagnostics.duplicate_active_call_items,
-            self.diagnostics.dropped_reused_closed_call_items,
-            self.diagnostics.binding_conflicts_output_index,
-            self.diagnostics.binding_conflicts_item_id,
-            self.diagnostics.pending_tool_backlog_trimmed,
-            self.pending_tool_argument_updates.len()
-        ));
+        let summary = self.build_diagnostics_summary(terminal_event);
+        self.logger.log_raw(&format!("[DiagJSON] {}", summary));
+    }
+
+    fn build_diagnostics_summary(&self, terminal_event: &str) -> Value {
+        json!({
+            "type": "codex_response_transform_summary",
+            "terminal_event": terminal_event,
+            "counters": {
+                "deferred_unscoped_text_chunks": self.diagnostics.deferred_unscoped_text_chunks,
+                "deferred_unscoped_text_flushes": self.diagnostics.deferred_unscoped_text_flushes,
+                "dropped_leaked_marker_fragments": self.diagnostics.dropped_leaked_marker_fragments,
+                "dropped_raw_tool_json_fragments": self.diagnostics.dropped_raw_tool_json_fragments,
+                "dropped_contextual_note_json_fragments": self.diagnostics.dropped_contextual_note_json_fragments,
+                "dropped_incomplete_tool_json_fragments": self.diagnostics.dropped_incomplete_tool_json_fragments,
+                "queued_orphan_tool_argument_updates": self.diagnostics.queued_orphan_tool_argument_updates,
+                "applied_orphan_tool_argument_updates": self.diagnostics.applied_orphan_tool_argument_updates,
+                "dropped_orphan_tool_argument_updates_no_hint": self.diagnostics.dropped_orphan_tool_argument_updates_no_hint,
+                "dropped_orphan_tool_argument_updates_closed_call": self.diagnostics.dropped_orphan_tool_argument_updates_closed_call,
+                "dropped_pending_tool_argument_updates_closed_call": self.diagnostics.dropped_pending_tool_argument_updates_closed_call,
+                "duplicate_active_call_items": self.diagnostics.duplicate_active_call_items,
+                "dropped_reused_closed_call_items": self.diagnostics.dropped_reused_closed_call_items,
+                "binding_conflicts_output_index": self.diagnostics.binding_conflicts_output_index,
+                "binding_conflicts_item_id": self.diagnostics.binding_conflicts_item_id,
+                "pending_tool_backlog_trimmed": self.diagnostics.pending_tool_backlog_trimmed,
+                "pending_orphan_updates": self.pending_tool_argument_updates.len()
+            }
+        })
     }
 
     fn map_incomplete_reason_to_stop_reason(

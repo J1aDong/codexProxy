@@ -948,6 +948,56 @@ fn diagnostics_counters_track_defer_and_quarantine_paths() {
 }
 
 #[test]
+fn diagnostics_summary_payload_is_structured_for_log_aggregation() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    transformer.diagnostics.deferred_unscoped_text_chunks = 2;
+    transformer.diagnostics.dropped_raw_tool_json_fragments = 1;
+    transformer.diagnostics.queued_orphan_tool_argument_updates = 3;
+    transformer.diagnostics.applied_orphan_tool_argument_updates = 2;
+    transformer
+        .pending_tool_argument_updates
+        .push(PendingToolArgumentUpdate {
+            output_index: Some(7),
+            item_id: Some("fc_pending".to_string()),
+            call_id: Some("call_pending".to_string()),
+            kind: PendingToolArgumentUpdateKind::Delta("{\"x\":1}".to_string()),
+        });
+
+    let payload = transformer.build_diagnostics_summary("response.completed");
+    assert_eq!(
+        payload.get("type").and_then(|v| v.as_str()),
+        Some("codex_response_transform_summary"),
+        "summary payload type should be stable for downstream log parsers"
+    );
+    assert_eq!(
+        payload.get("terminal_event").and_then(|v| v.as_str()),
+        Some("response.completed"),
+        "terminal event should be included as top-level structured field"
+    );
+    assert_eq!(
+        payload
+            .pointer("/counters/deferred_unscoped_text_chunks")
+            .and_then(|v| v.as_u64()),
+        Some(2),
+        "deferred chunk count should be emitted in structured counters"
+    );
+    assert_eq!(
+        payload
+            .pointer("/counters/dropped_raw_tool_json_fragments")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "dropped raw tool json count should be emitted in structured counters"
+    );
+    assert_eq!(
+        payload
+            .pointer("/counters/pending_orphan_updates")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "pending orphan queue length should be emitted for backlog monitoring"
+    );
+}
+
+#[test]
 fn interleaved_parallel_function_calls_keep_separate_tool_blocks() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
