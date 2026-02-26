@@ -797,6 +797,23 @@ fn emit_stream_diag(
     }
 }
 
+fn emit_transform_diag(
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+    request_id: &str,
+    session_id: &str,
+    summary: &Value,
+) {
+    emit_stream_diag(
+        log_tx,
+        logger,
+        format!(
+            "[TransformDiag] #{} session_id={} {}",
+            request_id, session_id, summary
+        ),
+    );
+}
+
 #[derive(Clone, Copy)]
 enum ConnErrorClass {
     ClientDisconnect,
@@ -3588,6 +3605,10 @@ async fn handle_request(
                 .unwrap());
         }
 
+        if let Some(summary) = transformer.take_diagnostics_summary() {
+            emit_transform_diag(&log_tx, &logger, &request_id, "-", &summary);
+        }
+
         if let Some(ref l) = AppLogger::get() {
             l.log("════════════════════════════════════════════════════════════════");
             l.log("✅ Request completed");
@@ -3629,6 +3650,7 @@ async fn handle_request(
         let mut transformer =
             request_backend_for_stream.create_response_transformer(&model_for_stream);
         let mut active_upstream_body_for_stream = upstream_body_for_stream.clone();
+        let mut active_session_id_for_stream = "-".to_string();
         let mut line_buffer = String::new();
         let mut frame_parser = SseFrameParser::default();
         let mut upstream_log_counter = 0u64;
@@ -4079,6 +4101,7 @@ async fn handle_request(
                 );
 
                 let retry_session_id = Uuid::new_v4().to_string();
+                active_session_id_for_stream = retry_session_id.clone();
                 let retry_req = request_backend_for_stream.build_upstream_request(
                     &http_client_for_stream,
                     &upstream_url_for_stream,
@@ -4168,6 +4191,7 @@ async fn handle_request(
                 );
 
                 let retry_session_id = Uuid::new_v4().to_string();
+                active_session_id_for_stream = retry_session_id.clone();
                 let retry_req = request_backend_for_stream.build_upstream_request(
                     &http_client_for_stream,
                     &upstream_url_for_stream,
@@ -4255,6 +4279,7 @@ async fn handle_request(
                 );
 
                 let retry_session_id = Uuid::new_v4().to_string();
+                active_session_id_for_stream = retry_session_id.clone();
                 let retry_req = request_backend_for_stream.build_upstream_request(
                     &http_client_for_stream,
                     &upstream_url_for_stream,
@@ -4617,6 +4642,16 @@ async fn handle_request(
                 decision.empty_completion_retry_succeeded,
                 decision.incomplete_stream_retry_attempts,
                 decision.incomplete_stream_retry_succeeded,
+            );
+        }
+
+        if let Some(summary) = transformer.take_diagnostics_summary() {
+            emit_transform_diag(
+                &log_tx_clone,
+                &logger_for_stream,
+                &request_id_for_stream,
+                &active_session_id_for_stream,
+                &summary,
             );
         }
 

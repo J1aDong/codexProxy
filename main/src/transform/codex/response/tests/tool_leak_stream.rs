@@ -998,6 +998,40 @@ fn diagnostics_summary_payload_is_structured_for_log_aggregation() {
 }
 
 #[test]
+fn take_diagnostics_summary_uses_terminal_event_context() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let leak_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Preparing edit. {\"file_path\":\"/tmp/mod.ts\",\"new_string\":\"a\",\"old_string\":\"b\",\"replace_all\":false}"
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": { "status": "completed" }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&leak_line);
+    let _ = transformer.transform_sse_line(&completed);
+    let summary =
+        <TransformResponse as crate::transform::ResponseTransformer>::take_diagnostics_summary(
+            &mut transformer,
+        )
+        .expect("diagnostics summary should exist after leak suppression");
+
+    assert_eq!(
+        summary.get("terminal_event").and_then(|v| v.as_str()),
+        Some("response.completed"),
+        "diagnostics summary should carry terminal event context for request-level attribution"
+    );
+}
+
+#[test]
 fn interleaved_parallel_function_calls_keep_separate_tool_blocks() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 

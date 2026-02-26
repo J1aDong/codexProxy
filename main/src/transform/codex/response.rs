@@ -219,6 +219,7 @@ pub struct TransformResponse {
     had_reasoning_in_response: bool,
     // Track if we've seen a message-type output_item.added (means phase detection is explicit)
     saw_message_item_added: bool,
+    last_terminal_event: Option<String>,
     diagnostics: TransformDiagnostics,
 
     logger: std::sync::Arc<AppLogger>,
@@ -919,6 +920,7 @@ impl TransformResponse {
             in_commentary_phase: false,
             had_reasoning_in_response: false,
             saw_message_item_added: false,
+            last_terminal_event: None,
             diagnostics: TransformDiagnostics::default(),
             logger: AppLogger::get().unwrap_or_else(|| {
                 // 如果全局 logger 未初始化，创建一个临时的
@@ -2210,11 +2212,13 @@ impl TransformResponse {
             "event: message_stop\ndata: {}\n\n",
             json!({ "type": "message_stop" })
         ));
-        self.log_diagnostics_summary(if force_incomplete {
+        let terminal_event = if force_incomplete {
             "response.incomplete"
         } else {
             "response.completed"
-        });
+        };
+        self.last_terminal_event = Some(terminal_event.to_string());
+        self.log_diagnostics_summary(terminal_event);
         self.transition_to(StreamPhase::Terminal);
     }
 
@@ -2285,6 +2289,7 @@ impl TransformResponse {
             "event: message_stop\ndata: {}\n\n",
             json!({ "type": "message_stop" })
         ));
+        self.last_terminal_event = Some("response.failed_or_error".to_string());
         self.log_diagnostics_summary("response.failed_or_error");
         self.transition_to(StreamPhase::Terminal);
     }
@@ -2707,6 +2712,17 @@ impl TransformResponse {
 impl ResponseTransformer for TransformResponse {
     fn transform_line(&mut self, line: &str) -> Vec<String> {
         self.transform_sse_line(line)
+    }
+
+    fn take_diagnostics_summary(&mut self) -> Option<Value> {
+        if !self.diagnostics.has_activity() {
+            return None;
+        }
+        let terminal_event = self
+            .last_terminal_event
+            .as_deref()
+            .unwrap_or("not_terminal");
+        Some(self.build_diagnostics_summary(terminal_event))
     }
 }
 
