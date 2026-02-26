@@ -80,7 +80,7 @@ fn split_leaked_tool_line_across_chunks_is_suppressed() {
 }
 
 #[test]
-fn raw_parallel_tool_json_without_marker_is_suppressed() {
+fn raw_parallel_tool_json_without_marker_recovers_readonly_tool() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(
         "data: {}",
@@ -98,8 +98,70 @@ fn raw_parallel_tool_json_without_marker_is_suppressed() {
         "normal prefix text should stay visible"
     );
     assert!(
-        !joined.contains("\"recipient_name\"") && !joined.contains("\"type\":\"tool_use\""),
-        "raw leaked tool json must be hidden and not promoted"
+        !joined.contains("\"tool_uses\"")
+            && !joined.contains("\"recipient_name\"")
+            && joined.contains("\"type\":\"tool_use\"")
+            && joined.contains("\"name\":\"Read\"")
+            && joined.contains("spec-a.md"),
+        "readonly leaked tool payload should be recovered into synthetic tool_use"
+    );
+}
+
+#[test]
+fn raw_multi_tool_uses_json_without_marker_recovers_readonly_tools() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Inspecting shared theme decoration ####json {\"tool_uses\":[{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/Users/mr.j/myRoom/YAT/aldi_opp_app/aldi_opp_app/packages/core/lib/R/themes/app_base_theme.dart\",\"offset\":360,\"limit\":70}},{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/Users/mr.j/myRoom/YAT/aldi_opp_app/aldi_opp_app/apps/yatbot/lib/yatbot_theme.dart\"}}]}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("\"type\":\"text_delta\"")
+            && joined.contains("\"text\":\"Inspecting shared theme decoration\""),
+        "status prefix should remain visible after json-marker cleanup"
+    );
+    assert!(
+        !joined.contains("\"tool_uses\"")
+            && !joined.contains("\"recipient_name\"")
+            && !joined.contains("####json")
+            && joined.matches("\"type\":\"tool_use\"").count() == 2
+            && joined.contains("app_base_theme.dart")
+            && joined.contains("yatbot_theme.dart"),
+        "readonly leaked multi-tool payload should be recovered into synthetic tool_use"
+    );
+}
+
+#[test]
+fn raw_multi_tool_uses_with_non_readonly_tool_is_still_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Patch file quickly. {\"tool_uses\":[{\"recipient_name\":\"functions.Edit\",\"parameters\":{\"file_path\":\"/tmp/a.ts\",\"old_string\":\"a\",\"new_string\":\"b\"}}]}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("Patch file quickly."),
+        "normal prefix text should remain visible"
+    );
+    assert!(
+        !joined.contains("\"tool_uses\"")
+            && !joined.contains("\"recipient_name\"")
+            && !joined.contains("\"old_string\"")
+            && !joined.contains("\"new_string\"")
+            && !joined.contains("\"type\":\"tool_use\""),
+        "non-readonly leaked tool payload must stay suppressed"
     );
 }
 

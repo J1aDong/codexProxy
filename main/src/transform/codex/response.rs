@@ -39,6 +39,8 @@ struct TransformDiagnostics {
     deferred_unscoped_text_flushes: u64,
     dropped_leaked_marker_fragments: u64,
     dropped_raw_tool_json_fragments: u64,
+    recovered_readonly_leaked_tool_payloads: u64,
+    recovered_readonly_leaked_tool_calls: u64,
     dropped_contextual_note_json_fragments: u64,
     dropped_incomplete_tool_json_fragments: u64,
     queued_orphan_tool_argument_updates: u64,
@@ -59,6 +61,8 @@ impl TransformDiagnostics {
             || self.deferred_unscoped_text_flushes > 0
             || self.dropped_leaked_marker_fragments > 0
             || self.dropped_raw_tool_json_fragments > 0
+            || self.recovered_readonly_leaked_tool_payloads > 0
+            || self.recovered_readonly_leaked_tool_calls > 0
             || self.dropped_contextual_note_json_fragments > 0
             || self.dropped_incomplete_tool_json_fragments > 0
             || self.queued_orphan_tool_argument_updates > 0
@@ -623,12 +627,124 @@ impl TransformResponse {
 
     fn sanitize_prefix_before_raw_tool_json(prefix: &str) -> String {
         let cleaned = Self::strip_known_leak_suffix_noise(prefix);
-        if let Some(cut_pos) = Self::find_internal_planning_leak_start(&cleaned) {
-            return cleaned[..cut_pos]
-                .trim_end_matches(char::is_whitespace)
-                .to_string();
+        let trimmed_meta = if let Some(cut_pos) = Self::find_internal_planning_leak_start(&cleaned)
+        {
+            cleaned[..cut_pos].to_string()
+        } else {
+            cleaned
+        };
+
+        Self::strip_trailing_json_hint_noise(&trimmed_meta)
+    }
+
+    fn strip_trailing_json_hint_noise(text: &str) -> String {
+        let mut current = text.to_string();
+        let mut removed_any = false;
+        let marker_variants = ["```json", "####json", "###json", "##json", "#json", "json"];
+        loop {
+            let trimmed = current.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            let lowered = trimmed.to_ascii_lowercase();
+            let mut removed = false;
+            for marker in marker_variants {
+                if lowered.ends_with(marker) {
+                    let cut = trimmed.len().saturating_sub(marker.len());
+                    current = trimmed[..cut]
+                        .trim_end_matches(|ch: char| {
+                            ch.is_whitespace()
+                                || matches!(
+                                    ch,
+                                    '#' | '`' | '*' | ':' | ';' | '-' | '_' | '.' | '。'
+                                )
+                        })
+                        .to_string();
+                    removed_any = true;
+                    removed = true;
+                    break;
+                }
+            }
+
+            if !removed {
+                break;
+            }
         }
-        cleaned
+
+        if removed_any {
+            current
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn normalize_recipient_tool_name(recipient_name: &str) -> Option<&str> {
+        let trimmed = recipient_name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.rsplit('.').next().unwrap_or(trimmed))
+    }
+
+    fn is_readonly_tool_name(name: &str) -> bool {
+        name.eq_ignore_ascii_case("Read")
+            || name.eq_ignore_ascii_case("Grep")
+            || name.eq_ignore_ascii_case("Glob")
+            || name.eq_ignore_ascii_case("LS")
+    }
+
+    fn next_recovered_leak_call_id(&mut self, tool_name: &str) -> String {
+        let seq = self.next_tool_arrival_seq;
+        self.next_tool_arrival_seq = self.next_tool_arrival_seq.saturating_add(1);
+        format!("leak_recovered_{}_{}", tool_name.to_ascii_lowercase(), seq)
+    }
+
+    fn try_recover_readonly_tool_uses_from_raw_json(
+        &mut self,
+        output: &mut Vec<String>,
+        raw_json: &str,
+    ) -> Option<usize> {
+        let parsed = serde_json::from_str::<Value>(raw_json).ok()?;
+        let tool_uses = parsed.get("tool_uses")?.as_array()?;
+        if tool_uses.is_empty() {
+            return None;
+        }
+
+        let mut recovered_calls = Vec::with_capacity(tool_uses.len());
+        for tool in tool_uses {
+            let recipient = tool.get("recipient_name").and_then(|v| v.as_str())?;
+            let tool_name = Self::normalize_recipient_tool_name(recipient)?;
+            if !Self::is_readonly_tool_name(tool_name) {
+                return None;
+            }
+
+            let parameters = tool.get("parameters")?;
+            if !parameters.is_object() {
+                return None;
+            }
+
+            let arguments = serde_json::to_string(parameters).ok()?;
+            let call_id = self.next_recovered_leak_call_id(tool_name);
+
+            recovered_calls.push(BufferedToolCall {
+                order_key: u64::MAX,
+                arrival_seq: u64::MAX,
+                output_index: None,
+                item_id: None,
+                call_id,
+                name: tool_name.to_string(),
+                arguments_buffer: arguments,
+                done_flag: true,
+            });
+        }
+
+        for tool in &recovered_calls {
+            self.saw_tool_call = true;
+            self.emit_serialized_tool_call(output, tool);
+        }
+        self.sync_phase_from_runtime();
+
+        Some(recovered_calls.len())
     }
 
     fn looks_like_raw_tool_json_fragment(line: &str) -> bool {
@@ -860,16 +976,30 @@ impl TransformResponse {
         }
 
         // 检查高置信工具参数泄漏
-        if let Some((prefix, _, suffix)) = Self::split_tool_json_prefix_suffix(&pending_raw) {
+        if let Some((prefix, raw_json, suffix)) = Self::split_tool_json_prefix_suffix(&pending_raw)
+        {
             self.diagnostics.dropped_raw_tool_json_fragments += 1;
-            self.logger
-                .log_raw("[Warn] Dropping raw leaked tool json fragment");
             if !prefix.is_empty() {
                 let cleaned_prefix = Self::sanitize_prefix_before_raw_tool_json(&prefix);
                 if !cleaned_prefix.is_empty() {
                     self.emit_plain_text_fragment(output, &cleaned_prefix);
                 }
             }
+
+            if let Some(recovered_calls) =
+                self.try_recover_readonly_tool_uses_from_raw_json(output, &raw_json)
+            {
+                self.diagnostics.recovered_readonly_leaked_tool_payloads += 1;
+                self.diagnostics.recovered_readonly_leaked_tool_calls += recovered_calls as u64;
+                self.logger.log_raw(&format!(
+                    "[Warn] Recovered leaked readonly tool_uses payload into synthetic tool_use events count={}",
+                    recovered_calls
+                ));
+            } else {
+                self.logger
+                    .log_raw("[Warn] Dropping raw leaked tool json fragment");
+            }
+
             if !suffix.is_empty() {
                 self.handle_text_fragment(output, &suffix, true);
             }
@@ -2046,12 +2176,26 @@ impl TransformResponse {
         }
 
         // 检查高置信工具参数泄漏
-        if let Some((prefix, _, suffix)) = Self::split_tool_json_prefix_suffix(&carryover) {
+        if let Some((prefix, raw_json, suffix)) = Self::split_tool_json_prefix_suffix(&carryover) {
             self.diagnostics.dropped_raw_tool_json_fragments += 1;
-            self.logger
-                .log_raw("[Warn] Dropping raw leaked tool json from carryover");
             if !self.has_open_tool_block() && !prefix.is_empty() {
-                self.emit_plain_text_fragment(output, &prefix);
+                let cleaned_prefix = Self::sanitize_prefix_before_raw_tool_json(&prefix);
+                if !cleaned_prefix.is_empty() {
+                    self.emit_plain_text_fragment(output, &cleaned_prefix);
+                }
+            }
+            if let Some(recovered_calls) =
+                self.try_recover_readonly_tool_uses_from_raw_json(output, &raw_json)
+            {
+                self.diagnostics.recovered_readonly_leaked_tool_payloads += 1;
+                self.diagnostics.recovered_readonly_leaked_tool_calls += recovered_calls as u64;
+                self.logger.log_raw(&format!(
+                    "[Warn] Recovered leaked readonly tool_uses payload from carryover count={}",
+                    recovered_calls
+                ));
+            } else {
+                self.logger
+                    .log_raw("[Warn] Dropping raw leaked tool json from carryover");
             }
             if !suffix.is_empty() {
                 self.handle_text_fragment(output, &suffix, true);
@@ -2118,6 +2262,8 @@ impl TransformResponse {
                 "deferred_unscoped_text_flushes": self.diagnostics.deferred_unscoped_text_flushes,
                 "dropped_leaked_marker_fragments": self.diagnostics.dropped_leaked_marker_fragments,
                 "dropped_raw_tool_json_fragments": self.diagnostics.dropped_raw_tool_json_fragments,
+                "recovered_readonly_leaked_tool_payloads": self.diagnostics.recovered_readonly_leaked_tool_payloads,
+                "recovered_readonly_leaked_tool_calls": self.diagnostics.recovered_readonly_leaked_tool_calls,
                 "dropped_contextual_note_json_fragments": self.diagnostics.dropped_contextual_note_json_fragments,
                 "dropped_incomplete_tool_json_fragments": self.diagnostics.dropped_incomplete_tool_json_fragments,
                 "queued_orphan_tool_argument_updates": self.diagnostics.queued_orphan_tool_argument_updates,

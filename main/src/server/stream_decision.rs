@@ -19,6 +19,7 @@ pub(crate) struct StreamDecisionState {
     pub sent_message_start_to_client: bool,
     pub emitted_non_heartbeat_event: bool,
     pub emitted_business_event: bool,
+    pub emitted_tool_event: bool,
     pub empty_completion_retry_attempts: u32,
     pub empty_completion_retry_succeeded: bool,
     pub incomplete_stream_retry_attempts: u32,
@@ -62,6 +63,9 @@ impl StreamDecisionState {
         if business_event {
             self.emitted_business_event = true;
         }
+        if super::is_tool_stream_output(output) {
+            self.emitted_tool_event = true;
+        }
 
         OutputDisposition::Accepted {
             message_stop,
@@ -74,6 +78,7 @@ impl StreamDecisionState {
         self.saw_response_failed = false;
         self.saw_sibling_tool_call_error = false;
         self.saw_message_stop = false;
+        self.emitted_tool_event = false;
         self.upstream_error_event_type = None;
         self.upstream_error_message = None;
         self.upstream_error_code = None;
@@ -98,7 +103,7 @@ impl StreamDecisionState {
             && leak_detected
             && !self.saw_response_failed
             && !self.saw_message_stop
-            && !self.emitted_business_event
+            && !self.emitted_tool_event
             && !self.leaked_tool_text_retry_attempted
             && has_serial_fallback
     }
@@ -308,9 +313,15 @@ mod tests {
         assert!(state.allow_leaked_tool_retry(true, true, true));
 
         state.emitted_business_event = true;
+        assert!(
+            state.allow_leaked_tool_retry(true, true, true),
+            "text/thinking outputs should not block leak-triggered serial retry"
+        );
+
+        state.emitted_tool_event = true;
         assert!(!state.allow_leaked_tool_retry(true, true, true));
 
-        state.emitted_business_event = false;
+        state.emitted_tool_event = false;
         state.leaked_tool_text_retry_attempted = true;
         assert!(!state.allow_leaked_tool_retry(true, true, true));
 
@@ -322,5 +333,25 @@ mod tests {
         assert!(!state.allow_leaked_tool_retry(false, true, true));
         assert!(!state.allow_leaked_tool_retry(true, false, true));
         assert!(!state.allow_leaked_tool_retry(true, true, false));
+    }
+
+    #[test]
+    fn classify_output_marks_tool_events_for_leak_retry_guard() {
+        let mut state = StreamDecisionState::default();
+        let text_output = r#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"status"}}
+
+"#;
+        let tool_output = r#"event: content_block_start
+data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}
+
+"#;
+
+        let _ = state.classify_output(text_output, true);
+        assert!(state.emitted_business_event);
+        assert!(!state.emitted_tool_event);
+
+        let _ = state.classify_output(tool_output, true);
+        assert!(state.emitted_tool_event);
     }
 }

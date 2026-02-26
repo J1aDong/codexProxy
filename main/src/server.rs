@@ -1095,6 +1095,28 @@ fn is_business_stream_output(chunk: &str) -> bool {
     }
 }
 
+fn is_tool_stream_output(chunk: &str) -> bool {
+    let Some((event, payload)) = parse_sse_chunk(chunk) else {
+        return false;
+    };
+
+    match event.as_str() {
+        "content_block_start" => payload
+            .get("content_block")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .map(|kind| kind == "tool_use")
+            .unwrap_or(false),
+        "content_block_delta" => payload
+            .get("delta")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .map(|kind| kind == "input_json_delta")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn should_skip_transformed_output(
     decision: &mut StreamDecisionState,
     output: &str,
@@ -1525,8 +1547,8 @@ fn leaked_tool_text_retry_skip_reason(
     if decision.saw_message_stop {
         return Some("message_stop_seen");
     }
-    if decision.emitted_business_event {
-        return Some("business_event_emitted");
+    if decision.emitted_tool_event {
+        return Some("tool_event_emitted");
     }
     if decision.leaked_tool_text_retry_attempted {
         return Some("already_attempted");
@@ -4232,6 +4254,7 @@ async fn handle_request(
                             decision.on_retry_success_reset();
                             decision.emitted_non_heartbeat_event = false;
                             decision.emitted_business_event = false;
+                            decision.emitted_tool_event = false;
                             last_upstream_activity = Instant::now();
                             continue 'stream_attempt;
                         }
@@ -4342,6 +4365,7 @@ async fn handle_request(
                             decision.on_retry_success_reset();
                             decision.emitted_non_heartbeat_event = false;
                             decision.emitted_business_event = false;
+                            decision.emitted_tool_event = false;
                             last_upstream_activity = Instant::now();
                             continue 'stream_attempt;
                         }
@@ -4707,6 +4731,9 @@ async fn handle_request(
                 }
                 if is_business_stream_output(&output) {
                     decision.emitted_business_event = true;
+                }
+                if is_tool_stream_output(&output) {
+                    decision.emitted_tool_event = true;
                 }
                 metrics.mark_downstream_output(&output);
                 event_counters.mark_downstream_chunk(&output);
@@ -5227,9 +5254,12 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
         assert!(allow_leaked_tool_text_retry(&state, true, true, signal));
 
         state.emitted_business_event = true;
+        assert!(allow_leaked_tool_text_retry(&state, true, true, signal));
+
+        state.emitted_tool_event = true;
         assert!(!allow_leaked_tool_text_retry(&state, true, true, signal));
 
-        state.emitted_business_event = false;
+        state.emitted_tool_event = false;
         state.leaked_tool_text_retry_attempted = true;
         assert!(!allow_leaked_tool_text_retry(&state, true, true, signal));
 
@@ -5238,9 +5268,9 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
     }
 
     #[test]
-    fn test_leaked_tool_text_retry_skip_reason_reports_business_event_block() {
+    fn test_leaked_tool_text_retry_skip_reason_reports_tool_event_block() {
         let state = super::StreamDecisionState {
-            emitted_business_event: true,
+            emitted_tool_event: true,
             ..Default::default()
         };
         let signal = Some(super::ToolLeakRetrySignal {
@@ -5251,7 +5281,7 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
 
         assert_eq!(
             leaked_tool_text_retry_skip_reason(&state, true, true, signal),
-            Some("business_event_emitted")
+            Some("tool_event_emitted")
         );
     }
 
