@@ -24,6 +24,7 @@ pub(crate) struct StreamDecisionState {
     pub incomplete_stream_retry_attempts: u32,
     pub incomplete_stream_retry_succeeded: bool,
     pub sibling_tool_error_retry_attempted: bool,
+    pub leaked_tool_text_retry_attempted: bool,
     pub upstream_error_event_type: Option<String>,
     pub upstream_error_message: Option<String>,
     pub upstream_error_code: Option<String>,
@@ -84,6 +85,21 @@ impl StreamDecisionState {
             && !self.saw_message_stop
             && !self.emitted_business_event
             && !self.sibling_tool_error_retry_attempted
+            && has_serial_fallback
+    }
+
+    pub fn allow_leaked_tool_retry(
+        &self,
+        is_codex_stream: bool,
+        leak_detected: bool,
+        has_serial_fallback: bool,
+    ) -> bool {
+        is_codex_stream
+            && leak_detected
+            && !self.saw_response_failed
+            && !self.saw_message_stop
+            && !self.emitted_business_event
+            && !self.leaked_tool_text_retry_attempted
             && has_serial_fallback
     }
 
@@ -284,5 +300,27 @@ mod tests {
         assert!(!state.saw_response_failed);
         assert!(!state.saw_sibling_tool_call_error);
         assert!(!state.saw_message_stop);
+    }
+
+    #[test]
+    fn leaked_tool_retry_guard_requires_clean_empty_state() {
+        let mut state = StreamDecisionState::default();
+        assert!(state.allow_leaked_tool_retry(true, true, true));
+
+        state.emitted_business_event = true;
+        assert!(!state.allow_leaked_tool_retry(true, true, true));
+
+        state.emitted_business_event = false;
+        state.leaked_tool_text_retry_attempted = true;
+        assert!(!state.allow_leaked_tool_retry(true, true, true));
+
+        state.leaked_tool_text_retry_attempted = false;
+        state.saw_response_failed = true;
+        assert!(!state.allow_leaked_tool_retry(true, true, true));
+
+        state.saw_response_failed = false;
+        assert!(!state.allow_leaked_tool_retry(false, true, true));
+        assert!(!state.allow_leaked_tool_retry(true, false, true));
+        assert!(!state.allow_leaked_tool_retry(true, true, false));
     }
 }

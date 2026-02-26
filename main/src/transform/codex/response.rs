@@ -592,6 +592,45 @@ impl TransformResponse {
         text.to_string()
     }
 
+    fn find_internal_planning_leak_start(text: &str) -> Option<usize> {
+        let lower = text.to_ascii_lowercase();
+        let cue_patterns = [
+            "need now run ",
+            "outside cwd?",
+            "tools allowed read/write anywhere",
+            "need respond concise",
+            "no need reviewers",
+            "let's run grep tool",
+            "maybe run dart analyze",
+        ];
+
+        let mut first_hit: Option<usize> = None;
+        let mut hit_count = 0usize;
+
+        for pattern in cue_patterns {
+            if let Some(pos) = lower.find(pattern) {
+                hit_count += 1;
+                first_hit = Some(first_hit.map_or(pos, |current| current.min(pos)));
+            }
+        }
+
+        if hit_count >= 2 {
+            return first_hit;
+        }
+
+        None
+    }
+
+    fn sanitize_prefix_before_raw_tool_json(prefix: &str) -> String {
+        let cleaned = Self::strip_known_leak_suffix_noise(prefix);
+        if let Some(cut_pos) = Self::find_internal_planning_leak_start(&cleaned) {
+            return cleaned[..cut_pos]
+                .trim_end_matches(char::is_whitespace)
+                .to_string();
+        }
+        cleaned
+    }
+
     fn looks_like_raw_tool_json_fragment(line: &str) -> bool {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('{') {
@@ -826,7 +865,7 @@ impl TransformResponse {
             self.logger
                 .log_raw("[Warn] Dropping raw leaked tool json fragment");
             if !prefix.is_empty() {
-                let cleaned_prefix = Self::strip_known_leak_suffix_noise(&prefix);
+                let cleaned_prefix = Self::sanitize_prefix_before_raw_tool_json(&prefix);
                 if !cleaned_prefix.is_empty() {
                     self.emit_plain_text_fragment(output, &cleaned_prefix);
                 }
@@ -1720,7 +1759,7 @@ impl TransformResponse {
         if let Some(raw_json_start) = Self::find_potential_raw_tool_json_start(&combined) {
             let (prefix_text, leaked_fragment) = combined.split_at(raw_json_start);
             if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
-                let cleaned_prefix = Self::strip_known_leak_suffix_noise(prefix_text);
+                let cleaned_prefix = Self::sanitize_prefix_before_raw_tool_json(prefix_text);
                 if !cleaned_prefix.is_empty() {
                     self.emit_plain_text_fragment(output, &cleaned_prefix);
                 }

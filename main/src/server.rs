@@ -1452,6 +1452,91 @@ fn allow_sibling_tool_error_retry(
     opts.enable_sibling_tool_error_retry && decision.allow_sibling_tool_retry(has_serial_fallback)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ToolLeakRetrySignal {
+    dropped_leaked_marker_fragments: u64,
+    dropped_raw_tool_json_fragments: u64,
+    dropped_incomplete_tool_json_fragments: u64,
+}
+
+impl ToolLeakRetrySignal {
+    fn total(self) -> u64 {
+        self.dropped_leaked_marker_fragments
+            + self.dropped_raw_tool_json_fragments
+            + self.dropped_incomplete_tool_json_fragments
+    }
+}
+
+fn extract_tool_leak_retry_signal(summary: &Value) -> Option<ToolLeakRetrySignal> {
+    if summary.get("type").and_then(|v| v.as_str()) != Some("codex_response_transform_summary") {
+        return None;
+    }
+
+    let counters = summary.get("counters")?.as_object()?;
+    let signal = ToolLeakRetrySignal {
+        dropped_leaked_marker_fragments: counters
+            .get("dropped_leaked_marker_fragments")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        dropped_raw_tool_json_fragments: counters
+            .get("dropped_raw_tool_json_fragments")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        dropped_incomplete_tool_json_fragments: counters
+            .get("dropped_incomplete_tool_json_fragments")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    };
+
+    if signal.total() == 0 {
+        None
+    } else {
+        Some(signal)
+    }
+}
+
+fn allow_leaked_tool_text_retry(
+    decision: &StreamDecisionState,
+    is_codex_stream: bool,
+    has_serial_fallback: bool,
+    signal: Option<ToolLeakRetrySignal>,
+) -> bool {
+    decision.allow_leaked_tool_retry(is_codex_stream, signal.is_some(), has_serial_fallback)
+}
+
+fn leaked_tool_text_retry_skip_reason(
+    decision: &StreamDecisionState,
+    is_codex_stream: bool,
+    has_serial_fallback: bool,
+    signal: Option<ToolLeakRetrySignal>,
+) -> Option<&'static str> {
+    if signal.is_none() {
+        return None;
+    }
+    if allow_leaked_tool_text_retry(decision, is_codex_stream, has_serial_fallback, signal) {
+        return None;
+    }
+    if !is_codex_stream {
+        return Some("non_codex_stream");
+    }
+    if decision.saw_response_failed {
+        return Some("response_failed_seen");
+    }
+    if decision.saw_message_stop {
+        return Some("message_stop_seen");
+    }
+    if decision.emitted_business_event {
+        return Some("business_event_emitted");
+    }
+    if decision.leaked_tool_text_retry_attempted {
+        return Some("already_attempted");
+    }
+    if !has_serial_fallback {
+        return Some("serial_fallback_unavailable");
+    }
+    Some("guard_blocked")
+}
+
 fn sibling_tool_error_retry_skip_reason(
     decision: &StreamDecisionState,
     opts: StreamRuntimeOptions,
@@ -4174,6 +4259,116 @@ async fn handle_request(
                 }
             }
 
+            let tool_leak_signal = transformer
+                .take_diagnostics_summary()
+                .as_ref()
+                .and_then(extract_tool_leak_retry_signal);
+            let leaked_tool_text_retry_allowed = allow_leaked_tool_text_retry(
+                &decision,
+                is_codex_stream_for_task,
+                has_serial_fallback,
+                tool_leak_signal,
+            );
+
+            if let Some(skip_reason) = leaked_tool_text_retry_skip_reason(
+                &decision,
+                is_codex_stream_for_task,
+                has_serial_fallback,
+                tool_leak_signal,
+            ) {
+                emit_stream_diag(
+                    &log_tx_clone,
+                    &logger_for_stream,
+                    format!(
+                        "[Stream] #{} leaked_tool_text_retry_skipped reason={}",
+                        request_id_for_stream, skip_reason
+                    ),
+                );
+            }
+
+            if leaked_tool_text_retry_allowed {
+                decision.leaked_tool_text_retry_attempted = true;
+                active_upstream_body_for_stream = serial_fallback_upstream_body_for_stream
+                    .as_ref()
+                    .cloned()
+                    .expect("serial fallback body should exist");
+                let signal = tool_leak_signal.expect("signal should exist when retry allowed");
+                emit_stream_diag(
+                    &log_tx_clone,
+                    &logger_for_stream,
+                    format!(
+                        "[Stream] #{} leaked_tool_text_retry_started mode=serial_parallel_tool_calls_false marker_drops={} raw_json_drops={} incomplete_json_drops={}",
+                        request_id_for_stream,
+                        signal.dropped_leaked_marker_fragments,
+                        signal.dropped_raw_tool_json_fragments,
+                        signal.dropped_incomplete_tool_json_fragments
+                    ),
+                );
+
+                let retry_session_id = Uuid::new_v4().to_string();
+                active_session_id_for_stream = retry_session_id.clone();
+                let retry_req = request_backend_for_stream.build_upstream_request(
+                    &http_client_for_stream,
+                    &upstream_url_for_stream,
+                    &upstream_api_key_for_stream,
+                    &active_upstream_body_for_stream,
+                    &retry_session_id,
+                    &anthropic_version_for_stream,
+                );
+                let retry_req = if let Some(beta) = anthropic_beta_for_stream.as_ref() {
+                    retry_req.header("anthropic-beta", beta)
+                } else {
+                    retry_req
+                };
+
+                match retry_req.send().await {
+                    Ok(retry_response) => {
+                        let retry_status = retry_response.status().as_u16();
+                        if retry_response.status().is_success() {
+                            emit_stream_diag(
+                                &log_tx_clone,
+                                &logger_for_stream,
+                                format!(
+                                    "[Stream] #{} leaked_tool_text_retry_succeeded status={}",
+                                    request_id_for_stream, retry_status
+                                ),
+                            );
+                            current_upstream_status = retry_status;
+                            stream = retry_response.bytes_stream();
+                            transformer = request_backend_for_stream
+                                .create_response_transformer(&model_for_stream);
+                            line_buffer.clear();
+                            frame_parser = SseFrameParser::default();
+                            decision.on_retry_success_reset();
+                            decision.emitted_non_heartbeat_event = false;
+                            decision.emitted_business_event = false;
+                            last_upstream_activity = Instant::now();
+                            continue 'stream_attempt;
+                        }
+
+                        let retry_error = retry_response.text().await.unwrap_or_default();
+                        emit_stream_diag(
+                            &log_tx_clone,
+                            &logger_for_stream,
+                            format!(
+                                "[Stream] #{} leaked_tool_text_retry_failed status={} body={}",
+                                request_id_for_stream, retry_status, retry_error
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        emit_stream_diag(
+                            &log_tx_clone,
+                            &logger_for_stream,
+                            format!(
+                                "[Stream] #{} leaked_tool_text_retry_failed network_error={}",
+                                request_id_for_stream, err
+                            ),
+                        );
+                    }
+                }
+            }
+
             let stream_incomplete = !decision.saw_response_completed;
             let incomplete_retry_allowed = decision.allow_incomplete_retry(stream_opts_for_task);
 
@@ -4802,9 +4997,10 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_sibling_tool_error_retry, chunk_contains_sibling_tool_call_error,
-        classify_connection_error, derive_stream_close_cause,
+        allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
+        chunk_contains_sibling_tool_call_error, classify_connection_error, derive_stream_close_cause,
         disable_parallel_tool_calls_in_upstream_body, is_business_stream_output,
+        extract_tool_leak_retry_signal, leaked_tool_text_retry_skip_reason,
         observe_upstream_chunk_events, resolve_effective_stream, resolve_upstream_url,
         should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
         ConnErrorClass, SseFrameParser, StreamEventCounters, StreamRuntimeOptions,
@@ -5000,6 +5196,62 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
         assert_eq!(
             sibling_tool_error_retry_skip_reason(&state, opts, true),
             Some("feature_disabled")
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_leak_retry_signal_from_transform_diag() {
+        let summary = json!({
+            "type": "codex_response_transform_summary",
+            "counters": {
+                "dropped_leaked_marker_fragments": 2,
+                "dropped_raw_tool_json_fragments": 1,
+                "dropped_incomplete_tool_json_fragments": 0
+            }
+        });
+
+        let signal = extract_tool_leak_retry_signal(&summary).expect("should parse signal");
+        assert_eq!(signal.dropped_leaked_marker_fragments, 2);
+        assert_eq!(signal.dropped_raw_tool_json_fragments, 1);
+        assert_eq!(signal.dropped_incomplete_tool_json_fragments, 0);
+    }
+
+    #[test]
+    fn test_allow_leaked_tool_text_retry_requires_signal_and_clean_state() {
+        let signal = Some(super::ToolLeakRetrySignal {
+            dropped_leaked_marker_fragments: 1,
+            dropped_raw_tool_json_fragments: 0,
+            dropped_incomplete_tool_json_fragments: 0,
+        });
+        let mut state = super::StreamDecisionState::default();
+        assert!(allow_leaked_tool_text_retry(&state, true, true, signal));
+
+        state.emitted_business_event = true;
+        assert!(!allow_leaked_tool_text_retry(&state, true, true, signal));
+
+        state.emitted_business_event = false;
+        state.leaked_tool_text_retry_attempted = true;
+        assert!(!allow_leaked_tool_text_retry(&state, true, true, signal));
+
+        state.leaked_tool_text_retry_attempted = false;
+        assert!(!allow_leaked_tool_text_retry(&state, true, true, None));
+    }
+
+    #[test]
+    fn test_leaked_tool_text_retry_skip_reason_reports_business_event_block() {
+        let state = super::StreamDecisionState {
+            emitted_business_event: true,
+            ..Default::default()
+        };
+        let signal = Some(super::ToolLeakRetrySignal {
+            dropped_leaked_marker_fragments: 1,
+            dropped_raw_tool_json_fragments: 1,
+            dropped_incomplete_tool_json_fragments: 0,
+        });
+
+        assert_eq!(
+            leaked_tool_text_retry_skip_reason(&state, true, true, signal),
+            Some("business_event_emitted")
         );
     }
 

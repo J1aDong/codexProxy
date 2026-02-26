@@ -306,6 +306,44 @@ fn same_chunk_natural_language_json_and_suffix_only_suppresses_tool_json() {
 }
 
 #[test]
+fn planning_meta_prefix_before_raw_grep_json_is_trimmed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Checking both rendered sections ...\". Need now run Grep properly. do that. then maybe run dart analyze? maybe heavy maybe okay but outside cwd? We are in src-tauri cwd, editing outside path. tools allowed read/write anywhere? yes likely. need respond concise Chinese simplified. no need reviewers due user rule. do grep and maybe maybe no tests. let's run Grep tool. {\"path\":\"/Users/mr.j/myRoom/YAT/aldi_opp_app/aldi_opp_app/apps/yatbot/packages/products/agribot/lib/pages/group_devices/widgets/agribot_group_device_card.dart\",\"pattern\":\"item\\\\.\\\\$3|errorColor\",\"output_mode\":\"content\",\"-n\":true}"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("Checking both rendered sections"),
+        "normal short status prefix should remain visible"
+    );
+    assert!(
+        !joined.contains("Need now run Grep properly")
+            && !joined.contains("tools allowed read/write anywhere")
+            && !joined.contains("need respond concise")
+            && !joined.contains("no need reviewers"),
+        "internal planning/meta preamble should be suppressed"
+    );
+    assert!(
+        !joined.contains("\"path\"")
+            && !joined.contains("\"pattern\"")
+            && !joined.contains("\"output_mode\"")
+            && !joined.contains("\"-n\""),
+        "raw grep json payload should be suppressed from visible text"
+    );
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "suppressed raw grep payload must not create tool_use blocks"
+    );
+}
+
+#[test]
 fn structured_function_call_events_still_produce_tool_use() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
