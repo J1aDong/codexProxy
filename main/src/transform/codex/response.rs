@@ -39,6 +39,8 @@ struct TransformDiagnostics {
     deferred_unscoped_text_flushes: u64,
     dropped_leaked_marker_fragments: u64,
     dropped_raw_tool_json_fragments: u64,
+    dropped_high_risk_raw_tool_json_fragments: u64,
+    emitted_high_risk_leak_questions: u64,
     recovered_readonly_leaked_tool_payloads: u64,
     recovered_readonly_leaked_tool_calls: u64,
     dropped_contextual_note_json_fragments: u64,
@@ -61,6 +63,8 @@ impl TransformDiagnostics {
             || self.deferred_unscoped_text_flushes > 0
             || self.dropped_leaked_marker_fragments > 0
             || self.dropped_raw_tool_json_fragments > 0
+            || self.dropped_high_risk_raw_tool_json_fragments > 0
+            || self.emitted_high_risk_leak_questions > 0
             || self.recovered_readonly_leaked_tool_payloads > 0
             || self.recovered_readonly_leaked_tool_calls > 0
             || self.dropped_contextual_note_json_fragments > 0
@@ -223,6 +227,7 @@ pub struct TransformResponse {
     had_reasoning_in_response: bool,
     // Track if we've seen a message-type output_item.added (means phase detection is explicit)
     saw_message_item_added: bool,
+    high_risk_leak_question_emitted: bool,
     last_terminal_event: Option<String>,
     diagnostics: TransformDiagnostics,
 
@@ -678,6 +683,52 @@ impl TransformResponse {
         }
     }
 
+    fn is_high_risk_raw_tool_json(raw_json: &str) -> bool {
+        let Ok(parsed) = serde_json::from_str::<Value>(raw_json) else {
+            return false;
+        };
+        let Some(obj) = parsed.as_object() else {
+            return false;
+        };
+
+        if let Some(tool_uses) = obj.get("tool_uses").and_then(|v| v.as_array()) {
+            for tool in tool_uses {
+                let recipient = tool.get("recipient_name").and_then(|v| v.as_str());
+                let Some(recipient) = recipient else {
+                    return true;
+                };
+                let Some(name) = Self::normalize_recipient_tool_name(recipient) else {
+                    return true;
+                };
+                if !Self::is_readonly_tool_name(name) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        let has_edit_shape = obj.contains_key("old_string")
+            && obj.contains_key("new_string")
+            && obj.contains_key("file_path");
+        let has_write_shape = obj.contains_key("content") && obj.contains_key("file_path");
+        let has_exec_shape = obj.contains_key("command") || obj.contains_key("cmd");
+
+        has_edit_shape || has_write_shape || has_exec_shape
+    }
+
+    fn maybe_emit_high_risk_leak_question(&mut self, output: &mut Vec<String>) {
+        if self.high_risk_leak_question_emitted {
+            return;
+        }
+        self.high_risk_leak_question_emitted = true;
+        self.diagnostics.emitted_high_risk_leak_questions += 1;
+        self.close_open_thinking_block(output);
+        self.emit_visible_text_fragment(
+            output,
+            "\n\n⚠️ **安全确认（高风险操作已拦截）**\n检测到疑似高风险工具参数泄露，系统已拦截且未自动执行。是否继续由我在安全模式下重试？请回复“继续”或“取消”。\n\n",
+        );
+    }
+
     fn normalize_recipient_tool_name(recipient_name: &str) -> Option<&str> {
         let trimmed = recipient_name.trim();
         if trimmed.is_empty() {
@@ -929,13 +980,21 @@ impl TransformResponse {
         let pending_for_tool_parse = &pending_raw[trimmed_start_len..];
 
         if Self::starts_with_leaked_tool_marker(pending_for_tool_parse) {
-            if let Some((_, _, suffix)) =
+            if let Some((_, raw_json, suffix)) =
                 Self::split_tool_json_prefix_suffix(pending_for_tool_parse)
             {
                 self.diagnostics.dropped_leaked_marker_fragments += 1;
-                self.logger.log_raw(
-                    "[Warn] Dropping leaked tool marker + json fragment from visible text",
-                );
+                if Self::is_high_risk_raw_tool_json(&raw_json) {
+                    self.diagnostics.dropped_high_risk_raw_tool_json_fragments += 1;
+                    self.logger.log_raw(
+                        "[Warn] Dropping high-risk leaked tool marker + json fragment from visible text",
+                    );
+                    self.maybe_emit_high_risk_leak_question(output);
+                } else {
+                    self.logger.log_raw(
+                        "[Warn] Dropping leaked tool marker + json fragment from visible text",
+                    );
+                }
                 if !suffix.is_empty() {
                     self.handle_text_fragment(output, &suffix, true);
                 }
@@ -996,8 +1055,15 @@ impl TransformResponse {
                     recovered_calls
                 ));
             } else {
-                self.logger
-                    .log_raw("[Warn] Dropping raw leaked tool json fragment");
+                if Self::is_high_risk_raw_tool_json(&raw_json) {
+                    self.diagnostics.dropped_high_risk_raw_tool_json_fragments += 1;
+                    self.logger
+                        .log_raw("[Warn] Dropping high-risk raw leaked tool json fragment");
+                    self.maybe_emit_high_risk_leak_question(output);
+                } else {
+                    self.logger
+                        .log_raw("[Warn] Dropping raw leaked tool json fragment");
+                }
             }
 
             if !suffix.is_empty() {
@@ -1089,6 +1155,7 @@ impl TransformResponse {
             in_commentary_phase: false,
             had_reasoning_in_response: false,
             saw_message_item_added: false,
+            high_risk_leak_question_emitted: false,
             last_terminal_event: None,
             diagnostics: TransformDiagnostics::default(),
             logger: AppLogger::get().unwrap_or_else(|| {
@@ -2194,8 +2261,15 @@ impl TransformResponse {
                     recovered_calls
                 ));
             } else {
-                self.logger
-                    .log_raw("[Warn] Dropping raw leaked tool json from carryover");
+                if Self::is_high_risk_raw_tool_json(&raw_json) {
+                    self.diagnostics.dropped_high_risk_raw_tool_json_fragments += 1;
+                    self.logger
+                        .log_raw("[Warn] Dropping high-risk raw leaked tool json from carryover");
+                    self.maybe_emit_high_risk_leak_question(output);
+                } else {
+                    self.logger
+                        .log_raw("[Warn] Dropping raw leaked tool json from carryover");
+                }
             }
             if !suffix.is_empty() {
                 self.handle_text_fragment(output, &suffix, true);
@@ -2262,6 +2336,8 @@ impl TransformResponse {
                 "deferred_unscoped_text_flushes": self.diagnostics.deferred_unscoped_text_flushes,
                 "dropped_leaked_marker_fragments": self.diagnostics.dropped_leaked_marker_fragments,
                 "dropped_raw_tool_json_fragments": self.diagnostics.dropped_raw_tool_json_fragments,
+                "dropped_high_risk_raw_tool_json_fragments": self.diagnostics.dropped_high_risk_raw_tool_json_fragments,
+                "emitted_high_risk_leak_questions": self.diagnostics.emitted_high_risk_leak_questions,
                 "recovered_readonly_leaked_tool_payloads": self.diagnostics.recovered_readonly_leaked_tool_payloads,
                 "recovered_readonly_leaked_tool_calls": self.diagnostics.recovered_readonly_leaked_tool_calls,
                 "dropped_contextual_note_json_fragments": self.diagnostics.dropped_contextual_note_json_fragments,

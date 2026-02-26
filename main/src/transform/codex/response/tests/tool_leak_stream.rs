@@ -156,12 +156,51 @@ fn raw_multi_tool_uses_with_non_readonly_tool_is_still_suppressed() {
         "normal prefix text should remain visible"
     );
     assert!(
+        joined.contains("安全确认")
+            && joined.contains("高风险操作已拦截")
+            && joined.contains("是否继续"),
+        "high-risk leak suppression should emit explicit confirmation question"
+    );
+    assert!(
         !joined.contains("\"tool_uses\"")
             && !joined.contains("\"recipient_name\"")
             && !joined.contains("\"old_string\"")
             && !joined.contains("\"new_string\"")
             && !joined.contains("\"type\":\"tool_use\""),
         "non-readonly leaked tool payload must stay suppressed"
+    );
+}
+
+#[test]
+fn high_risk_leak_confirmation_question_is_emitted_once_per_response() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "First risky chunk. {\"tool_uses\":[{\"recipient_name\":\"functions.Edit\",\"parameters\":{\"file_path\":\"/tmp/a.ts\",\"old_string\":\"a\",\"new_string\":\"b\"}}]}"
+        })
+    );
+    let line_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Second risky chunk. {\"command\":\"rm -rf /tmp/demo\",\"description\":\"dangerous\"}"
+        })
+    );
+
+    let e1 = transformer.transform_sse_line(&line_1);
+    let e2 = transformer.transform_sse_line(&line_2);
+    let joined = format!("{}{}", e1.join(""), e2.join(""));
+
+    let question_count = joined.matches("安全确认（高风险操作已拦截）").count();
+    assert_eq!(
+        question_count, 1,
+        "confirmation question should be emitted once per response"
+    );
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "high-risk leaked payloads should remain suppressed"
     );
 }
 
@@ -1052,6 +1091,8 @@ fn diagnostics_summary_payload_is_structured_for_log_aggregation() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     transformer.diagnostics.deferred_unscoped_text_chunks = 2;
     transformer.diagnostics.dropped_raw_tool_json_fragments = 1;
+    transformer.diagnostics.dropped_high_risk_raw_tool_json_fragments = 1;
+    transformer.diagnostics.emitted_high_risk_leak_questions = 1;
     transformer.diagnostics.queued_orphan_tool_argument_updates = 3;
     transformer.diagnostics.applied_orphan_tool_argument_updates = 2;
     transformer
@@ -1087,6 +1128,20 @@ fn diagnostics_summary_payload_is_structured_for_log_aggregation() {
             .and_then(|v| v.as_u64()),
         Some(1),
         "dropped raw tool json count should be emitted in structured counters"
+    );
+    assert_eq!(
+        payload
+            .pointer("/counters/dropped_high_risk_raw_tool_json_fragments")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "high-risk dropped count should be emitted in structured counters"
+    );
+    assert_eq!(
+        payload
+            .pointer("/counters/emitted_high_risk_leak_questions")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "high-risk question emission count should be emitted in structured counters"
     );
     assert_eq!(
         payload

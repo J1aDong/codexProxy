@@ -1478,6 +1478,7 @@ fn allow_sibling_tool_error_retry(
 struct ToolLeakRetrySignal {
     dropped_leaked_marker_fragments: u64,
     dropped_raw_tool_json_fragments: u64,
+    dropped_high_risk_raw_tool_json_fragments: u64,
     dropped_incomplete_tool_json_fragments: u64,
 }
 
@@ -1485,6 +1486,7 @@ impl ToolLeakRetrySignal {
     fn total(self) -> u64 {
         self.dropped_leaked_marker_fragments
             + self.dropped_raw_tool_json_fragments
+            + self.dropped_high_risk_raw_tool_json_fragments
             + self.dropped_incomplete_tool_json_fragments
     }
 }
@@ -1502,6 +1504,10 @@ fn extract_tool_leak_retry_signal(summary: &Value) -> Option<ToolLeakRetrySignal
             .unwrap_or(0),
         dropped_raw_tool_json_fragments: counters
             .get("dropped_raw_tool_json_fragments")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        dropped_high_risk_raw_tool_json_fragments: counters
+            .get("dropped_high_risk_raw_tool_json_fragments")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         dropped_incomplete_tool_json_fragments: counters
@@ -1523,6 +1529,12 @@ fn allow_leaked_tool_text_retry(
     has_serial_fallback: bool,
     signal: Option<ToolLeakRetrySignal>,
 ) -> bool {
+    if signal
+        .map(|s| s.dropped_high_risk_raw_tool_json_fragments > 0)
+        .unwrap_or(false)
+    {
+        return false;
+    }
     decision.allow_leaked_tool_retry(is_codex_stream, signal.is_some(), has_serial_fallback)
 }
 
@@ -1540,6 +1552,12 @@ fn leaked_tool_text_retry_skip_reason(
     }
     if !is_codex_stream {
         return Some("non_codex_stream");
+    }
+    if signal
+        .map(|s| s.dropped_high_risk_raw_tool_json_fragments > 0)
+        .unwrap_or(false)
+    {
+        return Some("high_risk_leak_requires_confirmation");
     }
     if decision.saw_response_failed {
         return Some("response_failed_seen");
@@ -5233,6 +5251,7 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
             "counters": {
                 "dropped_leaked_marker_fragments": 2,
                 "dropped_raw_tool_json_fragments": 1,
+                "dropped_high_risk_raw_tool_json_fragments": 0,
                 "dropped_incomplete_tool_json_fragments": 0
             }
         });
@@ -5240,6 +5259,7 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
         let signal = extract_tool_leak_retry_signal(&summary).expect("should parse signal");
         assert_eq!(signal.dropped_leaked_marker_fragments, 2);
         assert_eq!(signal.dropped_raw_tool_json_fragments, 1);
+        assert_eq!(signal.dropped_high_risk_raw_tool_json_fragments, 0);
         assert_eq!(signal.dropped_incomplete_tool_json_fragments, 0);
     }
 
@@ -5248,6 +5268,7 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
         let signal = Some(super::ToolLeakRetrySignal {
             dropped_leaked_marker_fragments: 1,
             dropped_raw_tool_json_fragments: 0,
+            dropped_high_risk_raw_tool_json_fragments: 0,
             dropped_incomplete_tool_json_fragments: 0,
         });
         let mut state = super::StreamDecisionState::default();
@@ -5276,12 +5297,30 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
         let signal = Some(super::ToolLeakRetrySignal {
             dropped_leaked_marker_fragments: 1,
             dropped_raw_tool_json_fragments: 1,
+            dropped_high_risk_raw_tool_json_fragments: 0,
             dropped_incomplete_tool_json_fragments: 0,
         });
 
         assert_eq!(
             leaked_tool_text_retry_skip_reason(&state, true, true, signal),
             Some("tool_event_emitted")
+        );
+    }
+
+    #[test]
+    fn test_leaked_tool_text_retry_skip_reason_reports_high_risk_confirmation_required() {
+        let state = super::StreamDecisionState::default();
+        let signal = Some(super::ToolLeakRetrySignal {
+            dropped_leaked_marker_fragments: 0,
+            dropped_raw_tool_json_fragments: 1,
+            dropped_high_risk_raw_tool_json_fragments: 1,
+            dropped_incomplete_tool_json_fragments: 0,
+        });
+
+        assert!(!allow_leaked_tool_text_retry(&state, true, true, signal));
+        assert_eq!(
+            leaked_tool_text_retry_skip_reason(&state, true, true, signal),
+            Some("high_risk_leak_requires_confirmation")
         );
     }
 
