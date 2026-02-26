@@ -148,6 +148,7 @@ pub struct TransformResponse {
     tool_order_by_output_index: HashMap<u64, u64>,
     tool_order_by_item_id: HashMap<String, u64>,
     tool_order_by_call_id: HashMap<String, u64>,
+    closed_tool_call_ids: HashSet<String>,
     last_buffered_tool_order: Option<u64>,
     item_kind_by_output_index: HashMap<u64, UpstreamItemKind>,
     item_kind_by_item_id: HashMap<String, UpstreamItemKind>,
@@ -848,6 +849,7 @@ impl TransformResponse {
             tool_order_by_output_index: HashMap::new(),
             tool_order_by_item_id: HashMap::new(),
             tool_order_by_call_id: HashMap::new(),
+            closed_tool_call_ids: HashSet::new(),
             last_buffered_tool_order: None,
             item_kind_by_output_index: HashMap::new(),
             item_kind_by_item_id: HashMap::new(),
@@ -1043,6 +1045,61 @@ impl TransformResponse {
             });
     }
 
+    fn upsert_output_index_binding(&mut self, output_index: u64, order_key: u64) -> bool {
+        if let Some(existing) = self.tool_order_by_output_index.get(&output_index).copied() {
+            if existing != order_key {
+                self.logger
+                    .log_raw("[Warn] Ignoring conflicting function_call output_index binding");
+                return false;
+            }
+            return true;
+        }
+        self.tool_order_by_output_index
+            .insert(output_index, order_key);
+        true
+    }
+
+    fn upsert_item_id_binding(&mut self, item_id: &str, order_key: u64) -> bool {
+        if let Some(existing) = self.tool_order_by_item_id.get(item_id).copied() {
+            if existing != order_key {
+                self.logger
+                    .log_raw("[Warn] Ignoring conflicting function_call item_id binding");
+                return false;
+            }
+            return true;
+        }
+        self.tool_order_by_item_id
+            .insert(item_id.to_string(), order_key);
+        true
+    }
+
+    fn backfill_tool_metadata_bindings(
+        &mut self,
+        order_key: u64,
+        output_index: Option<u64>,
+        item_id: Option<&str>,
+    ) {
+        if let Some(idx) = output_index {
+            if self.upsert_output_index_binding(idx, order_key) {
+                if let Some(tool) = self.get_buffered_tool_mut(order_key) {
+                    if tool.output_index.is_none() {
+                        tool.output_index = Some(idx);
+                    }
+                }
+            }
+        }
+
+        if let Some(item_id) = item_id {
+            if self.upsert_item_id_binding(item_id, order_key) {
+                if let Some(tool) = self.get_buffered_tool_mut(order_key) {
+                    if tool.item_id.is_none() {
+                        tool.item_id = Some(item_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     fn buffer_tool_call(
         &mut self,
         output_index: Option<u64>,
@@ -1050,17 +1107,40 @@ impl TransformResponse {
         call_id: String,
         name: String,
     ) {
+        if let Some(existing_order) = self.tool_order_by_call_id.get(&call_id).copied() {
+            self.logger.log_raw(
+                "[Warn] Duplicate function_call item for active call_id; reusing existing buffered call",
+            );
+            self.backfill_tool_metadata_bindings(existing_order, output_index, item_id.as_deref());
+            return;
+        }
+
+        if self.closed_tool_call_ids.contains(call_id.as_str()) {
+            self.logger.log_raw(
+                "[Warn] Dropping function_call item because call_id was already closed in this response",
+            );
+            return;
+        }
+
         let order_key = self.next_tool_order_key;
         self.next_tool_order_key += 1;
         let arrival_seq = self.next_tool_arrival_seq;
         self.next_tool_arrival_seq += 1;
 
+        let mut resolved_output_index = None;
         if let Some(idx) = output_index {
-            self.tool_order_by_output_index.insert(idx, order_key);
+            if self.upsert_output_index_binding(idx, order_key) {
+                resolved_output_index = Some(idx);
+            }
         }
-        if let Some(ref id) = item_id {
-            self.tool_order_by_item_id.insert(id.clone(), order_key);
+
+        let mut resolved_item_id = None;
+        if let Some(id) = item_id {
+            if self.upsert_item_id_binding(id.as_str(), order_key) {
+                resolved_item_id = Some(id);
+            }
         }
+
         self.tool_order_by_call_id
             .insert(call_id.clone(), order_key);
         self.last_buffered_tool_order = Some(order_key);
@@ -1068,8 +1148,8 @@ impl TransformResponse {
         self.buffered_tool_calls.push(BufferedToolCall {
             order_key,
             arrival_seq,
-            output_index,
-            item_id,
+            output_index: resolved_output_index,
+            item_id: resolved_item_id,
             call_id,
             name,
             arguments_buffer: String::new(),
@@ -1086,10 +1166,12 @@ impl TransformResponse {
         item_id: Option<&str>,
         call_id: Option<&str>,
     ) -> Option<u64> {
-        output_index
-            .and_then(|idx| self.tool_order_by_output_index.get(&idx).copied())
+        call_id
+            .and_then(|id| self.tool_order_by_call_id.get(id).copied())
             .or_else(|| item_id.and_then(|id| self.tool_order_by_item_id.get(id).copied()))
-            .or_else(|| call_id.and_then(|id| self.tool_order_by_call_id.get(id).copied()))
+            .or_else(|| {
+                output_index.and_then(|idx| self.tool_order_by_output_index.get(&idx).copied())
+            })
             .or_else(|| {
                 if self.buffered_tool_calls.len() == 1 {
                     self.buffered_tool_calls.first().map(|tool| tool.order_key)
@@ -1126,6 +1208,15 @@ impl TransformResponse {
             return;
         }
 
+        if let Some(call_id) = metadata.call_id.as_deref() {
+            if self.closed_tool_call_ids.contains(call_id) {
+                self.logger.log_raw(
+                    "[Warn] Dropping orphan tool arguments event for already-closed call_id",
+                );
+                return;
+            }
+        }
+
         if self.pending_tool_argument_updates.len() >= 64 {
             self.pending_tool_argument_updates.remove(0);
             self.logger
@@ -1150,6 +1241,14 @@ impl TransformResponse {
 
         let mut remaining = Vec::with_capacity(self.pending_tool_argument_updates.len());
         for pending in std::mem::take(&mut self.pending_tool_argument_updates) {
+            if let Some(call_id) = pending.call_id.as_deref() {
+                if self.closed_tool_call_ids.contains(call_id) {
+                    self.logger.log_raw(
+                        "[Warn] Dropping pending tool-argument update for already-closed call_id",
+                    );
+                    continue;
+                }
+            }
             let order_key = self.find_buffered_tool_order_from_metadata(
                 pending.output_index,
                 pending.item_id.as_deref(),
@@ -1215,12 +1314,19 @@ impl TransformResponse {
 
     fn cleanup_tool_mappings(&mut self, tool: &BufferedToolCall) {
         if let Some(idx) = tool.output_index {
-            self.tool_order_by_output_index.remove(&idx);
+            if self.tool_order_by_output_index.get(&idx).copied() == Some(tool.order_key) {
+                self.tool_order_by_output_index.remove(&idx);
+            }
         }
         if let Some(ref item_id) = tool.item_id {
-            self.tool_order_by_item_id.remove(item_id);
+            if self.tool_order_by_item_id.get(item_id).copied() == Some(tool.order_key) {
+                self.tool_order_by_item_id.remove(item_id);
+            }
         }
-        self.tool_order_by_call_id.remove(&tool.call_id);
+        if self.tool_order_by_call_id.get(&tool.call_id).copied() == Some(tool.order_key) {
+            self.tool_order_by_call_id.remove(&tool.call_id);
+        }
+        self.closed_tool_call_ids.insert(tool.call_id.clone());
         if self.last_buffered_tool_order == Some(tool.order_key) {
             self.last_buffered_tool_order =
                 self.buffered_tool_calls.iter().map(|t| t.order_key).max();

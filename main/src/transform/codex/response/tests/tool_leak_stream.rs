@@ -527,6 +527,297 @@ fn orphan_done_arguments_before_output_item_added_is_replayed_after_binding() {
 }
 
 #[test]
+fn duplicate_active_call_id_is_idempotent_and_does_not_create_extra_tool_use() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_dup_first",
+                "type": "function_call",
+                "call_id": "call_duplicate_live",
+                "name": "Edit"
+            }
+        })
+    );
+    let add_duplicate = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_dup_second",
+                "type": "function_call",
+                "call_id": "call_duplicate_live",
+                "name": "Edit"
+            }
+        })
+    );
+    let done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_dup_first",
+                "type": "function_call",
+                "call_id": "call_duplicate_live",
+                "name": "Edit"
+            }
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": { "status": "completed" }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add_first);
+    let _ = transformer.transform_sse_line(&add_duplicate);
+    let mut events = transformer.transform_sse_line(&done);
+    events.extend(transformer.transform_sse_line(&completed));
+    let joined = events.join("");
+
+    let tool_use_count = joined.matches("\"type\":\"tool_use\"").count();
+    assert_eq!(
+        tool_use_count, 1,
+        "duplicate active call_id should be treated as idempotent and not emit duplicate tool_use"
+    );
+}
+
+#[test]
+fn call_id_precedence_prevents_output_index_conflict_argument_hijack() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_conflict_first",
+                "type": "function_call",
+                "call_id": "call_conflict_first",
+                "name": "Edit"
+            }
+        })
+    );
+    let add_second_conflict = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_conflict_second",
+                "type": "function_call",
+                "call_id": "call_conflict_second",
+                "name": "Edit"
+            }
+        })
+    );
+    let delta_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_conflict_first",
+            "call_id": "call_conflict_first",
+            "delta": "{\"file_path\":\"/tmp/conflict-first.ts\"}"
+        })
+    );
+    let delta_second = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_conflict_second",
+            "call_id": "call_conflict_second",
+            "delta": "{\"file_path\":\"/tmp/conflict-second.ts\"}"
+        })
+    );
+    let done_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_conflict_first",
+                "type": "function_call",
+                "call_id": "call_conflict_first",
+                "name": "Edit"
+            }
+        })
+    );
+    let done_second = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_conflict_second",
+                "type": "function_call",
+                "call_id": "call_conflict_second",
+                "name": "Edit"
+            }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add_first);
+    let _ = transformer.transform_sse_line(&add_second_conflict);
+    let _ = transformer.transform_sse_line(&delta_first);
+    let _ = transformer.transform_sse_line(&delta_second);
+    let mut events = transformer.transform_sse_line(&done_first);
+    events.extend(transformer.transform_sse_line(&done_second));
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("\"id\":\"call_conflict_first\"")
+            && joined.contains("\"id\":\"call_conflict_second\""),
+        "both function calls should still be emitted"
+    );
+
+    let first_start = joined
+        .find("\"id\":\"call_conflict_first\"")
+        .expect("first call block should exist");
+    let first_stop = joined[first_start..]
+        .find("\"type\":\"content_block_stop\"")
+        .map(|pos| first_start + pos)
+        .expect("first call block should stop");
+    let first_block = &joined[first_start..first_stop];
+
+    let second_start = joined
+        .find("\"id\":\"call_conflict_second\"")
+        .expect("second call block should exist");
+    let second_stop = joined[second_start..]
+        .find("\"type\":\"content_block_stop\"")
+        .map(|pos| second_start + pos)
+        .expect("second call block should stop");
+    let second_block = &joined[second_start..second_stop];
+
+    assert!(
+        first_block.contains("conflict-first.ts") && !first_block.contains("conflict-second.ts"),
+        "first call block should keep its own arguments only"
+    );
+    assert!(
+        second_block.contains("conflict-second.ts") && !second_block.contains("conflict-first.ts"),
+        "second call block should keep its own arguments only"
+    );
+}
+
+#[test]
+fn call_id_reuse_after_close_is_dropped_in_same_response() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_reuse_first",
+                "type": "function_call",
+                "call_id": "call_reuse_once",
+                "name": "Read"
+            }
+        })
+    );
+    let delta_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_reuse_first",
+            "call_id": "call_reuse_once",
+            "delta": "{\"file_path\":\"/tmp/reuse-first.ts\"}"
+        })
+    );
+    let done_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_reuse_first",
+                "type": "function_call",
+                "call_id": "call_reuse_once",
+                "name": "Read"
+            }
+        })
+    );
+    let add_reused = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_reuse_second",
+                "type": "function_call",
+                "call_id": "call_reuse_once",
+                "name": "Read"
+            }
+        })
+    );
+    let delta_reused = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_reuse_second",
+            "call_id": "call_reuse_once",
+            "delta": "{\"file_path\":\"/tmp/reuse-second.ts\"}"
+        })
+    );
+    let done_reused = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_reuse_second",
+                "type": "function_call",
+                "call_id": "call_reuse_once",
+                "name": "Read"
+            }
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": { "status": "completed" }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&add_first);
+    events.extend(transformer.transform_sse_line(&delta_first));
+    events.extend(transformer.transform_sse_line(&done_first));
+    events.extend(transformer.transform_sse_line(&add_reused));
+    events.extend(transformer.transform_sse_line(&delta_reused));
+    events.extend(transformer.transform_sse_line(&done_reused));
+    events.extend(transformer.transform_sse_line(&completed));
+    let joined = events.join("");
+
+    let tool_use_count = joined.matches("\"type\":\"tool_use\"").count();
+    assert_eq!(
+        tool_use_count, 1,
+        "reused call_id after closure should be ignored in the same response"
+    );
+    assert!(
+        joined.contains("reuse-first.ts"),
+        "first call payload should remain intact"
+    );
+    assert!(
+        !joined.contains("reuse-second.ts"),
+        "reused call payload should be dropped to avoid ambiguous lifecycle"
+    );
+}
+
+#[test]
 fn interleaved_parallel_function_calls_keep_separate_tool_blocks() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
