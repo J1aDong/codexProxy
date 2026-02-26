@@ -1219,6 +1219,117 @@ fn ambiguous_parallel_delta_without_metadata_is_not_attached() {
 }
 
 #[test]
+fn unscoped_text_delta_is_deferred_until_tool_window_closes() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_defer_text",
+                "type": "function_call",
+                "call_id": "call_defer_text",
+                "name": "Edit"
+            }
+        })
+    );
+    let unscoped_text = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "I will summarize once the tool call is done."
+        })
+    );
+    let done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_defer_text",
+                "type": "function_call",
+                "call_id": "call_defer_text",
+                "name": "Edit"
+            }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add);
+    let during_tool_window = transformer.transform_sse_line(&unscoped_text).join("");
+    let after_tool_window = transformer.transform_sse_line(&done).join("");
+
+    assert!(
+        !during_tool_window.contains("I will summarize"),
+        "unscoped text should be buffered while tool window is still open"
+    );
+    assert!(
+        after_tool_window.contains("\"type\":\"tool_use\"")
+            && after_tool_window.contains("\"id\":\"call_defer_text\""),
+        "tool use should still be emitted when the call completes"
+    );
+    assert!(
+        after_tool_window.contains("I will summarize once the tool call is done."),
+        "buffered unscoped text should flush after tool window closes"
+    );
+}
+
+#[test]
+fn deferred_unscoped_leak_is_suppressed_when_tool_window_closes() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_defer_leak",
+                "type": "function_call",
+                "call_id": "call_defer_leak",
+                "name": "Read"
+            }
+        })
+    );
+    let leaked = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Removing obsolete payload branch +#+#+#+#+#+{\"file_path\":\"/tmp/demo.txt\",\"offset\":0,\"limit\":50}"
+        })
+    );
+    let done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_defer_leak",
+                "type": "function_call",
+                "call_id": "call_defer_leak",
+                "name": "Read"
+            }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add);
+    let _ = transformer.transform_sse_line(&leaked);
+    let joined = transformer.transform_sse_line(&done).join("");
+
+    assert!(
+        joined.contains("Removing obsolete payload branch"),
+        "safe prefix text should survive deferred flush"
+    );
+    assert!(
+        !joined.contains("\\\"file_path\\\"")
+            && !joined.contains("\\\"offset\\\"")
+            && !joined.contains("\\\"limit\\\""),
+        "leaked read payload should still be suppressed after deferred flush"
+    );
+}
+
+#[test]
 fn suggestion_mode_prompt_is_suppressed_from_visible_text() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(

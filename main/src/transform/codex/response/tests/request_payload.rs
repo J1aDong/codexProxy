@@ -695,7 +695,9 @@ fn test_codex_input_strips_markerless_taskoutput_json_tail() {
         "normal human-readable prefix text should remain"
     );
     assert!(
-        text_blocks.iter().all(|text| !text.contains("\"task_id\"") && !text.contains("\"timeout\"")),
+        text_blocks
+            .iter()
+            .all(|text| !text.contains("\"task_id\"") && !text.contains("\"timeout\"")),
         "markerless task-output args json tail should be stripped from outbound message text"
     );
     assert!(

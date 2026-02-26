@@ -26,6 +26,13 @@ enum UpstreamItemKind {
     Unknown,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextRoutingDecision {
+    Emit,
+    Suppress,
+    DeferUntilToolWindowCloses,
+}
+
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 struct EventPartKey {
     output_index: Option<u64>,
@@ -141,6 +148,7 @@ pub struct TransformResponse {
     sent_message_start: bool,
     text_carryover: String,
     pending_tool_text: String,
+    deferred_unscoped_text: String,
 
     // Cross-chunk leak suppression state
     suppressing_cross_chunk_leak: bool,
@@ -839,6 +847,7 @@ impl TransformResponse {
             sent_message_start: false,
             text_carryover: String::new(),
             pending_tool_text: String::new(),
+            deferred_unscoped_text: String::new(),
             suppressing_cross_chunk_leak: false,
             suppressing_suggestion_mode_prompt: false,
             in_markdown_bash: false,
@@ -984,13 +993,22 @@ impl TransformResponse {
         self.active_text_parts.remove(part_key)
     }
 
-    fn should_emit_text_for_event(&self, metadata: &EventMetadata) -> bool {
+    fn decide_text_routing(&self, metadata: &EventMetadata) -> TextRoutingDecision {
         match self.lookup_item_kind(metadata) {
-            Some(UpstreamItemKind::FunctionCall) => false,
-            Some(UpstreamItemKind::Reasoning) => false,
-            Some(UpstreamItemKind::Message) => true,
+            Some(UpstreamItemKind::FunctionCall) | Some(UpstreamItemKind::Reasoning) => {
+                TextRoutingDecision::Suppress
+            }
+            Some(UpstreamItemKind::Message) => TextRoutingDecision::Emit,
             Some(UpstreamItemKind::Unknown) | None => {
-                !(metadata.has_routing_hint() && self.has_open_tool_block())
+                if self.has_open_tool_block() {
+                    if metadata.has_routing_hint() {
+                        TextRoutingDecision::Suppress
+                    } else {
+                        TextRoutingDecision::DeferUntilToolWindowCloses
+                    }
+                } else {
+                    TextRoutingDecision::Emit
+                }
             }
         }
     }
@@ -1185,6 +1203,30 @@ impl TransformResponse {
             self.cleanup_tool_mappings(&tool);
         }
         self.sync_phase_from_runtime();
+        if !self.has_open_tool_block() {
+            self.flush_deferred_unscoped_text(output, false);
+        }
+    }
+
+    fn buffer_deferred_unscoped_text(&mut self, fragment: &str) {
+        if fragment.is_empty() {
+            return;
+        }
+        self.deferred_unscoped_text.push_str(fragment);
+    }
+
+    fn flush_deferred_unscoped_text(&mut self, output: &mut Vec<String>, force: bool) {
+        if self.deferred_unscoped_text.is_empty() {
+            return;
+        }
+        if self.has_open_tool_block() && !force {
+            return;
+        }
+
+        let deferred = std::mem::take(&mut self.deferred_unscoped_text);
+        self.logger
+            .log_raw("[Info] Flushing deferred unscoped text after tool window");
+        self.handle_text_fragment(output, &deferred, true);
     }
 
     fn open_thinking_block_if_needed(&mut self, output: &mut Vec<String>) {
@@ -1855,6 +1897,9 @@ impl TransformResponse {
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
         self.flush_serialized_tool_calls(output, true);
+        self.flush_deferred_unscoped_text(output, true);
+        self.close_open_text_block(output);
+        self.close_open_thinking_block(output);
 
         let stop_reason = self.determine_stop_reason(data, force_incomplete);
 
@@ -1927,10 +1972,7 @@ impl TransformResponse {
                 let metadata = EventMetadata::from_data(&data);
                 let part_key = metadata.part_key();
                 self.register_text_part_if_scoped(&part_key);
-
-                if !self.should_emit_text_for_event(&metadata) {
-                    return output;
-                }
+                let routing = self.decide_text_routing(&metadata);
 
                 let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
                 let Some(delta) = self.dedupe_cross_source_fragment(
@@ -1940,6 +1982,15 @@ impl TransformResponse {
                 ) else {
                     return output;
                 };
+
+                if routing == TextRoutingDecision::Suppress {
+                    return output;
+                }
+                if routing == TextRoutingDecision::DeferUntilToolWindowCloses {
+                    self.buffer_deferred_unscoped_text(&delta);
+                    return output;
+                }
+
                 // Only close thinking block if text will NOT be redirected to thinking
                 // (avoids unnecessary open/close cycles during commentary)
                 let redirect_to_thinking = self.in_commentary_phase
@@ -1956,20 +2007,26 @@ impl TransformResponse {
                 let part_key = metadata.part_key();
                 if let Some(fragment) = Self::extract_content_part_text(&data) {
                     self.register_text_part_if_scoped(&part_key);
-                    if !self.should_emit_text_for_event(&metadata) {
+                    let routing = self.decide_text_routing(&metadata);
+                    if routing == TextRoutingDecision::Suppress {
                         return output;
                     }
 
-                    let redirect_to_thinking = self.in_commentary_phase
-                        || (self.had_reasoning_in_response && !self.saw_message_item_added);
-                    if !redirect_to_thinking {
-                        self.close_open_thinking_block(&mut output);
-                    }
                     if let Some(text) = self.dedupe_cross_source_fragment(
                         &part_key,
                         TextEventSource::ContentPartAdded,
                         fragment,
                     ) {
+                        if routing == TextRoutingDecision::DeferUntilToolWindowCloses {
+                            self.buffer_deferred_unscoped_text(&text);
+                            return output;
+                        }
+
+                        let redirect_to_thinking = self.in_commentary_phase
+                            || (self.had_reasoning_in_response && !self.saw_message_item_added);
+                        if !redirect_to_thinking {
+                            self.close_open_thinking_block(&mut output);
+                        }
                         self.handle_text_fragment(&mut output, &text, true);
                     }
                 }
@@ -1980,14 +2037,23 @@ impl TransformResponse {
                 let metadata = EventMetadata::from_data(&data);
                 let part_key = metadata.part_key();
                 self.flush_text_carryover(&mut output);
-                if self.should_emit_text_for_event(&metadata) {
-                    if let Some(done_text) = data.get("text").and_then(|t| t.as_str()) {
-                        self.handle_text_fragment(&mut output, done_text, false);
+                match self.decide_text_routing(&metadata) {
+                    TextRoutingDecision::Emit => {
+                        if let Some(done_text) = data.get("text").and_then(|t| t.as_str()) {
+                            self.handle_text_fragment(&mut output, done_text, false);
+                        }
                     }
+                    TextRoutingDecision::DeferUntilToolWindowCloses => {
+                        if let Some(done_text) = data.get("text").and_then(|t| t.as_str()) {
+                            self.buffer_deferred_unscoped_text(done_text);
+                        }
+                    }
+                    TextRoutingDecision::Suppress => {}
                 }
                 if !self.pending_tool_text.is_empty() {
                     self.flush_pending_tool_text(&mut output);
                 }
+                self.flush_deferred_unscoped_text(&mut output, false);
 
                 if self.finish_text_part(&part_key) && self.active_text_parts.is_empty() {
                     self.close_open_text_block(&mut output);
@@ -2001,6 +2067,7 @@ impl TransformResponse {
                 if !self.pending_tool_text.is_empty() {
                     self.flush_pending_tool_text(&mut output);
                 }
+                self.flush_deferred_unscoped_text(&mut output, false);
                 if Self::is_text_content_part(&data)
                     && self.finish_text_part(&part_key)
                     && self.active_text_parts.is_empty()
