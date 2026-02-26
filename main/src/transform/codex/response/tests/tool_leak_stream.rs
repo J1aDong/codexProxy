@@ -78,6 +78,48 @@ fn marker_prefixed_high_risk_tool_json_emits_confirmation_and_stays_blocked() {
 }
 
 #[test]
+fn raw_tool_json_assessment_scores_readonly_highrisk_and_suppressed_shapes() {
+    let readonly = LeakDetector::assess_raw_tool_json(
+        "{\"tool_uses\":[{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/tmp/a.txt\"}}]}",
+    );
+    assert_eq!(
+        readonly.tier,
+        RawToolJsonRiskTier::ReadonlyRecoverable,
+        "readonly tool_uses should be classified as recoverable"
+    );
+    assert!(
+        readonly.score >= 90,
+        "readonly recoverable payload should receive high confidence score"
+    );
+
+    let high_risk = LeakDetector::assess_raw_tool_json(
+        "{\"file_path\":\"/tmp/a.ts\",\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":false}",
+    );
+    assert_eq!(
+        high_risk.tier,
+        RawToolJsonRiskTier::HighRisk,
+        "edit-shape payload should be classified as high risk"
+    );
+    assert!(
+        high_risk.score >= 85,
+        "high-risk payload should receive strong confidence score"
+    );
+
+    let suppressed = LeakDetector::assess_raw_tool_json(
+        "{\"file_path\":\"/tmp/a.txt\",\"offset\":0,\"limit\":120}",
+    );
+    assert_eq!(
+        suppressed.tier,
+        RawToolJsonRiskTier::Suppressed,
+        "read window payload without tool envelope should stay in suppressed tier"
+    );
+    assert!(
+        suppressed.score >= 70,
+        "suppressed payload should still have meaningful confidence for observability"
+    );
+}
+
+#[test]
 fn leaked_tool_suffix_keeps_prefix_text_visible() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(
@@ -1147,6 +1189,9 @@ fn diagnostics_summary_payload_is_structured_for_log_aggregation() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     transformer.diagnostics.deferred_unscoped_text_chunks = 2;
     transformer.diagnostics.dropped_raw_tool_json_fragments = 1;
+    transformer.diagnostics.assessed_raw_tool_json_fragments = 3;
+    transformer.diagnostics.assessed_raw_tool_json_high_risk = 1;
+    transformer.diagnostics.assessed_raw_tool_json_suppressed = 2;
     transformer.diagnostics.dropped_high_risk_raw_tool_json_fragments = 1;
     transformer.diagnostics.emitted_high_risk_leak_questions = 1;
     transformer.diagnostics.queued_orphan_tool_argument_updates = 3;
@@ -1184,6 +1229,20 @@ fn diagnostics_summary_payload_is_structured_for_log_aggregation() {
             .and_then(|v| v.as_u64()),
         Some(1),
         "dropped raw tool json count should be emitted in structured counters"
+    );
+    assert_eq!(
+        payload
+            .pointer("/counters/assessed_raw_tool_json_fragments")
+            .and_then(|v| v.as_u64()),
+        Some(3),
+        "raw tool json assessment total should be emitted in structured counters"
+    );
+    assert_eq!(
+        payload
+            .pointer("/counters/assessed_raw_tool_json_high_risk")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "high-risk assessment count should be emitted in structured counters"
     );
     assert_eq!(
         payload
