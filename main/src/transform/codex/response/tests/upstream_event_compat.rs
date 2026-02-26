@@ -95,3 +95,71 @@ fn response_refusal_stream_maps_to_text_blocks_and_refusal_stop_reason() {
     assert!(joined.contains("\"stop_reason\":\"refusal\""));
     assert!(joined.contains("\"type\":\"message_stop\""));
 }
+
+#[test]
+fn response_failed_emits_error_with_upstream_message_and_code() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let failed = format!(
+        "data: {}",
+        json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "message": "Sibling tool call errored: Invalid tool parameters",
+                    "code": "invalid_tool_arguments"
+                }
+            }
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&failed).join("");
+    assert!(joined.contains("event: error"));
+    assert!(joined.contains("Sibling tool call errored: Invalid tool parameters"));
+    assert!(joined.contains("\"code\":\"invalid_tool_arguments\""));
+    assert!(joined.contains("\"type\":\"message_stop\""));
+}
+
+#[test]
+fn error_event_emits_error_with_message_and_code() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let error_line = format!(
+        "data: {}",
+        json!({
+            "type": "error",
+            "error": {
+                "message": "Rate limit exceeded",
+                "code": "rate_limit_exceeded"
+            }
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&error_line).join("");
+    assert!(joined.contains("event: error"));
+    assert!(joined.contains("Rate limit exceeded"));
+    assert!(joined.contains("\"code\":\"rate_limit_exceeded\""));
+    assert!(joined.contains("\"type\":\"message_stop\""));
+}
+
+#[test]
+fn response_failed_without_message_uses_default_error_message() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let failed = format!(
+        "data: {}",
+        json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "unknown_error"
+                }
+            }
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&failed).join("");
+    assert!(joined.contains("Upstream returned response.failed and terminated the stream."));
+    assert!(joined.contains("\"code\":\"unknown_error\""));
+    assert!(joined.contains("\"type\":\"message_stop\""));
+}

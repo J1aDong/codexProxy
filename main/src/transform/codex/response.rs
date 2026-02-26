@@ -122,6 +122,18 @@ struct BufferedToolCall {
     done_flag: bool,
 }
 
+enum PendingToolArgumentUpdateKind {
+    Delta(String),
+    Snapshot(String),
+}
+
+struct PendingToolArgumentUpdate {
+    output_index: Option<u64>,
+    item_id: Option<String>,
+    call_id: Option<String>,
+    kind: PendingToolArgumentUpdateKind,
+}
+
 /// 响应转换器 - Codex SSE -> Anthropic SSE
 pub struct TransformResponse {
     message_id: String,
@@ -149,6 +161,7 @@ pub struct TransformResponse {
     text_carryover: String,
     pending_tool_text: String,
     deferred_unscoped_text: String,
+    pending_tool_argument_updates: Vec<PendingToolArgumentUpdate>,
 
     // Cross-chunk leak suppression state
     suppressing_cross_chunk_leak: bool,
@@ -848,6 +861,7 @@ impl TransformResponse {
             text_carryover: String::new(),
             pending_tool_text: String::new(),
             deferred_unscoped_text: String::new(),
+            pending_tool_argument_updates: Vec::new(),
             suppressing_cross_chunk_leak: false,
             suppressing_suggestion_mode_prompt: false,
             in_markdown_bash: false,
@@ -1100,6 +1114,63 @@ impl TransformResponse {
         self.find_buffered_tool_order_from_metadata(output_index, item_id, call_id)
     }
 
+    fn queue_pending_tool_argument_update(
+        &mut self,
+        data: &Value,
+        kind: PendingToolArgumentUpdateKind,
+    ) {
+        let metadata = EventMetadata::from_data(data);
+        if !metadata.has_routing_hint() {
+            self.logger
+                .log_raw("[Warn] Dropping orphan tool arguments event without routing hints");
+            return;
+        }
+
+        if self.pending_tool_argument_updates.len() >= 64 {
+            self.pending_tool_argument_updates.remove(0);
+            self.logger
+                .log_raw("[Warn] Trimming pending tool-argument update backlog");
+        }
+
+        self.pending_tool_argument_updates
+            .push(PendingToolArgumentUpdate {
+                output_index: metadata.output_index,
+                item_id: metadata.item_id,
+                call_id: metadata.call_id,
+                kind,
+            });
+        self.logger
+            .log_raw("[Info] Queued orphan tool arguments event waiting for function_call item");
+    }
+
+    fn apply_pending_tool_argument_updates(&mut self) {
+        if self.pending_tool_argument_updates.is_empty() {
+            return;
+        }
+
+        let mut remaining = Vec::with_capacity(self.pending_tool_argument_updates.len());
+        for pending in std::mem::take(&mut self.pending_tool_argument_updates) {
+            let order_key = self.find_buffered_tool_order_from_metadata(
+                pending.output_index,
+                pending.item_id.as_deref(),
+                pending.call_id.as_deref(),
+            );
+            if let Some(order_key) = order_key {
+                match pending.kind {
+                    PendingToolArgumentUpdateKind::Delta(delta) => {
+                        self.append_tool_arguments_delta(order_key, &delta);
+                    }
+                    PendingToolArgumentUpdateKind::Snapshot(arguments) => {
+                        self.apply_tool_arguments_snapshot(order_key, &arguments);
+                    }
+                }
+            } else {
+                remaining.push(pending);
+            }
+        }
+        self.pending_tool_argument_updates = remaining;
+    }
+
     fn get_buffered_tool_mut(&mut self, order_key: u64) -> Option<&mut BufferedToolCall> {
         self.buffered_tool_calls
             .iter_mut()
@@ -1188,6 +1259,7 @@ impl TransformResponse {
     }
 
     fn flush_serialized_tool_calls(&mut self, output: &mut Vec<String>, include_incomplete: bool) {
+        self.apply_pending_tool_argument_updates();
         loop {
             let should_flush_front = self
                 .buffered_tool_calls
@@ -1933,6 +2005,76 @@ impl TransformResponse {
         self.transition_to(StreamPhase::Terminal);
     }
 
+    fn extract_upstream_error_message_and_code(data: &Value) -> (Option<String>, Option<String>) {
+        let message = data
+            .pointer("/response/error/message")
+            .or_else(|| data.pointer("/error/message"))
+            .or_else(|| data.pointer("/response/error/details/message"))
+            .or_else(|| data.pointer("/error/details/message"))
+            .or_else(|| data.get("message"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+
+        let code = data
+            .pointer("/response/error/code")
+            .or_else(|| data.pointer("/error/code"))
+            .or_else(|| data.get("code"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+
+        (message, code)
+    }
+
+    fn emit_error_and_stop(
+        &mut self,
+        output: &mut Vec<String>,
+        data: &Value,
+        default_message: &str,
+    ) {
+        if self.phase == StreamPhase::Terminal {
+            return;
+        }
+
+        self.flush_text_carryover(output);
+        self.flush_pending_tool_text(output);
+        self.flush_markdown_bash(output);
+        self.reset_text_dedupe_state();
+        self.suppressing_suggestion_mode_prompt = false;
+
+        self.close_open_text_block(output);
+        self.close_open_thinking_block(output);
+        self.flush_serialized_tool_calls(output, true);
+        self.flush_deferred_unscoped_text(output, true);
+        self.close_open_text_block(output);
+        self.close_open_thinking_block(output);
+
+        let (message, code) = Self::extract_upstream_error_message_and_code(data);
+        let mut error_payload = json!({
+            "type": "api_error",
+            "message": message.unwrap_or_else(|| default_message.to_string())
+        });
+        if let Some(code) = code {
+            if !code.trim().is_empty() {
+                if let Some(obj) = error_payload.as_object_mut() {
+                    obj.insert("code".to_string(), Value::String(code));
+                }
+            }
+        }
+
+        output.push(format!(
+            "event: error\ndata: {}\n\n",
+            json!({
+                "type": "error",
+                "error": error_payload
+            })
+        ));
+        output.push(format!(
+            "event: message_stop\ndata: {}\n\n",
+            json!({ "type": "message_stop" })
+        ));
+        self.transition_to(StreamPhase::Terminal);
+    }
+
     pub fn transform_sse_line(&mut self, line: &str) -> Vec<String> {
         let mut output = Vec::new();
 
@@ -2176,6 +2318,7 @@ impl TransformResponse {
                                     }
                                 }
                             }
+                            self.apply_pending_tool_argument_updates();
                         }
                         "message" => {
                             self.saw_message_item_added = true;
@@ -2209,6 +2352,11 @@ impl TransformResponse {
                 if !delta.is_empty() {
                     if let Some(order_key) = self.find_buffered_tool_order(&data) {
                         self.append_tool_arguments_delta(order_key, delta);
+                    } else {
+                        self.queue_pending_tool_argument_update(
+                            &data,
+                            PendingToolArgumentUpdateKind::Delta(delta.to_string()),
+                        );
                     }
                 }
             }
@@ -2221,6 +2369,11 @@ impl TransformResponse {
                 if !full_arguments.is_empty() {
                     if let Some(order_key) = self.find_buffered_tool_order(&data) {
                         self.apply_tool_arguments_snapshot(order_key, full_arguments);
+                    } else {
+                        self.queue_pending_tool_argument_update(
+                            &data,
+                            PendingToolArgumentUpdateKind::Snapshot(full_arguments.to_string()),
+                        );
                     }
                 }
             }
@@ -2230,6 +2383,7 @@ impl TransformResponse {
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 self.close_open_thinking_block(&mut output);
+                self.apply_pending_tool_argument_updates();
 
                 let output_index = data.get("output_index").and_then(|v| v.as_u64());
                 let item = data.get("item");
@@ -2303,6 +2457,24 @@ impl TransformResponse {
             // 响应不完整但已终止（例如 max_output_tokens / context limit）
             "response.incomplete" => {
                 self.emit_terminal_events(&mut output, &data, true);
+            }
+
+            // 上游主动失败：透传 message/code 并补齐终止事件，避免下游悬挂。
+            "response.failed" => {
+                self.emit_error_and_stop(
+                    &mut output,
+                    &data,
+                    "Upstream returned response.failed and terminated the stream.",
+                );
+            }
+
+            // 兼容上游显式 error 事件。
+            "error" => {
+                self.emit_error_and_stop(
+                    &mut output,
+                    &data,
+                    "Upstream returned an error event and terminated the stream.",
+                );
             }
 
             // 忽略其他事件类型（如 response.created, response.in_progress 等）

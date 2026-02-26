@@ -407,6 +407,126 @@ fn function_call_arguments_done_without_delta_is_still_streamed() {
 }
 
 #[test]
+fn orphan_delta_before_output_item_added_is_replayed_after_binding() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let orphan_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 3,
+            "item_id": "fc_late_bind",
+            "call_id": "call_late_bind",
+            "delta": "{\"file_path\":\"/tmp/late-bind.ts\"}"
+        })
+    );
+    let add_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 3,
+            "item": {
+                "id": "fc_late_bind",
+                "type": "function_call",
+                "call_id": "call_late_bind",
+                "name": "Edit"
+            }
+        })
+    );
+    let done_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 3,
+            "item": {
+                "id": "fc_late_bind",
+                "type": "function_call",
+                "call_id": "call_late_bind",
+                "name": "Edit"
+            }
+        })
+    );
+
+    let orphan_events = transformer.transform_sse_line(&orphan_delta).join("");
+    let _ = transformer.transform_sse_line(&add_line);
+    let done_events = transformer.transform_sse_line(&done_line).join("");
+
+    assert!(
+        !orphan_events.contains("late-bind.ts"),
+        "orphan delta should stay buffered until it can be bound to a function_call"
+    );
+    assert!(
+        done_events.contains("\"type\":\"tool_use\"")
+            && done_events.contains("\"id\":\"call_late_bind\""),
+        "late-bound function_call should still produce tool_use"
+    );
+    assert!(
+        done_events.contains("late-bind.ts"),
+        "queued delta should replay once the function_call binding exists"
+    );
+}
+
+#[test]
+fn orphan_done_arguments_before_output_item_added_is_replayed_after_binding() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let orphan_done_args = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 5,
+            "item_id": "fc_late_done",
+            "call_id": "call_late_done",
+            "arguments": "{\"file_path\":\"/tmp/late-done.ts\"}"
+        })
+    );
+    let add_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 5,
+            "item": {
+                "id": "fc_late_done",
+                "type": "function_call",
+                "call_id": "call_late_done",
+                "name": "Read"
+            }
+        })
+    );
+    let done_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 5,
+            "item": {
+                "id": "fc_late_done",
+                "type": "function_call",
+                "call_id": "call_late_done",
+                "name": "Read"
+            }
+        })
+    );
+
+    let orphan_events = transformer.transform_sse_line(&orphan_done_args).join("");
+    let _ = transformer.transform_sse_line(&add_line);
+    let done_events = transformer.transform_sse_line(&done_line).join("");
+
+    assert!(
+        !orphan_events.contains("late-done.ts"),
+        "orphan done-arguments should be buffered until function_call exists"
+    );
+    assert!(
+        done_events.contains("\"type\":\"tool_use\"")
+            && done_events.contains("\"id\":\"call_late_done\""),
+        "late-bound function_call should still produce tool_use"
+    );
+    assert!(
+        done_events.contains("late-done.ts"),
+        "queued done-arguments snapshot should replay once binding exists"
+    );
+}
+
+#[test]
 fn interleaved_parallel_function_calls_keep_separate_tool_blocks() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
