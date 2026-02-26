@@ -2987,6 +2987,7 @@ async fn handle_request(
     let mut successful_resolved_target_url = String::new();
     let mut successful_api_key = String::new();
     let mut successful_upstream_body: Option<Value> = None;
+    let mut successful_session_id = String::new();
 
     while attempt_index < max_lb_attempts {
         attempt_index += 1;
@@ -3351,6 +3352,7 @@ async fn handle_request(
         successful_resolved_target_url = resolved_target_url.clone();
         successful_api_key = route_selection.api_key.clone();
         successful_upstream_body = Some(upstream_body.clone());
+        successful_session_id = session_id.clone();
         break;
     }
 
@@ -3364,6 +3366,7 @@ async fn handle_request(
     let api_key_for_stream = successful_api_key;
     let upstream_body_for_stream =
         successful_upstream_body.expect("upstream body must exist after successful loop");
+    let session_id_for_request = successful_session_id;
     let _lb_permit = successful_lb_permit;
     let effective_stream = resolve_effective_stream(
         anthropic_body.stream,
@@ -3606,7 +3609,13 @@ async fn handle_request(
         }
 
         if let Some(summary) = transformer.take_diagnostics_summary() {
-            emit_transform_diag(&log_tx, &logger, &request_id, "-", &summary);
+            emit_transform_diag(
+                &log_tx,
+                &logger,
+                &request_id,
+                &session_id_for_request,
+                &summary,
+            );
         }
 
         if let Some(ref l) = AppLogger::get() {
@@ -3638,6 +3647,7 @@ async fn handle_request(
     let upstream_url_for_stream = resolved_target_url_for_stream.clone();
     let upstream_api_key_for_stream = api_key_for_stream.clone();
     let upstream_body_for_stream = upstream_body_for_stream.clone();
+    let session_id_for_stream = session_id_for_request.clone();
     let serial_fallback_upstream_body_for_stream =
         disable_parallel_tool_calls_in_upstream_body(&upstream_body_for_stream);
     let http_client_for_stream = http_client.clone();
@@ -3650,7 +3660,7 @@ async fn handle_request(
         let mut transformer =
             request_backend_for_stream.create_response_transformer(&model_for_stream);
         let mut active_upstream_body_for_stream = upstream_body_for_stream.clone();
-        let mut active_session_id_for_stream = "-".to_string();
+        let mut active_session_id_for_stream = session_id_for_stream;
         let mut line_buffer = String::new();
         let mut frame_parser = SseFrameParser::default();
         let mut upstream_log_counter = 0u64;
