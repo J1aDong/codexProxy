@@ -3156,6 +3156,9 @@ impl TransformResponse {
                     }
                     "message" => {
                         self.in_commentary_phase = false;
+                        // Fail-safe fence: once message item is done, force-close any open text
+                        // block before subsequent function_call items arrive.
+                        self.close_open_text_block(&mut output);
                     }
                     _ => {
                         // 兼容旧流：没有 item 元数据时回退关闭最近缓冲的 tool call
@@ -3176,6 +3179,11 @@ impl TransformResponse {
 
             // 响应完成 - 关键：确保完整的事件序列
             "response.completed" => {
+                self.emit_terminal_events(&mut output, &data, false);
+            }
+
+            // 上游别名事件：与 response.completed 语义等价
+            "response.done" => {
                 self.emit_terminal_events(&mut output, &data, false);
             }
 

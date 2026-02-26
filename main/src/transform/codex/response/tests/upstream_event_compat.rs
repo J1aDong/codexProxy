@@ -56,6 +56,114 @@ fn response_incomplete_maps_context_window_to_anthropic_stop_reason() {
 }
 
 #[test]
+fn response_done_alias_emits_terminal_events() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let text_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "final answer"
+        })
+    );
+    let done_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.done",
+            "response": {
+                "status": "completed",
+                "usage": { "input_tokens": 9, "output_tokens": 21 }
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&text_line);
+    events.extend(transformer.transform_sse_line(&done_line));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"message_delta\""));
+    assert!(joined.contains("\"stop_reason\":\"end_turn\""));
+    assert!(joined.contains("\"input_tokens\":9"));
+    assert!(joined.contains("\"output_tokens\":21"));
+    assert!(joined.contains("\"type\":\"message_stop\""));
+}
+
+#[test]
+fn message_output_item_done_force_closes_text_before_tool_item() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let text_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg_1",
+            "delta": "need read file"
+        })
+    );
+    let message_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": { "id": "msg_1", "type": "message" }
+        })
+    );
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Read"
+            }
+        })
+    );
+    let tool_args_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_1",
+            "call_id": "call_1",
+            "delta": "{\"file_path\":\"/tmp/a.txt\"}"
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Read"
+            }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&text_delta);
+    let done_events = transformer.transform_sse_line(&message_done).join("");
+    assert!(
+        done_events.contains("\"type\":\"content_block_stop\""),
+        "message output_item.done should force-close active text block"
+    );
+
+    let mut tool_events = transformer.transform_sse_line(&tool_added);
+    tool_events.extend(transformer.transform_sse_line(&tool_args_delta));
+    tool_events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = tool_events.join("");
+    assert!(
+        joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Read\""),
+        "tool sequence should remain healthy after message-done fence"
+    );
+}
+
+#[test]
 fn response_refusal_stream_maps_to_text_blocks_and_refusal_stop_reason() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 

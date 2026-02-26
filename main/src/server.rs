@@ -1364,6 +1364,43 @@ fn disable_parallel_tool_calls_in_upstream_body(body: &Value) -> Option<Value> {
     Some(next)
 }
 
+const RETRY_NO_TOOL_TEXT_MIX_GUARDRAIL_TAG: &str = "RETRY_GUARDRAIL_NO_TOOL_TEXT_MIX";
+const RETRY_NO_TOOL_TEXT_MIX_GUARDRAIL_INSTRUCTION: &str = r#"On retry, enforce strict tool/text channel separation:
+- Never emit tool protocol text in assistant natural-language output.
+- Never print raw tool JSON arguments in text.
+- Do not output markers like `assistant to=...`, `to=functions...`, or `{"tool_uses":...}`.
+- Emit tool calls only via structured tool/function call events.
+- Keep plain text and tool payloads physically separated in the stream."#;
+
+fn inject_retry_no_tool_text_mix_guardrail(body: &Value) -> Option<Value> {
+    let mut next = body.clone();
+    let obj = next.as_object_mut()?;
+
+    let existing = obj
+        .get("instructions")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if existing.contains(RETRY_NO_TOOL_TEXT_MIX_GUARDRAIL_TAG) {
+        return Some(next);
+    }
+
+    let injected = format!(
+        "\n\n[{}]\n{}\n[/{}]",
+        RETRY_NO_TOOL_TEXT_MIX_GUARDRAIL_TAG,
+        RETRY_NO_TOOL_TEXT_MIX_GUARDRAIL_INSTRUCTION,
+        RETRY_NO_TOOL_TEXT_MIX_GUARDRAIL_TAG
+    );
+
+    let merged = if existing.is_empty() {
+        injected
+    } else {
+        format!("{}{}", existing, injected)
+    };
+
+    obj.insert("instructions".to_string(), json!(merged));
+    Some(next)
+}
+
 fn extract_upstream_error_details(chunk: &str) -> Option<(String, Option<String>, Option<String>)> {
     let mut event_name: Option<String> = None;
 
@@ -4329,17 +4366,28 @@ async fn handle_request(
 
             if leaked_tool_text_retry_allowed {
                 decision.leaked_tool_text_retry_attempted = true;
-                active_upstream_body_for_stream = serial_fallback_upstream_body_for_stream
+                let mut retry_upstream_body = serial_fallback_upstream_body_for_stream
                     .as_ref()
                     .cloned()
                     .expect("serial fallback body should exist");
+                let guardrail_injected =
+                    if let Some(injected) = inject_retry_no_tool_text_mix_guardrail(
+                        &retry_upstream_body,
+                    ) {
+                        retry_upstream_body = injected;
+                        true
+                    } else {
+                        false
+                    };
+                active_upstream_body_for_stream = retry_upstream_body;
                 let signal = tool_leak_signal.expect("signal should exist when retry allowed");
                 emit_stream_diag(
                     &log_tx_clone,
                     &logger_for_stream,
                     format!(
-                        "[Stream] #{} leaked_tool_text_retry_started mode=serial_parallel_tool_calls_false marker_drops={} raw_json_drops={} incomplete_json_drops={}",
+                        "[Stream] #{} leaked_tool_text_retry_started mode=serial_parallel_tool_calls_false guardrail_injected={} marker_drops={} raw_json_drops={} incomplete_json_drops={}",
                         request_id_for_stream,
+                        guardrail_injected,
                         signal.dropped_leaked_marker_fragments,
                         signal.dropped_raw_tool_json_fragments,
                         signal.dropped_incomplete_tool_json_fragments
@@ -5044,8 +5092,9 @@ mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
         chunk_contains_sibling_tool_call_error, classify_connection_error, derive_stream_close_cause,
-        disable_parallel_tool_calls_in_upstream_body, is_business_stream_output,
-        extract_tool_leak_retry_signal, leaked_tool_text_retry_skip_reason,
+        disable_parallel_tool_calls_in_upstream_body, extract_tool_leak_retry_signal,
+        inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
+        leaked_tool_text_retry_skip_reason,
         observe_upstream_chunk_events, resolve_effective_stream, resolve_upstream_url,
         should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
         ConnErrorClass, SseFrameParser, StreamEventCounters, StreamRuntimeOptions,
@@ -5192,6 +5241,41 @@ data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"a
             Some(false)
         );
         assert_eq!(rewritten.get("model"), original.get("model"));
+    }
+
+    #[test]
+    fn test_inject_retry_no_tool_text_mix_guardrail_appends_once() {
+        let original = json!({
+            "instructions": "base instructions",
+            "parallel_tool_calls": false
+        });
+
+        let first = inject_retry_no_tool_text_mix_guardrail(&original)
+            .expect("guardrail should be injectable");
+        let first_instructions = first
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .expect("instructions should remain string");
+        assert!(
+            first_instructions.contains("RETRY_GUARDRAIL_NO_TOOL_TEXT_MIX"),
+            "retry guardrail tag should be injected"
+        );
+        assert!(
+            first_instructions.contains("Never print raw tool JSON arguments in text."),
+            "retry guardrail body should be appended"
+        );
+
+        let second = inject_retry_no_tool_text_mix_guardrail(&first)
+            .expect("guardrail reinjection should still return body");
+        let second_instructions = second
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .expect("instructions should remain string");
+        assert_eq!(
+            second_instructions.matches("RETRY_GUARDRAIL_NO_TOOL_TEXT_MIX").count(),
+            2,
+            "guardrail wrapper tag pair should not be duplicated on reinjection"
+        );
     }
 
     #[test]
