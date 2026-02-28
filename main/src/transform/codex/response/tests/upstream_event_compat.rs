@@ -163,6 +163,129 @@ fn message_output_item_done_force_closes_text_before_tool_item() {
     );
 }
 
+/// 验证事件交错时 Message 文本不会在工具窗口期间被丢弃。
+/// 场景：text delta 在 function_call output_item.added 之后到达（事件交错）
+#[test]
+fn interleaved_message_text_during_tool_window_is_preserved() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    // 1. 注册 message item
+    let msg_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": { "id": "msg_1", "type": "message" }
+        })
+    );
+    // 2. 第一段文本
+    let text1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg_1",
+            "delta": "I'll read"
+        })
+    );
+    // 3. function_call 注册（此时文本 block 被关闭、工具被缓冲）
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Read"
+            }
+        })
+    );
+    // 4. 第二段文本（交错到达，属于 message output_index=0）
+    let text2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg_1",
+            "delta": " the file"
+        })
+    );
+    // 5. 工具参数
+    let tool_args = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_1",
+            "call_id": "call_1",
+            "delta": "{\"file_path\":\"/tmp/a.txt\"}"
+        })
+    );
+    // 6. 工具完成
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Read"
+            }
+        })
+    );
+    // 7. 响应完成
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": { "input_tokens": 10, "output_tokens": 20 }
+            }
+        })
+    );
+
+    let mut all_output = Vec::new();
+    all_output.extend(transformer.transform_sse_line(&msg_added));
+    all_output.extend(transformer.transform_sse_line(&text1));
+    all_output.extend(transformer.transform_sse_line(&tool_added));
+    all_output.extend(transformer.transform_sse_line(&text2));
+    all_output.extend(transformer.transform_sse_line(&tool_args));
+    all_output.extend(transformer.transform_sse_line(&tool_done));
+    all_output.extend(transformer.transform_sse_line(&completed));
+
+    let joined = all_output.join("");
+
+    // 验证：第一段文本被发射
+    assert!(
+        joined.contains("I'll read"),
+        "First text fragment should be emitted"
+    );
+
+    // 验证：第二段文本（交错到达）被保留（延迟发射），不应被丢弃
+    assert!(
+        joined.contains(" the file"),
+        "Interleaved message text during tool window should be preserved (deferred), not dropped. Output: {}",
+        joined
+    );
+
+    // 验证：工具调用正常
+    assert!(
+        joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"Read\""),
+        "Tool use block should be emitted correctly"
+    );
+
+    // 验证：有正确的终止事件
+    assert!(
+        joined.contains("\"type\":\"message_stop\""),
+        "Message stop should be emitted"
+    );
+}
+
 #[test]
 fn response_refusal_stream_maps_to_text_blocks_and_refusal_stop_reason() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");

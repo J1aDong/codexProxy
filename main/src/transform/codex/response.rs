@@ -1664,7 +1664,15 @@ impl TransformResponse {
             Some(UpstreamItemKind::FunctionCall) | Some(UpstreamItemKind::Reasoning) => {
                 TextRoutingDecision::Suppress
             }
-            Some(UpstreamItemKind::Message) => TextRoutingDecision::Emit,
+            Some(UpstreamItemKind::Message) => {
+                // 工具缓冲期间，Message 文本延迟发射，避免被 handle_text_fragment
+                // 内部的 has_open_tool_block() 守卫静默丢弃
+                if self.has_open_tool_block() {
+                    TextRoutingDecision::DeferUntilToolWindowCloses
+                } else {
+                    TextRoutingDecision::Emit
+                }
+            }
             Some(UpstreamItemKind::Unknown) | None => {
                 if self.has_open_tool_block() {
                     if metadata.has_routing_hint() {
@@ -2278,8 +2286,8 @@ impl TransformResponse {
 
         if let Some(start_idx) = fragment.find(Self::SUGGESTION_MODE_START_MARKER) {
             let prefix = &fragment[..start_idx];
-            if emit_plain_text && !self.has_open_tool_block() && !prefix.is_empty() {
-                self.emit_plain_text_fragment(output, prefix);
+            if emit_plain_text && !prefix.is_empty() {
+                self.emit_or_defer_plain_text(output, prefix);
             }
 
             let after_start = &fragment[start_idx..];
@@ -2354,8 +2362,8 @@ impl TransformResponse {
             let prefix_text = &combined[..marker_start];
             let after_marker = &combined[marker_start + marker_len..];
 
-            if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
-                self.emit_plain_text_fragment(output, prefix_text);
+            if emit_plain_text && !prefix_text.is_empty() {
+                self.emit_or_defer_plain_text(output, prefix_text);
             }
             self.in_markdown_bash = true;
             self.markdown_bash_buffer.push_str(after_marker);
@@ -2380,8 +2388,8 @@ impl TransformResponse {
         if let Some(marker_start) = LeakDetector::find_potential_leaked_tool_marker_start(&combined)
         {
             let (prefix_text, leaked_fragment) = combined.split_at(marker_start);
-            if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
-                self.emit_plain_text_fragment(output, prefix_text);
+            if emit_plain_text && !prefix_text.is_empty() {
+                self.emit_or_defer_plain_text(output, prefix_text);
             }
             self.pending_tool_text.push_str(leaked_fragment);
             self.process_pending_tool_text(output, !emit_plain_text);
@@ -2392,11 +2400,11 @@ impl TransformResponse {
         // 将裸 JSON 片段送入 pending，按高置信规则分段抑制，仅保留前后安全文本。
         if let Some(raw_json_start) = LeakDetector::find_potential_raw_tool_json_start(&combined) {
             let (prefix_text, leaked_fragment) = combined.split_at(raw_json_start);
-            if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
+            if emit_plain_text && !prefix_text.is_empty() {
                 let cleaned_prefix =
                     LeakDetector::sanitize_prefix_before_raw_tool_json(prefix_text);
                 if !cleaned_prefix.is_empty() {
-                    self.emit_plain_text_fragment(output, &cleaned_prefix);
+                    self.emit_or_defer_plain_text(output, &cleaned_prefix);
                 }
             }
             self.pending_tool_text.push_str(leaked_fragment);
@@ -2413,14 +2421,18 @@ impl TransformResponse {
             if is_cross_chunk {
                 self.suppressing_cross_chunk_leak = true;
             }
-            if emit_plain_text && !self.has_open_tool_block() && !prefix.is_empty() {
-                self.emit_plain_text_fragment(output, &prefix);
+            if emit_plain_text && !prefix.is_empty() {
+                self.emit_or_defer_plain_text(output, &prefix);
             }
             // 注意：不处理 suffix，因为它包含可疑的尾巴噪声，应该被完全抑制
             return;
         }
 
         if !emit_plain_text || self.has_open_tool_block() {
+            // 工具窗口期间：延迟而非丢弃，保留文本在工具结束后发射
+            if emit_plain_text && self.has_open_tool_block() && !combined.is_empty() {
+                self.buffer_deferred_unscoped_text(&combined);
+            }
             return;
         }
 
@@ -2436,6 +2448,19 @@ impl TransformResponse {
             self.emit_plain_text_fragment(output, safe_text);
         }
         self.text_carryover.push_str(carryover);
+    }
+
+    /// 工具窗口安全的文本发射：有工具缓冲时延迟，否则直接发射。
+    /// 用于替换所有 `emit_plain_text && !has_open_tool_block()` 模式。
+    fn emit_or_defer_plain_text(&mut self, output: &mut Vec<String>, fragment: &str) {
+        if fragment.is_empty() {
+            return;
+        }
+        if self.has_open_tool_block() {
+            self.buffer_deferred_unscoped_text(fragment);
+        } else {
+            self.emit_plain_text_fragment(output, fragment);
+        }
     }
 
     fn emit_plain_text_fragment(&mut self, output: &mut Vec<String>, fragment: &str) {
