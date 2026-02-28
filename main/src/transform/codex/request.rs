@@ -556,7 +556,7 @@ impl TransformRequest {
             "tools": transformed_tools,
             "tool_choice": tool_choice,
             "parallel_tool_calls": true,
-            "reasoning": { "effort": reasoning_effort.as_str(), "summary": "auto" },
+            "reasoning": { "effort": reasoning_effort.as_str(), "summary": "detailed" },
             "store": false,
             "stream": true,
             "include": ["reasoning.encrypted_content"],
