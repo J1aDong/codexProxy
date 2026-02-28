@@ -4,6 +4,7 @@ use super::StreamRuntimeOptions;
 pub(crate) enum OutputDisposition {
     SkipDuplicateMessageStart,
     SkipPrematureMessageStop,
+    SkipPostMessageStopOutput,
     Accepted {
         message_stop: bool,
         business_event: bool,
@@ -13,6 +14,7 @@ pub(crate) enum OutputDisposition {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct StreamDecisionState {
     pub saw_response_completed: bool,
+    pub saw_response_incomplete: bool,
     pub saw_response_failed: bool,
     pub saw_sibling_tool_call_error: bool,
     pub saw_message_stop: bool,
@@ -32,6 +34,7 @@ pub(crate) struct StreamDecisionState {
     pub emitted_empty_completion_fallback_notice: bool,
     pub fallback_completion_injected: bool,
     pub logged_premature_stop_suppression: bool,
+    pub logged_post_message_stop_drop: bool,
     pub stream_close_cause: Option<&'static str>,
 }
 
@@ -48,9 +51,14 @@ impl StreamDecisionState {
             output,
             is_codex_stream,
             self.saw_response_completed,
+            self.saw_response_incomplete,
             self.saw_response_failed,
         ) {
             return OutputDisposition::SkipPrematureMessageStop;
+        }
+
+        if self.saw_message_stop && super::should_drop_post_message_stop_output(output) {
+            return OutputDisposition::SkipPostMessageStopOutput;
         }
 
         let message_stop = super::chunk_is_message_stop(output);
@@ -75,6 +83,7 @@ impl StreamDecisionState {
 
     pub fn on_retry_success_reset(&mut self) {
         self.saw_response_completed = false;
+        self.saw_response_incomplete = false;
         self.saw_response_failed = false;
         self.saw_sibling_tool_call_error = false;
         self.saw_message_stop = false;
@@ -133,36 +142,6 @@ impl StreamDecisionState {
         }
     }
 
-    pub fn allow_empty_completion_retry(&self, opts: StreamRuntimeOptions) -> bool {
-        self.saw_response_completed
-            && !self.saw_response_failed
-            && !self.emitted_business_event
-            && !self.saw_message_stop
-            && opts.enable_empty_completion_retry
-            && opts.empty_completion_retry_max_attempts > 0
-            && self.empty_completion_retry_attempts < opts.empty_completion_retry_max_attempts
-    }
-
-    pub fn empty_completion_retry_skip_reason(&self, opts: StreamRuntimeOptions) -> &'static str {
-        if !opts.enable_empty_completion_retry {
-            "disabled"
-        } else if opts.empty_completion_retry_max_attempts == 0 {
-            "max_attempts_zero"
-        } else if self.empty_completion_retry_attempts >= opts.empty_completion_retry_max_attempts {
-            "attempts_exhausted"
-        } else {
-            "guard_blocked"
-        }
-    }
-
-    pub fn should_emit_empty_notice(&self) -> bool {
-        self.saw_response_completed
-            && !self.saw_response_failed
-            && !self.emitted_business_event
-            && !self.saw_message_stop
-            && !self.empty_completion_retry_succeeded
-    }
-
     pub fn stream_outcome(&self) -> &'static str {
         if !self.saw_response_completed {
             if self.saw_response_failed {
@@ -197,8 +176,6 @@ mod tests {
             stream_silence_warn_ms: 20_000,
             stream_silence_error_ms: 90_000,
             stall_timeout_ms: 60_000,
-            enable_empty_completion_retry: true,
-            empty_completion_retry_max_attempts: 1,
             enable_incomplete_stream_retry: true,
             incomplete_stream_retry_max_attempts: 1,
             enable_sibling_tool_error_retry: true,
@@ -236,13 +213,44 @@ mod tests {
     }
 
     #[test]
+    fn classify_output_accepts_message_stop_after_incomplete_terminal() {
+        let mut state = StreamDecisionState {
+            saw_response_incomplete: true,
+            ..Default::default()
+        };
+        let output = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let decision = state.classify_output(output, true);
+        assert!(matches!(
+            decision,
+            OutputDisposition::Accepted {
+                message_stop: true,
+                ..
+            }
+        ));
+        assert!(state.saw_message_stop);
+    }
+
+    #[test]
+    fn classify_output_drops_business_output_after_message_stop() {
+        let mut state = StreamDecisionState {
+            saw_message_stop: true,
+            ..Default::default()
+        };
+        let output = r#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"late"}}
+
+"#;
+        let decision = state.classify_output(output, true);
+        assert!(matches!(
+            decision,
+            OutputDisposition::SkipPostMessageStopOutput
+        ));
+    }
+
+    #[test]
     fn guard_methods_reflect_retry_policies() {
         let mut state = StreamDecisionState::default();
         assert!(state.allow_incomplete_retry(opts()));
-        assert!(!state.allow_empty_completion_retry(opts()));
-
-        state.saw_response_completed = true;
-        assert!(state.allow_empty_completion_retry(opts()));
 
         state.incomplete_stream_retry_attempts = 1;
         assert!(!state.allow_incomplete_retry(opts()));
@@ -269,10 +277,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_notice_and_stream_outcome_follow_state() {
+    fn stream_outcome_follows_state() {
         let mut state = StreamDecisionState::default();
         assert_eq!(state.stream_outcome(), "incomplete");
-        assert!(!state.should_emit_empty_notice());
 
         state.saw_response_failed = true;
         assert_eq!(state.stream_outcome(), "failed");
@@ -282,17 +289,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(state.stream_outcome(), "empty_completed");
-        assert!(state.should_emit_empty_notice());
 
         state.emitted_business_event = true;
         assert_eq!(state.stream_outcome(), "success");
-        assert!(!state.should_emit_empty_notice());
     }
 
     #[test]
     fn retry_success_reset_clears_transient_flags() {
         let mut state = StreamDecisionState {
             saw_response_completed: true,
+            saw_response_incomplete: true,
             saw_response_failed: true,
             saw_sibling_tool_call_error: true,
             saw_message_stop: true,
@@ -302,6 +308,7 @@ mod tests {
         state.on_retry_success_reset();
 
         assert!(!state.saw_response_completed);
+        assert!(!state.saw_response_incomplete);
         assert!(!state.saw_response_failed);
         assert!(!state.saw_sibling_tool_call_error);
         assert!(!state.saw_message_stop);

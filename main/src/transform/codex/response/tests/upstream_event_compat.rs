@@ -271,3 +271,215 @@ fn response_failed_without_message_uses_default_error_message() {
     assert!(joined.contains("\"code\":\"unknown_error\""));
     assert!(joined.contains("\"type\":\"message_stop\""));
 }
+
+#[test]
+fn function_call_arguments_whitespace_flood_triggers_controlled_error_stop() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_ws_guard",
+                "type": "function_call",
+                "call_id": "call_ws_guard",
+                "name": "Read"
+            }
+        })
+    );
+    let flood_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_ws_guard",
+            "delta": " ".repeat(TransformResponse::MAX_FUNCTION_ARGS_WHITESPACE_RUN + 1)
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add);
+    let joined = transformer.transform_sse_line(&flood_delta).join("");
+
+    assert!(
+        joined.contains("event: error")
+            && joined.contains("\"code\":\"function_args_whitespace_overflow\""),
+        "whitespace flood should trigger deterministic error path"
+    );
+    assert!(
+        joined.contains("\"type\":\"message_stop\""),
+        "overflow guard should terminate stream cleanly"
+    );
+}
+
+#[test]
+fn mismatched_item_id_is_normalized_by_output_index_for_tool_arguments() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 7,
+            "item": {
+                "id": "fc_sync_primary",
+                "type": "function_call",
+                "call_id": "call_sync_primary",
+                "name": "Read"
+            }
+        })
+    );
+    let mismatched_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 7,
+            "item_id": "fc_sync_mismatch",
+            "delta": "{\"file_path\":\"/tmp/id-sync.ts\"}"
+        })
+    );
+    let done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 7,
+            "item": {
+                "id": "fc_sync_done_mismatch",
+                "type": "function_call",
+                "call_id": "call_sync_primary",
+                "name": "Read"
+            }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add);
+    let _ = transformer.transform_sse_line(&mismatched_delta);
+    let joined = transformer.transform_sse_line(&done).join("");
+
+    assert!(
+        joined.contains("\"type\":\"tool_use\"") && joined.contains("\"id\":\"call_sync_primary\""),
+        "mismatched item_id should still resolve to original tool call"
+    );
+    assert!(
+        joined.contains("id-sync.ts"),
+        "arguments routed by normalized output_index should stay attached"
+    );
+    assert!(
+        transformer.diagnostics.normalized_item_id_mismatches >= 1,
+        "normalization diagnostics should record item_id mismatch handling"
+    );
+}
+
+#[test]
+fn output_index_routing_wins_over_conflicting_item_id_for_tool_arguments() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_first",
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "Read"
+            }
+        })
+    );
+    let add_second = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {
+                "id": "fc_second",
+                "type": "function_call",
+                "call_id": "call_second",
+                "name": "Read"
+            }
+        })
+    );
+    let conflicting_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 2,
+            "item_id": "fc_first",
+            "delta": "{\"file_path\":\"/tmp/index-priority.txt\"}"
+        })
+    );
+    let done_second = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 2,
+            "item": {
+                "id": "fc_second",
+                "type": "function_call",
+                "call_id": "call_second",
+                "name": "Read"
+            }
+        })
+    );
+    let done_first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_first",
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "Read"
+            }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&add_first);
+    let _ = transformer.transform_sse_line(&add_second);
+    let _ = transformer.transform_sse_line(&conflicting_delta);
+    let _ = transformer.transform_sse_line(&done_second);
+    let joined = transformer.transform_sse_line(&done_first).join("");
+
+    let call_second_pos = joined
+        .find("\"id\":\"call_second\"")
+        .expect("second tool call should be emitted");
+    let path_pos = joined
+        .find("index-priority.txt")
+        .expect("argument payload should be emitted");
+
+    assert!(
+        path_pos > call_second_pos,
+        "conflicting item_id must not steal args from the output_index-matched tool call"
+    );
+}
+
+#[test]
+fn terminal_invariant_violation_emits_controlled_error_and_stop() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    transformer
+        .pending_tool_argument_updates
+        .push(PendingToolArgumentUpdate {
+            output_index: Some(999),
+            item_id: Some("orphan_item".to_string()),
+            call_id: Some("orphan_call".to_string()),
+            kind: PendingToolArgumentUpdateKind::Delta("{".to_string()),
+        });
+
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed"
+            }
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&completed).join("");
+    assert!(joined.contains("event: error"));
+    assert!(joined.contains("\"code\":\"terminal_invariant_violation\""));
+    assert!(joined.contains("\"type\":\"message_stop\""));
+}

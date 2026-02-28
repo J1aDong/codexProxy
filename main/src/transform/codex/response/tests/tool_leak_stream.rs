@@ -176,6 +176,60 @@ fn split_leaked_tool_line_across_chunks_is_suppressed() {
 }
 
 #[test]
+fn marker_newline_then_chunked_read_json_stays_suppressed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let marker_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "**Inspecting token refresh implementation** to=functions.Read\n"
+        })
+    );
+    let json_part_1 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "{\"file_path\":\"/tmp/token_refresh.dart\","
+        })
+    );
+    let json_part_2 = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "\"offset\":120,\"limit\":80}"
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed"
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&marker_line);
+    events.extend(transformer.transform_sse_line(&json_part_1));
+    events.extend(transformer.transform_sse_line(&json_part_2));
+    events.extend(transformer.transform_sse_line(&completed));
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("Inspecting token refresh implementation"),
+        "safe status prefix should remain visible"
+    );
+    assert!(
+        !joined.contains("\"file_path\"")
+            && !joined.contains("\"offset\"")
+            && !joined.contains("\"limit\"")
+            && !joined.contains("token_refresh.dart"),
+        "chunk-split read json tail should remain suppressed from visible text"
+    );
+    assert!(
+        !joined.contains("\"type\":\"tool_use\""),
+        "suppressed marker+chunked read json must not create synthetic tool_use"
+    );
+}
+
+#[test]
 fn raw_parallel_tool_json_without_marker_recovers_readonly_tool() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(
@@ -1192,7 +1246,9 @@ fn diagnostics_summary_payload_is_structured_for_log_aggregation() {
     transformer.diagnostics.assessed_raw_tool_json_fragments = 3;
     transformer.diagnostics.assessed_raw_tool_json_high_risk = 1;
     transformer.diagnostics.assessed_raw_tool_json_suppressed = 2;
-    transformer.diagnostics.dropped_high_risk_raw_tool_json_fragments = 1;
+    transformer
+        .diagnostics
+        .dropped_high_risk_raw_tool_json_fragments = 1;
     transformer.diagnostics.emitted_high_risk_leak_questions = 1;
     transformer.diagnostics.queued_orphan_tool_argument_updates = 3;
     transformer.diagnostics.applied_orphan_tool_argument_updates = 2;
@@ -1719,9 +1775,6 @@ fn contextual_note_json_leak_with_suspicious_tail_is_suppressed() {
     let events = transformer.transform_sse_line(&line);
     let joined = events.join("");
 
-    println!("DEBUG: Input delta: {}", "**Re-running targeted tests after syntax fixes****Re-running targeted tests after syntax fixes**```json\n{\"note\":\"Running tool_leak_stream, text_hygiene, request_payload again now.\"}```numerusform  天天中彩票user ");
-    println!("DEBUG: Output events: {}", joined);
-
     assert!(
         joined.contains("Re-running targeted tests after syntax fixes"),
         "normal prefix text should remain visible"
@@ -1821,12 +1874,6 @@ fn split_contextual_note_json_across_chunks_is_suppressed() {
     let events1 = transformer.transform_sse_line(&chunk1);
     let events2 = transformer.transform_sse_line(&chunk2);
     let joined = format!("{}{}", events1.join(""), events2.join(""));
-
-    println!("DEBUG: Chunk1: {}", chunk1);
-    println!("DEBUG: Chunk2: {}", chunk2);
-    println!("DEBUG: Events1: {:?}", events1);
-    println!("DEBUG: Events2: {:?}", events2);
-    println!("DEBUG: Joined output: {}", joined);
 
     assert!(
         joined.contains("Re-running targeted tests"),

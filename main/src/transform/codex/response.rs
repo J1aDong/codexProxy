@@ -58,7 +58,10 @@ struct TransformDiagnostics {
     dropped_reused_closed_call_items: u64,
     binding_conflicts_output_index: u64,
     binding_conflicts_item_id: u64,
+    normalized_item_id_mismatches: u64,
     pending_tool_backlog_trimmed: u64,
+    dropped_function_args_whitespace_overflow_fragments: u64,
+    terminal_invariant_violations: u64,
 }
 
 impl TransformDiagnostics {
@@ -86,7 +89,10 @@ impl TransformDiagnostics {
             || self.dropped_reused_closed_call_items > 0
             || self.binding_conflicts_output_index > 0
             || self.binding_conflicts_item_id > 0
+            || self.normalized_item_id_mismatches > 0
             || self.pending_tool_backlog_trimmed > 0
+            || self.dropped_function_args_whitespace_overflow_fragments > 0
+            || self.terminal_invariant_violations > 0
     }
 }
 
@@ -176,6 +182,7 @@ struct BufferedToolCall {
     call_id: String,
     name: String,
     arguments_buffer: String,
+    consecutive_whitespace_run: usize,
     done_flag: bool,
 }
 
@@ -389,6 +396,8 @@ pub struct TransformResponse {
     tool_order_by_output_index: HashMap<u64, u64>,
     tool_order_by_item_id: HashMap<String, u64>,
     tool_order_by_call_id: HashMap<String, u64>,
+    canonical_item_id_by_output_index: HashMap<u64, String>,
+    canonical_output_index_by_item_id: HashMap<String, u64>,
     closed_tool_call_ids: HashSet<String>,
     last_buffered_tool_order: Option<u64>,
     item_kind_by_output_index: HashMap<u64, UpstreamItemKind>,
@@ -427,6 +436,7 @@ pub struct TransformResponse {
 }
 
 impl TransformResponse {
+    const MAX_FUNCTION_ARGS_WHITESPACE_RUN: usize = 64;
     const LEAKED_TOOL_MARKERS: [&'static str; 3] =
         ["assistant to=", "to=functions", "to=multi_tool_use"];
 
@@ -940,6 +950,7 @@ impl TransformResponse {
             call_id: format!("call_high_risk_leak_question_{}", seq),
             name: "AskUserQuestion".to_string(),
             arguments_buffer: input.to_string(),
+            consecutive_whitespace_run: 0,
             done_flag: true,
         };
         self.emit_serialized_tool_call(output, &tool);
@@ -1001,6 +1012,7 @@ impl TransformResponse {
                 call_id,
                 name: tool_name.to_string(),
                 arguments_buffer: arguments,
+                consecutive_whitespace_run: 0,
                 done_flag: true,
             });
         }
@@ -1239,7 +1251,10 @@ impl TransformResponse {
                     if !suffix.is_empty() {
                         let cleaned_suffix = LeakDetector::strip_suspicious_trailing_noise(suffix);
                         if !cleaned_suffix.is_empty() {
-                            self.handle_text_fragment(output, &cleaned_suffix, true);
+                            // Keep post-marker suffix in pending mode instead of directly emitting.
+                            // This avoids leaking chunk-split JSON argument fragments as visible text.
+                            self.pending_tool_text = cleaned_suffix;
+                            self.process_pending_tool_text(output, false);
                         }
                     }
                     return;
@@ -1256,7 +1271,8 @@ impl TransformResponse {
                 if !suffix.is_empty() {
                     let cleaned_suffix = LeakDetector::strip_suspicious_trailing_noise(suffix);
                     if !cleaned_suffix.is_empty() {
-                        self.handle_text_fragment(output, &cleaned_suffix, true);
+                        self.pending_tool_text = cleaned_suffix;
+                        self.process_pending_tool_text(output, true);
                     }
                 }
             }
@@ -1264,7 +1280,8 @@ impl TransformResponse {
         }
 
         // 检查高置信工具参数泄漏
-        if let Some((prefix, raw_json, suffix)) = LeakDetector::split_tool_json_prefix_suffix(&pending_raw)
+        if let Some((prefix, raw_json, suffix)) =
+            LeakDetector::split_tool_json_prefix_suffix(&pending_raw)
         {
             self.diagnostics.dropped_raw_tool_json_fragments += 1;
             let assessment = LeakDetector::assess_raw_tool_json(&raw_json);
@@ -1324,7 +1341,8 @@ impl TransformResponse {
             return;
         }
 
-        if let Some(raw_json_start) = LeakDetector::find_potential_raw_tool_json_start(&pending_raw) {
+        if let Some(raw_json_start) = LeakDetector::find_potential_raw_tool_json_start(&pending_raw)
+        {
             let candidate = &pending_raw[raw_json_start..];
             let json_complete = Self::extract_first_json_object_fragment(candidate).is_some();
 
@@ -1368,6 +1386,8 @@ impl TransformResponse {
             tool_order_by_output_index: HashMap::new(),
             tool_order_by_item_id: HashMap::new(),
             tool_order_by_call_id: HashMap::new(),
+            canonical_item_id_by_output_index: HashMap::new(),
+            canonical_output_index_by_item_id: HashMap::new(),
             closed_tool_call_ids: HashSet::new(),
             last_buffered_tool_order: None,
             item_kind_by_output_index: HashMap::new(),
@@ -1439,6 +1459,46 @@ impl TransformResponse {
         }
     }
 
+    fn terminal_invariant_violation_reason(&self) -> Option<&'static str> {
+        if self.open_text_index.is_some() {
+            return Some("open_text_block");
+        }
+        if self.open_thinking_index.is_some() {
+            return Some("open_thinking_block");
+        }
+        if !self.buffered_tool_calls.is_empty() {
+            return Some("buffered_tool_calls_not_flushed");
+        }
+        if !self.pending_tool_argument_updates.is_empty() {
+            return Some("pending_tool_argument_updates_not_flushed");
+        }
+        if !self.pending_tool_text.trim().is_empty() {
+            return Some("pending_tool_text_not_flushed");
+        }
+        None
+    }
+
+    fn emit_terminal_invariant_violation_error(&mut self, output: &mut Vec<String>, reason: &str) {
+        self.diagnostics.terminal_invariant_violations += 1;
+        self.logger.log_raw(&format!(
+            "[Error] Terminal invariant violation detected before stop emission: {}",
+            reason
+        ));
+        let error_data = json!({
+            "error": {
+                "message": format!(
+                    "Response stream ended with inconsistent block state ({reason}) and was aborted for safety."
+                ),
+                "code": "terminal_invariant_violation"
+            }
+        });
+        self.emit_error_and_stop(
+            output,
+            &error_data,
+            "Response stream ended with inconsistent block state.",
+        );
+    }
+
     fn upstream_item_kind_from_type(item_type: &str) -> UpstreamItemKind {
         match item_type {
             "message" => UpstreamItemKind::Message,
@@ -1470,6 +1530,56 @@ impl TransformResponse {
         kind
     }
 
+    fn bind_output_item_identity(&mut self, output_index: Option<u64>, item_id: Option<&str>) {
+        let (Some(idx), Some(id)) = (output_index, item_id) else {
+            return;
+        };
+
+        self.canonical_output_index_by_item_id
+            .entry(id.to_string())
+            .or_insert(idx);
+
+        if let Some(canonical) = self.canonical_item_id_by_output_index.get(&idx) {
+            if canonical != id {
+                self.diagnostics.normalized_item_id_mismatches += 1;
+                self.logger.log_raw(
+                    "[Warn] Normalized mismatched item_id by output_index for stream compatibility",
+                );
+            }
+            return;
+        }
+
+        self.canonical_item_id_by_output_index
+            .insert(idx, id.to_string());
+    }
+
+    fn normalized_event_metadata(&mut self, data: &Value) -> EventMetadata {
+        let mut metadata = EventMetadata::from_data(data);
+
+        if metadata.output_index.is_none() {
+            if let Some(item_id) = metadata.item_id.as_deref() {
+                if let Some(idx) = self.canonical_output_index_by_item_id.get(item_id).copied() {
+                    metadata.output_index = Some(idx);
+                }
+            }
+        }
+
+        if let Some(idx) = metadata.output_index {
+            if let Some(canonical) = self.canonical_item_id_by_output_index.get(&idx).cloned() {
+                if metadata.item_id.as_deref() != Some(canonical.as_str()) {
+                    if metadata.item_id.is_some() {
+                        self.diagnostics.normalized_item_id_mismatches += 1;
+                    }
+                    metadata.item_id = Some(canonical);
+                }
+            } else if let Some(item_id) = metadata.item_id.as_deref() {
+                self.bind_output_item_identity(Some(idx), Some(item_id));
+            }
+        }
+
+        metadata
+    }
+
     fn clear_text_state_for_item(&mut self, output_index: Option<u64>, item_id: Option<&str>) {
         self.active_text_parts
             .retain(|key| !key.matches_item(output_index, item_id));
@@ -1483,24 +1593,42 @@ impl TransformResponse {
         item_id: Option<&str>,
         call_id: Option<&str>,
     ) {
+        let mut item_ids_to_clear: Vec<String> = Vec::new();
+
         if let Some(idx) = output_index {
             self.item_kind_by_output_index.remove(&idx);
-        }
-        if let Some(id) = item_id {
-            self.item_kind_by_item_id.remove(id);
+            if let Some(canonical_item_id) = self.canonical_item_id_by_output_index.remove(&idx) {
+                item_ids_to_clear.push(canonical_item_id);
+            }
         }
         if let Some(cid) = call_id {
             self.item_kind_by_call_id.remove(cid);
         }
+        if let Some(id) = item_id {
+            item_ids_to_clear.push(id.to_string());
+        }
 
-        self.clear_text_state_for_item(output_index, item_id);
+        item_ids_to_clear.sort_unstable();
+        item_ids_to_clear.dedup();
+        for id in &item_ids_to_clear {
+            self.item_kind_by_item_id.remove(id);
+            self.canonical_output_index_by_item_id.remove(id);
+        }
+
+        if item_ids_to_clear.is_empty() {
+            self.clear_text_state_for_item(output_index, None);
+        } else {
+            for id in &item_ids_to_clear {
+                self.clear_text_state_for_item(output_index, Some(id.as_str()));
+            }
+        }
     }
 
     fn lookup_item_kind(&self, metadata: &EventMetadata) -> Option<UpstreamItemKind> {
         metadata
-            .item_id
+            .call_id
             .as_deref()
-            .and_then(|id| self.item_kind_by_item_id.get(id).copied())
+            .and_then(|cid| self.item_kind_by_call_id.get(cid).copied())
             .or_else(|| {
                 metadata
                     .output_index
@@ -1508,9 +1636,9 @@ impl TransformResponse {
             })
             .or_else(|| {
                 metadata
-                    .call_id
+                    .item_id
                     .as_deref()
-                    .and_then(|cid| self.item_kind_by_call_id.get(cid).copied())
+                    .and_then(|id| self.item_kind_by_item_id.get(id).copied())
             })
     }
 
@@ -1630,14 +1758,14 @@ impl TransformResponse {
         item_id: Option<String>,
         call_id: String,
         name: String,
-    ) {
+    ) -> Option<u64> {
         if let Some(existing_order) = self.tool_order_by_call_id.get(&call_id).copied() {
             self.diagnostics.duplicate_active_call_items += 1;
             self.logger.log_raw(
                 "[Warn] Duplicate function_call item for active call_id; reusing existing buffered call",
             );
             self.backfill_tool_metadata_bindings(existing_order, output_index, item_id.as_deref());
-            return;
+            return Some(existing_order);
         }
 
         if self.closed_tool_call_ids.contains(call_id.as_str()) {
@@ -1645,7 +1773,7 @@ impl TransformResponse {
             self.logger.log_raw(
                 "[Warn] Dropping function_call item because call_id was already closed in this response",
             );
-            return;
+            return None;
         }
 
         let order_key = self.next_tool_order_key;
@@ -1679,11 +1807,13 @@ impl TransformResponse {
             call_id,
             name,
             arguments_buffer: String::new(),
+            consecutive_whitespace_run: 0,
             done_flag: false,
         });
         self.sort_buffered_tools();
         self.saw_tool_call = true;
         self.transition_to(StreamPhase::BufferingToolCalls);
+        Some(order_key)
     }
 
     fn find_buffered_tool_order_from_metadata(
@@ -1692,12 +1822,17 @@ impl TransformResponse {
         item_id: Option<&str>,
         call_id: Option<&str>,
     ) -> Option<u64> {
+        let normalized_output_index = output_index.or_else(|| {
+            item_id.and_then(|id| self.canonical_output_index_by_item_id.get(id).copied())
+        });
+
         call_id
             .and_then(|id| self.tool_order_by_call_id.get(id).copied())
-            .or_else(|| item_id.and_then(|id| self.tool_order_by_item_id.get(id).copied()))
             .or_else(|| {
-                output_index.and_then(|idx| self.tool_order_by_output_index.get(&idx).copied())
+                normalized_output_index
+                    .and_then(|idx| self.tool_order_by_output_index.get(&idx).copied())
             })
+            .or_else(|| item_id.and_then(|id| self.tool_order_by_item_id.get(id).copied()))
             .or_else(|| {
                 if self.buffered_tool_calls.len() == 1 {
                     self.buffered_tool_calls.first().map(|tool| tool.order_key)
@@ -1707,19 +1842,13 @@ impl TransformResponse {
             })
     }
 
-    fn find_buffered_tool_order(&self, data: &Value) -> Option<u64> {
-        let output_index = data.get("output_index").and_then(|v| v.as_u64());
-        let item_id = data.get("item_id").and_then(|v| v.as_str()).or_else(|| {
-            data.get("item")
-                .and_then(|v| v.get("id"))
-                .and_then(|v| v.as_str())
-        });
-        let call_id = data.get("call_id").and_then(|v| v.as_str()).or_else(|| {
-            data.get("item")
-                .and_then(|v| v.get("call_id"))
-                .and_then(|v| v.as_str())
-        });
-        self.find_buffered_tool_order_from_metadata(output_index, item_id, call_id)
+    fn find_buffered_tool_order(&mut self, data: &Value) -> Option<u64> {
+        let metadata = self.normalized_event_metadata(data);
+        self.find_buffered_tool_order_from_metadata(
+            metadata.output_index,
+            metadata.item_id.as_deref(),
+            metadata.call_id.as_deref(),
+        )
     }
 
     fn queue_pending_tool_argument_update(
@@ -1727,7 +1856,7 @@ impl TransformResponse {
         data: &Value,
         kind: PendingToolArgumentUpdateKind,
     ) {
-        let metadata = EventMetadata::from_data(data);
+        let metadata = self.normalized_event_metadata(data);
         if !metadata.has_routing_hint() {
             self.diagnostics
                 .dropped_orphan_tool_argument_updates_no_hint += 1;
@@ -1766,9 +1895,9 @@ impl TransformResponse {
             .log_raw("[Info] Queued orphan tool arguments event waiting for function_call item");
     }
 
-    fn apply_pending_tool_argument_updates(&mut self) {
+    fn apply_pending_tool_argument_updates(&mut self) -> bool {
         if self.pending_tool_argument_updates.is_empty() {
-            return;
+            return false;
         }
 
         let mut remaining = Vec::with_capacity(self.pending_tool_argument_updates.len());
@@ -1791,11 +1920,17 @@ impl TransformResponse {
             if let Some(order_key) = order_key {
                 match pending.kind {
                     PendingToolArgumentUpdateKind::Delta(delta) => {
-                        self.append_tool_arguments_delta(order_key, &delta);
+                        if self.append_tool_arguments_delta(order_key, &delta) {
+                            self.pending_tool_argument_updates.clear();
+                            return true;
+                        }
                         self.diagnostics.applied_orphan_tool_argument_updates += 1;
                     }
                     PendingToolArgumentUpdateKind::Snapshot(arguments) => {
-                        self.apply_tool_arguments_snapshot(order_key, &arguments);
+                        if self.apply_tool_arguments_snapshot(order_key, &arguments) {
+                            self.pending_tool_argument_updates.clear();
+                            return true;
+                        }
                         self.diagnostics.applied_orphan_tool_argument_updates += 1;
                     }
                 }
@@ -1804,6 +1939,7 @@ impl TransformResponse {
             }
         }
         self.pending_tool_argument_updates = remaining;
+        false
     }
 
     fn get_buffered_tool_mut(&mut self, order_key: u64) -> Option<&mut BufferedToolCall> {
@@ -1812,34 +1948,90 @@ impl TransformResponse {
             .find(|tool| tool.order_key == order_key)
     }
 
-    fn append_tool_arguments_delta(&mut self, order_key: u64, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
-        if let Some(tool) = self.get_buffered_tool_mut(order_key) {
-            tool.arguments_buffer.push_str(delta);
-        }
+    fn is_function_args_whitespace(ch: char) -> bool {
+        matches!(ch, ' ' | '\n' | '\r' | '\t')
     }
 
-    fn apply_tool_arguments_snapshot(&mut self, order_key: u64, full_arguments: &str) {
+    fn advance_whitespace_run(mut current_run: usize, text: &str) -> (usize, bool) {
+        for ch in text.chars() {
+            if Self::is_function_args_whitespace(ch) {
+                current_run += 1;
+                if current_run > Self::MAX_FUNCTION_ARGS_WHITESPACE_RUN {
+                    return (current_run, true);
+                }
+            } else {
+                current_run = 0;
+            }
+        }
+        (current_run, false)
+    }
+
+    fn trailing_whitespace_run(text: &str) -> usize {
+        text.chars()
+            .rev()
+            .take_while(|ch| Self::is_function_args_whitespace(*ch))
+            .count()
+    }
+
+    fn record_function_args_whitespace_overflow(&mut self) {
+        self.diagnostics
+            .dropped_function_args_whitespace_overflow_fragments += 1;
+        self.logger.log_raw(
+            "[Warn] Dropping function_call_arguments fragment due to whitespace flood overflow",
+        );
+    }
+
+    fn append_tool_arguments_delta(&mut self, order_key: u64, delta: &str) -> bool {
+        if delta.is_empty() {
+            return false;
+        }
+        if let Some(tool) = self.get_buffered_tool_mut(order_key) {
+            let (next_run, overflow) =
+                Self::advance_whitespace_run(tool.consecutive_whitespace_run, delta);
+            if overflow {
+                self.record_function_args_whitespace_overflow();
+                return true;
+            }
+            tool.arguments_buffer.push_str(delta);
+            tool.consecutive_whitespace_run = next_run;
+        }
+        false
+    }
+
+    fn apply_tool_arguments_snapshot(&mut self, order_key: u64, full_arguments: &str) -> bool {
         if full_arguments.is_empty() {
-            return;
+            return false;
         }
         if let Some(tool) = self.get_buffered_tool_mut(order_key) {
             if full_arguments.starts_with(tool.arguments_buffer.as_str()) {
                 let suffix = &full_arguments[tool.arguments_buffer.len()..];
                 if !suffix.is_empty() {
+                    let (next_run, overflow) =
+                        Self::advance_whitespace_run(tool.consecutive_whitespace_run, suffix);
+                    if overflow {
+                        self.record_function_args_whitespace_overflow();
+                        return true;
+                    }
                     tool.arguments_buffer.push_str(suffix);
+                    tool.consecutive_whitespace_run = next_run;
                 }
-                return;
+                return false;
             }
 
             if tool.arguments_buffer.starts_with(full_arguments) {
-                return;
+                return false;
+            }
+
+            let trailing_run = Self::trailing_whitespace_run(full_arguments);
+            if trailing_run > Self::MAX_FUNCTION_ARGS_WHITESPACE_RUN {
+                self.record_function_args_whitespace_overflow();
+                return true;
             }
 
             tool.arguments_buffer = full_arguments.to_string();
+            tool.consecutive_whitespace_run = trailing_run;
         }
+        false
     }
 
     fn mark_buffered_tool_done(&mut self, order_key: u64) {
@@ -1900,8 +2092,14 @@ impl TransformResponse {
         ));
     }
 
-    fn flush_serialized_tool_calls(&mut self, output: &mut Vec<String>, include_incomplete: bool) {
-        self.apply_pending_tool_argument_updates();
+    fn flush_serialized_tool_calls(
+        &mut self,
+        output: &mut Vec<String>,
+        include_incomplete: bool,
+    ) -> bool {
+        if self.apply_pending_tool_argument_updates() {
+            return true;
+        }
         loop {
             let should_flush_front = self
                 .buffered_tool_calls
@@ -1920,6 +2118,7 @@ impl TransformResponse {
         if !self.has_open_tool_block() {
             self.flush_deferred_unscoped_text(output, false);
         }
+        false
     }
 
     fn buffer_deferred_unscoped_text(&mut self, fragment: &str) {
@@ -2111,7 +2310,8 @@ impl TransformResponse {
 
                 // 检查剩余内容是否是可疑的尾巴噪声
                 if !remaining.is_empty() {
-                    let cleaned_remaining = LeakDetector::strip_suspicious_trailing_noise(remaining);
+                    let cleaned_remaining =
+                        LeakDetector::strip_suspicious_trailing_noise(remaining);
                     if !cleaned_remaining.is_empty() {
                         self.handle_text_fragment(output, &cleaned_remaining, emit_plain_text);
                     } else {
@@ -2149,7 +2349,8 @@ impl TransformResponse {
             return;
         }
 
-        if let Some((marker_start, marker_len)) = LeakDetector::find_markdown_bash_start(&combined) {
+        if let Some((marker_start, marker_len)) = LeakDetector::find_markdown_bash_start(&combined)
+        {
             let prefix_text = &combined[..marker_start];
             let after_marker = &combined[marker_start + marker_len..];
 
@@ -2176,7 +2377,8 @@ impl TransformResponse {
             return;
         }
 
-        if let Some(marker_start) = LeakDetector::find_potential_leaked_tool_marker_start(&combined) {
+        if let Some(marker_start) = LeakDetector::find_potential_leaked_tool_marker_start(&combined)
+        {
             let (prefix_text, leaked_fragment) = combined.split_at(marker_start);
             if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
@@ -2191,7 +2393,8 @@ impl TransformResponse {
         if let Some(raw_json_start) = LeakDetector::find_potential_raw_tool_json_start(&combined) {
             let (prefix_text, leaked_fragment) = combined.split_at(raw_json_start);
             if emit_plain_text && !self.has_open_tool_block() && !prefix_text.is_empty() {
-                let cleaned_prefix = LeakDetector::sanitize_prefix_before_raw_tool_json(prefix_text);
+                let cleaned_prefix =
+                    LeakDetector::sanitize_prefix_before_raw_tool_json(prefix_text);
                 if !cleaned_prefix.is_empty() {
                     self.emit_plain_text_fragment(output, &cleaned_prefix);
                 }
@@ -2434,6 +2637,7 @@ impl TransformResponse {
             call_id,
             name,
             arguments_buffer: arguments,
+            consecutive_whitespace_run: 0,
             done_flag: true,
         };
         self.saw_tool_call = true;
@@ -2454,7 +2658,8 @@ impl TransformResponse {
 
         let carryover = std::mem::take(&mut self.text_carryover);
 
-        if let Some((marker_start, marker_len)) = LeakDetector::find_markdown_bash_start(&carryover) {
+        if let Some((marker_start, marker_len)) = LeakDetector::find_markdown_bash_start(&carryover)
+        {
             let prefix_text = &carryover[..marker_start];
             let after_marker = &carryover[marker_start + marker_len..];
 
@@ -2467,7 +2672,9 @@ impl TransformResponse {
             return;
         }
 
-        if let Some(marker_start) = LeakDetector::find_potential_leaked_tool_marker_start(&carryover) {
+        if let Some(marker_start) =
+            LeakDetector::find_potential_leaked_tool_marker_start(&carryover)
+        {
             let (prefix_text, leaked_fragment) = carryover.split_at(marker_start);
             if !self.has_open_tool_block() && !prefix_text.is_empty() {
                 self.emit_plain_text_fragment(output, prefix_text);
@@ -2478,7 +2685,9 @@ impl TransformResponse {
         }
 
         // 检查高置信工具参数泄漏
-        if let Some((prefix, raw_json, suffix)) = LeakDetector::split_tool_json_prefix_suffix(&carryover) {
+        if let Some((prefix, raw_json, suffix)) =
+            LeakDetector::split_tool_json_prefix_suffix(&carryover)
+        {
             self.diagnostics.dropped_raw_tool_json_fragments += 1;
             let assessment = LeakDetector::assess_raw_tool_json(&raw_json);
             self.record_raw_tool_json_assessment(assessment);
@@ -2596,7 +2805,10 @@ impl TransformResponse {
                 "dropped_reused_closed_call_items": self.diagnostics.dropped_reused_closed_call_items,
                 "binding_conflicts_output_index": self.diagnostics.binding_conflicts_output_index,
                 "binding_conflicts_item_id": self.diagnostics.binding_conflicts_item_id,
+                "normalized_item_id_mismatches": self.diagnostics.normalized_item_id_mismatches,
                 "pending_tool_backlog_trimmed": self.diagnostics.pending_tool_backlog_trimmed,
+                "dropped_function_args_whitespace_overflow_fragments": self.diagnostics.dropped_function_args_whitespace_overflow_fragments,
+                "terminal_invariant_violations": self.diagnostics.terminal_invariant_violations,
                 "pending_orphan_updates": self.pending_tool_argument_updates.len()
             }
         })
@@ -2684,10 +2896,18 @@ impl TransformResponse {
 
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
-        self.flush_serialized_tool_calls(output, true);
+        if self.flush_serialized_tool_calls(output, true) {
+            self.emit_function_args_whitespace_overflow_error(output);
+            return;
+        }
         self.flush_deferred_unscoped_text(output, true);
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
+
+        if let Some(reason) = self.terminal_invariant_violation_reason() {
+            self.emit_terminal_invariant_violation_error(output, reason);
+            return;
+        }
 
         let stop_reason = self.determine_stop_reason(data, force_incomplete);
 
@@ -2766,7 +2986,7 @@ impl TransformResponse {
 
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
-        self.flush_serialized_tool_calls(output, true);
+        let _ = self.flush_serialized_tool_calls(output, true);
         self.flush_deferred_unscoped_text(output, true);
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
@@ -2798,6 +3018,20 @@ impl TransformResponse {
         self.last_terminal_event = Some("response.failed_or_error".to_string());
         self.log_diagnostics_summary("response.failed_or_error");
         self.transition_to(StreamPhase::Terminal);
+    }
+
+    fn emit_function_args_whitespace_overflow_error(&mut self, output: &mut Vec<String>) {
+        let error_data = json!({
+            "error": {
+                "message": "Function arguments stream contained excessive consecutive whitespace and was aborted for safety.",
+                "code": "function_args_whitespace_overflow"
+            }
+        });
+        self.emit_error_and_stop(
+            output,
+            &error_data,
+            "Function arguments stream exceeded whitespace safety threshold.",
+        );
     }
 
     pub fn transform_sse_line(&mut self, line: &str) -> Vec<String> {
@@ -2836,7 +3070,7 @@ impl TransformResponse {
         match event_type {
             // 纯文本输出 - 严格控制，只在非工具场景下开启文本块
             "response.output_text.delta" => {
-                let metadata = EventMetadata::from_data(&data);
+                let metadata = self.normalized_event_metadata(&data);
                 let part_key = metadata.part_key();
                 self.register_text_part_if_scoped(&part_key);
                 let routing = self.decide_text_routing(&metadata);
@@ -2870,7 +3104,7 @@ impl TransformResponse {
 
             // 新版事件：内容分片直接挂在 content_part.added
             "response.content_part.added" => {
-                let metadata = EventMetadata::from_data(&data);
+                let metadata = self.normalized_event_metadata(&data);
                 let part_key = metadata.part_key();
                 if let Some(fragment) = Self::extract_content_part_text(&data) {
                     self.register_text_part_if_scoped(&part_key);
@@ -2901,7 +3135,7 @@ impl TransformResponse {
 
             // 文本分片结束：如果 pending 里还有疑似工具泄露，立即按边界强制 flush
             "response.output_text.done" => {
-                let metadata = EventMetadata::from_data(&data);
+                let metadata = self.normalized_event_metadata(&data);
                 let part_key = metadata.part_key();
                 self.flush_text_carryover(&mut output);
                 match self.decide_text_routing(&metadata) {
@@ -2928,7 +3162,7 @@ impl TransformResponse {
             }
 
             "response.content_part.done" => {
-                let metadata = EventMetadata::from_data(&data);
+                let metadata = self.normalized_event_metadata(&data);
                 let part_key = metadata.part_key();
                 self.flush_text_carryover(&mut output);
                 if !self.pending_tool_text.is_empty() {
@@ -2998,10 +3232,11 @@ impl TransformResponse {
                 self.flush_pending_tool_text(&mut output);
                 self.close_open_thinking_block(&mut output);
                 if let Some(item) = data.get("item") {
+                    let metadata = self.normalized_event_metadata(&data);
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    let output_index = data.get("output_index").and_then(|v| v.as_u64());
-                    let item_id = item.get("id").and_then(|v| v.as_str());
-                    let call_id = item.get("call_id").and_then(|v| v.as_str());
+                    let output_index = metadata.output_index;
+                    let item_id = metadata.item_id.as_deref();
+                    let call_id = metadata.call_id.as_deref();
                     self.register_output_item_kind(output_index, item_id, call_id, item_type);
 
                     match item_type {
@@ -3022,12 +3257,14 @@ impl TransformResponse {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("unknown")
                                 .to_string();
-                            let item_id = item
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
+                            let normalized_item_id = item_id.map(|s| s.to_string());
 
-                            self.buffer_tool_call(output_index, item_id, call_id.clone(), name);
+                            let _ = self.buffer_tool_call(
+                                output_index,
+                                normalized_item_id.clone(),
+                                call_id.clone(),
+                                name,
+                            );
 
                             if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str())
                             {
@@ -3035,15 +3272,24 @@ impl TransformResponse {
                                     if let Some(order_key) = self
                                         .find_buffered_tool_order_from_metadata(
                                             output_index,
-                                            item.get("id").and_then(|v| v.as_str()),
+                                            normalized_item_id.as_deref(),
                                             Some(call_id.as_str()),
                                         )
                                     {
-                                        self.apply_tool_arguments_snapshot(order_key, arguments);
+                                        if self.apply_tool_arguments_snapshot(order_key, arguments)
+                                        {
+                                            self.emit_function_args_whitespace_overflow_error(
+                                                &mut output,
+                                            );
+                                            return output;
+                                        }
                                     }
                                 }
                             }
-                            self.apply_pending_tool_argument_updates();
+                            if self.apply_pending_tool_argument_updates() {
+                                self.emit_function_args_whitespace_overflow_error(&mut output);
+                                return output;
+                            }
                         }
                         "message" => {
                             self.saw_message_item_added = true;
@@ -3076,7 +3322,10 @@ impl TransformResponse {
 
                 if !delta.is_empty() {
                     if let Some(order_key) = self.find_buffered_tool_order(&data) {
-                        self.append_tool_arguments_delta(order_key, delta);
+                        if self.append_tool_arguments_delta(order_key, delta) {
+                            self.emit_function_args_whitespace_overflow_error(&mut output);
+                            return output;
+                        }
                     } else {
                         self.queue_pending_tool_argument_update(
                             &data,
@@ -3093,7 +3342,10 @@ impl TransformResponse {
                 let full_arguments = data.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
                 if !full_arguments.is_empty() {
                     if let Some(order_key) = self.find_buffered_tool_order(&data) {
-                        self.apply_tool_arguments_snapshot(order_key, full_arguments);
+                        if self.apply_tool_arguments_snapshot(order_key, full_arguments) {
+                            self.emit_function_args_whitespace_overflow_error(&mut output);
+                            return output;
+                        }
                     } else {
                         self.queue_pending_tool_argument_update(
                             &data,
@@ -3108,18 +3360,20 @@ impl TransformResponse {
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 self.close_open_thinking_block(&mut output);
-                self.apply_pending_tool_argument_updates();
+                if self.apply_pending_tool_argument_updates() {
+                    self.emit_function_args_whitespace_overflow_error(&mut output);
+                    return output;
+                }
 
-                let output_index = data.get("output_index").and_then(|v| v.as_u64());
+                let metadata = self.normalized_event_metadata(&data);
+                let output_index = metadata.output_index;
                 let item = data.get("item");
                 let item_type = item
                     .and_then(|it| it.get("type"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let item_id = item.and_then(|it| it.get("id")).and_then(|v| v.as_str());
-                let call_id = item
-                    .and_then(|it| it.get("call_id"))
-                    .and_then(|v| v.as_str());
+                let item_id = metadata.item_id.as_deref();
+                let call_id = metadata.call_id.as_deref();
 
                 self.clear_output_item_kind(output_index, item_id, call_id);
                 if self.active_text_parts.is_empty() {
@@ -3137,7 +3391,10 @@ impl TransformResponse {
                                 item_id,
                                 call_id,
                             ) {
-                                self.apply_tool_arguments_snapshot(order_key, full_arguments);
+                                if self.apply_tool_arguments_snapshot(order_key, full_arguments) {
+                                    self.emit_function_args_whitespace_overflow_error(&mut output);
+                                    return output;
+                                }
                             }
                         }
 
@@ -3152,7 +3409,10 @@ impl TransformResponse {
                             let order_key = self.buffered_tool_calls[0].order_key;
                             self.mark_buffered_tool_done(order_key);
                         }
-                        self.flush_serialized_tool_calls(&mut output, false);
+                        if self.flush_serialized_tool_calls(&mut output, false) {
+                            self.emit_function_args_whitespace_overflow_error(&mut output);
+                            return output;
+                        }
                     }
                     "message" => {
                         self.in_commentary_phase = false;
@@ -3171,7 +3431,10 @@ impl TransformResponse {
                             ) {
                                 self.mark_buffered_tool_done(order_key);
                             }
-                            self.flush_serialized_tool_calls(&mut output, false);
+                            if self.flush_serialized_tool_calls(&mut output, false) {
+                                self.emit_function_args_whitespace_overflow_error(&mut output);
+                                return output;
+                            }
                         }
                     }
                 }

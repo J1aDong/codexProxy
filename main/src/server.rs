@@ -117,8 +117,6 @@ struct RuntimeConfigState {
     stream_silence_warn_ms: u64,
     stream_silence_error_ms: u64,
     stall_timeout_ms: u64,
-    enable_empty_completion_retry: bool,
-    empty_completion_retry_max_attempts: u32,
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
     enable_sibling_tool_error_retry: bool,
@@ -145,8 +143,6 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             stream_silence_warn_ms: value.stream_silence_warn_ms,
             stream_silence_error_ms: value.stream_silence_error_ms,
             stall_timeout_ms: value.stall_timeout_ms,
-            enable_empty_completion_retry: value.enable_empty_completion_retry,
-            empty_completion_retry_max_attempts: value.empty_completion_retry_max_attempts,
             enable_incomplete_stream_retry: value.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: value.incomplete_stream_retry_max_attempts,
             enable_sibling_tool_error_retry: value.enable_sibling_tool_error_retry,
@@ -373,8 +369,6 @@ struct StreamRuntimeOptions {
     stream_silence_warn_ms: u64,
     stream_silence_error_ms: u64,
     stall_timeout_ms: u64,
-    enable_empty_completion_retry: bool,
-    empty_completion_retry_max_attempts: u32,
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
     enable_sibling_tool_error_retry: bool,
@@ -395,8 +389,6 @@ impl StreamRuntimeOptions {
             stream_silence_warn_ms: state.stream_silence_warn_ms,
             stream_silence_error_ms: state.stream_silence_error_ms,
             stall_timeout_ms: state.stall_timeout_ms,
-            enable_empty_completion_retry: state.enable_empty_completion_retry,
-            empty_completion_retry_max_attempts: state.empty_completion_retry_max_attempts,
             enable_incomplete_stream_retry: state.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: state.incomplete_stream_retry_max_attempts,
             enable_sibling_tool_error_retry: state.enable_sibling_tool_error_retry,
@@ -600,6 +592,7 @@ impl StreamEventCounters {
 fn observe_upstream_chunk_events(
     chunk: &str,
     saw_response_completed: &mut bool,
+    saw_response_incomplete: &mut bool,
     saw_response_failed: &mut bool,
     saw_sibling_tool_call_error: &mut bool,
     upstream_error_event_type: &mut Option<String>,
@@ -615,6 +608,7 @@ fn observe_upstream_chunk_events(
         counters.mark_response_completed();
     }
     if upstream_chunk_contains_event(chunk, "response.incomplete") {
+        *saw_response_incomplete = true;
         *saw_response_completed = true;
         counters.mark_response_incomplete();
     }
@@ -652,6 +646,7 @@ fn observe_upstream_chunk_events(
 fn derive_stream_close_cause(
     explicit_cause: Option<&str>,
     saw_response_completed: bool,
+    saw_response_incomplete: bool,
     saw_response_failed: bool,
     saw_message_stop: bool,
 ) -> String {
@@ -660,6 +655,12 @@ fn derive_stream_close_cause(
     }
     if saw_response_failed {
         return "response_failed".to_string();
+    }
+    if saw_response_incomplete && saw_message_stop {
+        return "response_incomplete".to_string();
+    }
+    if saw_response_incomplete {
+        return "response_incomplete_without_message_stop".to_string();
     }
     if saw_response_completed && saw_message_stop {
         return "completed".to_string();
@@ -678,6 +679,7 @@ fn emit_stream_terminal_summary(
     counters: &StreamEventCounters,
     metrics: &StreamMetrics,
     saw_response_completed: bool,
+    saw_response_incomplete: bool,
     saw_response_failed: bool,
     saw_message_stop: bool,
     emitted_business_event: bool,
@@ -691,6 +693,7 @@ fn emit_stream_terminal_summary(
         "close_cause": close_cause,
         "flags": {
             "saw_response_completed": saw_response_completed,
+            "saw_response_incomplete": saw_response_incomplete,
             "saw_response_failed": saw_response_failed,
             "saw_message_stop": saw_message_stop,
             "emitted_business_event": emitted_business_event,
@@ -1045,16 +1048,24 @@ fn chunk_is_message_stop(output: &str) -> bool {
         .unwrap_or_else(|| output.contains("event: message_stop"))
 }
 
+fn should_drop_post_message_stop_output(output: &str) -> bool {
+    if output.trim_start().starts_with(':') {
+        return false;
+    }
+    parse_sse_chunk(output)
+        .map(|(event, _)| event != "ping")
+        .unwrap_or(false)
+}
+
 fn should_suppress_premature_message_stop(
     output: &str,
     is_codex_stream: bool,
     saw_response_completed: bool,
+    saw_response_incomplete: bool,
     saw_response_failed: bool,
 ) -> bool {
-    is_codex_stream
-        && chunk_is_message_stop(output)
-        && !saw_response_completed
-        && !saw_response_failed
+    let saw_terminal = saw_response_completed || saw_response_incomplete || saw_response_failed;
+    is_codex_stream && chunk_is_message_stop(output) && !saw_terminal
 }
 
 fn should_drop_duplicate_message_start(
@@ -1085,12 +1096,17 @@ fn is_business_stream_output(chunk: &str) -> bool {
             .and_then(|v| v.as_str())
             .map(|kind| matches!(kind, "text" | "tool_use" | "thinking"))
             .unwrap_or(false),
-        "content_block_delta" => payload
-            .get("delta")
-            .and_then(|v| v.get("type"))
-            .and_then(|v| v.as_str())
-            .map(|kind| matches!(kind, "text_delta" | "input_json_delta" | "thinking_delta"))
-            .unwrap_or(false),
+        "content_block_delta" => {
+            let delta = payload.get("delta");
+            let kind = delta
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match kind {
+                "text_delta" | "input_json_delta" | "thinking_delta" => true,
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -1138,6 +1154,20 @@ fn should_skip_transformed_output(
                     ),
                 );
                 decision.logged_premature_stop_suppression = true;
+            }
+            true
+        }
+        OutputDisposition::SkipPostMessageStopOutput => {
+            if !decision.logged_post_message_stop_drop {
+                emit_stream_diag(
+                    log_tx,
+                    logger,
+                    format!(
+                        "[Stream] #{} drop_post_message_stop_output=true",
+                        request_id
+                    ),
+                );
+                decision.logged_post_message_stop_drop = true;
             }
             true
         }
@@ -1399,6 +1429,84 @@ fn inject_retry_no_tool_text_mix_guardrail(body: &Value) -> Option<Value> {
 
     obj.insert("instructions".to_string(), json!(merged));
     Some(next)
+}
+
+struct StreamRetrySuccess {
+    response: reqwest::Response,
+    status: u16,
+    session_id: String,
+}
+
+async fn execute_stream_retry_request(
+    request_backend: &Arc<dyn TransformBackend>,
+    http_client: &reqwest::Client,
+    upstream_url: &str,
+    upstream_api_key: &str,
+    upstream_body: &Value,
+    anthropic_version: &str,
+    anthropic_beta: Option<&str>,
+    request_id: &str,
+    retry_label: &str,
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+) -> Option<StreamRetrySuccess> {
+    let retry_session_id = Uuid::new_v4().to_string();
+    let retry_req = request_backend.build_upstream_request(
+        http_client,
+        upstream_url,
+        upstream_api_key,
+        upstream_body,
+        &retry_session_id,
+        anthropic_version,
+    );
+    let retry_req = if let Some(beta) = anthropic_beta {
+        retry_req.header("anthropic-beta", beta)
+    } else {
+        retry_req
+    };
+
+    match retry_req.send().await {
+        Ok(retry_response) => {
+            let retry_status = retry_response.status().as_u16();
+            if retry_response.status().is_success() {
+                emit_stream_diag(
+                    log_tx,
+                    logger,
+                    format!(
+                        "[Stream] #{} {}_succeeded status={}",
+                        request_id, retry_label, retry_status
+                    ),
+                );
+                Some(StreamRetrySuccess {
+                    response: retry_response,
+                    status: retry_status,
+                    session_id: retry_session_id,
+                })
+            } else {
+                let retry_error = retry_response.text().await.unwrap_or_default();
+                emit_stream_diag(
+                    log_tx,
+                    logger,
+                    format!(
+                        "[Stream] #{} {}_failed status={} body={}",
+                        request_id, retry_label, retry_status, retry_error
+                    ),
+                );
+                None
+            }
+        }
+        Err(err) => {
+            emit_stream_diag(
+                log_tx,
+                logger,
+                format!(
+                    "[Stream] #{} {}_failed network_error={}",
+                    request_id, retry_label, err
+                ),
+            );
+            None
+        }
+    }
 }
 
 fn extract_upstream_error_details(chunk: &str) -> Option<(String, Option<String>, Option<String>)> {
@@ -1879,6 +1987,74 @@ fn set_model_cooldown(cooldowns: &Arc<Mutex<HashMap<String, Instant>>>, model: &
             Instant::now() + Duration::from_secs(seconds),
         );
     }
+}
+
+const ENDPOINT_PARALLEL_TOOL_DEGRADE_SECONDS: u64 = 300;
+
+fn build_parallel_tool_degrade_key(
+    route: Option<&ResolvedEndpoint>,
+    target_url: &str,
+    converter: &str,
+    model: &str,
+) -> String {
+    if let Some(route) = route {
+        return format!("lb:{}", route.route_key);
+    }
+    format!(
+        "single:{}:{}:{}",
+        converter.to_ascii_lowercase(),
+        model.to_ascii_lowercase(),
+        strip_query(target_url.to_string())
+    )
+}
+
+fn get_parallel_tool_degrade_remaining_seconds(
+    degrade_map: &Arc<Mutex<HashMap<String, Instant>>>,
+    key: &str,
+) -> Option<u64> {
+    let mut map = degrade_map.lock().ok()?;
+    let until = *map.get(key)?;
+    let now = Instant::now();
+    if until <= now {
+        map.remove(key);
+        return None;
+    }
+    Some(until.saturating_duration_since(now).as_secs().max(1))
+}
+
+fn mark_parallel_tool_degrade(
+    degrade_map: &Arc<Mutex<HashMap<String, Instant>>>,
+    key: &str,
+    seconds: u64,
+) {
+    if seconds == 0 {
+        return;
+    }
+    if let Ok(mut map) = degrade_map.lock() {
+        map.insert(
+            key.to_string(),
+            Instant::now() + Duration::from_secs(seconds),
+        );
+    }
+}
+
+fn mark_parallel_tool_degrade_and_log(
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+    request_id: &str,
+    degrade_map: &Arc<Mutex<HashMap<String, Instant>>>,
+    key: &str,
+    reason: &str,
+) {
+    mark_parallel_tool_degrade(degrade_map, key, ENDPOINT_PARALLEL_TOOL_DEGRADE_SECONDS);
+    emit_stream_diag(
+        log_tx,
+        logger,
+        format!(
+            "[Stream] #{} endpoint_parallel_tool_degrade_marked key={} reason={} ttl={}s",
+            request_id, key, reason, ENDPOINT_PARALLEL_TOOL_DEGRADE_SECONDS
+        ),
+    );
 }
 
 fn strip_query(url: String) -> String {
@@ -2493,6 +2669,8 @@ impl ProxyServer {
 
         let model_cooldowns: Arc<Mutex<HashMap<String, Instant>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let parallel_tool_degrade_until: Arc<Mutex<HashMap<String, Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let runtime_handle = ProxyRuntimeHandle {
             state: Arc::new(RwLock::new(RuntimeConfigState::from(self.runtime_update()))),
         };
@@ -2549,6 +2727,8 @@ impl ProxyServer {
                                 let http_client = Arc::clone(&http_client);
                                 let semaphore = semaphore.clone();
                                 let model_cooldowns = Arc::clone(&model_cooldowns);
+                                let parallel_tool_degrade_until =
+                                    Arc::clone(&parallel_tool_degrade_until);
                                 let runtime_handle = runtime_handle_for_server.clone();
                                 let log_tx = log_tx.clone();
                                 let log_tx_for_request = log_tx.clone();
@@ -2568,6 +2748,7 @@ impl ProxyServer {
                                             Arc::clone(&http_client),
                                             semaphore.clone(),
                                             Arc::clone(&model_cooldowns),
+                                            Arc::clone(&parallel_tool_degrade_until),
                                             log_tx_for_request.clone(),
                                         )
                                     });
@@ -2626,6 +2807,7 @@ async fn handle_request(
     http_client: Arc<reqwest::Client>,
     semaphore: Option<Arc<Semaphore>>,
     model_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
+    parallel_tool_degrade_until: Arc<Mutex<HashMap<String, Instant>>>,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path().to_string();
@@ -3149,6 +3331,7 @@ async fn handle_request(
     let mut successful_resolved_target_url = String::new();
     let mut successful_api_key = String::new();
     let mut successful_upstream_body: Option<Value> = None;
+    let mut successful_parallel_tool_degrade_key: Option<String> = None;
     let mut successful_session_id = String::new();
 
     while attempt_index < max_lb_attempts {
@@ -3212,6 +3395,12 @@ async fn handle_request(
             &route_selection.converter,
             &route_selection.target_url,
             UpstreamOperation::Messages,
+            &route_selection.model_name,
+        );
+        let parallel_tool_degrade_key = build_parallel_tool_degrade_key(
+            route_selection.route.as_ref(),
+            &resolved_target_url,
+            &route_selection.converter,
             &route_selection.model_name,
         );
 
@@ -3292,7 +3481,7 @@ async fn handle_request(
         }
 
         let request_backend = build_backend_by_converter(&route_selection.converter);
-        let (upstream_body, session_id) =
+        let (mut upstream_body, session_id) =
             if route_selection.converter.eq_ignore_ascii_case("anthropic") {
                 let mut request_body = raw_request_body.clone();
                 if let Some(obj) = request_body.as_object_mut() {
@@ -3313,6 +3502,23 @@ async fn handle_request(
                     route_selection.reasoning_effort_override,
                 )
             };
+
+        if route_selection.converter.eq_ignore_ascii_case("codex") {
+            if let Some(remaining_secs) = get_parallel_tool_degrade_remaining_seconds(
+                &parallel_tool_degrade_until,
+                &parallel_tool_degrade_key,
+            ) {
+                if let Some(serial_body) =
+                    disable_parallel_tool_calls_in_upstream_body(&upstream_body)
+                {
+                    upstream_body = serial_body;
+                    let _ = log_tx.send(format!(
+                        "[Stream] #{} endpoint_parallel_tool_auto_degraded=true key={} retry_after={}s",
+                        request_id, parallel_tool_degrade_key, remaining_secs
+                    ));
+                }
+            }
+        }
 
         if let Some(input_summary) = summarize_codex_payload(&upstream_body) {
             let top_keys = sorted_object_keys(&upstream_body).join(",");
@@ -3514,6 +3720,7 @@ async fn handle_request(
         successful_resolved_target_url = resolved_target_url.clone();
         successful_api_key = route_selection.api_key.clone();
         successful_upstream_body = Some(upstream_body.clone());
+        successful_parallel_tool_degrade_key = Some(parallel_tool_degrade_key);
         successful_session_id = session_id.clone();
         break;
     }
@@ -3528,6 +3735,7 @@ async fn handle_request(
     let api_key_for_stream = successful_api_key;
     let upstream_body_for_stream =
         successful_upstream_body.expect("upstream body must exist after successful loop");
+    let parallel_tool_degrade_key_for_stream = successful_parallel_tool_degrade_key;
     let session_id_for_request = successful_session_id;
     let _lb_permit = successful_lb_permit;
     let effective_stream = resolve_effective_stream(
@@ -3816,6 +4024,8 @@ async fn handle_request(
     let anthropic_version_for_stream = anthropic_version.clone();
     let anthropic_beta_for_stream = anthropic_beta.clone();
     let is_codex_stream_for_task = request_converter.eq_ignore_ascii_case("codex");
+    let parallel_tool_degrade_until_for_stream = parallel_tool_degrade_until.clone();
+    let parallel_tool_degrade_key_for_stream = parallel_tool_degrade_key_for_stream.clone();
     tokio::spawn(async move {
         let _permit_guard = permit_for_stream;
         let mut stream = response.bytes_stream();
@@ -3847,6 +4057,7 @@ async fn handle_request(
         let mut decision = StreamDecisionState::default();
         let mut silence_warn_logged = false;
         let mut silence_error_logged = false;
+        let mut endpoint_parallel_degrade_marked = false;
 
         'stream_attempt: loop {
             loop {
@@ -3879,6 +4090,7 @@ async fn handle_request(
                                     observe_upstream_chunk_events(
                                         &frame,
                                         &mut decision.saw_response_completed,
+                                        &mut decision.saw_response_incomplete,
                                         &mut decision.saw_response_failed,
                                         &mut decision.saw_sibling_tool_call_error,
                                         &mut decision.upstream_error_event_type,
@@ -3960,6 +4172,7 @@ async fn handle_request(
                                     observe_upstream_chunk_events(
                                         &line,
                                         &mut decision.saw_response_completed,
+                                        &mut decision.saw_response_incomplete,
                                         &mut decision.saw_response_failed,
                                         &mut decision.saw_sibling_tool_call_error,
                                         &mut decision.upstream_error_event_type,
@@ -4141,6 +4354,7 @@ async fn handle_request(
                     observe_upstream_chunk_events(
                         &remaining,
                         &mut decision.saw_response_completed,
+                        &mut decision.saw_response_incomplete,
                         &mut decision.saw_response_failed,
                         &mut decision.saw_sibling_tool_call_error,
                         &mut decision.upstream_error_event_type,
@@ -4193,6 +4407,7 @@ async fn handle_request(
                 observe_upstream_chunk_events(
                     &line_buffer,
                     &mut decision.saw_response_completed,
+                    &mut decision.saw_response_incomplete,
                     &mut decision.saw_response_failed,
                     &mut decision.saw_sibling_tool_call_error,
                     &mut decision.upstream_error_event_type,
@@ -4257,6 +4472,20 @@ async fn handle_request(
                 );
             }
 
+            if !endpoint_parallel_degrade_marked && decision.saw_sibling_tool_call_error {
+                if let Some(key) = parallel_tool_degrade_key_for_stream.as_deref() {
+                    mark_parallel_tool_degrade_and_log(
+                        &log_tx_clone,
+                        &logger_for_stream,
+                        &request_id_for_stream,
+                        &parallel_tool_degrade_until_for_stream,
+                        key,
+                        "sibling_tool_call_error",
+                    );
+                    endpoint_parallel_degrade_marked = true;
+                }
+            }
+
             if sibling_tool_error_retry_allowed {
                 decision.sibling_tool_error_retry_attempted = true;
                 active_upstream_body_for_stream = serial_fallback_upstream_body_for_stream
@@ -4272,68 +4501,34 @@ async fn handle_request(
                     ),
                 );
 
-                let retry_session_id = Uuid::new_v4().to_string();
-                active_session_id_for_stream = retry_session_id.clone();
-                let retry_req = request_backend_for_stream.build_upstream_request(
+                if let Some(retry) = execute_stream_retry_request(
+                    &request_backend_for_stream,
                     &http_client_for_stream,
                     &upstream_url_for_stream,
                     &upstream_api_key_for_stream,
                     &active_upstream_body_for_stream,
-                    &retry_session_id,
                     &anthropic_version_for_stream,
-                );
-                let retry_req = if let Some(beta) = anthropic_beta_for_stream.as_ref() {
-                    retry_req.header("anthropic-beta", beta)
-                } else {
-                    retry_req
-                };
-
-                match retry_req.send().await {
-                    Ok(retry_response) => {
-                        let retry_status = retry_response.status().as_u16();
-                        if retry_response.status().is_success() {
-                            emit_stream_diag(
-                                &log_tx_clone,
-                                &logger_for_stream,
-                                format!(
-                                    "[Stream] #{} sibling_tool_error_retry_succeeded status={}",
-                                    request_id_for_stream, retry_status
-                                ),
-                            );
-                            current_upstream_status = retry_status;
-                            stream = retry_response.bytes_stream();
-                            transformer = request_backend_for_stream
-                                .create_response_transformer(&model_for_stream);
-                            line_buffer.clear();
-                            frame_parser = SseFrameParser::default();
-                            decision.on_retry_success_reset();
-                            decision.emitted_non_heartbeat_event = false;
-                            decision.emitted_business_event = false;
-                            decision.emitted_tool_event = false;
-                            last_upstream_activity = Instant::now();
-                            continue 'stream_attempt;
-                        }
-
-                        let retry_error = retry_response.text().await.unwrap_or_default();
-                        emit_stream_diag(
-                            &log_tx_clone,
-                            &logger_for_stream,
-                            format!(
-                                "[Stream] #{} sibling_tool_error_retry_failed status={} body={}",
-                                request_id_for_stream, retry_status, retry_error
-                            ),
-                        );
-                    }
-                    Err(err) => {
-                        emit_stream_diag(
-                            &log_tx_clone,
-                            &logger_for_stream,
-                            format!(
-                                "[Stream] #{} sibling_tool_error_retry_failed network_error={}",
-                                request_id_for_stream, err
-                            ),
-                        );
-                    }
+                    anthropic_beta_for_stream.as_deref(),
+                    &request_id_for_stream,
+                    "sibling_tool_error_retry",
+                    &log_tx_clone,
+                    &logger_for_stream,
+                )
+                .await
+                {
+                    active_session_id_for_stream = retry.session_id;
+                    current_upstream_status = retry.status;
+                    stream = retry.response.bytes_stream();
+                    transformer =
+                        request_backend_for_stream.create_response_transformer(&model_for_stream);
+                    line_buffer.clear();
+                    frame_parser = SseFrameParser::default();
+                    decision.on_retry_success_reset();
+                    decision.emitted_non_heartbeat_event = false;
+                    decision.emitted_business_event = false;
+                    decision.emitted_tool_event = false;
+                    last_upstream_activity = Instant::now();
+                    continue 'stream_attempt;
                 }
             }
 
@@ -4341,6 +4536,19 @@ async fn handle_request(
                 .take_diagnostics_summary()
                 .as_ref()
                 .and_then(extract_tool_leak_retry_signal);
+            if !endpoint_parallel_degrade_marked && tool_leak_signal.is_some() {
+                if let Some(key) = parallel_tool_degrade_key_for_stream.as_deref() {
+                    mark_parallel_tool_degrade_and_log(
+                        &log_tx_clone,
+                        &logger_for_stream,
+                        &request_id_for_stream,
+                        &parallel_tool_degrade_until_for_stream,
+                        key,
+                        "tool_text_leak",
+                    );
+                    endpoint_parallel_degrade_marked = true;
+                }
+            }
             let leaked_tool_text_retry_allowed = allow_leaked_tool_text_retry(
                 &decision,
                 is_codex_stream_for_task,
@@ -4370,15 +4578,14 @@ async fn handle_request(
                     .as_ref()
                     .cloned()
                     .expect("serial fallback body should exist");
-                let guardrail_injected =
-                    if let Some(injected) = inject_retry_no_tool_text_mix_guardrail(
-                        &retry_upstream_body,
-                    ) {
-                        retry_upstream_body = injected;
-                        true
-                    } else {
-                        false
-                    };
+                let guardrail_injected = if let Some(injected) =
+                    inject_retry_no_tool_text_mix_guardrail(&retry_upstream_body)
+                {
+                    retry_upstream_body = injected;
+                    true
+                } else {
+                    false
+                };
                 active_upstream_body_for_stream = retry_upstream_body;
                 let signal = tool_leak_signal.expect("signal should exist when retry allowed");
                 emit_stream_diag(
@@ -4394,68 +4601,34 @@ async fn handle_request(
                     ),
                 );
 
-                let retry_session_id = Uuid::new_v4().to_string();
-                active_session_id_for_stream = retry_session_id.clone();
-                let retry_req = request_backend_for_stream.build_upstream_request(
+                if let Some(retry) = execute_stream_retry_request(
+                    &request_backend_for_stream,
                     &http_client_for_stream,
                     &upstream_url_for_stream,
                     &upstream_api_key_for_stream,
                     &active_upstream_body_for_stream,
-                    &retry_session_id,
                     &anthropic_version_for_stream,
-                );
-                let retry_req = if let Some(beta) = anthropic_beta_for_stream.as_ref() {
-                    retry_req.header("anthropic-beta", beta)
-                } else {
-                    retry_req
-                };
-
-                match retry_req.send().await {
-                    Ok(retry_response) => {
-                        let retry_status = retry_response.status().as_u16();
-                        if retry_response.status().is_success() {
-                            emit_stream_diag(
-                                &log_tx_clone,
-                                &logger_for_stream,
-                                format!(
-                                    "[Stream] #{} leaked_tool_text_retry_succeeded status={}",
-                                    request_id_for_stream, retry_status
-                                ),
-                            );
-                            current_upstream_status = retry_status;
-                            stream = retry_response.bytes_stream();
-                            transformer = request_backend_for_stream
-                                .create_response_transformer(&model_for_stream);
-                            line_buffer.clear();
-                            frame_parser = SseFrameParser::default();
-                            decision.on_retry_success_reset();
-                            decision.emitted_non_heartbeat_event = false;
-                            decision.emitted_business_event = false;
-                            decision.emitted_tool_event = false;
-                            last_upstream_activity = Instant::now();
-                            continue 'stream_attempt;
-                        }
-
-                        let retry_error = retry_response.text().await.unwrap_or_default();
-                        emit_stream_diag(
-                            &log_tx_clone,
-                            &logger_for_stream,
-                            format!(
-                                "[Stream] #{} leaked_tool_text_retry_failed status={} body={}",
-                                request_id_for_stream, retry_status, retry_error
-                            ),
-                        );
-                    }
-                    Err(err) => {
-                        emit_stream_diag(
-                            &log_tx_clone,
-                            &logger_for_stream,
-                            format!(
-                                "[Stream] #{} leaked_tool_text_retry_failed network_error={}",
-                                request_id_for_stream, err
-                            ),
-                        );
-                    }
+                    anthropic_beta_for_stream.as_deref(),
+                    &request_id_for_stream,
+                    "leaked_tool_text_retry",
+                    &log_tx_clone,
+                    &logger_for_stream,
+                )
+                .await
+                {
+                    active_session_id_for_stream = retry.session_id;
+                    current_upstream_status = retry.status;
+                    stream = retry.response.bytes_stream();
+                    transformer =
+                        request_backend_for_stream.create_response_transformer(&model_for_stream);
+                    line_buffer.clear();
+                    frame_parser = SseFrameParser::default();
+                    decision.on_retry_success_reset();
+                    decision.emitted_non_heartbeat_event = false;
+                    decision.emitted_business_event = false;
+                    decision.emitted_tool_event = false;
+                    last_upstream_activity = Instant::now();
+                    continue 'stream_attempt;
                 }
             }
 
@@ -4485,64 +4658,30 @@ async fn handle_request(
                     ),
                 );
 
-                let retry_session_id = Uuid::new_v4().to_string();
-                active_session_id_for_stream = retry_session_id.clone();
-                let retry_req = request_backend_for_stream.build_upstream_request(
+                if let Some(retry) = execute_stream_retry_request(
+                    &request_backend_for_stream,
                     &http_client_for_stream,
                     &upstream_url_for_stream,
                     &upstream_api_key_for_stream,
                     &active_upstream_body_for_stream,
-                    &retry_session_id,
                     &anthropic_version_for_stream,
-                );
-                let retry_req = if let Some(beta) = anthropic_beta_for_stream.as_ref() {
-                    retry_req.header("anthropic-beta", beta)
-                } else {
-                    retry_req
-                };
-
-                match retry_req.send().await {
-                    Ok(retry_response) => {
-                        let retry_status = retry_response.status().as_u16();
-                        if retry_response.status().is_success() {
-                            emit_stream_diag(
-                                &log_tx_clone,
-                                &logger_for_stream,
-                                format!(
-                                    "[Stream] #{} stream_retry_succeeded status={}",
-                                    request_id_for_stream, retry_status
-                                ),
-                            );
-                            decision.incomplete_stream_retry_succeeded = true;
-                            current_upstream_status = retry_status;
-                            stream = retry_response.bytes_stream();
-                            line_buffer.clear();
-                            frame_parser = SseFrameParser::default();
-                            decision.on_retry_success_reset();
-                            last_upstream_activity = Instant::now();
-                            continue 'stream_attempt;
-                        }
-
-                        let retry_error = retry_response.text().await.unwrap_or_default();
-                        emit_stream_diag(
-                            &log_tx_clone,
-                            &logger_for_stream,
-                            format!(
-                                "[Stream] #{} stream_retry_failed status={} body={}",
-                                request_id_for_stream, retry_status, retry_error
-                            ),
-                        );
-                    }
-                    Err(err) => {
-                        emit_stream_diag(
-                            &log_tx_clone,
-                            &logger_for_stream,
-                            format!(
-                                "[Stream] #{} stream_retry_failed network_error={}",
-                                request_id_for_stream, err
-                            ),
-                        );
-                    }
+                    anthropic_beta_for_stream.as_deref(),
+                    &request_id_for_stream,
+                    "stream_retry",
+                    &log_tx_clone,
+                    &logger_for_stream,
+                )
+                .await
+                {
+                    active_session_id_for_stream = retry.session_id;
+                    decision.incomplete_stream_retry_succeeded = true;
+                    current_upstream_status = retry.status;
+                    stream = retry.response.bytes_stream();
+                    line_buffer.clear();
+                    frame_parser = SseFrameParser::default();
+                    decision.on_retry_success_reset();
+                    last_upstream_activity = Instant::now();
+                    continue 'stream_attempt;
                 }
             } else if stream_incomplete && !decision.saw_message_stop {
                 let reason = decision.incomplete_retry_skip_reason(stream_opts_for_task);
@@ -4556,111 +4695,7 @@ async fn handle_request(
                 );
             }
 
-            // V2 alignment: remove empty-completion dedicated retry branch.
-            let empty_retry_allowed =
-                false && decision.allow_empty_completion_retry(stream_opts_for_task);
-
-            if empty_retry_allowed {
-                decision.empty_completion_retry_attempts += 1;
-                emit_stream_diag(
-                    &log_tx_clone,
-                    &logger_for_stream,
-                    format!(
-                        "[Stream] #{} empty_completion_retry_started attempt={}/{}",
-                        request_id_for_stream,
-                        decision.empty_completion_retry_attempts,
-                        stream_opts_for_task.empty_completion_retry_max_attempts
-                    ),
-                );
-
-                let retry_session_id = Uuid::new_v4().to_string();
-                active_session_id_for_stream = retry_session_id.clone();
-                let retry_req = request_backend_for_stream.build_upstream_request(
-                    &http_client_for_stream,
-                    &upstream_url_for_stream,
-                    &upstream_api_key_for_stream,
-                    &active_upstream_body_for_stream,
-                    &retry_session_id,
-                    &anthropic_version_for_stream,
-                );
-                let retry_req = if let Some(beta) = anthropic_beta_for_stream.as_ref() {
-                    retry_req.header("anthropic-beta", beta)
-                } else {
-                    retry_req
-                };
-
-                match retry_req.send().await {
-                    Ok(retry_response) => {
-                        let retry_status = retry_response.status().as_u16();
-                        if retry_response.status().is_success() {
-                            emit_stream_diag(
-                                &log_tx_clone,
-                                &logger_for_stream,
-                                format!(
-                                    "[Stream] #{} empty_completion_retry_succeeded status={}",
-                                    request_id_for_stream, retry_status
-                                ),
-                            );
-                            decision.empty_completion_retry_succeeded = true;
-                            current_upstream_status = retry_status;
-                            stream = retry_response.bytes_stream();
-                            line_buffer.clear();
-                            frame_parser = SseFrameParser::default();
-                            decision.on_retry_success_reset();
-                            last_upstream_activity = Instant::now();
-                            continue 'stream_attempt;
-                        }
-
-                        let retry_error = retry_response.text().await.unwrap_or_default();
-                        emit_stream_diag(
-                            &log_tx_clone,
-                            &logger_for_stream,
-                            format!(
-                                "[Stream] #{} empty_completion_retry_failed status={} body={}",
-                                request_id_for_stream, retry_status, retry_error
-                            ),
-                        );
-                    }
-                    Err(err) => {
-                        emit_stream_diag(
-                            &log_tx_clone,
-                            &logger_for_stream,
-                            format!(
-                                "[Stream] #{} empty_completion_retry_failed network_error={}",
-                                request_id_for_stream, err
-                            ),
-                        );
-                    }
-                }
-            } else if decision.saw_response_completed
-                && !decision.emitted_business_event
-                && !decision.saw_message_stop
-            {
-                let reason = decision.empty_completion_retry_skip_reason(stream_opts_for_task);
-                emit_stream_diag(
-                    &log_tx_clone,
-                    &logger_for_stream,
-                    format!(
-                        "[Stream] #{} empty_completion_retry_skipped reason={}",
-                        request_id_for_stream, reason
-                    ),
-                );
-            }
-
             break 'stream_attempt;
-        }
-
-        if decision.empty_completion_retry_attempts > 0 {
-            emit_stream_diag(
-                &log_tx_clone,
-                &logger_for_stream,
-                format!(
-                    "[Stream] #{} empty_completion_retry_hits={} success={}",
-                    request_id_for_stream,
-                    decision.empty_completion_retry_attempts,
-                    decision.empty_completion_retry_succeeded
-                ),
-            );
         }
 
         if decision.incomplete_stream_retry_attempts > 0 {
@@ -4675,8 +4710,6 @@ async fn handle_request(
                 ),
             );
         }
-
-        let should_emit_empty_notice = false && decision.should_emit_empty_notice();
 
         if decision.saw_response_failed && !decision.saw_message_stop {
             decision.fallback_completion_injected = true;
@@ -4768,62 +4801,6 @@ async fn handle_request(
             decision.saw_message_stop = true;
         }
 
-        if should_emit_empty_notice {
-            decision.emitted_empty_completion_fallback_notice = true;
-            emit_stream_diag(
-                &log_tx_clone,
-                &logger_for_stream,
-                format!(
-                    "[Stream] #{} empty_completion_fallback_notice_emitted",
-                    request_id_for_stream
-                ),
-            );
-            let synthetic_notice_delta = format!(
-                "event: response.output_text.delta\ndata: {}\n\n",
-                json!({
-                    "type": "response.output_text.delta",
-                    "delta": "本轮仅收到推理摘要，未产出可见内容。系统已自动重试一次，建议你直接重试或精简上下文后再试。\n"
-                })
-            );
-            for output in transformer.transform_event(&synthetic_notice_delta) {
-                if should_drop_duplicate_message_start(
-                    &output,
-                    &mut decision.sent_message_start_to_client,
-                ) {
-                    continue;
-                }
-                if chunk_is_message_stop(&output) {
-                    decision.saw_message_stop = true;
-                }
-                if is_business_stream_output(&output) {
-                    decision.emitted_business_event = true;
-                }
-                if is_tool_stream_output(&output) {
-                    decision.emitted_tool_event = true;
-                }
-                metrics.mark_downstream_output(&output);
-                event_counters.mark_downstream_chunk(&output);
-                maybe_log_stream_downstream(
-                    &logger_for_stream,
-                    &output,
-                    stream_opts_for_task,
-                    &mut downstream_log_counter,
-                );
-                if tx.send(Ok(Frame::data(Bytes::from(output)))).await.is_err() {
-                    let _ = log_tx_clone.send(format!(
-                        "[Warning] #{} Client disconnected while sending empty-completion notice",
-                        request_id_for_stream
-                    ));
-                    metrics.emit(
-                        &log_tx_clone,
-                        &request_id_for_stream,
-                        stream_opts_for_task.enable_stream_metrics,
-                    );
-                    return;
-                }
-            }
-        }
-
         if !decision.saw_message_stop {
             decision.fallback_completion_injected = true;
 
@@ -4904,6 +4881,7 @@ async fn handle_request(
         let close_cause = derive_stream_close_cause(
             decision.stream_close_cause,
             decision.saw_response_completed,
+            decision.saw_response_incomplete,
             decision.saw_response_failed,
             decision.saw_message_stop,
         );
@@ -4912,10 +4890,11 @@ async fn handle_request(
             &log_tx_clone,
             &logger_for_stream,
             format!(
-                "[Stream] #{} stream_outcome={} saw_response_completed={} saw_response_failed={} saw_message_stop={} emitted_business_event={} final_fallback_emitted={}",
+                "[Stream] #{} stream_outcome={} saw_response_completed={} saw_response_incomplete={} saw_response_failed={} saw_message_stop={} emitted_business_event={} final_fallback_emitted={}",
                 request_id_for_stream,
                 stream_outcome,
                 decision.saw_response_completed,
+                decision.saw_response_incomplete,
                 decision.saw_response_failed,
                 decision.saw_message_stop,
                 decision.emitted_business_event,
@@ -4931,6 +4910,7 @@ async fn handle_request(
                 &event_counters,
                 &metrics,
                 decision.saw_response_completed,
+                decision.saw_response_incomplete,
                 decision.saw_response_failed,
                 decision.saw_message_stop,
                 decision.emitted_business_event,
@@ -5091,16 +5071,20 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
-        chunk_contains_sibling_tool_call_error, classify_connection_error, derive_stream_close_cause,
+        build_parallel_tool_degrade_key, chunk_contains_sibling_tool_call_error,
+        classify_connection_error, derive_stream_close_cause,
         disable_parallel_tool_calls_in_upstream_body, extract_tool_leak_retry_signal,
-        inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
-        leaked_tool_text_retry_skip_reason,
+        get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
+        is_business_stream_output, leaked_tool_text_retry_skip_reason, mark_parallel_tool_degrade,
         observe_upstream_chunk_events, resolve_effective_stream, resolve_upstream_url,
-        should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
-        ConnErrorClass, SseFrameParser, StreamEventCounters, StreamRuntimeOptions,
-        UpstreamOperation,
+        should_drop_post_message_stop_output, should_suppress_premature_message_stop,
+        sibling_tool_error_retry_skip_reason, ConnErrorClass, SseFrameParser, StreamEventCounters,
+        StreamRuntimeOptions, UpstreamOperation,
     };
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn stream_opts() -> StreamRuntimeOptions {
         StreamRuntimeOptions {
@@ -5116,8 +5100,6 @@ mod tests {
             stream_silence_warn_ms: 20_000,
             stream_silence_error_ms: 90_000,
             stall_timeout_ms: 60_000,
-            enable_empty_completion_retry: true,
-            empty_completion_retry_max_attempts: 1,
             enable_incomplete_stream_retry: true,
             incomplete_stream_retry_max_attempts: 1,
             enable_sibling_tool_error_retry: true,
@@ -5226,6 +5208,15 @@ data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"a
     }
 
     #[test]
+    fn test_is_business_stream_output_thinking_delta_true() {
+        let chunk = r#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"分析调用参数"}}
+
+"#;
+        assert!(is_business_stream_output(chunk));
+    }
+
+    #[test]
     fn test_disable_parallel_tool_calls_in_upstream_body() {
         let original = json!({
             "model": "gpt-5.3-codex",
@@ -5272,7 +5263,9 @@ data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"a
             .and_then(|v| v.as_str())
             .expect("instructions should remain string");
         assert_eq!(
-            second_instructions.matches("RETRY_GUARDRAIL_NO_TOOL_TEXT_MIX").count(),
+            second_instructions
+                .matches("RETRY_GUARDRAIL_NO_TOOL_TEXT_MIX")
+                .count(),
             2,
             "guardrail wrapper tag pair should not be duplicated on reinjection"
         );
@@ -5452,6 +5445,7 @@ data: {"type": "ping"}
     #[test]
     fn test_observe_upstream_chunk_events_marks_flags_and_counts() {
         let mut saw_completed = false;
+        let mut saw_incomplete = false;
         let mut saw_failed = false;
         let mut saw_sibling = false;
         let mut upstream_error_event_type = None;
@@ -5466,6 +5460,7 @@ data: {"type":"response.failed","response":{"error":{"message":"Sibling tool cal
         observe_upstream_chunk_events(
             chunk,
             &mut saw_completed,
+            &mut saw_incomplete,
             &mut saw_failed,
             &mut saw_sibling,
             &mut upstream_error_event_type,
@@ -5475,6 +5470,7 @@ data: {"type":"response.failed","response":{"error":{"message":"Sibling tool cal
         );
 
         assert!(!saw_completed);
+        assert!(!saw_incomplete);
         assert!(saw_failed);
         assert!(saw_sibling);
         assert_eq!(
@@ -5493,6 +5489,7 @@ data: {"type":"response.failed","response":{"error":{"message":"Sibling tool cal
     #[test]
     fn test_observe_upstream_chunk_events_marks_done_as_completed() {
         let mut saw_completed = false;
+        let mut saw_incomplete = false;
         let mut saw_failed = false;
         let mut saw_sibling = false;
         let mut upstream_error_event_type = None;
@@ -5507,6 +5504,7 @@ data: [DONE]
         observe_upstream_chunk_events(
             chunk,
             &mut saw_completed,
+            &mut saw_incomplete,
             &mut saw_failed,
             &mut saw_sibling,
             &mut upstream_error_event_type,
@@ -5516,6 +5514,7 @@ data: [DONE]
         );
 
         assert!(saw_completed);
+        assert!(!saw_incomplete);
         assert!(!saw_failed);
         assert!(!saw_sibling);
         assert_eq!(upstream_error_event_type, None);
@@ -5527,6 +5526,7 @@ data: [DONE]
     #[test]
     fn test_observe_upstream_chunk_events_marks_incomplete_as_completed() {
         let mut saw_completed = false;
+        let mut saw_incomplete = false;
         let mut saw_failed = false;
         let mut saw_sibling = false;
         let mut upstream_error_event_type = None;
@@ -5541,6 +5541,7 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
         observe_upstream_chunk_events(
             chunk,
             &mut saw_completed,
+            &mut saw_incomplete,
             &mut saw_failed,
             &mut saw_sibling,
             &mut upstream_error_event_type,
@@ -5550,6 +5551,7 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
         );
 
         assert!(saw_completed);
+        assert!(saw_incomplete);
         assert!(!saw_failed);
         assert!(!saw_sibling);
         assert_eq!(upstream_error_event_type, None);
@@ -5562,6 +5564,7 @@ data: {"type":"response.incomplete","response":{"status":"incomplete","incomplet
     #[test]
     fn test_observe_upstream_chunk_events_captures_error_event_message_and_code() {
         let mut saw_completed = false;
+        let mut saw_incomplete = false;
         let mut saw_failed = false;
         let mut saw_sibling = false;
         let mut upstream_error_event_type = None;
@@ -5576,6 +5579,7 @@ data: {"type":"error","error":{"message":"Rate limit exceeded","code":"rate_limi
         observe_upstream_chunk_events(
             chunk,
             &mut saw_completed,
+            &mut saw_incomplete,
             &mut saw_failed,
             &mut saw_sibling,
             &mut upstream_error_event_type,
@@ -5585,6 +5589,7 @@ data: {"type":"error","error":{"message":"Rate limit exceeded","code":"rate_limi
         );
 
         assert!(!saw_completed);
+        assert!(!saw_incomplete);
         assert!(saw_failed);
         assert!(!saw_sibling);
         assert_eq!(upstream_error_event_type.as_deref(), Some("error"));
@@ -5598,14 +5603,21 @@ data: {"type":"error","error":{"message":"Rate limit exceeded","code":"rate_limi
 
     #[test]
     fn test_derive_stream_close_cause_prefers_explicit_value() {
-        let cause = derive_stream_close_cause(Some("client_disconnected"), false, false, false);
+        let cause =
+            derive_stream_close_cause(Some("client_disconnected"), false, false, false, false);
         assert_eq!(cause, "client_disconnected");
     }
 
     #[test]
     fn test_derive_stream_close_cause_completed_without_stop() {
-        let cause = derive_stream_close_cause(None, true, false, false);
+        let cause = derive_stream_close_cause(None, true, false, false, false);
         assert_eq!(cause, "completed_without_message_stop");
+    }
+
+    #[test]
+    fn test_derive_stream_close_cause_incomplete_with_stop() {
+        let cause = derive_stream_close_cause(None, true, true, false, true);
+        assert_eq!(cause, "response_incomplete");
     }
 
     #[test]
@@ -5636,13 +5648,58 @@ data: {"type":"message_stop"}
 "#;
 
         assert!(should_suppress_premature_message_stop(
-            output, true, false, false
+            output, true, false, false, false
         ));
         assert!(!should_suppress_premature_message_stop(
-            output, false, false, false
+            output, false, false, false, false
         ));
         assert!(!should_suppress_premature_message_stop(
-            output, true, true, false
+            output, true, true, false, false
         ));
+        assert!(!should_suppress_premature_message_stop(
+            output, true, false, true, false
+        ));
+    }
+
+    #[test]
+    fn test_should_drop_post_message_stop_output() {
+        let content_delta = r#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"late"}}
+
+"#;
+        let ping = r#"event: ping
+data: {"type":"ping"}
+
+"#;
+        let keepalive = ": keep-alive\n\n";
+
+        assert!(should_drop_post_message_stop_output(content_delta));
+        assert!(!should_drop_post_message_stop_output(ping));
+        assert!(!should_drop_post_message_stop_output(keepalive));
+    }
+
+    #[test]
+    fn test_parallel_tool_degrade_helpers_work() {
+        let degrade_map: Arc<Mutex<HashMap<String, Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let key = build_parallel_tool_degrade_key(
+            None,
+            "https://example.com/openai/responses",
+            "codex",
+            "gpt-5.3-codex",
+        );
+
+        assert!(key.starts_with("single:codex:gpt-5.3-codex:"));
+        assert!(get_parallel_tool_degrade_remaining_seconds(&degrade_map, &key).is_none());
+
+        mark_parallel_tool_degrade(&degrade_map, &key, 2);
+        let remaining = get_parallel_tool_degrade_remaining_seconds(&degrade_map, &key)
+            .expect("degrade ttl should be active");
+        assert!((1..=2).contains(&remaining));
+
+        if let Ok(mut guard) = degrade_map.lock() {
+            guard.insert(key.clone(), Instant::now() - Duration::from_secs(1));
+        }
+        assert!(get_parallel_tool_degrade_remaining_seconds(&degrade_map, &key).is_none());
     }
 }
