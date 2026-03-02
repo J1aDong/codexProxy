@@ -255,53 +255,6 @@ fn extract_available_skill_names_from_request(request: &AnthropicRequest) -> Vec
     ordered_names
 }
 
-fn looks_like_skill_inventory_query(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let normalized = lower.replace(' ', "");
-    let keywords = [
-        "有哪些skill",
-        "哪些skill",
-        "可调用技能",
-        "技能列表",
-        "skill列表",
-        "列出skill",
-        "listskills",
-        "availableskills",
-        "slashskills",
-        "/skills",
-    ];
-
-    keywords
-        .iter()
-        .any(|kw| lower.contains(kw) || normalized.contains(kw))
-}
-
-fn build_skill_inventory_hint(request: &AnthropicRequest) -> Option<String> {
-    if !has_skill_tool(request.tools.as_ref()) {
-        return None;
-    }
-
-    let latest = latest_user_text(request)?;
-    if !looks_like_skill_inventory_query(&latest) {
-        return None;
-    }
-
-    let names = extract_available_skill_names_from_request(request);
-    if names.is_empty() {
-        return None;
-    }
-
-    let mut body = String::from(
-        "Skill catalog snapshot from current system-reminder. Treat this as complete for this turn.\nWhen user asks for skills, list all names below; do not answer with only examples.\n",
-    );
-    for name in names {
-        body.push_str("- ");
-        body.push_str(&name);
-        body.push('\n');
-    }
-    Some(body)
-}
-
 fn extract_slash_skill_tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = text.chars().collect();
@@ -1116,17 +1069,6 @@ impl TransformRequest {
 
         // 追加对话历史
         final_input.extend(chat_messages);
-        if let Some(skill_inventory_hint) = build_skill_inventory_hint(anthropic_body) {
-            log("🎯 [Transform] Skill inventory query detected, injecting complete catalog hint");
-            final_input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": skill_inventory_hint
-                }]
-            }));
-        }
         if let Some(skill_name) = detect_requested_skill_name(anthropic_body) {
             log(&format!(
                 "🎯 [Transform] Skill intent matched, nudging Skill tool: {}",
@@ -1498,8 +1440,7 @@ impl TransformRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_skill_inventory_hint, compact_tool_description, detect_requested_skill_name,
-        extract_request_cwd,
+        compact_tool_description, detect_requested_skill_name, extract_request_cwd,
         TransformRequest,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
@@ -1521,10 +1462,10 @@ mod tests {
     }
 
     #[test]
-    fn build_skill_inventory_hint_includes_all_available_names_for_list_query() {
+    fn transform_does_not_inject_skill_catalog_hint_for_skill_list_queries() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
-            "messages": [{"role":"user","content":"你有哪些 skill"}],
+            "messages": [{"role":"user","content":"我当前有哪些技能"}],
             "system": "<system-reminder>\nThe following skills are available:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n- review-pr: Review pull request\n</system-reminder>",
             "tools": [{
                 "name": "Skill",
@@ -1534,48 +1475,25 @@ mod tests {
             "stream": true
         }))
         .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
 
-        let hint = build_skill_inventory_hint(&request).expect("should build hint");
-        assert!(hint.contains("Skill catalog snapshot"), "hint header should exist");
-        assert!(hint.contains("- figma-implement-design"), "should include figma skill");
-        assert!(hint.contains("- pdf"), "should include pdf skill");
-        assert!(hint.contains("- review-pr"), "should include review-pr skill");
-    }
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
 
-    #[test]
-    fn build_skill_inventory_hint_reads_catalog_from_message_system_reminder() {
-        let request: AnthropicRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4-5",
-            "messages": [
-                {
-                    "role":"user",
-                    "content":[
-                        {
-                            "type":"text",
-                            "text":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n- figma: Figma support\n- pdf: PDF support\n- /help: Builtin command\n</system-reminder>"
-                        },
-                        {
-                            "type":"text",
-                            "text":"你有哪些skill"
-                        }
-                    ]
-                }
-            ],
-            "tools": [{
-                "name": "Skill",
-                "description": "Execute skill",
-                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
-            }],
-            "stream": true
-        }))
-        .expect("valid anthropic request");
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let catalog_hint_count = input_items
+            .iter()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|blocks| blocks.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .filter(|text| text.contains("Skill catalog snapshot from current system-reminder."))
+            .count();
 
-        let hint = build_skill_inventory_hint(&request).expect("should build hint from message reminder");
-        assert!(hint.contains("- figma"), "should include figma skill");
-        assert!(hint.contains("- pdf"), "should include pdf skill");
-        assert!(
-            !hint.contains("/help"),
-            "builtin slash commands should not be treated as skill catalog entries"
+        assert_eq!(
+            catalog_hint_count, 0,
+            "skill list queries should not receive forced catalog hint injection"
         );
     }
 
