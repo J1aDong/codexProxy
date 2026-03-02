@@ -140,6 +140,49 @@ fn extract_slash_skill_tokens(text: &str) -> Vec<String> {
             idx += 1;
             continue;
         }
+        if idx > 0 {
+            let prev = chars[idx - 1];
+            // Skip URL/path-like slashes (`https://`, `/Users/...`) to avoid false positives.
+            if is_skill_identifier_char(prev) || matches!(prev, '/' | ':' | '.') {
+                idx += 1;
+                continue;
+            }
+        }
+        let mut end = idx + 1;
+        while end < chars.len() && is_skill_identifier_char(chars[end]) {
+            end += 1;
+        }
+        if end > idx + 1 {
+            if chars.get(end).is_some_and(|ch| matches!(ch, '.' | '/')) {
+                idx = end;
+                continue;
+            }
+            let token: String = chars[idx + 1..end].iter().collect();
+            if let Some(name) = normalize_skill_name_token(&token) {
+                tokens.push(name);
+            }
+        }
+        idx = end;
+    }
+    tokens
+}
+
+fn extract_dollar_skill_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if chars[idx] != '$' {
+            idx += 1;
+            continue;
+        }
+        if idx > 0 {
+            let prev = chars[idx - 1];
+            if is_skill_identifier_char(prev) {
+                idx += 1;
+                continue;
+            }
+        }
         let mut end = idx + 1;
         while end < chars.len() && is_skill_identifier_char(chars[end]) {
             end += 1;
@@ -153,19 +196,6 @@ fn extract_slash_skill_tokens(text: &str) -> Vec<String> {
         idx = end;
     }
     tokens
-}
-
-fn contains_skill_name_with_boundary(text_lower: &str, skill_name_lower: &str) -> bool {
-    for (idx, _) in text_lower.match_indices(skill_name_lower) {
-        let before = text_lower[..idx].chars().next_back();
-        let after = text_lower[idx + skill_name_lower.len()..].chars().next();
-        let before_ok = before.map(|ch| !is_skill_identifier_char(ch)).unwrap_or(true);
-        let after_ok = after.map(|ch| !is_skill_identifier_char(ch)).unwrap_or(true);
-        if before_ok && after_ok {
-            return true;
-        }
-    }
-    false
 }
 
 fn latest_user_text(request: &AnthropicRequest) -> Option<String> {
@@ -215,26 +245,18 @@ fn detect_requested_skill_name(request: &AnthropicRequest) -> Option<String> {
         return None;
     }
     let latest_text = latest_user_text(request)?;
-    let latest_lower = latest_text.to_ascii_lowercase();
 
-    for token in extract_slash_skill_tokens(&latest_lower) {
+    for token in extract_slash_skill_tokens(&latest_text) {
         if available.contains(&token) {
             return Some(token);
         }
     }
-
-    let has_skill_intent_word = ["skill", "skills", "技能", "使用", "调用", "invoke", "run"]
-        .iter()
-        .any(|kw| latest_lower.contains(kw));
-    if !has_skill_intent_word {
-        return None;
+    for token in extract_dollar_skill_tokens(&latest_text) {
+        if available.contains(&token) {
+            return Some(token);
+        }
     }
-
-    let mut ordered: Vec<String> = available.into_iter().collect();
-    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    ordered
-        .into_iter()
-        .find(|name| contains_skill_name_with_boundary(&latest_lower, name))
+    None
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1395,10 +1417,10 @@ mod tests {
     }
 
     #[test]
-    fn transform_injects_skill_routing_hint_when_skill_intent_detected() {
+    fn transform_injects_skill_routing_hint_when_explicit_skill_token_detected() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
-            "messages": [{"role":"user","content":"请使用 figma-implement-design 处理这个节点"}],
+            "messages": [{"role":"user","content":"请使用 /figma-implement-design 处理这个节点"}],
             "system": "<system-reminder>\nThe following skills are available:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n</system-reminder>",
             "tools": [{
                 "name": "Skill",
@@ -1429,6 +1451,48 @@ mod tests {
         assert!(
             hint_texts[0].contains("figma-implement-design"),
             "routing hint should include matched skill name"
+        );
+    }
+
+    #[test]
+    fn detect_requested_skill_name_supports_dollar_prefixed_skill() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"请用 $figma-implement-design 完成这个任务"}],
+            "system": "<system-reminder>\nThe following skills are available:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n</system-reminder>",
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+
+        assert_eq!(
+            detect_requested_skill_name(&request).as_deref(),
+            Some("figma-implement-design")
+        );
+    }
+
+    #[test]
+    fn detect_requested_skill_name_ignores_path_like_slashes() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"请看 /Users/mr.j/.agents/skills/platform/SKILL.md"}],
+            "system": "<system-reminder>\nThe following skills are available:\n- platform: Internal platform helper\n- pdf: Read PDF files\n</system-reminder>",
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+
+        assert!(
+            detect_requested_skill_name(&request).is_none(),
+            "file path slashes should not be interpreted as explicit skill invocation"
         );
     }
 }
