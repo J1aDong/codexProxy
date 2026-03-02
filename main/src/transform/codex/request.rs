@@ -738,8 +738,10 @@ fn strip_leaked_tool_suffix_from_text(text: &str) -> Option<String> {
 fn strip_system_reminder_blocks(text: &str) -> String {
     const START: &str = "<system-reminder>";
     const END: &str = "</system-reminder>";
-    const SKILL_MARKERS: [&str; 7] = [
+    const SKILL_MARKERS: [&str; 9] = [
         "available skills",
+        "the following skills are available",
+        "skills are available for use with the skill tool",
         "### available skills",
         "how to use skills",
         "a skill is a set of local instructions",
@@ -937,6 +939,7 @@ impl TransformRequest {
             custom_injection_prompt,
             codex_model,
             true,
+            false,
         )
     }
 
@@ -947,6 +950,7 @@ impl TransformRequest {
         custom_injection_prompt: &str,
         codex_model: &str,
         enable_tool_schema_compaction: bool,
+        enable_skill_routing_hint: bool,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
 
@@ -1069,22 +1073,24 @@ impl TransformRequest {
 
         // 追加对话历史
         final_input.extend(chat_messages);
-        if let Some(skill_name) = detect_requested_skill_name(anthropic_body) {
-            log(&format!(
-                "🎯 [Transform] Skill intent matched, nudging Skill tool: {}",
-                skill_name
-            ));
-            final_input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": format!(
-                        "Skill routing hint: the latest user request targets skill `{}`.\nIf this skill is available, call the `Skill` tool first before normal text response.",
-                        skill_name
-                    )
-                }]
-            }));
+        if enable_skill_routing_hint {
+            if let Some(skill_name) = detect_requested_skill_name(anthropic_body) {
+                log(&format!(
+                    "🎯 [Transform] Skill intent matched, nudging Skill tool: {}",
+                    skill_name
+                ));
+                final_input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!(
+                            "Skill routing hint: the latest user request targets skill `{}`.\nIf this skill is available, call the `Skill` tool first before normal text response.",
+                            skill_name
+                        )
+                    }]
+                }));
+            }
         }
         Self::sanitize_input_for_codex(&mut final_input);
         reconcile_function_call_pairs(&mut final_input);
@@ -2042,8 +2048,15 @@ mod tests {
         .expect("valid anthropic request");
         let mapping = ReasoningEffortMapping::default();
 
-        let (body, _) =
-            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let (body, _) = TransformRequest::transform_with_options(
+            &request,
+            None,
+            &mapping,
+            "",
+            "gpt-5.3-codex",
+            true,
+            true,
+        );
 
         let input_items = body
             .get("input")
@@ -2061,6 +2074,43 @@ mod tests {
         assert!(
             hint_texts[0].contains("figma-implement-design"),
             "routing hint should include matched skill name"
+        );
+    }
+
+    #[test]
+    fn transform_does_not_inject_skill_routing_hint_by_default() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"请使用 /figma-implement-design 处理这个节点"}],
+            "system": "<system-reminder>\nThe following skills are available:\n- figma-implement-design: Translate Figma nodes\n</system-reminder>",
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let hint_text_count = input_items
+            .iter()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|blocks| blocks.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .filter(|text| text.contains("Skill routing hint"))
+            .count();
+
+        assert_eq!(
+            hint_text_count, 0,
+            "skill routing hint should be disabled by default for passthrough parity"
         );
     }
 
@@ -2138,6 +2188,45 @@ mod tests {
             detect_requested_skill_name(&request).as_deref(),
             Some("figma-implement-design"),
             "skill detection should work even when catalog comes from message reminder"
+        );
+    }
+
+    #[test]
+    fn transform_preserves_skill_catalog_system_reminder_from_messages() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content":[
+                    {
+                        "type":"text",
+                        "text":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n</system-reminder>"
+                    }
+                ]
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let preserved_count = input_items
+            .iter()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|blocks| blocks.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .filter(|text| text.contains("The following skills are available for use with the Skill tool"))
+            .count();
+
+        assert_eq!(
+            preserved_count, 1,
+            "skill catalog reminder from messages should be preserved for downstream model context"
         );
     }
 }

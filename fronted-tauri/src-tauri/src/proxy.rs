@@ -356,6 +356,11 @@ pub struct ProxyConfig {
     )]
     pub enable_codex_tool_schema_compaction: bool,
     #[serde(
+        rename = "enableSkillRoutingHint",
+        default = "default_enable_skill_routing_hint"
+    )]
+    pub enable_skill_routing_hint: bool,
+    #[serde(
         rename = "enableStatefulResponsesChain",
         default = "default_enable_stateful_responses_chain"
     )]
@@ -508,6 +513,10 @@ fn default_prefer_codex_v1_path() -> bool {
 
 fn default_enable_codex_tool_schema_compaction() -> bool {
     true
+}
+
+fn default_enable_skill_routing_hint() -> bool {
+    false
 }
 
 fn default_enable_stateful_responses_chain() -> bool {
@@ -728,6 +737,7 @@ fn build_runtime_update(
             codex_model: config.codex_model.clone(),
             gemini_reasoning_effort: config.gemini_reasoning_effort.to_gemini_mapping(),
             enable_codex_tool_schema_compaction: config.enable_codex_tool_schema_compaction,
+            enable_skill_routing_hint: config.enable_skill_routing_hint,
         },
         ignore_probe_requests: config.ignore_probe_requests,
         allow_count_tokens_fallback_estimate: config.allow_count_tokens_fallback_estimate,
@@ -753,6 +763,7 @@ fn build_runtime_update(
         enable_sibling_tool_error_retry: config.enable_sibling_tool_error_retry,
         prefer_codex_v1_path: config.prefer_codex_v1_path,
         enable_codex_tool_schema_compaction: config.enable_codex_tool_schema_compaction,
+        enable_skill_routing_hint: config.enable_skill_routing_hint,
         enable_stateful_responses_chain: config.enable_stateful_responses_chain,
         load_balancer_runtime,
     }
@@ -1011,6 +1022,7 @@ async fn start_proxy_with_manager(
         .with_enable_sibling_tool_error_retry(config.enable_sibling_tool_error_retry)
         .with_prefer_codex_v1_path(config.prefer_codex_v1_path)
         .with_enable_codex_tool_schema_compaction(config.enable_codex_tool_schema_compaction)
+        .with_enable_skill_routing_hint(config.enable_skill_routing_hint)
         .with_enable_stateful_responses_chain(config.enable_stateful_responses_chain)
         .with_allow_external_access(config.allow_external_access)
         .with_max_concurrency(config.max_concurrency);

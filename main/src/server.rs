@@ -69,6 +69,7 @@ pub struct ProxyServer {
     enable_sibling_tool_error_retry: bool,
     prefer_codex_v1_path: bool,
     enable_codex_tool_schema_compaction: bool,
+    enable_skill_routing_hint: bool,
     enable_stateful_responses_chain: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
@@ -102,6 +103,7 @@ pub struct RuntimeConfigUpdate {
     pub enable_sibling_tool_error_retry: bool,
     pub prefer_codex_v1_path: bool,
     pub enable_codex_tool_schema_compaction: bool,
+    pub enable_skill_routing_hint: bool,
     pub enable_stateful_responses_chain: bool,
     pub load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
@@ -130,6 +132,7 @@ struct RuntimeConfigState {
     enable_sibling_tool_error_retry: bool,
     prefer_codex_v1_path: bool,
     enable_codex_tool_schema_compaction: bool,
+    enable_skill_routing_hint: bool,
     enable_stateful_responses_chain: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
@@ -138,6 +141,7 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
     fn from(value: RuntimeConfigUpdate) -> Self {
         let mut ctx = value.ctx;
         ctx.enable_codex_tool_schema_compaction = value.enable_codex_tool_schema_compaction;
+        ctx.enable_skill_routing_hint = value.enable_skill_routing_hint;
         Self {
             target_url: value.target_url,
             api_key: value.api_key,
@@ -161,6 +165,7 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             enable_sibling_tool_error_retry: value.enable_sibling_tool_error_retry,
             prefer_codex_v1_path: value.prefer_codex_v1_path,
             enable_codex_tool_schema_compaction: value.enable_codex_tool_schema_compaction,
+            enable_skill_routing_hint: value.enable_skill_routing_hint,
             enable_stateful_responses_chain: value.enable_stateful_responses_chain,
             load_balancer_runtime: value.load_balancer_runtime,
         }
@@ -302,6 +307,7 @@ fn transform_request_with_optional_codex_effort_override(
                 &ctx.custom_injection_prompt,
                 model_name,
                 ctx.enable_codex_tool_schema_compaction,
+                ctx.enable_skill_routing_hint,
             );
         }
     }
@@ -414,6 +420,7 @@ impl StreamRuntimeOptions {
 }
 
 const STATEFUL_CHAIN_MAX_ENTRIES: usize = 128;
+const SKILL_CATALOG_CACHE_MAX_ENTRIES: usize = 128;
 const STATEFUL_CHAIN_HINT_HEADERS: [&str; 6] = [
     "x-codex-proxy-session",
     "x-claude-session-id",
@@ -441,6 +448,13 @@ struct StatefulChainEntry {
 type StatefulChainStore = Arc<Mutex<HashMap<String, StatefulChainEntry>>>;
 type StatefulChainUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type CodexV1UnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
+type SkillCatalogReminderStore = Arc<Mutex<HashMap<String, SkillCatalogCacheEntry>>>;
+
+#[derive(Clone)]
+struct SkillCatalogCacheEntry {
+    reminder_text: String,
+    updated_at: Instant,
+}
 
 fn is_stateful_endpoint_previous_response_id_unsupported(
     unsupported_store: &StatefulChainUnsupportedEndpointStore,
@@ -592,6 +606,198 @@ fn derive_stateful_chain_key(
     let prefix_signature = build_message_prefix_signature(request);
     let fingerprint = hash_to_u64(&[converter, model, &system_text, &prefix_signature]);
     format!("fallback:{}:{:016x}", converter.to_ascii_lowercase(), fingerprint)
+}
+
+fn derive_skill_catalog_cache_key(hint: Option<&str>, request: &AnthropicRequest) -> String {
+    if let Some(hint_value) = hint {
+        let normalized = hint_value.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return format!("hint:{}", normalized);
+        }
+    }
+
+    let model = request.model.as_deref().unwrap_or_default();
+    let system_text = request
+        .system
+        .as_ref()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let fingerprint = hash_to_u64(&[model, &system_text]);
+    format!("fallback:{:016x}", fingerprint)
+}
+
+fn extract_skill_catalog_reminder_blocks(text: &str) -> Vec<String> {
+    const START: &str = "<system-reminder>";
+    const END: &str = "</system-reminder>";
+    const SKILL_MARKERS: [&str; 4] = [
+        "the following skills are available",
+        "skills are available for use with the skill tool",
+        "skills available in this session",
+        "### available skills",
+    ];
+
+    let mut out = Vec::new();
+    let mut remaining = text;
+
+    loop {
+        let Some(start_idx) = remaining.find(START) else {
+            break;
+        };
+        let after_start = &remaining[start_idx + START.len()..];
+        let Some(end_rel) = after_start.find(END) else {
+            break;
+        };
+
+        let block_inner = &after_start[..end_rel];
+        let block_lower = block_inner.to_ascii_lowercase();
+        if SKILL_MARKERS
+            .iter()
+            .any(|marker| block_lower.contains(marker))
+        {
+            out.push(format!("{}{}{}", START, block_inner, END));
+        }
+
+        remaining = &after_start[end_rel + END.len()..];
+    }
+
+    out
+}
+
+fn collect_skill_catalog_reminder_blocks(request: &AnthropicRequest) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(system) = request.system.as_ref() {
+        for block in extract_skill_catalog_reminder_blocks(&system.to_string()) {
+            if seen.insert(block.clone()) {
+                blocks.push(block);
+            }
+        }
+    }
+
+    for message in &request.messages {
+        if let Some(text) = extract_message_text(message) {
+            for block in extract_skill_catalog_reminder_blocks(&text) {
+                if seen.insert(block.clone()) {
+                    blocks.push(block);
+                }
+            }
+        }
+    }
+
+    blocks
+}
+
+fn get_cached_skill_catalog_reminder(
+    reminder_store: &SkillCatalogReminderStore,
+    cache_key: &str,
+) -> Option<String> {
+    match reminder_store.lock() {
+        Ok(guard) => guard.get(cache_key).map(|entry| entry.reminder_text.clone()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .get(cache_key)
+            .map(|entry| entry.reminder_text.clone()),
+    }
+}
+
+fn upsert_skill_catalog_reminder(
+    reminder_store: &SkillCatalogReminderStore,
+    cache_key: &str,
+    reminder_blocks: &[String],
+) {
+    if reminder_blocks.is_empty() {
+        return;
+    }
+
+    let mut dedup = HashSet::new();
+    let merged = reminder_blocks
+        .iter()
+        .filter(|block| dedup.insert((*block).clone()))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if merged.trim().is_empty() {
+        return;
+    }
+
+    let mut guard = match reminder_store.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if guard.len() >= SKILL_CATALOG_CACHE_MAX_ENTRIES && !guard.contains_key(cache_key) {
+        if let Some((oldest_key, _)) = guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.updated_at)
+            .map(|(key, entry)| (key.clone(), entry.updated_at))
+        {
+            guard.remove(&oldest_key);
+        }
+    }
+
+    guard.insert(
+        cache_key.to_string(),
+        SkillCatalogCacheEntry {
+            reminder_text: merged,
+            updated_at: Instant::now(),
+        },
+    );
+}
+
+fn ensure_skill_catalog_context_for_codex(
+    request: &mut AnthropicRequest,
+    reminder_store: &SkillCatalogReminderStore,
+    cache_key: &str,
+    request_id: &str,
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+) {
+    let current_blocks = collect_skill_catalog_reminder_blocks(request);
+    if !current_blocks.is_empty() {
+        upsert_skill_catalog_reminder(reminder_store, cache_key, &current_blocks);
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[SkillCatalogCache] #{} observed={} action=refresh",
+                request_id,
+                current_blocks.len()
+            ),
+        );
+        return;
+    }
+
+    let Some(cached_text) = get_cached_skill_catalog_reminder(reminder_store, cache_key) else {
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[SkillCatalogCache] #{} observed=0 action=miss key={}",
+                request_id,
+                tail_chars(cache_key, 24)
+            ),
+        );
+        return;
+    };
+
+    request.messages.insert(
+        0,
+        Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(cached_text)),
+        },
+    );
+
+    emit_stream_diag(
+        log_tx,
+        logger,
+        format!(
+            "[SkillCatalogCache] #{} observed=0 action=injected",
+            request_id
+        ),
+    );
 }
 
 fn common_prefix_len(a: &[Value], b: &[Value]) -> usize {
@@ -2896,6 +3102,7 @@ impl ProxyServer {
             enable_sibling_tool_error_retry: true,
             prefer_codex_v1_path: true,
             enable_codex_tool_schema_compaction: true,
+            enable_skill_routing_hint: false,
             enable_stateful_responses_chain: true,
             load_balancer_runtime: None,
         }
@@ -3066,6 +3273,11 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_enable_skill_routing_hint(mut self, enable: bool) -> Self {
+        self.enable_skill_routing_hint = enable;
+        self
+    }
+
     pub fn with_enable_stateful_responses_chain(mut self, enable: bool) -> Self {
         self.enable_stateful_responses_chain = enable;
         self
@@ -3089,6 +3301,7 @@ impl ProxyServer {
                 codex_model: self.codex_model.clone(),
                 gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),
                 enable_codex_tool_schema_compaction: self.enable_codex_tool_schema_compaction,
+                enable_skill_routing_hint: self.enable_skill_routing_hint,
             },
             ignore_probe_requests: self.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: self.allow_count_tokens_fallback_estimate,
@@ -3114,6 +3327,7 @@ impl ProxyServer {
             enable_sibling_tool_error_retry: self.enable_sibling_tool_error_retry,
             prefer_codex_v1_path: self.prefer_codex_v1_path,
             enable_codex_tool_schema_compaction: self.enable_codex_tool_schema_compaction,
+            enable_skill_routing_hint: self.enable_skill_routing_hint,
             enable_stateful_responses_chain: self.enable_stateful_responses_chain,
             load_balancer_runtime: self.load_balancer_runtime.clone(),
         }
@@ -3155,6 +3369,8 @@ impl ProxyServer {
             Arc::new(Mutex::new(HashSet::new()));
         let codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
+        let skill_catalog_reminders: SkillCatalogReminderStore =
+            Arc::new(Mutex::new(HashMap::new()));
         let runtime_handle = ProxyRuntimeHandle {
             state: Arc::new(RwLock::new(RuntimeConfigState::from(self.runtime_update()))),
         };
@@ -3218,6 +3434,8 @@ impl ProxyServer {
                                     Arc::clone(&stateful_chain_unsupported_endpoints);
                                 let codex_v1_unsupported_endpoints =
                                     Arc::clone(&codex_v1_unsupported_endpoints);
+                                let skill_catalog_reminders =
+                                    Arc::clone(&skill_catalog_reminders);
                                 let runtime_handle = runtime_handle_for_server.clone();
                                 let log_tx = log_tx.clone();
                                 let log_tx_for_request = log_tx.clone();
@@ -3241,6 +3459,7 @@ impl ProxyServer {
                                             Arc::clone(&stateful_chain_store),
                                             Arc::clone(&stateful_chain_unsupported_endpoints),
                                             Arc::clone(&codex_v1_unsupported_endpoints),
+                                            Arc::clone(&skill_catalog_reminders),
                                             log_tx_for_request.clone(),
                                         )
                                     });
@@ -3303,6 +3522,7 @@ async fn handle_request(
     stateful_chain_store: StatefulChainStore,
     stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore,
     codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore,
+    skill_catalog_reminders: SkillCatalogReminderStore,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path().to_string();
@@ -3367,6 +3587,7 @@ async fn handle_request(
     let mut ctx = runtime_state.ctx;
     // Keep transformer compaction behavior aligned with runtime switches even if context was stale.
     ctx.enable_codex_tool_schema_compaction = runtime_state.enable_codex_tool_schema_compaction;
+    ctx.enable_skill_routing_hint = runtime_state.enable_skill_routing_hint;
     let ignore_probe_requests = runtime_state.ignore_probe_requests;
     let allow_count_tokens_fallback_estimate = runtime_state.allow_count_tokens_fallback_estimate;
     let prefer_codex_v1_path = runtime_state.prefer_codex_v1_path;
@@ -3498,7 +3719,8 @@ async fn handle_request(
     };
 
     // 再解析为结构体用于日志统计、模型路由等逻辑
-    let anthropic_body: AnthropicRequest = match serde_json::from_value(raw_request_body.clone()) {
+    let mut anthropic_body: AnthropicRequest =
+        match serde_json::from_value(raw_request_body.clone()) {
         Ok(body) => body,
         Err(e) => {
             return Ok(Response::builder()
@@ -3509,7 +3731,10 @@ async fn handle_request(
                 ))
                 .unwrap());
         }
-    };
+        };
+
+    let skill_catalog_cache_key =
+        derive_skill_catalog_cache_key(stateful_chain_hint.as_deref(), &anthropic_body);
 
     if is_messages && ignore_probe_requests {
         if let Some(probe_kind) = detect_probe_request(&anthropic_body) {
@@ -3547,11 +3772,13 @@ async fn handle_request(
         }
     }
 
-    let input_model = anthropic_body
+    let input_model_owned = anthropic_body
         .model
         .as_deref()
-        .unwrap_or("claude-3-5-sonnet-20240620");
-    let input_slot = ModelSlot::from_model_name(input_model);
+        .unwrap_or("claude-3-5-sonnet-20240620")
+        .to_string();
+    let input_model = input_model_owned.as_str();
+    let input_slot = ModelSlot::from_model_name(&input_model);
 
     // count_tokens 请求不计入统计
     if !is_count_tokens {
@@ -3571,6 +3798,7 @@ async fn handle_request(
         .as_ref()
         .map(|system| system.to_string().chars().count())
         .unwrap_or(0);
+    let logger = AppLogger::get();
 
     if is_count_tokens {
         let route_selection = match resolve_route_selection(
@@ -3725,6 +3953,17 @@ async fn handle_request(
                 }
             }
         } else {
+            if route_selection.converter.eq_ignore_ascii_case("codex") {
+                ensure_skill_catalog_context_for_codex(
+                    &mut anthropic_body,
+                    &skill_catalog_reminders,
+                    &skill_catalog_cache_key,
+                    &request_id,
+                    &log_tx,
+                    &logger,
+                );
+            }
+
             let (codex_body, _) = transform_request_with_optional_codex_effort_override(
                 &route_selection.converter,
                 &request_backend,
@@ -3902,7 +4141,6 @@ async fn handle_request(
         .map(|runtime| runtime.candidate_count_for_model(input_model).max(1))
         .unwrap_or(1);
 
-    let logger = AppLogger::get();
     if let Some(ref l) = logger {
         l.log_anthropic_request(&body_bytes);
     }
@@ -4103,6 +4341,16 @@ async fn handle_request(
                 }
                 (request_body, Uuid::new_v4().to_string())
             } else {
+                if route_selection.converter.eq_ignore_ascii_case("codex") {
+                    ensure_skill_catalog_context_for_codex(
+                        &mut anthropic_body,
+                        &skill_catalog_reminders,
+                        &skill_catalog_cache_key,
+                        &request_id,
+                        &log_tx,
+                        &logger,
+                    );
+                }
                 transform_request_with_optional_codex_effort_override(
                     &route_selection.converter,
                     &request_backend,
@@ -6044,9 +6292,11 @@ mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
         build_parallel_tool_degrade_key, chunk_contains_sibling_tool_call_error,
-        classify_connection_error, derive_stateful_chain_key, derive_stream_close_cause,
+        classify_connection_error, collect_skill_catalog_reminder_blocks,
+        derive_skill_catalog_cache_key, derive_stateful_chain_key, derive_stream_close_cause,
         disable_parallel_tool_calls_in_upstream_body, extract_tool_leak_retry_signal,
         extract_upstream_response_id,
+        ensure_skill_catalog_context_for_codex, get_cached_skill_catalog_reminder,
         get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
         is_business_stream_output, is_codex_v1_responses_path,
         leaked_tool_text_retry_skip_reason, mark_parallel_tool_degrade,
@@ -6056,14 +6306,15 @@ mod tests {
         should_drop_post_message_stop_output, should_suppress_premature_message_stop,
         sibling_tool_error_retry_skip_reason, ConnErrorClass, StatefulChainEntry,
         StatefulChainRequestMeta, StatefulChainStore, StatefulChainUnsupportedEndpointStore,
-        SseFrameParser, StreamEventCounters, StreamRuntimeOptions, UpstreamOperation,
-        is_previous_response_id_unsupported_error,
+        SkillCatalogReminderStore, SseFrameParser, StreamEventCounters, StreamRuntimeOptions,
+        UpstreamOperation, is_previous_response_id_unsupported_error, upsert_skill_catalog_reminder,
     };
     use crate::models::AnthropicRequest;
     use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use tokio::sync::broadcast;
 
     fn stream_opts() -> StreamRuntimeOptions {
         StreamRuntimeOptions {
@@ -6083,6 +6334,86 @@ mod tests {
             incomplete_stream_retry_max_attempts: 1,
             enable_sibling_tool_error_retry: true,
         }
+    }
+
+    #[test]
+    fn test_collect_skill_catalog_reminder_blocks_from_request() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>"
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let blocks = collect_skill_catalog_reminder_blocks(&request);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains("The following skills are available"));
+        assert!(blocks[0].contains("- pdf: Read PDF files"));
+    }
+
+    #[test]
+    fn test_skill_catalog_cache_injects_when_missing_and_refreshes_dynamically() {
+        let reminder_store: SkillCatalogReminderStore = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut request_with_catalog: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>"
+            }, {
+                "role": "user",
+                "content": "你好"
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let cache_key = derive_skill_catalog_cache_key(None, &request_with_catalog);
+        ensure_skill_catalog_context_for_codex(
+            &mut request_with_catalog,
+            &reminder_store,
+            &cache_key,
+            "req1",
+            &broadcast::channel(8).0,
+            &None,
+        );
+        let cached = get_cached_skill_catalog_reminder(&reminder_store, &cache_key)
+            .expect("catalog should be cached after observation");
+        assert!(cached.contains("- pdf: Read PDF files"));
+
+        let mut request_without_catalog: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "你当前有些什么技能，只从当前上下文告诉我"
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        ensure_skill_catalog_context_for_codex(
+            &mut request_without_catalog,
+            &reminder_store,
+            &cache_key,
+            "req2",
+            &broadcast::channel(8).0,
+            &None,
+        );
+        let injected_text = super::extract_message_text(&request_without_catalog.messages[0])
+            .unwrap_or_default();
+        assert!(injected_text.contains("The following skills are available"));
+        assert!(injected_text.contains("- pdf: Read PDF files"));
+
+        let refreshed_blocks = vec![
+            "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- playwright: browser automation\n</system-reminder>".to_string()
+        ];
+        upsert_skill_catalog_reminder(&reminder_store, &cache_key, &refreshed_blocks);
+        let refreshed = get_cached_skill_catalog_reminder(&reminder_store, &cache_key)
+            .expect("catalog should be updated");
+        assert!(refreshed.contains("- playwright: browser automation"));
     }
 
     #[test]
