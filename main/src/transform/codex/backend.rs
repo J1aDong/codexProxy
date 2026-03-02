@@ -17,12 +17,13 @@ impl TransformBackend for CodexBackend {
         ctx: &TransformContext,
         model_override: Option<String>,
     ) -> (Value, String) {
-        TransformRequest::transform(
+        TransformRequest::transform_with_options(
             anthropic_body,
             log_tx,
             &ctx.reasoning_mapping,
             &ctx.custom_injection_prompt,
             model_override.as_deref().unwrap_or(&ctx.codex_model),
+            ctx.enable_codex_tool_schema_compaction,
         )
     }
 

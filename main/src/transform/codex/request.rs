@@ -14,6 +14,7 @@ const EMPTY_TOOL_OUTPUT_PLACEHOLDER: &str = "(No output)";
 const PROMPT_CACHE_KEY_MAX_CWD_LEN: usize = 64;
 const PROMPT_CACHE_KEY_SEP: u8 = 0x1f;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 240;
+const MAX_TOOL_SCHEMA_DESCRIPTION_CHARS: usize = 120;
 const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
 const ENV_REASONING_SUMMARY_MODE: &str = "CODEX_PROXY_REASONING_SUMMARY";
 const ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT: &str =
@@ -77,6 +78,43 @@ fn should_inject_runtime_environment_context(system_text: &str) -> bool {
     let lower = system_text.to_ascii_lowercase();
     !(lower.contains("<environment_context>")
         || (lower.contains("<cwd>") && lower.contains("<approval_policy>")))
+}
+
+fn collect_request_text_corpus(request: &AnthropicRequest) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(system_text) = request.system.as_ref().map(|s| s.to_string()) {
+        let trimmed = system_text.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    for message in &request.messages {
+        let Some(content) = message.content.as_ref() else {
+            continue;
+        };
+        match content {
+            MessageContent::Text(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    if let ContentBlock::Text { text } = block {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    parts.join("\n")
 }
 
 fn has_skill_tool(tools: Option<&Vec<Value>>) -> bool {
@@ -404,8 +442,8 @@ fn build_prompt_cache_key(
     format!("codex-proxy:{}:{}:{:016x}", model_segment, cwd_segment, key_hash)
 }
 
-fn compact_tool_description(description: Option<&str>) -> String {
-    let Some(raw) = description else {
+fn compact_text_field(value: Option<&str>, max_chars: usize) -> String {
+    let Some(raw) = value else {
         return String::new();
     };
 
@@ -422,16 +460,58 @@ fn compact_tool_description(description: Option<&str>) -> String {
         .join(" ");
 
     let char_count = normalized.chars().count();
-    if char_count <= MAX_TOOL_DESCRIPTION_CHARS {
+    if char_count <= max_chars {
         return normalized;
     }
 
-    let mut clipped: String = normalized.chars().take(MAX_TOOL_DESCRIPTION_CHARS).collect();
+    let mut clipped: String = normalized.chars().take(max_chars).collect();
     while clipped.ends_with(|ch: char| ch.is_whitespace()) {
         clipped.pop();
     }
     clipped.push_str("...");
     clipped
+}
+
+fn compact_tool_description(description: Option<&str>) -> String {
+    compact_text_field(description, MAX_TOOL_DESCRIPTION_CHARS)
+}
+
+fn compact_tool_schema_description(description: Option<&str>) -> String {
+    compact_text_field(description, MAX_TOOL_SCHEMA_DESCRIPTION_CHARS)
+}
+
+fn compact_tool_parameters_schema(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            for key in [
+                "title",
+                "examples",
+                "example",
+                "deprecated",
+                "readOnly",
+                "writeOnly",
+                "$comment",
+            ] {
+                obj.remove(key);
+            }
+
+            if let Some(description) = obj.get_mut("description") {
+                if let Some(text) = description.as_str() {
+                    *description = Value::String(compact_tool_schema_description(Some(text)));
+                }
+            }
+
+            for child in obj.values_mut() {
+                compact_tool_parameters_schema(child);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                compact_tool_parameters_schema(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn sanitize_function_call_name_for_codex(name: &str) -> String {
@@ -862,6 +942,24 @@ impl TransformRequest {
         custom_injection_prompt: &str,
         codex_model: &str,
     ) -> (Value, String) {
+        Self::transform_with_options(
+            anthropic_body,
+            log_tx,
+            reasoning_mapping,
+            custom_injection_prompt,
+            codex_model,
+            true,
+        )
+    }
+
+    pub fn transform_with_options(
+        anthropic_body: &AnthropicRequest,
+        log_tx: Option<&broadcast::Sender<String>>,
+        reasoning_mapping: &ReasoningEffortMapping,
+        custom_injection_prompt: &str,
+        codex_model: &str,
+        enable_tool_schema_compaction: bool,
+    ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
@@ -907,15 +1005,15 @@ impl TransformRequest {
         // 构建 input 数组（只包含当前请求上下文，不注入静态模板文件）
         let mut final_input: Vec<Value> = Vec::new();
 
+        let request_text_corpus = collect_request_text_corpus(anthropic_body);
         let mut system_text_for_cache_key = None::<String>;
-        let mut include_static_codex_instructions = true;
+        let include_static_codex_instructions =
+            should_include_static_codex_instructions(Some(&request_text_corpus));
 
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let system_text = system.to_string();
             system_text_for_cache_key = Some(system_text.clone());
-            include_static_codex_instructions =
-                should_include_static_codex_instructions(Some(&system_text));
             log(&format!(
                 "📋 [Transform] System prompt: {} chars",
                 system_text.len()
@@ -938,7 +1036,7 @@ impl TransformRequest {
                 }]
             }));
 
-            if should_inject_runtime_environment_context(system_text_for_cache_key.as_deref().unwrap_or("")) {
+            if should_inject_runtime_environment_context(&request_text_corpus) {
                 final_input.push(json!({
                     "type": "message",
                     "role": "user",
@@ -954,7 +1052,7 @@ impl TransformRequest {
                     }]
                 }));
             } else {
-                log("📋 [Transform] Skip runtime <environment_context> injection (already present in system)");
+                log("📋 [Transform] Skip runtime <environment_context> injection (already present in request text)");
             }
         }
 
@@ -1025,7 +1123,11 @@ impl TransformRequest {
         reconcile_function_call_pairs(&mut final_input);
 
         // 转换工具
-        let transformed_tools = Self::transform_tools(anthropic_body.tools.as_ref(), log_tx);
+        let transformed_tools = Self::transform_tools(
+            anthropic_body.tools.as_ref(),
+            log_tx,
+            enable_tool_schema_compaction,
+        );
 
         log(&format!(
             "📋 [Transform] Final: {} input items, {} tools",
@@ -1210,6 +1312,7 @@ impl TransformRequest {
     fn transform_tools(
         tools: Option<&Vec<Value>>,
         log_tx: Option<&broadcast::Sender<String>>,
+        enable_tool_schema_compaction: bool,
     ) -> Vec<Value> {
         // 获取全局日志记录器
         let logger = AppLogger::get();
@@ -1237,8 +1340,9 @@ impl TransformRequest {
         }
 
         log(&format!("🔧 [Tools] Processing {} tools", tools.len()));
+        let before_bytes = serde_json::to_vec(tools).map(|buf| buf.len()).unwrap_or(0);
 
-        tools
+        let transformed: Vec<Value> = tools
             .iter()
             .map(|tool| {
 // Claude Code 格式: { name, description, input_schema }
@@ -1255,6 +1359,9 @@ impl TransformRequest {
 
                     if let Some(obj) = parameters.as_object_mut() {
                         obj.entry("properties").or_insert_with(|| json!({}));
+                    }
+                    if enable_tool_schema_compaction {
+                        compact_tool_parameters_schema(&mut parameters);
                     }
 
                     return json!({
@@ -1280,6 +1387,9 @@ impl TransformRequest {
 
                     if let Some(obj) = parameters.as_object_mut() {
                         obj.entry("properties").or_insert_with(|| json!({}));
+                    }
+                    if enable_tool_schema_compaction {
+                        compact_tool_parameters_schema(&mut parameters);
                     }
 
                     return json!({
@@ -1307,6 +1417,9 @@ impl TransformRequest {
                     if let Some(obj) = parameters.as_object_mut() {
                         obj.entry("properties").or_insert_with(|| json!({}));
                     }
+                    if enable_tool_schema_compaction {
+                        compact_tool_parameters_schema(&mut parameters);
+                    }
 
                     return json!({
                         "type": "function",
@@ -1331,6 +1444,9 @@ impl TransformRequest {
                 if let Some(obj) = parameters.as_object_mut() {
                     obj.entry("properties").or_insert_with(|| json!({}));
                 }
+                if enable_tool_schema_compaction {
+                    compact_tool_parameters_schema(&mut parameters);
+                }
 
                 json!({
                     "type": "function",
@@ -1340,7 +1456,17 @@ impl TransformRequest {
                     "parameters": parameters
                 })
             })
-            .collect()
+            .collect();
+
+        let after_bytes = serde_json::to_vec(&transformed)
+            .map(|buf| buf.len())
+            .unwrap_or(0);
+        log(&format!(
+            "🔧 [Tools] bytes_before={} bytes_after={} schema_compaction={}",
+            before_bytes, after_bytes, enable_tool_schema_compaction
+        ));
+
+        transformed
     }
 }
 
@@ -1460,7 +1586,7 @@ mod tests {
             "description": long_description,
             "input_schema": {"type":"object","properties":{"command":{"type":"string"}}}
         })];
-        let transformed = TransformRequest::transform_tools(Some(&tools), None);
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
         assert_eq!(transformed.len(), 1, "one tool should remain");
         let description = transformed[0]
             .get("description")
@@ -1469,6 +1595,95 @@ mod tests {
         assert!(
             description.chars().count() <= 243,
             "tool description should be compacted for faster request payloads"
+        );
+    }
+
+    #[test]
+    fn transform_tools_compacts_schema_display_fields() {
+        let tools = vec![json!({
+            "name": "Read",
+            "description": "Read file",
+            "input_schema": {
+                "title": "ReadInput",
+                "type": "object",
+                "description": "Read helper schema ".repeat(30),
+                "deprecated": false,
+                "examples": [{"file_path":"/tmp/a.txt"}],
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "title": "Path",
+                        "readOnly": false,
+                        "description": "Absolute path to read ".repeat(20)
+                    }
+                },
+                "required": ["file_path"]
+            }
+        })];
+
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        let parameters = transformed[0].get("parameters").cloned().unwrap_or_default();
+        let parameters_obj = parameters.as_object().expect("schema object");
+
+        assert!(
+            !parameters_obj.contains_key("title"),
+            "title should be removed from compacted schema"
+        );
+        assert!(
+            !parameters_obj.contains_key("examples"),
+            "examples should be removed from compacted schema"
+        );
+        assert!(
+            !parameters_obj.contains_key("deprecated"),
+            "deprecated should be removed from compacted schema"
+        );
+        assert_eq!(
+            parameters
+                .pointer("/required/0")
+                .and_then(|v| v.as_str()),
+            Some("file_path"),
+            "required fields should be preserved"
+        );
+        assert!(
+            parameters
+                .pointer("/properties/file_path/type")
+                .and_then(|v| v.as_str())
+                == Some("string"),
+            "property types should be preserved"
+        );
+        assert!(
+            parameters
+                .pointer("/properties/file_path/description")
+                .and_then(|v| v.as_str())
+                .map(|text| text.chars().count() <= 123)
+                .unwrap_or(false),
+            "nested schema description should be compacted"
+        );
+    }
+
+    #[test]
+    fn transform_tools_keeps_schema_when_compaction_disabled() {
+        let tools = vec![json!({
+            "name": "Read",
+            "description": "Read file",
+            "input_schema": {
+                "title": "ReadInput",
+                "type": "object",
+                "examples": [{"file_path":"/tmp/a.txt"}],
+                "properties": {"file_path": {"type":"string"}}
+            }
+        })];
+
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, false);
+        let parameters = transformed[0].get("parameters").cloned().unwrap_or_default();
+        let parameters_obj = parameters.as_object().expect("schema object");
+        assert!(
+            parameters_obj.contains_key("title"),
+            "title should be kept when schema compaction disabled"
+        );
+        assert!(
+            parameters_obj.contains_key("examples"),
+            "examples should be kept when schema compaction disabled"
         );
     }
 
@@ -1551,6 +1766,28 @@ mod tests {
     }
 
     #[test]
+    fn skips_static_instructions_when_messages_already_contain_codex_harness_rules() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content":"You are Codex, based on GPT-5.\n## Editing constraints\n## Plan tool\n## Presenting your work"
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert!(
+            body.get("instructions").is_none(),
+            "static instructions should be omitted when equivalent guidance exists in messages"
+        );
+    }
+
+    #[test]
     fn skips_runtime_environment_context_when_system_already_provides_it() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
@@ -1578,6 +1815,40 @@ mod tests {
         assert_eq!(
             env_context_count, 1,
             "runtime environment context should not be appended when already present"
+        );
+    }
+
+    #[test]
+    fn skips_runtime_environment_context_when_messages_already_provide_it() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content":"<environment_context><cwd>/tmp</cwd><approval_policy>on-request</approval_policy></environment_context>"
+            }],
+            "system": "System prompt",
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let env_context_count = input_items
+            .iter()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|blocks| blocks.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .filter(|text| text.contains("<environment_context>"))
+            .count();
+
+        assert_eq!(
+            env_context_count, 1,
+            "runtime environment context should not be duplicated when already present in messages"
         );
     }
 

@@ -67,6 +67,8 @@ pub struct ProxyServer {
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
     enable_sibling_tool_error_retry: bool,
+    prefer_codex_v1_path: bool,
+    enable_codex_tool_schema_compaction: bool,
     enable_stateful_responses_chain: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
@@ -98,6 +100,8 @@ pub struct RuntimeConfigUpdate {
     pub enable_incomplete_stream_retry: bool,
     pub incomplete_stream_retry_max_attempts: u32,
     pub enable_sibling_tool_error_retry: bool,
+    pub prefer_codex_v1_path: bool,
+    pub enable_codex_tool_schema_compaction: bool,
     pub enable_stateful_responses_chain: bool,
     pub load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
@@ -124,16 +128,20 @@ struct RuntimeConfigState {
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
     enable_sibling_tool_error_retry: bool,
+    prefer_codex_v1_path: bool,
+    enable_codex_tool_schema_compaction: bool,
     enable_stateful_responses_chain: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
 impl From<RuntimeConfigUpdate> for RuntimeConfigState {
     fn from(value: RuntimeConfigUpdate) -> Self {
+        let mut ctx = value.ctx;
+        ctx.enable_codex_tool_schema_compaction = value.enable_codex_tool_schema_compaction;
         Self {
             target_url: value.target_url,
             api_key: value.api_key,
-            ctx: value.ctx,
+            ctx,
             ignore_probe_requests: value.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: value.allow_count_tokens_fallback_estimate,
             force_stream_for_codex: value.force_stream_for_codex,
@@ -151,6 +159,8 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             enable_incomplete_stream_retry: value.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: value.incomplete_stream_retry_max_attempts,
             enable_sibling_tool_error_retry: value.enable_sibling_tool_error_retry,
+            prefer_codex_v1_path: value.prefer_codex_v1_path,
+            enable_codex_tool_schema_compaction: value.enable_codex_tool_schema_compaction,
             enable_stateful_responses_chain: value.enable_stateful_responses_chain,
             load_balancer_runtime: value.load_balancer_runtime,
         }
@@ -285,12 +295,13 @@ fn transform_request_with_optional_codex_effort_override(
                 .with_opus(override_effort)
                 .with_sonnet(override_effort)
                 .with_haiku(override_effort);
-            return crate::transform::codex::TransformRequest::transform(
+            return crate::transform::codex::TransformRequest::transform_with_options(
                 anthropic_body,
                 Some(log_tx),
                 &override_mapping,
                 &ctx.custom_injection_prompt,
                 model_name,
+                ctx.enable_codex_tool_schema_compaction,
             );
         }
     }
@@ -429,6 +440,7 @@ struct StatefulChainEntry {
 
 type StatefulChainStore = Arc<Mutex<HashMap<String, StatefulChainEntry>>>;
 type StatefulChainUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
+type CodexV1UnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 
 fn is_stateful_endpoint_previous_response_id_unsupported(
     unsupported_store: &StatefulChainUnsupportedEndpointStore,
@@ -484,6 +496,36 @@ fn build_stateful_endpoint_key(
     format!("{}:{:016x}", converter.to_ascii_lowercase(), fingerprint)
 }
 
+fn build_codex_v1_endpoint_key(converter: &str, target_url: &str, api_key: &str) -> String {
+    let fingerprint = hash_to_u64(&[converter, target_url, api_key]);
+    format!("{}:{:016x}", converter.to_ascii_lowercase(), fingerprint)
+}
+
+fn is_codex_v1_endpoint_unsupported(
+    unsupported_store: &CodexV1UnsupportedEndpointStore,
+    endpoint_key: &str,
+) -> bool {
+    match unsupported_store.lock() {
+        Ok(guard) => guard.contains(endpoint_key),
+        Err(poisoned) => poisoned.into_inner().contains(endpoint_key),
+    }
+}
+
+fn mark_codex_v1_endpoint_unsupported(
+    unsupported_store: &CodexV1UnsupportedEndpointStore,
+    endpoint_key: &str,
+) {
+    match unsupported_store.lock() {
+        Ok(mut guard) => {
+            guard.insert(endpoint_key.to_string());
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.insert(endpoint_key.to_string());
+        }
+    }
+}
+
 fn extract_stateful_chain_hint(req: &Request<hyper::body::Incoming>) -> Option<String> {
     for name in STATEFUL_CHAIN_HINT_HEADERS {
         if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
@@ -503,7 +545,8 @@ fn build_message_prefix_signature(request: &AnthropicRequest) -> String {
         .take(4)
         .map(|message| {
             let preview = extract_message_text(message).unwrap_or_default();
-            let compact_preview: String = preview.chars().take(80).collect();
+            let normalized_preview = normalize_stateful_prefix_preview(&preview);
+            let compact_preview: String = normalized_preview.chars().take(80).collect();
             format!(
                 "{}:{}",
                 message.role.to_ascii_lowercase(),
@@ -512,6 +555,20 @@ fn build_message_prefix_signature(request: &AnthropicRequest) -> String {
         })
         .collect::<Vec<_>>()
         .join("|")
+}
+
+fn normalize_stateful_prefix_preview(preview: &str) -> String {
+    let normalized = preview.replace('\r', "").replace('\n', " ");
+    let lower = normalized.to_ascii_lowercase();
+
+    if lower.contains("<system-reminder>") && lower.contains("sessionstart") {
+        return "<system-reminder>:sessionstart".to_string();
+    }
+    if lower.contains("<system-reminder>") && lower.contains("plan mode is active") {
+        return "<system-reminder>:plan-mode-active".to_string();
+    }
+
+    normalized
 }
 
 fn derive_stateful_chain_key(
@@ -2364,6 +2421,16 @@ fn strip_query(url: String) -> String {
     }
 }
 
+fn extract_url_path(url: &str) -> String {
+    let clean = strip_query(url.to_string());
+    if let Some((_, rest)) = clean.split_once("://") {
+        if let Some((_, path)) = rest.split_once('/') {
+            return format!("/{}", path);
+        }
+    }
+    "/".to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpstreamOperation {
     Messages,
@@ -2432,22 +2499,6 @@ fn build_gemini_messages_endpoint(target_url: &str, model: &str) -> String {
     )
 }
 
-fn build_codex_messages_endpoint(target_url: &str) -> String {
-    let clean = strip_query(target_url.to_string());
-    if let Some(idx) = clean.rfind("/responses/input_tokens") {
-        let mut endpoint = clean;
-        endpoint.replace_range(idx..idx + "/responses/input_tokens".len(), "/responses");
-        return endpoint;
-    }
-
-    if clean.contains("/responses") {
-        return clean;
-    }
-
-    let base = clean.trim_end_matches('/');
-    format!("{}/responses", base)
-}
-
 fn build_codex_input_tokens_endpoint(target_url: &str) -> String {
     let clean = strip_query(target_url.to_string());
     if let Some(idx) = clean.rfind("/responses") {
@@ -2458,6 +2509,113 @@ fn build_codex_input_tokens_endpoint(target_url: &str) -> String {
 
     let base = clean.trim_end_matches('/');
     format!("{}/responses/input_tokens", base)
+}
+
+fn build_codex_messages_endpoint(target_url: &str) -> String {
+    let endpoint = build_codex_input_tokens_endpoint(target_url);
+    if let Some(idx) = endpoint.rfind("/responses/input_tokens") {
+        let mut normalized = endpoint;
+        normalized.replace_range(idx..idx + "/responses/input_tokens".len(), "/responses");
+        return normalized;
+    }
+    endpoint
+}
+
+fn build_codex_endpoint_with_path_preference(
+    target_url: &str,
+    operation: UpstreamOperation,
+    prefer_v1: bool,
+) -> String {
+    let legacy_endpoint = match operation {
+        UpstreamOperation::Messages => build_codex_messages_endpoint(target_url),
+        UpstreamOperation::CountTokens => build_codex_input_tokens_endpoint(target_url),
+    };
+    let desired_suffix = match operation {
+        UpstreamOperation::Messages => {
+            if prefer_v1 {
+                "/v1/responses"
+            } else {
+                "/responses"
+            }
+        }
+        UpstreamOperation::CountTokens => {
+            if prefer_v1 {
+                "/v1/responses/input_tokens"
+            } else {
+                "/responses/input_tokens"
+            }
+        }
+    };
+    let known_suffixes = [
+        "/v1/responses/input_tokens",
+        "/responses/input_tokens",
+        "/v1/responses",
+        "/responses",
+    ];
+
+    for suffix in known_suffixes {
+        if let Some(idx) = legacy_endpoint.rfind(suffix) {
+            let mut endpoint = legacy_endpoint.clone();
+            endpoint.replace_range(idx..idx + suffix.len(), desired_suffix);
+            return endpoint;
+        }
+    }
+
+    let base = legacy_endpoint.trim_end_matches('/');
+    if prefer_v1 {
+        if base.ends_with("/v1") {
+            format!("{}/{}", base, desired_suffix.trim_start_matches("/v1/"))
+        } else {
+            format!("{}/{}", base, desired_suffix.trim_start_matches('/'))
+        }
+    } else {
+        format!("{}/{}", base, desired_suffix.trim_start_matches('/'))
+    }
+}
+
+fn is_codex_v1_responses_path(url: &str) -> bool {
+    let clean = strip_query(url.to_string());
+    clean.contains("/v1/responses")
+}
+
+fn should_retry_codex_v1_path_with_legacy(status: u16, error_text: &str) -> bool {
+    if status == StatusCode::NOT_FOUND.as_u16() {
+        let lower = error_text.to_ascii_lowercase();
+        return lower.contains("route ") && lower.contains(" not found")
+            || lower.contains("route_not_found")
+            || lower.contains("no route")
+            || lower.contains("unknown route");
+    }
+
+    if status == StatusCode::BAD_REQUEST.as_u16() || status == StatusCode::UNPROCESSABLE_ENTITY.as_u16()
+    {
+        let lower = error_text.to_ascii_lowercase();
+        return lower.contains("unsupported")
+            && (lower.contains("path")
+                || lower.contains("endpoint")
+                || lower.contains("url")
+                || lower.contains("/v1/responses"));
+    }
+
+    false
+}
+
+fn resolve_upstream_url_with_codex_path_preference(
+    converter: &str,
+    target_url: &str,
+    operation: UpstreamOperation,
+    model: &str,
+    prefer_codex_v1_path: bool,
+) -> String {
+    if converter.eq_ignore_ascii_case("codex") {
+        return build_codex_endpoint_with_path_preference(
+            target_url,
+            operation,
+            prefer_codex_v1_path,
+        );
+    }
+
+    resolve_upstream_url(converter, target_url, operation, model)
 }
 
 fn build_anthropic_messages_endpoint(target_url: &str) -> String {
@@ -2736,6 +2894,8 @@ impl ProxyServer {
             enable_incomplete_stream_retry: true,
             incomplete_stream_retry_max_attempts: 2,
             enable_sibling_tool_error_retry: true,
+            prefer_codex_v1_path: true,
+            enable_codex_tool_schema_compaction: true,
             enable_stateful_responses_chain: true,
             load_balancer_runtime: None,
         }
@@ -2896,6 +3056,16 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_prefer_codex_v1_path(mut self, enable: bool) -> Self {
+        self.prefer_codex_v1_path = enable;
+        self
+    }
+
+    pub fn with_enable_codex_tool_schema_compaction(mut self, enable: bool) -> Self {
+        self.enable_codex_tool_schema_compaction = enable;
+        self
+    }
+
     pub fn with_enable_stateful_responses_chain(mut self, enable: bool) -> Self {
         self.enable_stateful_responses_chain = enable;
         self
@@ -2918,6 +3088,7 @@ impl ProxyServer {
                 converter: self.converter.clone(),
                 codex_model: self.codex_model.clone(),
                 gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),
+                enable_codex_tool_schema_compaction: self.enable_codex_tool_schema_compaction,
             },
             ignore_probe_requests: self.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: self.allow_count_tokens_fallback_estimate,
@@ -2941,6 +3112,8 @@ impl ProxyServer {
             enable_incomplete_stream_retry: self.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: self.incomplete_stream_retry_max_attempts,
             enable_sibling_tool_error_retry: self.enable_sibling_tool_error_retry,
+            prefer_codex_v1_path: self.prefer_codex_v1_path,
+            enable_codex_tool_schema_compaction: self.enable_codex_tool_schema_compaction,
             enable_stateful_responses_chain: self.enable_stateful_responses_chain,
             load_balancer_runtime: self.load_balancer_runtime.clone(),
         }
@@ -2979,6 +3152,8 @@ impl ProxyServer {
             Arc::new(Mutex::new(HashMap::new()));
         let stateful_chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
         let stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        let codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
         let runtime_handle = ProxyRuntimeHandle {
             state: Arc::new(RwLock::new(RuntimeConfigState::from(self.runtime_update()))),
@@ -3041,6 +3216,8 @@ impl ProxyServer {
                                 let stateful_chain_store = Arc::clone(&stateful_chain_store);
                                 let stateful_chain_unsupported_endpoints =
                                     Arc::clone(&stateful_chain_unsupported_endpoints);
+                                let codex_v1_unsupported_endpoints =
+                                    Arc::clone(&codex_v1_unsupported_endpoints);
                                 let runtime_handle = runtime_handle_for_server.clone();
                                 let log_tx = log_tx.clone();
                                 let log_tx_for_request = log_tx.clone();
@@ -3063,6 +3240,7 @@ impl ProxyServer {
                                             Arc::clone(&parallel_tool_degrade_until),
                                             Arc::clone(&stateful_chain_store),
                                             Arc::clone(&stateful_chain_unsupported_endpoints),
+                                            Arc::clone(&codex_v1_unsupported_endpoints),
                                             log_tx_for_request.clone(),
                                         )
                                     });
@@ -3124,6 +3302,7 @@ async fn handle_request(
     parallel_tool_degrade_until: Arc<Mutex<HashMap<String, Instant>>>,
     stateful_chain_store: StatefulChainStore,
     stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore,
+    codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path().to_string();
@@ -3185,9 +3364,12 @@ async fn handle_request(
     let stream_opts = StreamRuntimeOptions::from_state(&runtime_state);
     let target_url = runtime_state.target_url;
     let api_key = runtime_state.api_key;
-    let ctx = runtime_state.ctx;
+    let mut ctx = runtime_state.ctx;
+    // Keep transformer compaction behavior aligned with runtime switches even if context was stale.
+    ctx.enable_codex_tool_schema_compaction = runtime_state.enable_codex_tool_schema_compaction;
     let ignore_probe_requests = runtime_state.ignore_probe_requests;
     let allow_count_tokens_fallback_estimate = runtime_state.allow_count_tokens_fallback_estimate;
+    let prefer_codex_v1_path = runtime_state.prefer_codex_v1_path;
     let enable_stateful_responses_chain = runtime_state.enable_stateful_responses_chain;
     let load_balancer_runtime = runtime_state.load_balancer_runtime;
 
@@ -3435,11 +3617,35 @@ async fn handle_request(
         let mut token_count: Option<u64> = None;
         let mut upstream_status: Option<u16> = None;
         let mut source = "estimate".to_string();
-        let count_tokens_endpoint = resolve_upstream_url(
+        let codex_v1_endpoint_key = if route_selection.converter.eq_ignore_ascii_case("codex") {
+            Some(build_codex_v1_endpoint_key(
+                &route_selection.converter,
+                &route_selection.target_url,
+                &route_selection.api_key,
+            ))
+        } else {
+            None
+        };
+        let prefer_codex_v1_path_for_route = route_selection.converter.eq_ignore_ascii_case("codex")
+            && prefer_codex_v1_path
+            && codex_v1_endpoint_key.as_ref().map_or(true, |key| {
+                !is_codex_v1_endpoint_unsupported(&codex_v1_unsupported_endpoints, key)
+            });
+        if route_selection.converter.eq_ignore_ascii_case("codex")
+            && prefer_codex_v1_path
+            && !prefer_codex_v1_path_for_route
+        {
+            let _ = log_tx.send(format!(
+                "[Route] #{} codex_v1_preferred=false reason=endpoint_cached_unsupported",
+                request_id
+            ));
+        }
+        let mut count_tokens_endpoint = resolve_upstream_url_with_codex_path_preference(
             &route_selection.converter,
             &route_selection.target_url,
             UpstreamOperation::CountTokens,
             &route_selection.model_name,
+            prefer_codex_v1_path_for_route,
         );
 
         if route_selection.converter.eq_ignore_ascii_case("gemini") {
@@ -3529,7 +3735,7 @@ async fn handle_request(
                 route_selection.reasoning_effort_override,
             );
 
-            let response = http_client
+            let request = http_client
                 .post(&count_tokens_endpoint)
                 .header("Content-Type", "application/json")
                 .header(
@@ -3542,9 +3748,9 @@ async fn handle_request(
                 .body(codex_body.to_string());
 
             let response = if let Some(beta) = &anthropic_beta {
-                response.header("anthropic-beta", beta).send().await
+                request.header("anthropic-beta", beta).send().await
             } else {
-                response.send().await
+                request.send().await
             };
 
             if let Ok(resp) = response {
@@ -3555,6 +3761,68 @@ async fn handle_request(
                             token_count = parse_input_tokens(&value);
                             if token_count.is_some() {
                                 source = "codex_input_tokens".to_string();
+                            }
+                        }
+                    }
+                } else {
+                    let status = resp.status().as_u16();
+                    let error_text = resp.text().await.unwrap_or_default();
+                    if is_codex_v1_responses_path(&count_tokens_endpoint)
+                        && should_retry_codex_v1_path_with_legacy(status, &error_text)
+                    {
+                        let fallback_endpoint = resolve_upstream_url_with_codex_path_preference(
+                            &route_selection.converter,
+                            &route_selection.target_url,
+                            UpstreamOperation::CountTokens,
+                            &route_selection.model_name,
+                            false,
+                        );
+                        let _ = log_tx.send(format!(
+                            "[Route] #{} codex_v1_count_tokens_fallback=true from={} to={}",
+                            request_id, count_tokens_endpoint, fallback_endpoint
+                        ));
+                        count_tokens_endpoint = fallback_endpoint;
+
+                        let retry_request = http_client
+                            .post(&count_tokens_endpoint)
+                            .header("Content-Type", "application/json")
+                            .header(
+                                "Authorization",
+                                format!("Bearer {}", &route_selection.api_key),
+                            )
+                            .header("x-api-key", &route_selection.api_key)
+                            .header("x-anthropic-version", &anthropic_version)
+                            .header("originator", "codex_cli_rs")
+                            .body(codex_body.to_string());
+
+                        let retry_response = if let Some(beta) = &anthropic_beta {
+                            retry_request.header("anthropic-beta", beta).send().await
+                        } else {
+                            retry_request.send().await
+                        };
+
+                        match retry_response {
+                            Ok(retry_resp) => {
+                                upstream_status = Some(retry_resp.status().as_u16());
+                                if retry_resp.status().is_success() {
+                                    if let Some(endpoint_key) = codex_v1_endpoint_key.as_ref() {
+                                        mark_codex_v1_endpoint_unsupported(
+                                            &codex_v1_unsupported_endpoints,
+                                            endpoint_key,
+                                        );
+                                    }
+                                    if let Ok(text) = retry_resp.text().await {
+                                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                            token_count = parse_input_tokens(&value);
+                                            if token_count.is_some() {
+                                                source = "codex_input_tokens".to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                upstream_status = None;
                             }
                         }
                     }
@@ -3710,13 +3978,37 @@ async fn handle_request(
             "-".to_string()
         };
 
-        let resolved_target_url = resolve_upstream_url(
+        let codex_v1_endpoint_key = if route_selection.converter.eq_ignore_ascii_case("codex") {
+            Some(build_codex_v1_endpoint_key(
+                &route_selection.converter,
+                &route_selection.target_url,
+                &route_selection.api_key,
+            ))
+        } else {
+            None
+        };
+        let prefer_codex_v1_path_for_route = route_selection.converter.eq_ignore_ascii_case("codex")
+            && prefer_codex_v1_path
+            && codex_v1_endpoint_key.as_ref().map_or(true, |key| {
+                !is_codex_v1_endpoint_unsupported(&codex_v1_unsupported_endpoints, key)
+            });
+        if route_selection.converter.eq_ignore_ascii_case("codex")
+            && prefer_codex_v1_path
+            && !prefer_codex_v1_path_for_route
+        {
+            let _ = log_tx.send(format!(
+                "[Route] #{} codex_v1_preferred=false reason=endpoint_cached_unsupported",
+                request_id
+            ));
+        }
+        let mut resolved_target_url = resolve_upstream_url_with_codex_path_preference(
             &route_selection.converter,
             &route_selection.target_url,
             UpstreamOperation::Messages,
             &route_selection.model_name,
+            prefer_codex_v1_path_for_route,
         );
-        let parallel_tool_degrade_key = build_parallel_tool_degrade_key(
+        let mut parallel_tool_degrade_key = build_parallel_tool_degrade_key(
             route_selection.route.as_ref(),
             &resolved_target_url,
             &route_selection.converter,
@@ -3822,7 +4114,7 @@ async fn handle_request(
                 )
             };
 
-        let stateful_chain_meta_for_attempt = if enable_stateful_responses_chain
+        let mut stateful_chain_meta_for_attempt = if enable_stateful_responses_chain
             && route_selection.converter.eq_ignore_ascii_case("codex")
         {
             let endpoint_key = build_stateful_endpoint_key(
@@ -3851,6 +4143,29 @@ async fn handle_request(
             None
         };
 
+        let stateful_chain_mode = if !enable_stateful_responses_chain {
+            "disabled".to_string()
+        } else if !route_selection.converter.eq_ignore_ascii_case("codex") {
+            "disabled_non_codex".to_string()
+        } else if upstream_body
+            .get("previous_response_id")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            "attached".to_string()
+        } else if let Some(meta) = stateful_chain_meta_for_attempt.as_ref() {
+            if is_stateful_endpoint_previous_response_id_unsupported(
+                &stateful_chain_unsupported_endpoints,
+                &meta.endpoint_key,
+            ) {
+                "skipped_endpoint_unsupported".to_string()
+            } else {
+                "skipped_no_previous_response_id".to_string()
+            }
+        } else {
+            "skipped_not_applicable".to_string()
+        };
+
         if route_selection.converter.eq_ignore_ascii_case("codex") {
             if let Some(remaining_secs) = get_parallel_tool_degrade_remaining_seconds(
                 &parallel_tool_degrade_until,
@@ -3875,11 +4190,31 @@ async fn handle_request(
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.len())
                 .unwrap_or(0);
+            let request_body_bytes = serde_json::to_vec(&upstream_body)
+                .map(|buf| buf.len())
+                .unwrap_or(0);
+            let tools_bytes_before = anthropic_body
+                .tools
+                .as_ref()
+                .and_then(|tools| serde_json::to_vec(tools).ok())
+                .map(|buf| buf.len())
+                .unwrap_or(0);
+            let tools_bytes_after = upstream_body
+                .get("tools")
+                .and_then(|tools| serde_json::to_vec(tools).ok())
+                .map(|buf| buf.len())
+                .unwrap_or(0);
+            let resolved_url_path = extract_url_path(&resolved_target_url);
             let _ = log_tx.send(format!(
-                "[ReqPayload] #{} keys={} input_items={} summary={}",
+                "[ReqPayload] #{} keys={} input_items={} resolved_url_path={} request_body_bytes={} tools_bytes_before={} tools_bytes_after={} stateful_chain_mode={} summary={}",
                 request_id,
                 top_keys,
                 input_items,
+                resolved_url_path,
+                request_body_bytes,
+                tools_bytes_before,
+                tools_bytes_after,
+                stateful_chain_mode,
                 tail_chars(&input_summary, 320),
             ));
         }
@@ -3977,10 +4312,117 @@ async fn handle_request(
             let mut status = response.status().as_u16();
             let mut error_text = response.text().await.unwrap_or_default();
             let mut recovered_response: Option<reqwest::Response> = None;
+            let mut used_legacy_codex_route = false;
+
+            if route_selection.converter.eq_ignore_ascii_case("codex")
+                && is_codex_v1_responses_path(&resolved_target_url)
+                && should_retry_codex_v1_path_with_legacy(status, &error_text)
+            {
+                let fallback_target_url = resolve_upstream_url_with_codex_path_preference(
+                    &route_selection.converter,
+                    &route_selection.target_url,
+                    UpstreamOperation::Messages,
+                    &route_selection.model_name,
+                    false,
+                );
+
+                if fallback_target_url != resolved_target_url {
+                    emit_stream_diag(
+                        &log_tx,
+                        &logger,
+                        format!(
+                            "[Route] #{} codex_v1_fallback=true from={} to={}",
+                            request_id, resolved_target_url, fallback_target_url
+                        ),
+                    );
+                    resolved_target_url = fallback_target_url.clone();
+                    parallel_tool_degrade_key = build_parallel_tool_degrade_key(
+                        route_selection.route.as_ref(),
+                        &resolved_target_url,
+                        &route_selection.converter,
+                        &route_selection.model_name,
+                    );
+
+                    if let Some(ref l) = logger {
+                        let headers = vec![
+                            ("Content-Type", "application/json"),
+                            ("Authorization", "Bearer <API_KEY>"),
+                            ("User-Agent", "Anthropic-Node/0.3.4"),
+                            ("x-anthropic-version", &anthropic_version),
+                            ("Accept", "text/event-stream"),
+                            ("session_id", &session_id),
+                        ];
+                        l.log_curl_request(
+                            "POST",
+                            &resolved_target_url,
+                            &headers,
+                            &upstream_body,
+                            backend_label_by_converter(&route_selection.converter),
+                        );
+                    }
+
+                    let fallback_req = request_backend.build_upstream_request(
+                        &http_client,
+                        &resolved_target_url,
+                        &route_selection.api_key,
+                        &upstream_body,
+                        &session_id,
+                        &anthropic_version,
+                    );
+
+                    let fallback_req = if let Some(beta) = &anthropic_beta {
+                        fallback_req.header("anthropic-beta", beta)
+                    } else {
+                        fallback_req
+                    };
+
+                    match fallback_req.send().await {
+                        Ok(fallback_resp) if fallback_resp.status().is_success() => {
+                            used_legacy_codex_route = true;
+                            if let Some(endpoint_key) = codex_v1_endpoint_key.as_ref() {
+                                mark_codex_v1_endpoint_unsupported(
+                                    &codex_v1_unsupported_endpoints,
+                                    endpoint_key,
+                                );
+                            }
+                            if let Some(meta) = stateful_chain_meta_for_attempt.as_mut() {
+                                meta.endpoint_key = build_stateful_endpoint_key(
+                                    &route_selection.converter,
+                                    &resolved_target_url,
+                                    &route_selection.model_name,
+                                    &route_selection.api_key,
+                                );
+                            }
+                            recovered_response = Some(fallback_resp);
+                        }
+                        Ok(fallback_resp) => {
+                            retry_after = fallback_resp
+                                .headers()
+                                .get("retry-after")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("-")
+                                .to_string();
+                            status = fallback_resp.status().as_u16();
+                            error_text = fallback_resp.text().await.unwrap_or_default();
+                        }
+                        Err(fallback_err) => {
+                            retry_after = "-".to_string();
+                            status = StatusCode::BAD_GATEWAY.as_u16();
+                            error_text = json!({
+                                "error": {
+                                    "message": format!("Upstream error after codex_v1_fallback: {}", fallback_err)
+                                }
+                            })
+                            .to_string();
+                        }
+                    }
+                }
+            }
 
             let can_retry_without_previous_response_id = route_selection
                 .converter
                 .eq_ignore_ascii_case("codex")
+                && recovered_response.is_none()
                 && upstream_body
                     .get("previous_response_id")
                     .and_then(|v| v.as_str())
@@ -4084,6 +4526,13 @@ async fn handle_request(
 
             if let Some(recovered) = recovered_response {
                 response = recovered;
+                if used_legacy_codex_route {
+                    let _ = log_tx.send(format!(
+                        "[Route] #{} codex_v1_fallback_result=succeeded resolved_url_path={}",
+                        request_id,
+                        extract_url_path(&resolved_target_url),
+                    ));
+                }
             } else {
                 let action = if let (Some(runtime), Some(route)) = (
                     load_balancer_runtime.as_ref(),
@@ -5599,9 +6048,11 @@ mod tests {
         disable_parallel_tool_calls_in_upstream_body, extract_tool_leak_retry_signal,
         extract_upstream_response_id,
         get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
-        is_business_stream_output, leaked_tool_text_retry_skip_reason, mark_parallel_tool_degrade,
+        is_business_stream_output, is_codex_v1_responses_path,
+        leaked_tool_text_retry_skip_reason, mark_parallel_tool_degrade,
         observe_upstream_chunk_events, prepare_stateful_chain_request, record_stateful_chain_entry,
         resolve_effective_stream, resolve_upstream_url,
+        resolve_upstream_url_with_codex_path_preference, should_retry_codex_v1_path_with_legacy,
         should_drop_post_message_stop_output, should_suppress_premature_message_stop,
         sibling_tool_error_retry_skip_reason, ConnErrorClass, StatefulChainEntry,
         StatefulChainRequestMeta, StatefulChainStore, StatefulChainUnsupportedEndpointStore,
@@ -5654,6 +6105,71 @@ mod tests {
             "gpt-5.3-codex",
         );
         assert_eq!(url, "https://codex.funai.vip/openai/responses/input_tokens");
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_with_codex_preference_uses_v1_path() {
+        let url = resolve_upstream_url_with_codex_path_preference(
+            "codex",
+            "https://codex.funai.vip/openai",
+            UpstreamOperation::Messages,
+            "gpt-5.3-codex",
+            true,
+        );
+        assert_eq!(url, "https://codex.funai.vip/openai/v1/responses");
+
+        let count_tokens_url = resolve_upstream_url_with_codex_path_preference(
+            "codex",
+            "https://codex.funai.vip/openai",
+            UpstreamOperation::CountTokens,
+            "gpt-5.3-codex",
+            true,
+        );
+        assert_eq!(
+            count_tokens_url,
+            "https://codex.funai.vip/openai/v1/responses/input_tokens"
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_with_codex_preference_can_fallback_legacy() {
+        let url = resolve_upstream_url_with_codex_path_preference(
+            "codex",
+            "https://codex.funai.vip/openai/v1/responses",
+            UpstreamOperation::Messages,
+            "gpt-5.3-codex",
+            false,
+        );
+        assert_eq!(url, "https://codex.funai.vip/openai/responses");
+    }
+
+    #[test]
+    fn test_should_retry_codex_v1_path_with_legacy_detects_route_not_found() {
+        assert!(should_retry_codex_v1_path_with_legacy(
+            404,
+            r#"{"error":{"message":"Route not found"}}"#
+        ));
+        assert!(should_retry_codex_v1_path_with_legacy(
+            400,
+            r#"{"error":{"message":"Unsupported endpoint /v1/responses"}}"#
+        ));
+        assert!(!should_retry_codex_v1_path_with_legacy(
+            429,
+            r#"{"error":{"message":"rate limit exceeded"}}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_codex_v1_responses_path_matcher() {
+        assert!(is_codex_v1_responses_path(
+            "https://example.com/openai/v1/responses"
+        ));
+        assert!(is_codex_v1_responses_path(
+            "https://example.com/openai/v1/responses/input_tokens"
+        ));
+        assert!(!is_codex_v1_responses_path(
+            "https://example.com/openai/responses"
+        ));
     }
 
     #[test]
@@ -6140,6 +6656,33 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             &request,
         );
         assert_eq!(key, "hint:codex:session-123");
+    }
+
+    #[test]
+    fn test_derive_stateful_chain_key_ignores_sessionstart_noise() {
+        let request_a: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content":[{"type":"text","text":"<system-reminder>\nSessionStart:startup hook success: Success\n</system-reminder>"}]
+            }],
+            "stream": true
+        }))
+        .expect("request_a");
+
+        let request_b: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content":[{"type":"text","text":"<system-reminder>\nSessionStart hook additional context: another variant\n</system-reminder>"}]
+            }],
+            "stream": true
+        }))
+        .expect("request_b");
+
+        let key_a = derive_stateful_chain_key(None, "codex", "gpt-5.3-codex", &request_a);
+        let key_b = derive_stateful_chain_key(None, "codex", "gpt-5.3-codex", &request_b);
+        assert_eq!(key_a, key_b);
     }
 
     #[test]

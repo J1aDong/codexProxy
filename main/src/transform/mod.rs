@@ -21,6 +21,7 @@ pub struct TransformContext {
     pub converter: String,
     pub codex_model: String,
     pub gemini_reasoning_effort: GeminiReasoningEffortMapping,
+    pub enable_codex_tool_schema_compaction: bool,
 }
 
 /// 协议转换后端 —— 每种上游 API 实现一份

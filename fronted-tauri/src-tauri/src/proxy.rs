@@ -346,6 +346,16 @@ pub struct ProxyConfig {
     )]
     pub enable_sibling_tool_error_retry: bool,
     #[serde(
+        rename = "preferCodexV1Path",
+        default = "default_prefer_codex_v1_path"
+    )]
+    pub prefer_codex_v1_path: bool,
+    #[serde(
+        rename = "enableCodexToolSchemaCompaction",
+        default = "default_enable_codex_tool_schema_compaction"
+    )]
+    pub enable_codex_tool_schema_compaction: bool,
+    #[serde(
         rename = "enableStatefulResponsesChain",
         default = "default_enable_stateful_responses_chain"
     )]
@@ -475,6 +485,14 @@ fn default_incomplete_stream_retry_max_attempts() -> u32 {
 }
 
 fn default_enable_sibling_tool_error_retry() -> bool {
+    true
+}
+
+fn default_prefer_codex_v1_path() -> bool {
+    true
+}
+
+fn default_enable_codex_tool_schema_compaction() -> bool {
     true
 }
 
@@ -694,6 +712,7 @@ fn build_runtime_update(
             converter: config.converter.clone(),
             codex_model: config.codex_model.clone(),
             gemini_reasoning_effort: config.gemini_reasoning_effort.to_gemini_mapping(),
+            enable_codex_tool_schema_compaction: config.enable_codex_tool_schema_compaction,
         },
         ignore_probe_requests: config.ignore_probe_requests,
         allow_count_tokens_fallback_estimate: config.allow_count_tokens_fallback_estimate,
@@ -717,6 +736,8 @@ fn build_runtime_update(
         enable_incomplete_stream_retry: config.enable_incomplete_stream_retry,
         incomplete_stream_retry_max_attempts: config.incomplete_stream_retry_max_attempts,
         enable_sibling_tool_error_retry: config.enable_sibling_tool_error_retry,
+        prefer_codex_v1_path: config.prefer_codex_v1_path,
+        enable_codex_tool_schema_compaction: config.enable_codex_tool_schema_compaction,
         enable_stateful_responses_chain: config.enable_stateful_responses_chain,
         load_balancer_runtime,
     }
@@ -972,6 +993,8 @@ async fn start_proxy_with_manager(
         .with_enable_incomplete_stream_retry(config.enable_incomplete_stream_retry)
         .with_incomplete_stream_retry_max_attempts(config.incomplete_stream_retry_max_attempts)
         .with_enable_sibling_tool_error_retry(config.enable_sibling_tool_error_retry)
+        .with_prefer_codex_v1_path(config.prefer_codex_v1_path)
+        .with_enable_codex_tool_schema_compaction(config.enable_codex_tool_schema_compaction)
         .with_enable_stateful_responses_chain(config.enable_stateful_responses_chain)
         .with_allow_external_access(config.allow_external_access)
         .with_max_concurrency(config.max_concurrency);
