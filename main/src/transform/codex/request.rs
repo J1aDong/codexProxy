@@ -4,11 +4,285 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::logger::{is_debug_log_enabled, AppLogger};
-use crate::models::{get_reasoning_effort, AnthropicRequest, ReasoningEffortMapping};
+use crate::models::{
+    get_reasoning_effort, AnthropicRequest, ContentBlock, MessageContent, ReasoningEffortMapping,
+};
 use crate::transform::MessageProcessor;
 
 const CODEX_INSTRUCTIONS: &str = include_str!("../../instructions.txt");
 const EMPTY_TOOL_OUTPUT_PLACEHOLDER: &str = "(No output)";
+const PROMPT_CACHE_KEY_MAX_CWD_LEN: usize = 64;
+const PROMPT_CACHE_KEY_SEP: u8 = 0x1f;
+const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
+const ENV_REASONING_SUMMARY_MODE: &str = "CODEX_PROXY_REASONING_SUMMARY";
+const ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT: &str =
+    "CODEX_PROXY_INCLUDE_REASONING_ENCRYPTED_CONTENT";
+const ENV_FORCE_STATIC_CODEX_INSTRUCTIONS: &str = "CODEX_PROXY_FORCE_STATIC_INSTRUCTIONS";
+
+fn bool_env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| parse_env_bool(&v))
+        .unwrap_or(false)
+}
+
+fn parse_env_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn resolve_reasoning_summary_mode() -> String {
+    let from_env = std::env::var(ENV_REASONING_SUMMARY_MODE)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase());
+    match from_env.as_deref() {
+        Some("auto") | Some("detailed") | Some("concise") => from_env.unwrap_or_default(),
+        _ => DEFAULT_REASONING_SUMMARY_MODE.to_string(),
+    }
+}
+
+fn resolve_include_reasoning_encrypted_content() -> bool {
+    bool_env_enabled(ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT)
+}
+
+fn system_looks_like_codex_harness_instructions(system_text: &str) -> bool {
+    let lower = system_text.to_ascii_lowercase();
+    (lower.contains("you are codex") || lower.contains("codex cli"))
+        && (lower.contains("editing constraints")
+            || lower.contains("plan tool")
+            || lower.contains("presenting your work"))
+}
+
+fn should_include_static_codex_instructions(system_text: Option<&str>) -> bool {
+    if bool_env_enabled(ENV_FORCE_STATIC_CODEX_INSTRUCTIONS) {
+        return true;
+    }
+    match system_text {
+        Some(text) => !system_looks_like_codex_harness_instructions(text),
+        None => true,
+    }
+}
+
+fn is_wrapped_agents_instructions(system_text: &str) -> bool {
+    let lower = system_text.to_ascii_lowercase();
+    lower.contains("agents.md instructions")
+        && lower.contains("<instructions>")
+        && lower.contains("</instructions>")
+}
+
+fn should_inject_runtime_environment_context(system_text: &str) -> bool {
+    let lower = system_text.to_ascii_lowercase();
+    !(lower.contains("<environment_context>")
+        || (lower.contains("<cwd>") && lower.contains("<approval_policy>")))
+}
+
+fn has_skill_tool(tools: Option<&Vec<Value>>) -> bool {
+    let Some(tools) = tools else {
+        return false;
+    };
+    tools.iter().any(|tool| {
+        let direct_name = tool.get("name").and_then(|v| v.as_str());
+        let nested_name = tool
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str());
+        direct_name
+            .or(nested_name)
+            .map(|name| name.eq_ignore_ascii_case("skill"))
+            .unwrap_or(false)
+    })
+}
+
+fn is_skill_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ':'
+}
+
+fn normalize_skill_name_token(token: &str) -> Option<String> {
+    let trimmed = token
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | ';' | '!' | '?'))
+        .trim_start_matches('/');
+    if trimmed.len() < 2 {
+        return None;
+    }
+    if !trimmed.chars().all(is_skill_identifier_char) {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+fn extract_available_skill_names(system_text: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for line in system_text.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            continue;
+        };
+        let candidate = rest.splitn(2, ':').next().unwrap_or_default();
+        if let Some(name) = normalize_skill_name_token(candidate) {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+fn extract_slash_skill_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if chars[idx] != '/' {
+            idx += 1;
+            continue;
+        }
+        let mut end = idx + 1;
+        while end < chars.len() && is_skill_identifier_char(chars[end]) {
+            end += 1;
+        }
+        if end > idx + 1 {
+            let token: String = chars[idx + 1..end].iter().collect();
+            if let Some(name) = normalize_skill_name_token(&token) {
+                tokens.push(name);
+            }
+        }
+        idx = end;
+    }
+    tokens
+}
+
+fn contains_skill_name_with_boundary(text_lower: &str, skill_name_lower: &str) -> bool {
+    for (idx, _) in text_lower.match_indices(skill_name_lower) {
+        let before = text_lower[..idx].chars().next_back();
+        let after = text_lower[idx + skill_name_lower.len()..].chars().next();
+        let before_ok = before.map(|ch| !is_skill_identifier_char(ch)).unwrap_or(true);
+        let after_ok = after.map(|ch| !is_skill_identifier_char(ch)).unwrap_or(true);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn latest_user_text(request: &AnthropicRequest) -> Option<String> {
+    for message in request.messages.iter().rev() {
+        if !message.role.eq_ignore_ascii_case("user") {
+            continue;
+        }
+        let Some(content) = message.content.as_ref() else {
+            continue;
+        };
+        match content {
+            MessageContent::Text(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            MessageContent::Blocks(blocks) => {
+                let mut parts: Vec<String> = Vec::new();
+                for block in blocks {
+                    if let ContentBlock::Text { text } = block {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_string());
+                        }
+                    }
+                }
+                if !parts.is_empty() {
+                    return Some(parts.join("\n"));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_requested_skill_name(request: &AnthropicRequest) -> Option<String> {
+    if !has_skill_tool(request.tools.as_ref()) {
+        return None;
+    }
+    let system_text = request.system.as_ref().map(|s| s.to_string()).unwrap_or_default();
+    if system_text.is_empty() {
+        return None;
+    }
+    let available = extract_available_skill_names(&system_text);
+    if available.is_empty() {
+        return None;
+    }
+    let latest_text = latest_user_text(request)?;
+    let latest_lower = latest_text.to_ascii_lowercase();
+
+    for token in extract_slash_skill_tokens(&latest_lower) {
+        if available.contains(&token) {
+            return Some(token);
+        }
+    }
+
+    let has_skill_intent_word = ["skill", "skills", "技能", "使用", "调用", "invoke", "run"]
+        .iter()
+        .any(|kw| latest_lower.contains(kw));
+    if !has_skill_intent_word {
+        return None;
+    }
+
+    let mut ordered: Vec<String> = available.into_iter().collect();
+    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    ordered
+        .into_iter()
+        .find(|name| contains_skill_name_with_boundary(&latest_lower, name))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn sanitize_cache_key_segment(input: &str, max_len: usize) -> String {
+    let mut segment = String::with_capacity(input.len().min(max_len));
+    for ch in input.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() { ch } else { '_' };
+        segment.push(normalized);
+        if segment.len() >= max_len {
+            break;
+        }
+    }
+
+    let trimmed = segment.trim_matches('_');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_prompt_cache_key(
+    cwd: &str,
+    codex_model: &str,
+    custom_injection_prompt: &str,
+    system_text: Option<&str>,
+) -> String {
+    let mut key_material = Vec::new();
+    key_material.extend_from_slice(CODEX_INSTRUCTIONS.as_bytes());
+    key_material.push(PROMPT_CACHE_KEY_SEP);
+    key_material.extend_from_slice(custom_injection_prompt.trim().as_bytes());
+    key_material.push(PROMPT_CACHE_KEY_SEP);
+    if let Some(system) = system_text {
+        key_material.extend_from_slice(system.trim().as_bytes());
+    }
+    let key_hash = fnv1a64(&key_material);
+    let model_segment = sanitize_cache_key_segment(codex_model, 48);
+    let cwd_segment = sanitize_cache_key_segment(cwd, PROMPT_CACHE_KEY_MAX_CWD_LEN);
+    format!("codex-proxy:{}:{}:{:016x}", model_segment, cwd_segment, key_hash)
+}
 
 fn sanitize_function_call_name_for_codex(name: &str) -> String {
     let mut normalized = String::with_capacity(name.len());
@@ -246,6 +520,15 @@ fn strip_leaked_tool_suffix_from_text(text: &str) -> Option<String> {
 fn strip_system_reminder_blocks(text: &str) -> String {
     const START: &str = "<system-reminder>";
     const END: &str = "</system-reminder>";
+    const SKILL_MARKERS: [&str; 7] = [
+        "available skills",
+        "### available skills",
+        "how to use skills",
+        "a skill is a set of local instructions",
+        "skill.md",
+        "skills available in this session",
+        "slash command",
+    ];
 
     let mut remaining = text;
     let mut sanitized = String::with_capacity(text.len());
@@ -259,7 +542,19 @@ fn strip_system_reminder_blocks(text: &str) -> String {
         sanitized.push_str(&remaining[..start_idx]);
         let after_start = &remaining[start_idx + START.len()..];
         let Some(end_rel) = after_start.find(END) else {
+            // Keep malformed trailing text intact rather than truncating content.
+            sanitized.push_str(&remaining[start_idx..]);
             break;
+        };
+        let block = &after_start[..end_rel];
+        let block_lower = block.to_ascii_lowercase();
+        let preserve_block = SKILL_MARKERS
+            .iter()
+            .any(|marker| block_lower.contains(marker));
+        if preserve_block {
+            sanitized.push_str(START);
+            sanitized.push_str(block);
+            sanitized.push_str(END);
         };
         remaining = &after_start[end_rel + END.len()..];
     }
@@ -462,37 +757,55 @@ impl TransformRequest {
         // 构建 input 数组（只包含当前请求上下文，不注入静态模板文件）
         let mut final_input: Vec<Value> = Vec::new();
 
+        let mut system_text_for_cache_key = None::<String>;
+        let mut include_static_codex_instructions = true;
+
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let system_text = system.to_string();
+            system_text_for_cache_key = Some(system_text.clone());
+            include_static_codex_instructions =
+                should_include_static_codex_instructions(Some(&system_text));
             log(&format!(
                 "📋 [Transform] System prompt: {} chars",
                 system_text.len()
             ));
 
+            let system_payload_text = if is_wrapped_agents_instructions(&system_text) {
+                system_text
+            } else {
+                format!(
+                    "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+                    cwd, system_text
+                )
+            };
             final_input.push(json!({
                 "type": "message",
                 "role": "user",
                 "content": [{
                     "type": "input_text",
-                    "text": format!("# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>", cwd, system_text)
+                    "text": system_payload_text
                 }]
             }));
 
-            final_input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": format!(r#"<environment_context>
+            if should_inject_runtime_environment_context(system_text_for_cache_key.as_deref().unwrap_or("")) {
+                final_input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!(r#"<environment_context>
   <cwd>{}</cwd>
   <approval_policy>on-request</approval_policy>
   <sandbox_mode>workspace-write</sandbox_mode>
   <network_access>restricted</network_access>
   <shell>{}</shell>
 </environment_context>"#, cwd, std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string()))
-                }]
-            }));
+                    }]
+                }));
+            } else {
+                log("📋 [Transform] Skip runtime <environment_context> injection (already present in system)");
+            }
         }
 
         // 注入提取的 Skills
@@ -530,6 +843,23 @@ impl TransformRequest {
 
         // 追加对话历史
         final_input.extend(chat_messages);
+        if let Some(skill_name) = detect_requested_skill_name(anthropic_body) {
+            log(&format!(
+                "🎯 [Transform] Skill intent matched, nudging Skill tool: {}",
+                skill_name
+            ));
+            final_input.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!(
+                        "Skill routing hint: the latest user request targets skill `{}`.\nIf this skill is available, call the `Skill` tool first before normal text response.",
+                        skill_name
+                    )
+                }]
+            }));
+        }
         Self::sanitize_input_for_codex(&mut final_input);
         reconcile_function_call_pairs(&mut final_input);
 
@@ -548,20 +878,42 @@ impl TransformRequest {
         } else {
             json!("auto")
         };
+        let prompt_cache_key = build_prompt_cache_key(
+            &cwd,
+            final_codex_model,
+            custom_injection_prompt,
+            system_text_for_cache_key.as_deref(),
+        );
+        let reasoning_summary_mode = resolve_reasoning_summary_mode();
+        let include_reasoning_encrypted_content = resolve_include_reasoning_encrypted_content();
+        log(&format!(
+            "🧠 [Transform] reasoning.summary={} include.reasoning.encrypted_content={}",
+            reasoning_summary_mode, include_reasoning_encrypted_content
+        ));
 
-        let body = json!({
+        let mut body = json!({
             "model": final_codex_model,
-            "instructions": CODEX_INSTRUCTIONS,
             "input": final_input,
             "tools": transformed_tools,
             "tool_choice": tool_choice,
             "parallel_tool_calls": true,
-            "reasoning": { "effort": reasoning_effort.as_str(), "summary": "detailed" },
+            "reasoning": { "effort": reasoning_effort.as_str(), "summary": reasoning_summary_mode },
             "store": false,
             "stream": true,
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": session_id
+            "prompt_cache_key": prompt_cache_key
         });
+        if include_static_codex_instructions {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("instructions".to_string(), json!(CODEX_INSTRUCTIONS));
+            }
+        } else {
+            log("📋 [Transform] Skip static instructions injection (already present in system)");
+        }
+        if include_reasoning_encrypted_content {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
+            }
+        }
 
         (body, session_id.clone())
     }
@@ -828,5 +1180,255 @@ impl TransformRequest {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_requested_skill_name, TransformRequest};
+    use crate::models::{AnthropicRequest, ReasoningEffortMapping};
+    use serde_json::json;
+
+    fn sample_request() -> AnthropicRequest {
+        serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type":"text","text":"hello"}]
+                }
+            ],
+            "system": "System prompt",
+            "stream": true
+        }))
+        .expect("valid anthropic request")
+    }
+
+    #[test]
+    fn prompt_cache_key_is_stable_across_requests() {
+        let request = sample_request();
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body_a, session_a) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+        let (body_b, session_b) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert_ne!(session_a, session_b, "session id should remain per-request");
+        assert_eq!(
+            body_a.get("prompt_cache_key"),
+            body_b.get("prompt_cache_key"),
+            "prompt cache key should be stable for cache hits"
+        );
+        assert_ne!(
+            body_a.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some(session_a.as_str()),
+            "prompt cache key should not use random session id"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_changes_when_custom_prompt_changes() {
+        let request = sample_request();
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body_a, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt A", "gpt-5.3-codex");
+        let (body_b, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt B", "gpt-5.3-codex");
+
+        assert_ne!(
+            body_a.get("prompt_cache_key"),
+            body_b.get("prompt_cache_key"),
+            "cache key should rotate when static prefix changes"
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_default_is_auto_and_include_omitted() {
+        let request = sample_request();
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert_eq!(
+            body.pointer("/reasoning/summary").and_then(|v| v.as_str()),
+            Some("auto"),
+            "default summary mode should be auto for lower token usage"
+        );
+        assert!(
+            body.get("include").is_none(),
+            "include should be omitted by default to avoid unnecessary response payload"
+        );
+    }
+
+    #[test]
+    fn skips_static_instructions_when_system_already_contains_codex_harness_rules() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"hi"}],
+            "system": "You are Codex, based on GPT-5.\n## Editing constraints\n## Plan tool\n",
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert!(
+            body.get("instructions").is_none(),
+            "static instructions should be omitted when equivalent system guidance already exists"
+        );
+    }
+
+    #[test]
+    fn skips_runtime_environment_context_when_system_already_provides_it() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"hi"}],
+            "system": "<environment_context><cwd>/tmp</cwd><approval_policy>on-request</approval_policy></environment_context>",
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let env_context_count = input_items
+            .iter()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|blocks| blocks.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .filter(|text| text.contains("<environment_context>"))
+            .count();
+
+        assert_eq!(
+            env_context_count, 1,
+            "runtime environment context should not be appended when already present"
+        );
+    }
+
+    #[test]
+    fn preserves_existing_agents_wrapper_without_double_wrapping() {
+        let already_wrapped = "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nhello\n</INSTRUCTIONS>";
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"hi"}],
+            "system": already_wrapped,
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let first_system_text = input_items
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|v| v.as_array())
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let marker_count = first_system_text.matches("AGENTS.md instructions").count();
+        assert_eq!(
+            marker_count, 1,
+            "existing AGENTS wrapper should not be nested"
+        );
+        assert_eq!(
+            first_system_text, already_wrapped,
+            "wrapped system text should be preserved as-is"
+        );
+    }
+
+    #[test]
+    fn detect_requested_skill_name_prefers_explicit_slash_skill() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"请用 /figma-implement-design 做一个页面"}],
+            "system": "<system-reminder>\nThe following skills are available:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n</system-reminder>",
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+
+        assert_eq!(
+            detect_requested_skill_name(&request).as_deref(),
+            Some("figma-implement-design")
+        );
+    }
+
+    #[test]
+    fn detect_requested_skill_name_requires_skill_tool_presence() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"请用 /figma-implement-design 做一个页面"}],
+            "system": "<system-reminder>\nThe following skills are available:\n- figma-implement-design: Translate Figma nodes\n</system-reminder>",
+            "tools": [{
+                "name": "Read",
+                "description": "Read files",
+                "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+
+        assert!(
+            detect_requested_skill_name(&request).is_none(),
+            "should not inject skill hint when Skill tool is unavailable"
+        );
+    }
+
+    #[test]
+    fn transform_injects_skill_routing_hint_when_skill_intent_detected() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"请使用 figma-implement-design 处理这个节点"}],
+            "system": "<system-reminder>\nThe following skills are available:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n</system-reminder>",
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}, "args":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let hint_texts: Vec<&str> = input_items
+            .iter()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|blocks| blocks.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .filter(|text| text.contains("Skill routing hint"))
+            .collect();
+
+        assert_eq!(hint_texts.len(), 1, "expected one injected routing hint");
+        assert!(
+            hint_texts[0].contains("figma-implement-design"),
+            "routing hint should include matched skill name"
+        );
     }
 }

@@ -18,8 +18,10 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -65,6 +67,7 @@ pub struct ProxyServer {
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
     enable_sibling_tool_error_retry: bool,
+    enable_stateful_responses_chain: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -95,6 +98,7 @@ pub struct RuntimeConfigUpdate {
     pub enable_incomplete_stream_retry: bool,
     pub incomplete_stream_retry_max_attempts: u32,
     pub enable_sibling_tool_error_retry: bool,
+    pub enable_stateful_responses_chain: bool,
     pub load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -120,6 +124,7 @@ struct RuntimeConfigState {
     enable_incomplete_stream_retry: bool,
     incomplete_stream_retry_max_attempts: u32,
     enable_sibling_tool_error_retry: bool,
+    enable_stateful_responses_chain: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
@@ -146,6 +151,7 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             enable_incomplete_stream_retry: value.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: value.incomplete_stream_retry_max_attempts,
             enable_sibling_tool_error_retry: value.enable_sibling_tool_error_retry,
+            enable_stateful_responses_chain: value.enable_stateful_responses_chain,
             load_balancer_runtime: value.load_balancer_runtime,
         }
     }
@@ -394,6 +400,281 @@ impl StreamRuntimeOptions {
             enable_sibling_tool_error_retry: state.enable_sibling_tool_error_retry,
         }
     }
+}
+
+const STATEFUL_CHAIN_MAX_ENTRIES: usize = 128;
+const STATEFUL_CHAIN_HINT_HEADERS: [&str; 6] = [
+    "x-codex-proxy-session",
+    "x-claude-session-id",
+    "x-session-id",
+    "session-id",
+    "x-conversation-id",
+    "conversation-id",
+];
+
+#[derive(Clone)]
+struct StatefulChainRequestMeta {
+    chain_key: String,
+    endpoint_key: String,
+    full_input: Vec<Value>,
+}
+
+#[derive(Clone)]
+struct StatefulChainEntry {
+    response_id: String,
+    endpoint_key: String,
+    full_input: Vec<Value>,
+    updated_at: Instant,
+}
+
+type StatefulChainStore = Arc<Mutex<HashMap<String, StatefulChainEntry>>>;
+type StatefulChainUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
+
+fn is_stateful_endpoint_previous_response_id_unsupported(
+    unsupported_store: &StatefulChainUnsupportedEndpointStore,
+    endpoint_key: &str,
+) -> bool {
+    match unsupported_store.lock() {
+        Ok(guard) => guard.contains(endpoint_key),
+        Err(poisoned) => poisoned.into_inner().contains(endpoint_key),
+    }
+}
+
+fn mark_stateful_endpoint_previous_response_id_unsupported(
+    unsupported_store: &StatefulChainUnsupportedEndpointStore,
+    endpoint_key: &str,
+) {
+    match unsupported_store.lock() {
+        Ok(mut guard) => {
+            guard.insert(endpoint_key.to_string());
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.insert(endpoint_key.to_string());
+        }
+    }
+}
+
+fn is_previous_response_id_unsupported_error(status: u16, error_text: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST.as_u16() {
+        return false;
+    }
+    let normalized = error_text.to_ascii_lowercase();
+    normalized.contains("previous_response_id")
+        && (normalized.contains("unsupported parameter")
+            || normalized.contains("unknown parameter")
+            || normalized.contains("additional properties are not allowed"))
+}
+
+fn hash_to_u64(parts: &[&str]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn build_stateful_endpoint_key(
+    converter: &str,
+    target_url: &str,
+    model: &str,
+    api_key: &str,
+) -> String {
+    let fingerprint = hash_to_u64(&[converter, target_url, model, api_key]);
+    format!("{}:{:016x}", converter.to_ascii_lowercase(), fingerprint)
+}
+
+fn extract_stateful_chain_hint(req: &Request<hyper::body::Incoming>) -> Option<String> {
+    for name in STATEFUL_CHAIN_HINT_HEADERS {
+        if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_message_prefix_signature(request: &AnthropicRequest) -> String {
+    request
+        .messages
+        .iter()
+        .take(4)
+        .map(|message| {
+            let preview = extract_message_text(message).unwrap_or_default();
+            let compact_preview: String = preview.chars().take(80).collect();
+            format!(
+                "{}:{}",
+                message.role.to_ascii_lowercase(),
+                compact_preview.replace('\n', " ").replace('\r', " ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn derive_stateful_chain_key(
+    hint: Option<&str>,
+    converter: &str,
+    model: &str,
+    request: &AnthropicRequest,
+) -> String {
+    if let Some(hint_value) = hint {
+        let normalized = hint_value.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return format!("hint:{}:{}", converter.to_ascii_lowercase(), normalized);
+        }
+    }
+
+    let system_text = request
+        .system
+        .as_ref()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let prefix_signature = build_message_prefix_signature(request);
+    let fingerprint = hash_to_u64(&[converter, model, &system_text, &prefix_signature]);
+    format!("fallback:{}:{:016x}", converter.to_ascii_lowercase(), fingerprint)
+}
+
+fn common_prefix_len(a: &[Value], b: &[Value]) -> usize {
+    let mut len = 0usize;
+    for (lhs, rhs) in a.iter().zip(b.iter()) {
+        if lhs == rhs {
+            len += 1;
+        } else {
+            break;
+        }
+    }
+    len
+}
+
+fn prepare_stateful_chain_request(
+    body: &mut Value,
+    chain_store: &StatefulChainStore,
+    unsupported_endpoints: &StatefulChainUnsupportedEndpointStore,
+    chain_key: &str,
+    endpoint_key: &str,
+    request_id: &str,
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+) -> Option<StatefulChainRequestMeta> {
+    let obj = body.as_object_mut()?;
+    let full_input = obj.get("input").and_then(|v| v.as_array()).cloned()?;
+    obj.insert("store".to_string(), json!(true));
+
+    if is_stateful_endpoint_previous_response_id_unsupported(unsupported_endpoints, endpoint_key) {
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[StatefulChain] #{} previous_response_id_skipped reason=endpoint_unsupported",
+                request_id
+            ),
+        );
+        return Some(StatefulChainRequestMeta {
+            chain_key: chain_key.to_string(),
+            endpoint_key: endpoint_key.to_string(),
+            full_input,
+        });
+    }
+
+    let existing_entry = match chain_store.lock() {
+        Ok(guard) => guard.get(chain_key).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(chain_key).cloned(),
+    };
+
+    if let Some(entry) = existing_entry {
+        if entry.endpoint_key == endpoint_key {
+            let prefix_len = common_prefix_len(&entry.full_input, &full_input);
+            if prefix_len == entry.full_input.len() && full_input.len() > prefix_len {
+                let incremental_input = full_input[prefix_len..].to_vec();
+                obj.insert("input".to_string(), Value::Array(incremental_input));
+                obj.insert(
+                    "previous_response_id".to_string(),
+                    json!(entry.response_id.clone()),
+                );
+                emit_stream_diag(
+                    log_tx,
+                    logger,
+                    format!(
+                        "[StatefulChain] #{} enabled=true previous_response_id_attached=true trimmed_prefix_items={} original_input_items={} incremental_input_items={}",
+                        request_id,
+                        prefix_len,
+                        full_input.len(),
+                        full_input.len() - prefix_len
+                    ),
+                );
+            } else {
+                emit_stream_diag(
+                    log_tx,
+                    logger,
+                    format!(
+                        "[StatefulChain] #{} previous_response_id_skipped reason=prefix_mismatch_or_no_delta matched_prefix_items={} stored_items={} current_items={}",
+                        request_id,
+                        prefix_len,
+                        entry.full_input.len(),
+                        full_input.len()
+                    ),
+                );
+            }
+        } else {
+            emit_stream_diag(
+                log_tx,
+                logger,
+                format!(
+                    "[StatefulChain] #{} previous_response_id_skipped reason=endpoint_changed",
+                    request_id
+                ),
+            );
+        }
+    } else {
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[StatefulChain] #{} previous_response_id_skipped reason=no_prior_entry",
+                request_id
+            ),
+        );
+    }
+
+    Some(StatefulChainRequestMeta {
+        chain_key: chain_key.to_string(),
+        endpoint_key: endpoint_key.to_string(),
+        full_input,
+    })
+}
+
+fn record_stateful_chain_entry(
+    chain_store: &StatefulChainStore,
+    meta: &StatefulChainRequestMeta,
+    response_id: &str,
+) {
+    let mut guard = match chain_store.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if guard.len() >= STATEFUL_CHAIN_MAX_ENTRIES && !guard.contains_key(&meta.chain_key) {
+        if let Some((oldest_key, _)) = guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.updated_at)
+            .map(|(key, entry)| (key.clone(), entry.updated_at))
+        {
+            guard.remove(&oldest_key);
+        }
+    }
+
+    guard.insert(
+        meta.chain_key.clone(),
+        StatefulChainEntry {
+            response_id: response_id.to_string(),
+            endpoint_key: meta.endpoint_key.clone(),
+            full_input: meta.full_input.clone(),
+            updated_at: Instant::now(),
+        },
+    );
 }
 
 #[derive(Default)]
@@ -997,6 +1278,24 @@ fn parse_sse_chunk(chunk: &str) -> Option<(String, Value)> {
         (Some(event), Some(payload)) => Some((event, payload)),
         _ => None,
     }
+}
+
+fn extract_upstream_response_id(chunk: &str) -> Option<String> {
+    let (event, payload) = parse_sse_chunk(chunk)?;
+    let normalized_event = event.trim();
+    if normalized_event != "response.completed"
+        && normalized_event != "response.done"
+        && normalized_event != "response.incomplete"
+    {
+        return None;
+    }
+
+    payload
+        .pointer("/response/id")
+        .or_else(|| payload.pointer("/response_id"))
+        .or_else(|| payload.get("id"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
 }
 
 fn upstream_chunk_indicates_done(chunk: &str) -> bool {
@@ -2435,8 +2734,9 @@ impl ProxyServer {
             enable_empty_completion_retry: false,
             empty_completion_retry_max_attempts: 0,
             enable_incomplete_stream_retry: true,
-            incomplete_stream_retry_max_attempts: 5,
+            incomplete_stream_retry_max_attempts: 2,
             enable_sibling_tool_error_retry: true,
+            enable_stateful_responses_chain: true,
             load_balancer_runtime: None,
         }
     }
@@ -2596,6 +2896,11 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_enable_stateful_responses_chain(mut self, enable: bool) -> Self {
+        self.enable_stateful_responses_chain = enable;
+        self
+    }
+
     pub fn with_load_balancer_runtime(mut self, runtime: LoadBalancerRuntime) -> Self {
         self.load_balancer_runtime = Some(runtime);
         self
@@ -2636,6 +2941,7 @@ impl ProxyServer {
             enable_incomplete_stream_retry: self.enable_incomplete_stream_retry,
             incomplete_stream_retry_max_attempts: self.incomplete_stream_retry_max_attempts,
             enable_sibling_tool_error_retry: self.enable_sibling_tool_error_retry,
+            enable_stateful_responses_chain: self.enable_stateful_responses_chain,
             load_balancer_runtime: self.load_balancer_runtime.clone(),
         }
     }
@@ -2671,6 +2977,9 @@ impl ProxyServer {
             Arc::new(Mutex::new(HashMap::new()));
         let parallel_tool_degrade_until: Arc<Mutex<HashMap<String, Instant>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let stateful_chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
         let runtime_handle = ProxyRuntimeHandle {
             state: Arc::new(RwLock::new(RuntimeConfigState::from(self.runtime_update()))),
         };
@@ -2729,6 +3038,9 @@ impl ProxyServer {
                                 let model_cooldowns = Arc::clone(&model_cooldowns);
                                 let parallel_tool_degrade_until =
                                     Arc::clone(&parallel_tool_degrade_until);
+                                let stateful_chain_store = Arc::clone(&stateful_chain_store);
+                                let stateful_chain_unsupported_endpoints =
+                                    Arc::clone(&stateful_chain_unsupported_endpoints);
                                 let runtime_handle = runtime_handle_for_server.clone();
                                 let log_tx = log_tx.clone();
                                 let log_tx_for_request = log_tx.clone();
@@ -2749,6 +3061,8 @@ impl ProxyServer {
                                             semaphore.clone(),
                                             Arc::clone(&model_cooldowns),
                                             Arc::clone(&parallel_tool_degrade_until),
+                                            Arc::clone(&stateful_chain_store),
+                                            Arc::clone(&stateful_chain_unsupported_endpoints),
                                             log_tx_for_request.clone(),
                                         )
                                     });
@@ -2808,6 +3122,8 @@ async fn handle_request(
     semaphore: Option<Arc<Semaphore>>,
     model_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
     parallel_tool_degrade_until: Arc<Mutex<HashMap<String, Instant>>>,
+    stateful_chain_store: StatefulChainStore,
+    stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path().to_string();
@@ -2872,6 +3188,7 @@ async fn handle_request(
     let ctx = runtime_state.ctx;
     let ignore_probe_requests = runtime_state.ignore_probe_requests;
     let allow_count_tokens_fallback_estimate = runtime_state.allow_count_tokens_fallback_estimate;
+    let enable_stateful_responses_chain = runtime_state.enable_stateful_responses_chain;
     let load_balancer_runtime = runtime_state.load_balancer_runtime;
 
     // 只处理 POST /messages、/v1/messages、/messages/count_tokens、/v1/messages/count_tokens
@@ -2942,6 +3259,7 @@ async fn handle_request(
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
+    let stateful_chain_hint = extract_stateful_chain_hint(&req);
 
     // 确定最终使用的 API key
     let final_api_key = if let Some(key) = api_key.clone() {
@@ -3333,6 +3651,7 @@ async fn handle_request(
     let mut successful_upstream_body: Option<Value> = None;
     let mut successful_parallel_tool_degrade_key: Option<String> = None;
     let mut successful_session_id = String::new();
+    let mut successful_stateful_chain_meta: Option<StatefulChainRequestMeta> = None;
 
     while attempt_index < max_lb_attempts {
         attempt_index += 1;
@@ -3503,6 +3822,35 @@ async fn handle_request(
                 )
             };
 
+        let stateful_chain_meta_for_attempt = if enable_stateful_responses_chain
+            && route_selection.converter.eq_ignore_ascii_case("codex")
+        {
+            let endpoint_key = build_stateful_endpoint_key(
+                &route_selection.converter,
+                &resolved_target_url,
+                &route_selection.model_name,
+                &route_selection.api_key,
+            );
+            let chain_key = derive_stateful_chain_key(
+                stateful_chain_hint.as_deref(),
+                &route_selection.converter,
+                &route_selection.model_name,
+                &anthropic_body,
+            );
+            prepare_stateful_chain_request(
+                &mut upstream_body,
+                &stateful_chain_store,
+                &stateful_chain_unsupported_endpoints,
+                &chain_key,
+                &endpoint_key,
+                &request_id,
+                &log_tx,
+                &logger,
+            )
+        } else {
+            None
+        };
+
         if route_selection.converter.eq_ignore_ascii_case("codex") {
             if let Some(remaining_secs) = get_parallel_tool_degrade_remaining_seconds(
                 &parallel_tool_degrade_until,
@@ -3569,7 +3917,7 @@ async fn handle_request(
             upstream_req
         };
 
-        let response = match upstream_req.send().await {
+        let mut response = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
                 let action = if let (Some(runtime), Some(route)) = (
@@ -3620,87 +3968,196 @@ async fn handle_request(
         };
 
         if !response.status().is_success() {
-            let retry_after = response
+            let mut retry_after = response
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("-")
                 .to_string();
-            let status = response.status().as_u16();
-            let error_text = response.text().await.unwrap_or_default();
+            let mut status = response.status().as_u16();
+            let mut error_text = response.text().await.unwrap_or_default();
+            let mut recovered_response: Option<reqwest::Response> = None;
 
-            let action = if let (Some(runtime), Some(route)) = (
-                load_balancer_runtime.as_ref(),
-                route_selection.route.as_ref(),
-            ) {
-                runtime.handle_upstream_outcome(route, Some(status), false, Some(&error_text))
-            } else {
-                UpstreamOutcomeAction::ReturnToClient
-            };
+            let can_retry_without_previous_response_id = route_selection
+                .converter
+                .eq_ignore_ascii_case("codex")
+                && upstream_body
+                    .get("previous_response_id")
+                    .and_then(|v| v.as_str())
+                    .is_some()
+                && stateful_chain_meta_for_attempt.is_some()
+                && is_previous_response_id_unsupported_error(status, &error_text);
 
-            let _ = log_tx.send(format!(
-                "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={} status={} retry_after={}",
-                request_id,
-                path,
-                target_url,
-                resolved_target_url,
-                route_mode,
-                route_slot,
-                route_endpoint,
-                route_key,
-                route_selection.converter,
-                input_model,
-                route_selection.model_name,
-                route_effort,
-                status,
-                retry_after,
-            ));
+            if can_retry_without_previous_response_id {
+                let mut retry_body = upstream_body.clone();
+                if let Some(obj) = retry_body.as_object_mut() {
+                    obj.remove("previous_response_id");
+                    if let Some(meta) = stateful_chain_meta_for_attempt.as_ref() {
+                        obj.insert("input".to_string(), Value::Array(meta.full_input.clone()));
+                        mark_stateful_endpoint_previous_response_id_unsupported(
+                            &stateful_chain_unsupported_endpoints,
+                            &meta.endpoint_key,
+                        );
+                    }
+                }
 
-            if let Some((cooldown_model, cooldown_secs, reason)) = extract_cooldown_info(
-                status,
-                &error_text,
-                &retry_after,
-                &route_selection.model_name,
-            ) {
-                set_model_cooldown(&model_cooldowns, &cooldown_model, cooldown_secs);
                 let _ = log_tx.send(format!(
-                    "[RateLimit] #{} upstream=429 reason={} model={} retry_after={}s in={} out={} msgs={} summary={}",
+                    "[StatefulChain] #{} previous_response_id_unsupported -> retry_without_previous_response_id=true",
+                    request_id
+                ));
+
+                if let Some(ref l) = logger {
+                    let headers = vec![
+                        ("Content-Type", "application/json"),
+                        ("Authorization", "Bearer <API_KEY>"),
+                        ("User-Agent", "Anthropic-Node/0.3.4"),
+                        ("x-anthropic-version", &anthropic_version),
+                        ("Accept", "text/event-stream"),
+                        ("session_id", &session_id),
+                    ];
+                    l.log_curl_request(
+                        "POST",
+                        &resolved_target_url,
+                        &headers,
+                        &retry_body,
+                        backend_label_by_converter(&route_selection.converter),
+                    );
+                }
+
+                let retry_req = request_backend.build_upstream_request(
+                    &http_client,
+                    &resolved_target_url,
+                    &route_selection.api_key,
+                    &retry_body,
+                    &session_id,
+                    &anthropic_version,
+                );
+
+                let retry_req = if let Some(beta) = &anthropic_beta {
+                    retry_req.header("anthropic-beta", beta)
+                } else {
+                    retry_req
+                };
+
+                match retry_req.send().await {
+                    Ok(retry_resp) if retry_resp.status().is_success() => {
+                        let _ = log_tx.send(format!(
+                            "[StatefulChain] #{} retry_without_previous_response_id=succeeded",
+                            request_id
+                        ));
+                        upstream_body = retry_body;
+                        recovered_response = Some(retry_resp);
+                    }
+                    Ok(retry_resp) => {
+                        retry_after = retry_resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("-")
+                            .to_string();
+                        status = retry_resp.status().as_u16();
+                        error_text = retry_resp.text().await.unwrap_or_default();
+                        let _ = log_tx.send(format!(
+                            "[StatefulChain] #{} retry_without_previous_response_id=failed status={}",
+                            request_id, status
+                        ));
+                    }
+                    Err(retry_err) => {
+                        retry_after = "-".to_string();
+                        status = StatusCode::BAD_GATEWAY.as_u16();
+                        error_text = json!({
+                            "error": {
+                                "message": format!(
+                                    "Upstream error after retry_without_previous_response_id: {}",
+                                    retry_err
+                                )
+                            }
+                        })
+                        .to_string();
+                        let _ = log_tx.send(format!(
+                            "[StatefulChain] #{} retry_without_previous_response_id=failed network_error={}",
+                            request_id, retry_err
+                        ));
+                    }
+                }
+            }
+
+            if let Some(recovered) = recovered_response {
+                response = recovered;
+            } else {
+                let action = if let (Some(runtime), Some(route)) = (
+                    load_balancer_runtime.as_ref(),
+                    route_selection.route.as_ref(),
+                ) {
+                    runtime.handle_upstream_outcome(route, Some(status), false, Some(&error_text))
+                } else {
+                    UpstreamOutcomeAction::ReturnToClient
+                };
+
+                let _ = log_tx.send(format!(
+                    "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={} status={} retry_after={}",
                     request_id,
-                    reason,
-                    cooldown_model,
-                    cooldown_secs,
+                    path,
+                    target_url,
+                    resolved_target_url,
+                    route_mode,
+                    route_slot,
+                    route_endpoint,
+                    route_key,
+                    route_selection.converter,
                     input_model,
                     route_selection.model_name,
-                    anthropic_body.messages.len(),
-                    display_summary,
+                    route_effort,
+                    status,
+                    retry_after,
                 ));
-            }
 
-            let _ = log_tx.send(format!(
-                "[Error] #{} Upstream returned {}: {}",
-                request_id, status, error_text
-            ));
+                if let Some((cooldown_model, cooldown_secs, reason)) = extract_cooldown_info(
+                    status,
+                    &error_text,
+                    &retry_after,
+                    &route_selection.model_name,
+                ) {
+                    set_model_cooldown(&model_cooldowns, &cooldown_model, cooldown_secs);
+                    let _ = log_tx.send(format!(
+                        "[RateLimit] #{} upstream=429 reason={} model={} retry_after={}s in={} out={} msgs={} summary={}",
+                        request_id,
+                        reason,
+                        cooldown_model,
+                        cooldown_secs,
+                        input_model,
+                        route_selection.model_name,
+                        anthropic_body.messages.len(),
+                        display_summary,
+                    ));
+                }
 
-            if let Some(ref l) = logger {
-                l.log_upstream_response(status, &error_text);
-            }
-
-            if action == UpstreamOutcomeAction::RetryNextCandidate
-                && load_balancer_runtime.is_some()
-                && attempt_index < max_lb_attempts
-            {
                 let _ = log_tx.send(format!(
-                    "[LB] #{} failover continue reason=upstream_status_{} from_route={}",
-                    request_id, status, route_key
+                    "[Error] #{} Upstream returned {}: {}",
+                    request_id, status, error_text
                 ));
-                continue;
-            }
 
-            return Ok(Response::builder()
-                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
-                .header("Content-Type", "application/json")
-                .body(full_body(error_text))
-                .unwrap());
+                if let Some(ref l) = logger {
+                    l.log_upstream_response(status, &error_text);
+                }
+
+                if action == UpstreamOutcomeAction::RetryNextCandidate
+                    && load_balancer_runtime.is_some()
+                    && attempt_index < max_lb_attempts
+                {
+                    let _ = log_tx.send(format!(
+                        "[LB] #{} failover continue reason=upstream_status_{} from_route={}",
+                        request_id, status, route_key
+                    ));
+                    continue;
+                }
+
+                return Ok(Response::builder()
+                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                    .header("Content-Type", "application/json")
+                    .body(full_body(error_text))
+                    .unwrap());
+            }
         }
 
         let upstream_status = response.status().as_u16();
@@ -3722,6 +4179,7 @@ async fn handle_request(
         successful_upstream_body = Some(upstream_body.clone());
         successful_parallel_tool_degrade_key = Some(parallel_tool_degrade_key);
         successful_session_id = session_id.clone();
+        successful_stateful_chain_meta = stateful_chain_meta_for_attempt;
         break;
     }
 
@@ -3737,6 +4195,7 @@ async fn handle_request(
         successful_upstream_body.expect("upstream body must exist after successful loop");
     let parallel_tool_degrade_key_for_stream = successful_parallel_tool_degrade_key;
     let session_id_for_request = successful_session_id;
+    let stateful_chain_meta_for_request = successful_stateful_chain_meta;
     let _lb_permit = successful_lb_permit;
     let effective_stream = resolve_effective_stream(
         anthropic_body.stream,
@@ -3795,6 +4254,7 @@ async fn handle_request(
         let mut stop_reason_state: Option<String> = None;
         let mut usage_input_tokens: u64 = 0;
         let mut usage_output_tokens: u64 = 0;
+        let mut latest_upstream_response_id: Option<String> = None;
 
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
@@ -3805,6 +4265,9 @@ async fn handle_request(
 
                         if stream_opts.enable_sse_frame_parser {
                             for frame in frame_parser.push_chunk(&chunk_text) {
+                                if let Some(response_id) = extract_upstream_response_id(&frame) {
+                                    latest_upstream_response_id = Some(response_id);
+                                }
                                 if let Some(ref l) = logger {
                                     l.log_upstream_response(upstream_status, &frame);
                                 }
@@ -3827,6 +4290,9 @@ async fn handle_request(
                         } else {
                             line_buffer.push_str(&chunk_text);
                             for line in drain_complete_lines(&mut line_buffer) {
+                                if let Some(response_id) = extract_upstream_response_id(&line) {
+                                    latest_upstream_response_id = Some(response_id);
+                                }
                                 if let Some(ref l) = logger {
                                     l.log_upstream_response(upstream_status, &line);
                                 }
@@ -3882,6 +4348,9 @@ async fn handle_request(
 
         if stream_opts.enable_sse_frame_parser {
             if let Some(remaining) = frame_parser.take_remaining() {
+                if let Some(response_id) = extract_upstream_response_id(&remaining) {
+                    latest_upstream_response_id = Some(response_id);
+                }
                 if let Some(ref l) = logger {
                     l.log_upstream_response(upstream_status, &remaining);
                 }
@@ -3902,6 +4371,9 @@ async fn handle_request(
                 }
             }
         } else if !line_buffer.trim().is_empty() {
+            if let Some(response_id) = extract_upstream_response_id(&line_buffer) {
+                latest_upstream_response_id = Some(response_id);
+            }
             if let Some(ref l) = logger {
                 l.log_upstream_response(upstream_status, &line_buffer);
             }
@@ -3988,6 +4460,23 @@ async fn handle_request(
             );
         }
 
+        if request_converter.eq_ignore_ascii_case("codex") {
+            if let (Some(meta), Some(response_id)) = (
+                stateful_chain_meta_for_request.as_ref(),
+                latest_upstream_response_id.as_deref(),
+            ) {
+                record_stateful_chain_entry(&stateful_chain_store, meta, response_id);
+                emit_stream_diag(
+                    &log_tx,
+                    &logger,
+                    format!(
+                        "[StatefulChain] #{} stored response_id={} mode=non_stream",
+                        request_id, response_id
+                    ),
+                );
+            }
+        }
+
         if let Some(ref l) = AppLogger::get() {
             l.log("════════════════════════════════════════════════════════════════");
             l.log("✅ Request completed");
@@ -4024,6 +4513,10 @@ async fn handle_request(
     let anthropic_version_for_stream = anthropic_version.clone();
     let anthropic_beta_for_stream = anthropic_beta.clone();
     let is_codex_stream_for_task = request_converter.eq_ignore_ascii_case("codex");
+    let stateful_chain_enabled_for_stream =
+        enable_stateful_responses_chain && request_converter.eq_ignore_ascii_case("codex");
+    let stateful_chain_meta_for_stream = stateful_chain_meta_for_request.clone();
+    let stateful_chain_store_for_stream = stateful_chain_store.clone();
     let parallel_tool_degrade_until_for_stream = parallel_tool_degrade_until.clone();
     let parallel_tool_degrade_key_for_stream = parallel_tool_degrade_key_for_stream.clone();
     tokio::spawn(async move {
@@ -4055,6 +4548,7 @@ async fn handle_request(
         let mut last_downstream_activity = Instant::now();
         let mut current_upstream_status = upstream_status;
         let mut decision = StreamDecisionState::default();
+        let mut latest_upstream_response_id: Option<String> = None;
         let mut silence_warn_logged = false;
         let mut silence_error_logged = false;
         let mut endpoint_parallel_degrade_marked = false;
@@ -4079,6 +4573,9 @@ async fn handle_request(
 
                             if stream_opts_for_task.enable_sse_frame_parser {
                                 for frame in frame_parser.push_chunk(&chunk_text) {
+                                    if let Some(response_id) = extract_upstream_response_id(&frame) {
+                                        latest_upstream_response_id = Some(response_id);
+                                    }
                                     let mut emitted_output_for_frame = false;
                                     maybe_log_stream_upstream(
                                         &logger_for_stream,
@@ -4161,6 +4658,9 @@ async fn handle_request(
                             } else {
                                 line_buffer.push_str(&chunk_text);
                                 for line in drain_complete_lines(&mut line_buffer) {
+                                    if let Some(response_id) = extract_upstream_response_id(&line) {
+                                        latest_upstream_response_id = Some(response_id);
+                                    }
                                     let mut emitted_output_for_line = false;
                                     maybe_log_stream_upstream(
                                         &logger_for_stream,
@@ -4344,6 +4844,9 @@ async fn handle_request(
 
             if stream_opts_for_task.enable_sse_frame_parser {
                 if let Some(remaining) = frame_parser.take_remaining() {
+                    if let Some(response_id) = extract_upstream_response_id(&remaining) {
+                        latest_upstream_response_id = Some(response_id);
+                    }
                     maybe_log_stream_upstream(
                         &logger_for_stream,
                         current_upstream_status,
@@ -4397,6 +4900,9 @@ async fn handle_request(
                     }
                 }
             } else if !line_buffer.trim().is_empty() {
+                if let Some(response_id) = extract_upstream_response_id(&line_buffer) {
+                    latest_upstream_response_id = Some(response_id);
+                }
                 maybe_log_stream_upstream(
                     &logger_for_stream,
                     current_upstream_status,
@@ -4923,6 +5429,23 @@ async fn handle_request(
             );
         }
 
+        if stateful_chain_enabled_for_stream && decision.saw_response_completed && !decision.saw_response_failed {
+            if let (Some(meta), Some(response_id)) = (
+                stateful_chain_meta_for_stream.as_ref(),
+                latest_upstream_response_id.as_deref(),
+            ) {
+                record_stateful_chain_entry(&stateful_chain_store_for_stream, meta, response_id);
+                emit_stream_diag(
+                    &log_tx_clone,
+                    &logger_for_stream,
+                    format!(
+                        "[StatefulChain] #{} stored response_id={} mode=stream",
+                        request_id_for_stream, response_id
+                    ),
+                );
+            }
+        }
+
         if let Some(summary) = transformer.take_diagnostics_summary() {
             emit_transform_diag(
                 &log_tx_clone,
@@ -5072,17 +5595,22 @@ mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
         build_parallel_tool_degrade_key, chunk_contains_sibling_tool_call_error,
-        classify_connection_error, derive_stream_close_cause,
+        classify_connection_error, derive_stateful_chain_key, derive_stream_close_cause,
         disable_parallel_tool_calls_in_upstream_body, extract_tool_leak_retry_signal,
+        extract_upstream_response_id,
         get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
         is_business_stream_output, leaked_tool_text_retry_skip_reason, mark_parallel_tool_degrade,
-        observe_upstream_chunk_events, resolve_effective_stream, resolve_upstream_url,
+        observe_upstream_chunk_events, prepare_stateful_chain_request, record_stateful_chain_entry,
+        resolve_effective_stream, resolve_upstream_url,
         should_drop_post_message_stop_output, should_suppress_premature_message_stop,
-        sibling_tool_error_retry_skip_reason, ConnErrorClass, SseFrameParser, StreamEventCounters,
-        StreamRuntimeOptions, UpstreamOperation,
+        sibling_tool_error_retry_skip_reason, ConnErrorClass, StatefulChainEntry,
+        StatefulChainRequestMeta, StatefulChainStore, StatefulChainUnsupportedEndpointStore,
+        SseFrameParser, StreamEventCounters, StreamRuntimeOptions, UpstreamOperation,
+        is_previous_response_id_unsupported_error,
     };
-    use serde_json::json;
-    use std::collections::HashMap;
+    use crate::models::AnthropicRequest;
+    use serde_json::{json, Value};
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -5440,6 +5968,194 @@ data: {"type": "ping"}
 "#,
         );
         assert_eq!(counters.downstream_keepalive, 1);
+    }
+
+    #[test]
+    fn test_extract_upstream_response_id_from_completed_event() {
+        let frame = r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_123","status":"completed"}}
+
+"#;
+        assert_eq!(
+            extract_upstream_response_id(frame).as_deref(),
+            Some("resp_123")
+        );
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_attaches_previous_response_id_and_trims_input() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: vec![
+                        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
+                        json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}),
+                    ],
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+            ],
+            "store": false
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let meta = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            "test-chain",
+            "ep_1",
+            "req_1",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert_eq!(
+            body.get("previous_response_id").and_then(|v| v.as_str()),
+            Some("resp_prev")
+        );
+        assert_eq!(body.get("store").and_then(|v| v.as_bool()), Some(true));
+        let input = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(input.len(), 1, "only incremental suffix should remain");
+        assert_eq!(
+            input[0]
+                .pointer("/content/0/text")
+                .and_then(|v| v.as_str()),
+            Some("next")
+        );
+        assert_eq!(meta.full_input.len(), 3);
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_skips_previous_response_id_for_unsupported_endpoint() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = unsupported_store.lock().expect("lock");
+            guard.insert("ep_unsupported".to_string());
+        }
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_unsupported".to_string(),
+                    full_input: vec![
+                        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
+                    ],
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+            ],
+            "store": false
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let _meta = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            "test-chain",
+            "ep_unsupported",
+            "req_1",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert_eq!(body.get("store").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            body.get("previous_response_id").is_none(),
+            "unsupported endpoint should skip previous_response_id"
+        );
+        let input = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(input.len(), 2, "input should remain full when skipped");
+    }
+
+    #[test]
+    fn test_record_stateful_chain_entry_stores_latest_response() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let meta = StatefulChainRequestMeta {
+            chain_key: "chain-a".to_string(),
+            endpoint_key: "ep-a".to_string(),
+            full_input: vec![Value::String("x".to_string())],
+        };
+
+        record_stateful_chain_entry(&chain_store, &meta, "resp_001");
+
+        let guard = chain_store.lock().expect("lock");
+        let entry = guard.get("chain-a").expect("entry");
+        assert_eq!(entry.response_id, "resp_001");
+        assert_eq!(entry.endpoint_key, "ep-a");
+        assert_eq!(entry.full_input.len(), 1);
+    }
+
+    #[test]
+    fn test_derive_stateful_chain_key_prefers_hint_header() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"hello"}],
+            "stream": true
+        }))
+        .expect("request");
+        let key = derive_stateful_chain_key(
+            Some("session-123"),
+            "codex",
+            "gpt-5.3-codex",
+            &request,
+        );
+        assert_eq!(key, "hint:codex:session-123");
+    }
+
+    #[test]
+    fn test_is_previous_response_id_unsupported_error_matcher() {
+        assert!(is_previous_response_id_unsupported_error(
+            400,
+            r#"{"detail":"Unsupported parameter: previous_response_id"}"#
+        ));
+        assert!(!is_previous_response_id_unsupported_error(
+            429,
+            r#"{"detail":"Unsupported parameter: previous_response_id"}"#
+        ));
+        assert!(!is_previous_response_id_unsupported_error(
+            400,
+            r#"{"detail":"Unsupported parameter: parallel_tool_calls"}"#
+        ));
     }
 
     #[test]
