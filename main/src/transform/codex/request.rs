@@ -13,6 +13,7 @@ const CODEX_INSTRUCTIONS: &str = include_str!("../../instructions.txt");
 const EMPTY_TOOL_OUTPUT_PLACEHOLDER: &str = "(No output)";
 const PROMPT_CACHE_KEY_MAX_CWD_LEN: usize = 64;
 const PROMPT_CACHE_KEY_SEP: u8 = 0x1f;
+const MAX_TRUSTED_REQUEST_CWD_CHARS: usize = 512;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 240;
 const MAX_TOOL_SCHEMA_DESCRIPTION_CHARS: usize = 120;
 const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
@@ -74,10 +75,10 @@ fn is_wrapped_agents_instructions(system_text: &str) -> bool {
         && lower.contains("</instructions>")
 }
 
-fn should_inject_runtime_environment_context(system_text: &str) -> bool {
-    let lower = system_text.to_ascii_lowercase();
-    !(lower.contains("<environment_context>")
-        || (lower.contains("<cwd>") && lower.contains("<approval_policy>")))
+fn request_contains_environment_context(request_text_corpus: &str) -> bool {
+    request_text_corpus
+        .to_ascii_lowercase()
+        .contains("<environment_context>")
 }
 
 fn collect_request_text_corpus(request: &AnthropicRequest) -> String {
@@ -115,6 +116,38 @@ fn collect_request_text_corpus(request: &AnthropicRequest) -> String {
     }
 
     parts.join("\n")
+}
+
+fn extract_first_tag_content<'a>(text: &'a str, tag_start: &str, tag_end: &str) -> Option<&'a str> {
+    let start = text.find(tag_start)?;
+    let after_start = &text[start + tag_start.len()..];
+    let end_rel = after_start.find(tag_end)?;
+    Some(&after_start[..end_rel])
+}
+
+fn extract_request_cwd(request_text_corpus: &str) -> Option<String> {
+    const ENV_START: &str = "<environment_context>";
+    const ENV_END: &str = "</environment_context>";
+    const CWD_START: &str = "<cwd>";
+    const CWD_END: &str = "</cwd>";
+
+    let mut remaining = request_text_corpus;
+    while let Some(env_start_idx) = remaining.find(ENV_START) {
+        let after_env_start = &remaining[env_start_idx + ENV_START.len()..];
+        let Some(env_end_rel) = after_env_start.find(ENV_END) else {
+            break;
+        };
+        let env_block = &after_env_start[..env_end_rel];
+        if let Some(cwd_raw) = extract_first_tag_content(env_block, CWD_START, CWD_END) {
+            let cwd = cwd_raw.trim();
+            if !cwd.is_empty() && cwd.chars().count() <= MAX_TRUSTED_REQUEST_CWD_CHARS {
+                return Some(cwd.to_string());
+            }
+        }
+        remaining = &after_env_start[env_end_rel + ENV_END.len()..];
+    }
+
+    None
 }
 
 fn has_skill_tool(tools: Option<&Vec<Value>>) -> bool {
@@ -423,7 +456,7 @@ fn sanitize_cache_key_segment(input: &str, max_len: usize) -> String {
 }
 
 fn build_prompt_cache_key(
-    cwd: &str,
+    request_cwd: Option<&str>,
     codex_model: &str,
     custom_injection_prompt: &str,
     system_text: Option<&str>,
@@ -438,7 +471,9 @@ fn build_prompt_cache_key(
     }
     let key_hash = fnv1a64(&key_material);
     let model_segment = sanitize_cache_key_segment(codex_model, 48);
-    let cwd_segment = sanitize_cache_key_segment(cwd, PROMPT_CACHE_KEY_MAX_CWD_LEN);
+    let cwd_segment = request_cwd
+        .map(|cwd| sanitize_cache_key_segment(cwd, PROMPT_CACHE_KEY_MAX_CWD_LEN))
+        .unwrap_or_else(|| "default".to_string());
     format!("codex-proxy:{}:{}:{:016x}", model_segment, cwd_segment, key_hash)
 }
 
@@ -961,9 +996,6 @@ impl TransformRequest {
         enable_tool_schema_compaction: bool,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "/".to_string());
 
         // 获取全局日志记录器
         let logger = AppLogger::get();
@@ -1006,6 +1038,7 @@ impl TransformRequest {
         let mut final_input: Vec<Value> = Vec::new();
 
         let request_text_corpus = collect_request_text_corpus(anthropic_body);
+        let request_cwd = extract_request_cwd(&request_text_corpus);
         let mut system_text_for_cache_key = None::<String>;
         let include_static_codex_instructions =
             should_include_static_codex_instructions(Some(&request_text_corpus));
@@ -1021,10 +1054,15 @@ impl TransformRequest {
 
             let system_payload_text = if is_wrapped_agents_instructions(&system_text) {
                 system_text
-            } else {
+            } else if let Some(cwd) = request_cwd.as_deref() {
                 format!(
                     "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
                     cwd, system_text
+                )
+            } else {
+                format!(
+                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+                    system_text
                 )
             };
             final_input.push(json!({
@@ -1036,23 +1074,10 @@ impl TransformRequest {
                 }]
             }));
 
-            if should_inject_runtime_environment_context(&request_text_corpus) {
-                final_input.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": format!(r#"<environment_context>
-  <cwd>{}</cwd>
-  <approval_policy>on-request</approval_policy>
-  <sandbox_mode>workspace-write</sandbox_mode>
-  <network_access>restricted</network_access>
-  <shell>{}</shell>
-</environment_context>"#, cwd, std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string()))
-                    }]
-                }));
-            } else {
+            if request_contains_environment_context(&request_text_corpus) {
                 log("📋 [Transform] Skip runtime <environment_context> injection (already present in request text)");
+            } else {
+                log("📋 [Transform] Skip runtime <environment_context> injection (no trusted request cwd)");
             }
         }
 
@@ -1142,7 +1167,7 @@ impl TransformRequest {
             json!("auto")
         };
         let prompt_cache_key = build_prompt_cache_key(
-            &cwd,
+            request_cwd.as_deref(),
             final_codex_model,
             custom_injection_prompt,
             system_text_for_cache_key.as_deref(),
@@ -1474,6 +1499,7 @@ impl TransformRequest {
 mod tests {
     use super::{
         build_skill_inventory_hint, compact_tool_description, detect_requested_skill_name,
+        extract_request_cwd,
         TransformRequest,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
@@ -1724,6 +1750,155 @@ mod tests {
             body_a.get("prompt_cache_key"),
             body_b.get("prompt_cache_key"),
             "cache key should rotate when static prefix changes"
+        );
+    }
+
+    #[test]
+    fn no_local_cwd_injection_when_request_has_no_env_context() {
+        let request = sample_request();
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let env_context_count = input_items
+            .iter()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|blocks| blocks.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .filter(|text| text.contains("<environment_context>"))
+            .count();
+        assert_eq!(
+            env_context_count, 0,
+            "runtime environment context should not be injected when request has none"
+        );
+
+        let first_system_text = input_items
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|v| v.as_array())
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            first_system_text.starts_with("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n"),
+            "system wrapper should avoid local current_dir path when request cwd is missing"
+        );
+    }
+
+    #[test]
+    fn uses_request_cwd_when_present_for_agents_wrapper() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content":"<environment_context><cwd>/Users/mr.j</cwd><approval_policy>on-request</approval_policy></environment_context>"
+            }],
+            "system": "System prompt",
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        let input_items = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input array");
+        let first_system_text = input_items
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|v| v.as_array())
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            first_system_text.contains("# AGENTS.md instructions for /Users/mr.j"),
+            "wrapper should use trusted cwd extracted from request context"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_uses_default_segment_without_request_cwd() {
+        let request = sample_request();
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        let key = body
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            key.contains(":default:"),
+            "cache key should use default cwd segment when trusted request cwd is absent"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_changes_with_request_cwd() {
+        let request_a: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content":"<environment_context><cwd>/Users/mr.j/a</cwd><approval_policy>on-request</approval_policy></environment_context>"
+            }],
+            "system": "System prompt",
+            "stream": true
+        }))
+        .expect("valid request A");
+        let request_b: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content":"<environment_context><cwd>/Users/mr.j/b</cwd><approval_policy>on-request</approval_policy></environment_context>"
+            }],
+            "system": "System prompt",
+            "stream": true
+        }))
+        .expect("valid request B");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body_a, _) =
+            TransformRequest::transform(&request_a, None, &mapping, "global prompt", "gpt-5.3-codex");
+        let (body_b, _) =
+            TransformRequest::transform(&request_b, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        let key_a = body_a
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let key_b = body_b
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert_ne!(key_a, key_b, "cache key should change with trusted request cwd");
+        assert!(
+            key_a.contains(":Users_mr_j_a:"),
+            "cache key should include sanitized trusted cwd segment"
+        );
+        assert!(
+            key_b.contains(":Users_mr_j_b:"),
+            "cache key should include sanitized trusted cwd segment"
+        );
+    }
+
+    #[test]
+    fn extract_request_cwd_returns_none_without_environment_context() {
+        let corpus = "hello world\nsystem text";
+        assert!(
+            extract_request_cwd(corpus).is_none(),
+            "cwd should only come from explicit environment_context block"
         );
     }
 

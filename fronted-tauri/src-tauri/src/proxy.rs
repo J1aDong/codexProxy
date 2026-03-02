@@ -385,7 +385,7 @@ pub struct ProxyConfig {
     #[serde(
         rename = "customInjectionPrompt",
         alias = "skillInjectionPrompt",
-        default
+        default = "default_custom_injection_prompt"
     )]
     pub custom_injection_prompt: String,
     #[serde(default = "default_lang")]
@@ -394,6 +394,20 @@ pub struct ProxyConfig {
 
 fn default_lang() -> String {
     "zh".to_string()
+}
+
+const DEFAULT_CUSTOM_INJECTION_PROMPT: &str = "回复前先看下skills是否有一个skill符合的，可以执行。\n\nskills里的技能如果需要依赖，先安装，不要先用其他方案，如果还有问题告知用户解决方案让用户选择。\n\n如果你收到 <tool_use_error>Sibling tool call errored</tool_use_error>，请不要将其作为普通文本输出，而是分析导致该错误的原始Sibling的报错原因并继续工作。";
+
+fn default_custom_injection_prompt() -> String {
+    DEFAULT_CUSTOM_INJECTION_PROMPT.to_string()
+}
+
+fn resolve_custom_injection_prompt(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        default_custom_injection_prompt()
+    } else {
+        raw.to_string()
+    }
 }
 
 fn default_converter() -> String {
@@ -687,6 +701,7 @@ fn build_runtime_update(
     log_tx: Option<broadcast::Sender<String>>,
 ) -> RuntimeConfigUpdate {
     let (target_url, api_key) = resolve_target_and_api_key(config);
+    let custom_injection_prompt = resolve_custom_injection_prompt(&config.custom_injection_prompt);
     let load_balancer_runtime = if config.proxy_mode.eq_ignore_ascii_case("load_balancer") {
         build_lb_runtime(config, log_tx)
     } else {
@@ -708,7 +723,7 @@ fn build_runtime_update(
                 sonnet: config.anthropic_model_mapping.sonnet.clone(),
                 haiku: config.anthropic_model_mapping.haiku.clone(),
             },
-            custom_injection_prompt: config.custom_injection_prompt.clone(),
+            custom_injection_prompt: custom_injection_prompt,
             converter: config.converter.clone(),
             codex_model: config.codex_model.clone(),
             gemini_reasoning_effort: config.gemini_reasoning_effort.to_gemini_mapping(),
@@ -950,6 +965,7 @@ async fn start_proxy_with_manager(
         format!("[System] Target: {}", resolved_target_url),
     )
     .map_err(|e| e.to_string())?;
+    let custom_injection_prompt = resolve_custom_injection_prompt(&config.custom_injection_prompt);
 
     // 创建日志通道（容量 2048 减少高频场景下的 lag）
     let (log_tx, mut log_rx) = broadcast::channel::<String>(2048);
@@ -957,7 +973,7 @@ async fn start_proxy_with_manager(
 
     let server = ProxyServer::new(config.port, resolved_target_url.clone(), api_key)
         .with_reasoning_mapping(config.reasoning_effort.to_mapping())
-        .with_custom_injection_prompt(config.custom_injection_prompt.clone())
+        .with_custom_injection_prompt(custom_injection_prompt)
         .with_converter(config.converter.clone())
         .with_codex_model(config.codex_model.clone())
         .with_codex_model_mapping(CodexModelMapping {
@@ -1190,4 +1206,46 @@ pub fn import_config(config_json: String) -> Result<(), String> {
     let content =
         serde_json::to_string_pretty(&config).map_err(|e| format!("序列化配置失败: {}", e))?;
     fs::write(&path, content).map_err(|e| format!("写入配置文件失败: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn custom_injection_prompt_uses_default_when_field_missing() {
+        let config: ProxyConfig = serde_json::from_value(json!({
+            "port": 8889,
+            "targetUrl": "http://127.0.0.1:3000",
+            "apiKey": "test-key"
+        }))
+        .expect("config should deserialize");
+
+        assert_eq!(
+            config.custom_injection_prompt,
+            DEFAULT_CUSTOM_INJECTION_PROMPT
+        );
+    }
+
+    #[test]
+    fn build_runtime_update_falls_back_for_blank_prompt_and_keeps_custom_prompt() {
+        let mut blank = ProxyConfig::default();
+        blank.target_url = "http://127.0.0.1:3000".to_string();
+        blank.custom_injection_prompt = "   ".to_string();
+        let blank_update = build_runtime_update(&blank, None);
+        assert_eq!(
+            blank_update.ctx.custom_injection_prompt,
+            DEFAULT_CUSTOM_INJECTION_PROMPT
+        );
+
+        let mut custom = ProxyConfig::default();
+        custom.target_url = "http://127.0.0.1:3000".to_string();
+        custom.custom_injection_prompt = "user custom prompt".to_string();
+        let custom_update = build_runtime_update(&custom, None);
+        assert_eq!(
+            custom_update.ctx.custom_injection_prompt,
+            "user custom prompt"
+        );
+    }
 }
