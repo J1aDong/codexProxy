@@ -594,6 +594,49 @@ fn test_codex_input_strips_system_reminder_from_function_call_output() {
 }
 
 #[test]
+fn test_codex_input_preserves_skill_system_reminder_in_assistant_text() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![Message {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "Skill meta:\n<system-reminder>\n### Available skills\n- defuddle (file: /tmp/defuddle/SKILL.md)\n</system-reminder>\nDone.".to_string(),
+            }])),
+        }],
+        system: None,
+        stream: true,
+        tools: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+
+    let text_blocks: Vec<&str> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter_map(|msg| msg.get("content").and_then(|v| v.as_array()))
+        .flat_map(|content| content.iter())
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect();
+
+    assert!(
+        text_blocks
+            .iter()
+            .any(|text| text.contains("### Available skills") && text.contains("SKILL.md")),
+        "skill catalog reminder should be preserved for downstream skill awareness"
+    );
+}
+
+#[test]
 fn test_codex_input_keeps_empty_function_call_output() {
     let request = AnthropicRequest {
         model: Some("claude-sonnet-4-5-20250929".to_string()),

@@ -345,6 +345,11 @@ pub struct ProxyConfig {
         default = "default_enable_sibling_tool_error_retry"
     )]
     pub enable_sibling_tool_error_retry: bool,
+    #[serde(
+        rename = "enableStatefulResponsesChain",
+        default = "default_enable_stateful_responses_chain"
+    )]
+    pub enable_stateful_responses_chain: bool,
     #[serde(rename = "allowExternalAccess", default)]
     pub allow_external_access: bool,
     #[serde(default)]
@@ -466,10 +471,14 @@ fn default_enable_incomplete_stream_retry() -> bool {
 }
 
 fn default_incomplete_stream_retry_max_attempts() -> u32 {
-    5
+    2
 }
 
 fn default_enable_sibling_tool_error_retry() -> bool {
+    true
+}
+
+fn default_enable_stateful_responses_chain() -> bool {
     true
 }
 
@@ -708,6 +717,7 @@ fn build_runtime_update(
         enable_incomplete_stream_retry: config.enable_incomplete_stream_retry,
         incomplete_stream_retry_max_attempts: config.incomplete_stream_retry_max_attempts,
         enable_sibling_tool_error_retry: config.enable_sibling_tool_error_retry,
+        enable_stateful_responses_chain: config.enable_stateful_responses_chain,
         load_balancer_runtime,
     }
 }
@@ -962,6 +972,7 @@ async fn start_proxy_with_manager(
         .with_enable_incomplete_stream_retry(config.enable_incomplete_stream_retry)
         .with_incomplete_stream_retry_max_attempts(config.incomplete_stream_retry_max_attempts)
         .with_enable_sibling_tool_error_retry(config.enable_sibling_tool_error_retry)
+        .with_enable_stateful_responses_chain(config.enable_stateful_responses_chain)
         .with_allow_external_access(config.allow_external_access)
         .with_max_concurrency(config.max_concurrency);
 

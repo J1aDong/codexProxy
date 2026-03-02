@@ -6,8 +6,8 @@ use std::hash::{Hash, Hasher};
 use tokio::sync::broadcast;
 
 pub const IMAGE_SYSTEM_HINT: &str = "\n<system_hint>IMAGE PROVIDED. You can see the image above directly. Analyze it as requested. DO NOT ask for file paths.</system_hint>\n";
-const MAX_SKILL_CONTENT_CHARS: usize = 8_000;
-const MAX_TOTAL_SKILL_CHARS: usize = 32_000;
+const MAX_SKILL_CONTENT_CHARS: usize = 4_000;
+const MAX_TOTAL_SKILL_CHARS: usize = 12_000;
 const SKILL_TRUNCATION_MARKER: &str = "\n[skill content truncated]";
 
 pub struct MessageProcessor;
