@@ -13,6 +13,7 @@ const CODEX_INSTRUCTIONS: &str = include_str!("../../instructions.txt");
 const EMPTY_TOOL_OUTPUT_PLACEHOLDER: &str = "(No output)";
 const PROMPT_CACHE_KEY_MAX_CWD_LEN: usize = 64;
 const PROMPT_CACHE_KEY_SEP: u8 = 0x1f;
+const MAX_TOOL_DESCRIPTION_CHARS: usize = 240;
 const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
 const ENV_REASONING_SUMMARY_MODE: &str = "CODEX_PROXY_REASONING_SUMMARY";
 const ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT: &str =
@@ -113,8 +114,9 @@ fn normalize_skill_name_token(token: &str) -> Option<String> {
     Some(trimmed.to_ascii_lowercase())
 }
 
-fn extract_available_skill_names(system_text: &str) -> HashSet<String> {
-    let mut names = HashSet::new();
+fn extract_available_skill_names_ordered(system_text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
     for line in system_text.lines() {
         let trimmed = line.trim_start();
         let Some(rest) = trimmed
@@ -124,11 +126,109 @@ fn extract_available_skill_names(system_text: &str) -> HashSet<String> {
             continue;
         };
         let candidate = rest.splitn(2, ':').next().unwrap_or_default();
+        if candidate.trim_start().starts_with('/') {
+            // `/help`-style builtin command bullets are not Skill-tool skills.
+            continue;
+        }
         if let Some(name) = normalize_skill_name_token(candidate) {
-            names.insert(name);
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
         }
     }
     names
+}
+
+fn text_contains_skill_catalog_header(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("the following skills are available")
+        || lower.contains("skills are available for use with the skill tool")
+        || lower.contains("skills available in this session")
+        || lower.contains("### available skills")
+}
+
+fn extract_available_skill_names_from_request(request: &AnthropicRequest) -> Vec<String> {
+    let mut ordered_names = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_names = |text: &str| {
+        if !text_contains_skill_catalog_header(text) {
+            return;
+        }
+        for name in extract_available_skill_names_ordered(text) {
+            if seen.insert(name.clone()) {
+                ordered_names.push(name);
+            }
+        }
+    };
+
+    if let Some(system) = request.system.as_ref().map(|s| s.to_string()) {
+        push_names(&system);
+    }
+
+    for message in &request.messages {
+        let Some(content) = message.content.as_ref() else {
+            continue;
+        };
+        match content {
+            MessageContent::Text(text) => push_names(text),
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    if let ContentBlock::Text { text } = block {
+                        push_names(text);
+                    }
+                }
+            }
+        }
+    }
+
+    ordered_names
+}
+
+fn looks_like_skill_inventory_query(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let normalized = lower.replace(' ', "");
+    let keywords = [
+        "有哪些skill",
+        "哪些skill",
+        "可调用技能",
+        "技能列表",
+        "skill列表",
+        "列出skill",
+        "listskills",
+        "availableskills",
+        "slashskills",
+        "/skills",
+    ];
+
+    keywords
+        .iter()
+        .any(|kw| lower.contains(kw) || normalized.contains(kw))
+}
+
+fn build_skill_inventory_hint(request: &AnthropicRequest) -> Option<String> {
+    if !has_skill_tool(request.tools.as_ref()) {
+        return None;
+    }
+
+    let latest = latest_user_text(request)?;
+    if !looks_like_skill_inventory_query(&latest) {
+        return None;
+    }
+
+    let names = extract_available_skill_names_from_request(request);
+    if names.is_empty() {
+        return None;
+    }
+
+    let mut body = String::from(
+        "Skill catalog snapshot from current system-reminder. Treat this as complete for this turn.\nWhen user asks for skills, list all names below; do not answer with only examples.\n",
+    );
+    for name in names {
+        body.push_str("- ");
+        body.push_str(&name);
+        body.push('\n');
+    }
+    Some(body)
 }
 
 fn extract_slash_skill_tokens(text: &str) -> Vec<String> {
@@ -236,11 +336,9 @@ fn detect_requested_skill_name(request: &AnthropicRequest) -> Option<String> {
     if !has_skill_tool(request.tools.as_ref()) {
         return None;
     }
-    let system_text = request.system.as_ref().map(|s| s.to_string()).unwrap_or_default();
-    if system_text.is_empty() {
-        return None;
-    }
-    let available = extract_available_skill_names(&system_text);
+    let available: HashSet<String> = extract_available_skill_names_from_request(request)
+        .into_iter()
+        .collect();
     if available.is_empty() {
         return None;
     }
@@ -304,6 +402,36 @@ fn build_prompt_cache_key(
     let model_segment = sanitize_cache_key_segment(codex_model, 48);
     let cwd_segment = sanitize_cache_key_segment(cwd, PROMPT_CACHE_KEY_MAX_CWD_LEN);
     format!("codex-proxy:{}:{}:{:016x}", model_segment, cwd_segment, key_hash)
+}
+
+fn compact_tool_description(description: Option<&str>) -> String {
+    let Some(raw) = description else {
+        return String::new();
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Keep the first paragraph and normalize whitespace to cut verbose boilerplate.
+    let first_paragraph = trimmed.split("\n\n").next().unwrap_or(trimmed);
+    let normalized = first_paragraph
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let char_count = normalized.chars().count();
+    if char_count <= MAX_TOOL_DESCRIPTION_CHARS {
+        return normalized;
+    }
+
+    let mut clipped: String = normalized.chars().take(MAX_TOOL_DESCRIPTION_CHARS).collect();
+    while clipped.ends_with(|ch: char| ch.is_whitespace()) {
+        clipped.pop();
+    }
+    clipped.push_str("...");
+    clipped
 }
 
 fn sanitize_function_call_name_for_codex(name: &str) -> String {
@@ -865,6 +993,17 @@ impl TransformRequest {
 
         // 追加对话历史
         final_input.extend(chat_messages);
+        if let Some(skill_inventory_hint) = build_skill_inventory_hint(anthropic_body) {
+            log("🎯 [Transform] Skill inventory query detected, injecting complete catalog hint");
+            final_input.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": skill_inventory_hint
+                }]
+            }));
+        }
         if let Some(skill_name) = detect_requested_skill_name(anthropic_body) {
             log(&format!(
                 "🎯 [Transform] Skill intent matched, nudging Skill tool: {}",
@@ -1121,7 +1260,7 @@ impl TransformRequest {
                     return json!({
                         "type": "function",
                         "name": name,
-                        "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                        "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
                         "strict": false,
                         "parameters": parameters
                     });
@@ -1146,7 +1285,7 @@ impl TransformRequest {
                     return json!({
                         "type": "function",
                         "name": name,
-                        "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                        "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
                         "strict": false,
                         "parameters": parameters
                     });
@@ -1172,7 +1311,7 @@ impl TransformRequest {
                     return json!({
                         "type": "function",
                         "name": name,
-                        "description": func.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                        "description": compact_tool_description(func.get("description").and_then(|d| d.as_str())),
                         "strict": false,
                         "parameters": parameters
                     });
@@ -1196,7 +1335,7 @@ impl TransformRequest {
                 json!({
                     "type": "function",
                     "name": name,
-                    "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                    "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
                     "strict": false,
                     "parameters": parameters
                 })
@@ -1207,7 +1346,10 @@ impl TransformRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_requested_skill_name, TransformRequest};
+    use super::{
+        build_skill_inventory_hint, compact_tool_description, detect_requested_skill_name,
+        TransformRequest,
+    };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
     use serde_json::json;
 
@@ -1224,6 +1366,110 @@ mod tests {
             "stream": true
         }))
         .expect("valid anthropic request")
+    }
+
+    #[test]
+    fn build_skill_inventory_hint_includes_all_available_names_for_list_query() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"你有哪些 skill"}],
+            "system": "<system-reminder>\nThe following skills are available:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n- review-pr: Review pull request\n</system-reminder>",
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+
+        let hint = build_skill_inventory_hint(&request).expect("should build hint");
+        assert!(hint.contains("Skill catalog snapshot"), "hint header should exist");
+        assert!(hint.contains("- figma-implement-design"), "should include figma skill");
+        assert!(hint.contains("- pdf"), "should include pdf skill");
+        assert!(hint.contains("- review-pr"), "should include review-pr skill");
+    }
+
+    #[test]
+    fn build_skill_inventory_hint_reads_catalog_from_message_system_reminder() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role":"user",
+                    "content":[
+                        {
+                            "type":"text",
+                            "text":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n- figma: Figma support\n- pdf: PDF support\n- /help: Builtin command\n</system-reminder>"
+                        },
+                        {
+                            "type":"text",
+                            "text":"你有哪些skill"
+                        }
+                    ]
+                }
+            ],
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+
+        let hint = build_skill_inventory_hint(&request).expect("should build hint from message reminder");
+        assert!(hint.contains("- figma"), "should include figma skill");
+        assert!(hint.contains("- pdf"), "should include pdf skill");
+        assert!(
+            !hint.contains("/help"),
+            "builtin slash commands should not be treated as skill catalog entries"
+        );
+    }
+
+    #[test]
+    fn compact_tool_description_truncates_and_normalizes() {
+        let description = "First line with    extra spaces.\nSecond line stays in first paragraph.\n\nSecond paragraph should be dropped.";
+        let compacted = compact_tool_description(Some(description));
+        assert!(
+            compacted.contains("First line with extra spaces. Second line stays in first paragraph."),
+            "whitespace should be normalized and first paragraph preserved"
+        );
+        assert!(
+            !compacted.contains("Second paragraph should be dropped"),
+            "only first paragraph should remain"
+        );
+
+        let long = "a".repeat(600);
+        let compacted_long = compact_tool_description(Some(&long));
+        assert!(
+            compacted_long.chars().count() <= 243,
+            "long descriptions should be clipped with ellipsis"
+        );
+        assert!(
+            compacted_long.ends_with("..."),
+            "clipped descriptions should end with ellipsis"
+        );
+    }
+
+    #[test]
+    fn transform_tools_compacts_verbose_descriptions() {
+        let long_description = "Bash tool long description. ".repeat(120);
+        let tools = vec![json!({
+            "name": "Bash",
+            "description": long_description,
+            "input_schema": {"type":"object","properties":{"command":{"type":"string"}}}
+        })];
+        let transformed = TransformRequest::transform_tools(Some(&tools), None);
+        assert_eq!(transformed.len(), 1, "one tool should remain");
+        let description = transformed[0]
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            description.chars().count() <= 243,
+            "tool description should be compacted for faster request payloads"
+        );
     }
 
     #[test]
@@ -1493,6 +1739,41 @@ mod tests {
         assert!(
             detect_requested_skill_name(&request).is_none(),
             "file path slashes should not be interpreted as explicit skill invocation"
+        );
+    }
+
+    #[test]
+    fn detect_requested_skill_name_uses_catalog_from_message_system_reminder() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role":"user",
+                    "content":[
+                        {
+                            "type":"text",
+                            "text":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n</system-reminder>"
+                        }
+                    ]
+                },
+                {
+                    "role":"user",
+                    "content":"请用 /figma-implement-design 处理这个节点"
+                }
+            ],
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+
+        assert_eq!(
+            detect_requested_skill_name(&request).as_deref(),
+            Some("figma-implement-design"),
+            "skill detection should work even when catalog comes from message reminder"
         );
     }
 }
