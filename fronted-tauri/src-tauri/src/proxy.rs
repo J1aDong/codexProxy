@@ -255,6 +255,11 @@ pub struct ProxyConfig {
     )]
     pub allow_count_tokens_fallback_estimate: bool,
     #[serde(
+        rename = "enableCodexFastMode",
+        default = "default_enable_codex_fast_mode"
+    )]
+    pub enable_codex_fast_mode: bool,
+    #[serde(
         rename = "forceStreamForCodex",
         default = "default_force_stream_for_codex"
     )]
@@ -345,10 +350,7 @@ pub struct ProxyConfig {
         default = "default_enable_sibling_tool_error_retry"
     )]
     pub enable_sibling_tool_error_retry: bool,
-    #[serde(
-        rename = "preferCodexV1Path",
-        default = "default_prefer_codex_v1_path"
-    )]
+    #[serde(rename = "preferCodexV1Path", default = "default_prefer_codex_v1_path")]
     pub prefer_codex_v1_path: bool,
     #[serde(
         rename = "enableCodexToolSchemaCompaction",
@@ -424,6 +426,10 @@ fn default_codex_model() -> String {
 }
 
 fn default_allow_count_tokens_fallback_estimate() -> bool {
+    true
+}
+
+fn default_enable_codex_fast_mode() -> bool {
     true
 }
 
@@ -532,6 +538,64 @@ fn default_gemini_model_preset() -> Vec<String> {
         "gemini-2.5-flash".to_string(),
         "gemini-2.5-pro".to_string(),
     ]
+}
+
+fn default_proxy_config() -> ProxyConfig {
+    ProxyConfig {
+        port: 8889,
+        target_url: default_endpoint_options()
+            .into_iter()
+            .next()
+            .map(|item| item.url)
+            .unwrap_or_default(),
+        api_key: String::new(),
+        endpoint_options: default_endpoint_options(),
+        selected_endpoint_id: default_selected_endpoint_id(),
+        converter: default_converter(),
+        codex_model: default_codex_model(),
+        codex_model_mapping: CodexModelMappingConfig::default(),
+        anthropic_model_mapping: default_anthropic_model_mapping(),
+        codex_effort_capability_map: None,
+        gemini_model_preset: default_gemini_model_preset(),
+        max_concurrency: 0,
+        ignore_probe_requests: false,
+        allow_count_tokens_fallback_estimate: default_allow_count_tokens_fallback_estimate(),
+        enable_codex_fast_mode: default_enable_codex_fast_mode(),
+        force_stream_for_codex: default_force_stream_for_codex(),
+        enable_sse_frame_parser: default_enable_sse_frame_parser(),
+        enable_stream_heartbeat: default_enable_stream_heartbeat(),
+        stream_heartbeat_interval_ms: default_stream_heartbeat_interval_ms(),
+        enable_stream_log_sampling: default_enable_stream_log_sampling(),
+        stream_log_sample_every_n: default_stream_log_sample_every_n(),
+        stream_log_max_chars: default_stream_log_max_chars(),
+        enable_stream_metrics: default_enable_stream_metrics(),
+        enable_stream_event_metrics: default_enable_stream_event_metrics(),
+        stream_silence_warn_ms: default_stream_silence_warn_ms(),
+        stream_silence_error_ms: default_stream_silence_error_ms(),
+        enable_stall_retry: default_enable_stall_retry(),
+        stall_timeout_ms: default_stall_timeout_ms(),
+        stall_retry_max_attempts: default_stall_retry_max_attempts(),
+        stall_retry_only_heartbeat_phase: default_stall_retry_only_heartbeat_phase(),
+        enable_empty_completion_retry: default_enable_empty_completion_retry(),
+        empty_completion_retry_max_attempts: default_empty_completion_retry_max_attempts(),
+        enable_incomplete_stream_retry: default_enable_incomplete_stream_retry(),
+        incomplete_stream_retry_max_attempts: default_incomplete_stream_retry_max_attempts(),
+        enable_sibling_tool_error_retry: default_enable_sibling_tool_error_retry(),
+        prefer_codex_v1_path: default_prefer_codex_v1_path(),
+        enable_codex_tool_schema_compaction: default_enable_codex_tool_schema_compaction(),
+        enable_skill_routing_hint: default_enable_skill_routing_hint(),
+        enable_stateful_responses_chain: default_enable_stateful_responses_chain(),
+        allow_external_access: false,
+        force: false,
+        proxy_mode: default_proxy_mode(),
+        load_balancer: default_load_balancer(),
+        lb_model_cooldown_seconds: default_lb_model_cooldown_seconds(),
+        lb_transient_backoff_seconds: default_lb_transient_backoff_seconds(),
+        reasoning_effort: ReasoningEffortConfig::default(),
+        gemini_reasoning_effort: ReasoningEffortConfig::default(),
+        custom_injection_prompt: default_custom_injection_prompt(),
+        lang: default_lang(),
+    }
 }
 
 fn build_lb_runtime(
@@ -737,10 +801,12 @@ fn build_runtime_update(
             codex_model: config.codex_model.clone(),
             gemini_reasoning_effort: config.gemini_reasoning_effort.to_gemini_mapping(),
             enable_codex_tool_schema_compaction: config.enable_codex_tool_schema_compaction,
+            enable_codex_fast_mode: config.enable_codex_fast_mode,
             enable_skill_routing_hint: config.enable_skill_routing_hint,
         },
         ignore_probe_requests: config.ignore_probe_requests,
         allow_count_tokens_fallback_estimate: config.allow_count_tokens_fallback_estimate,
+        enable_codex_fast_mode: config.enable_codex_fast_mode,
         force_stream_for_codex: config.force_stream_for_codex,
         enable_sse_frame_parser: config.enable_sse_frame_parser,
         enable_stream_heartbeat: config.enable_stream_heartbeat,
@@ -867,9 +933,9 @@ pub fn save_lang(lang: String) -> Result<(), String> {
     let path = get_config_path()?;
     let mut config = if path.exists() {
         let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&content).unwrap_or_default()
+        serde_json::from_str(&content).unwrap_or_else(|_| default_proxy_config())
     } else {
-        ProxyConfig::default()
+        default_proxy_config()
     };
     config.lang = lang;
     save_config(config)
@@ -1000,6 +1066,7 @@ async fn start_proxy_with_manager(
         .with_gemini_reasoning_effort(config.gemini_reasoning_effort.to_gemini_mapping())
         .with_ignore_probe_requests(config.ignore_probe_requests)
         .with_allow_count_tokens_fallback_estimate(config.allow_count_tokens_fallback_estimate)
+        .with_enable_codex_fast_mode(config.enable_codex_fast_mode)
         .with_force_stream_for_codex(config.force_stream_for_codex)
         .with_enable_sse_frame_parser(config.enable_sse_frame_parser)
         .with_enable_stream_heartbeat(config.enable_stream_heartbeat)
@@ -1195,7 +1262,7 @@ pub fn export_config() -> Result<String, String> {
             serde_json::from_str(&content).map_err(|e| format!("解析配置文件失败: {}", e))?;
         serde_json::to_string_pretty(&config).map_err(|e| format!("序列化配置失败: {}", e))
     } else {
-        let default_config = ProxyConfig::default();
+        let default_config = default_proxy_config();
         serde_json::to_string_pretty(&default_config)
             .map_err(|e| format!("序列化默认配置失败: {}", e))
     }
@@ -1238,11 +1305,15 @@ mod tests {
             config.custom_injection_prompt,
             DEFAULT_CUSTOM_INJECTION_PROMPT
         );
+        assert!(
+            config.enable_codex_fast_mode,
+            "missing config field should default Codex fast mode to enabled"
+        );
     }
 
     #[test]
     fn build_runtime_update_falls_back_for_blank_prompt_and_keeps_custom_prompt() {
-        let mut blank = ProxyConfig::default();
+        let mut blank = default_proxy_config();
         blank.target_url = "http://127.0.0.1:3000".to_string();
         blank.custom_injection_prompt = "   ".to_string();
         let blank_update = build_runtime_update(&blank, None);
@@ -1250,8 +1321,10 @@ mod tests {
             blank_update.ctx.custom_injection_prompt,
             DEFAULT_CUSTOM_INJECTION_PROMPT
         );
+        assert!(blank_update.enable_codex_fast_mode);
+        assert!(blank_update.ctx.enable_codex_fast_mode);
 
-        let mut custom = ProxyConfig::default();
+        let mut custom = default_proxy_config();
         custom.target_url = "http://127.0.0.1:3000".to_string();
         custom.custom_injection_prompt = "user custom prompt".to_string();
         let custom_update = build_runtime_update(&custom, None);
@@ -1259,5 +1332,12 @@ mod tests {
             custom_update.ctx.custom_injection_prompt,
             "user custom prompt"
         );
+
+        let mut disabled_fast = default_proxy_config();
+        disabled_fast.target_url = "http://127.0.0.1:3000".to_string();
+        disabled_fast.enable_codex_fast_mode = false;
+        let disabled_fast_update = build_runtime_update(&disabled_fast, None);
+        assert!(!disabled_fast_update.enable_codex_fast_mode);
+        assert!(!disabled_fast_update.ctx.enable_codex_fast_mode);
     }
 }

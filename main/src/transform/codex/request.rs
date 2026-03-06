@@ -174,7 +174,12 @@ fn is_skill_identifier_char(ch: char) -> bool {
 fn normalize_skill_name_token(token: &str) -> Option<String> {
     let trimmed = token
         .trim()
-        .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | ';' | '!' | '?'))
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | ';' | '!' | '?'
+            )
+        })
         .trim_start_matches('/');
     if trimmed.len() < 2 {
         return None;
@@ -427,7 +432,10 @@ fn build_prompt_cache_key(
     let cwd_segment = request_cwd
         .map(|cwd| sanitize_cache_key_segment(cwd, PROMPT_CACHE_KEY_MAX_CWD_LEN))
         .unwrap_or_else(|| "default".to_string());
-    format!("codex-proxy:{}:{}:{:016x}", model_segment, cwd_segment, key_hash)
+    format!(
+        "codex-proxy:{}:{}:{:016x}",
+        model_segment, cwd_segment, key_hash
+    )
 }
 
 fn compact_text_field(value: Option<&str>, max_chars: usize) -> String {
@@ -939,6 +947,7 @@ impl TransformRequest {
             custom_injection_prompt,
             codex_model,
             true,
+            true,
             false,
         )
     }
@@ -950,6 +959,7 @@ impl TransformRequest {
         custom_injection_prompt: &str,
         codex_model: &str,
         enable_tool_schema_compaction: bool,
+        enable_codex_fast_mode: bool,
         enable_skill_routing_hint: bool,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
@@ -1138,6 +1148,11 @@ impl TransformRequest {
             "stream": true,
             "prompt_cache_key": prompt_cache_key
         });
+        if enable_codex_fast_mode {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("service_tier".to_string(), json!("priority"));
+            }
+        }
         if include_static_codex_instructions {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("instructions".to_string(), json!(CODEX_INSTRUCTIONS));
@@ -1147,7 +1162,10 @@ impl TransformRequest {
         }
         if include_reasoning_encrypted_content {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
+                obj.insert(
+                    "include".to_string(),
+                    json!(["reasoning.encrypted_content"]),
+                );
             }
         }
 
@@ -1508,7 +1526,8 @@ mod tests {
         let description = "First line with    extra spaces.\nSecond line stays in first paragraph.\n\nSecond paragraph should be dropped.";
         let compacted = compact_tool_description(Some(description));
         assert!(
-            compacted.contains("First line with extra spaces. Second line stays in first paragraph."),
+            compacted
+                .contains("First line with extra spaces. Second line stays in first paragraph."),
             "whitespace should be normalized and first paragraph preserved"
         );
         assert!(
@@ -1572,7 +1591,10 @@ mod tests {
         })];
 
         let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
-        let parameters = transformed[0].get("parameters").cloned().unwrap_or_default();
+        let parameters = transformed[0]
+            .get("parameters")
+            .cloned()
+            .unwrap_or_default();
         let parameters_obj = parameters.as_object().expect("schema object");
 
         assert!(
@@ -1588,9 +1610,7 @@ mod tests {
             "deprecated should be removed from compacted schema"
         );
         assert_eq!(
-            parameters
-                .pointer("/required/0")
-                .and_then(|v| v.as_str()),
+            parameters.pointer("/required/0").and_then(|v| v.as_str()),
             Some("file_path"),
             "required fields should be preserved"
         );
@@ -1625,7 +1645,10 @@ mod tests {
         })];
 
         let transformed = TransformRequest::transform_tools(Some(&tools), None, false);
-        let parameters = transformed[0].get("parameters").cloned().unwrap_or_default();
+        let parameters = transformed[0]
+            .get("parameters")
+            .cloned()
+            .unwrap_or_default();
         let parameters_obj = parameters.as_object().expect("schema object");
         assert!(
             parameters_obj.contains_key("title"),
@@ -1665,10 +1688,20 @@ mod tests {
         let request = sample_request();
         let mapping = ReasoningEffortMapping::default();
 
-        let (body_a, _) =
-            TransformRequest::transform(&request, None, &mapping, "global prompt A", "gpt-5.3-codex");
-        let (body_b, _) =
-            TransformRequest::transform(&request, None, &mapping, "global prompt B", "gpt-5.3-codex");
+        let (body_a, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt A",
+            "gpt-5.3-codex",
+        );
+        let (body_b, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt B",
+            "gpt-5.3-codex",
+        );
 
         assert_ne!(
             body_a.get("prompt_cache_key"),
@@ -1791,10 +1824,20 @@ mod tests {
         .expect("valid request B");
         let mapping = ReasoningEffortMapping::default();
 
-        let (body_a, _) =
-            TransformRequest::transform(&request_a, None, &mapping, "global prompt", "gpt-5.3-codex");
-        let (body_b, _) =
-            TransformRequest::transform(&request_b, None, &mapping, "global prompt", "gpt-5.3-codex");
+        let (body_a, _) = TransformRequest::transform(
+            &request_a,
+            None,
+            &mapping,
+            "global prompt",
+            "gpt-5.3-codex",
+        );
+        let (body_b, _) = TransformRequest::transform(
+            &request_b,
+            None,
+            &mapping,
+            "global prompt",
+            "gpt-5.3-codex",
+        );
 
         let key_a = body_a
             .get("prompt_cache_key")
@@ -1806,7 +1849,10 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        assert_ne!(key_a, key_b, "cache key should change with trusted request cwd");
+        assert_ne!(
+            key_a, key_b,
+            "cache key should change with trusted request cwd"
+        );
         assert!(
             key_a.contains(":Users_mr_j_a:"),
             "cache key should include sanitized trusted cwd segment"
@@ -1841,6 +1887,41 @@ mod tests {
         assert!(
             body.get("include").is_none(),
             "include should be omitted by default to avoid unnecessary response payload"
+        );
+    }
+
+    #[test]
+    fn codex_fast_mode_defaults_to_priority_service_tier() {
+        let request = sample_request();
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert_eq!(
+            body.get("service_tier").and_then(|v| v.as_str()),
+            Some("priority"),
+            "fast mode should map to priority processing by default"
+        );
+    }
+
+    #[test]
+    fn codex_fast_mode_can_be_disabled_per_request() {
+        let request = sample_request();
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) = TransformRequest::transform_with_options(
+            &request,
+            None,
+            &mapping,
+            "global prompt",
+            "gpt-5.3-codex",
+            true,
+            false,
+            false,
+        );
+
+        assert!(
+            body.get("service_tier").is_none(),
+            "fast mode disabled should omit service_tier"
         );
     }
 
@@ -1953,7 +2034,8 @@ mod tests {
 
     #[test]
     fn preserves_existing_agents_wrapper_without_double_wrapping() {
-        let already_wrapped = "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nhello\n</INSTRUCTIONS>";
+        let already_wrapped =
+            "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nhello\n</INSTRUCTIONS>";
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
             "messages": [{"role":"user","content":"hi"}],
@@ -2056,6 +2138,7 @@ mod tests {
             "gpt-5.3-codex",
             true,
             true,
+            true,
         );
 
         let input_items = body
@@ -2093,8 +2176,7 @@ mod tests {
         .expect("valid anthropic request");
         let mapping = ReasoningEffortMapping::default();
 
-        let (body, _) =
-            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
 
         let input_items = body
             .get("input")
@@ -2209,8 +2291,7 @@ mod tests {
         .expect("valid anthropic request");
         let mapping = ReasoningEffortMapping::default();
 
-        let (body, _) =
-            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
 
         let input_items = body
             .get("input")
@@ -2221,7 +2302,9 @@ mod tests {
             .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
             .flat_map(|blocks| blocks.iter())
             .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-            .filter(|text| text.contains("The following skills are available for use with the Skill tool"))
+            .filter(|text| {
+                text.contains("The following skills are available for use with the Skill tool")
+            })
             .count();
 
         assert_eq!(

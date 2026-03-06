@@ -24,6 +24,7 @@ impl TransformBackend for CodexBackend {
             &ctx.custom_injection_prompt,
             model_override.as_deref().unwrap_or(&ctx.codex_model),
             ctx.enable_codex_tool_schema_compaction,
+            ctx.enable_codex_fast_mode,
             ctx.enable_skill_routing_hint,
         )
     }

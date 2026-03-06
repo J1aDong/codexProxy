@@ -58,6 +58,7 @@ export interface ProxyConfig {
     maxConcurrency: number
     ignoreProbeRequests: boolean
     allowCountTokensFallbackEstimate: boolean
+    enableCodexFastMode: boolean
     allowExternalAccess: boolean
     lbModelCooldownSeconds: number
     lbTransientBackoffSeconds: number

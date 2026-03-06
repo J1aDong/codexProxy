@@ -47,6 +47,7 @@ pub struct ProxyServer {
     max_concurrency: u32,
     ignore_probe_requests: bool,
     allow_count_tokens_fallback_estimate: bool,
+    enable_codex_fast_mode: bool,
     force_stream_for_codex: bool,
     enable_sse_frame_parser: bool,
     enable_stream_heartbeat: bool,
@@ -81,6 +82,7 @@ pub struct RuntimeConfigUpdate {
     pub ctx: TransformContext,
     pub ignore_probe_requests: bool,
     pub allow_count_tokens_fallback_estimate: bool,
+    pub enable_codex_fast_mode: bool,
     pub force_stream_for_codex: bool,
     pub enable_sse_frame_parser: bool,
     pub enable_stream_heartbeat: bool,
@@ -115,6 +117,7 @@ struct RuntimeConfigState {
     ctx: TransformContext,
     ignore_probe_requests: bool,
     allow_count_tokens_fallback_estimate: bool,
+    enable_codex_fast_mode: bool,
     force_stream_for_codex: bool,
     enable_sse_frame_parser: bool,
     enable_stream_heartbeat: bool,
@@ -141,6 +144,7 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
     fn from(value: RuntimeConfigUpdate) -> Self {
         let mut ctx = value.ctx;
         ctx.enable_codex_tool_schema_compaction = value.enable_codex_tool_schema_compaction;
+        ctx.enable_codex_fast_mode = value.enable_codex_fast_mode;
         ctx.enable_skill_routing_hint = value.enable_skill_routing_hint;
         Self {
             target_url: value.target_url,
@@ -148,6 +152,7 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             ctx,
             ignore_probe_requests: value.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: value.allow_count_tokens_fallback_estimate,
+            enable_codex_fast_mode: value.enable_codex_fast_mode,
             force_stream_for_codex: value.force_stream_for_codex,
             enable_sse_frame_parser: value.enable_sse_frame_parser,
             enable_stream_heartbeat: value.enable_stream_heartbeat,
@@ -307,6 +312,7 @@ fn transform_request_with_optional_codex_effort_override(
                 &ctx.custom_injection_prompt,
                 model_name,
                 ctx.enable_codex_tool_schema_compaction,
+                ctx.enable_codex_fast_mode,
                 ctx.enable_skill_routing_hint,
             );
         }
@@ -448,6 +454,7 @@ struct StatefulChainEntry {
 type StatefulChainStore = Arc<Mutex<HashMap<String, StatefulChainEntry>>>;
 type StatefulChainUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type CodexV1UnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
+type CodexFastUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type SkillCatalogReminderStore = Arc<Mutex<HashMap<String, SkillCatalogCacheEntry>>>;
 
 #[derive(Clone)]
@@ -540,6 +547,31 @@ fn mark_codex_v1_endpoint_unsupported(
     }
 }
 
+fn is_codex_fast_endpoint_unsupported(
+    unsupported_store: &CodexFastUnsupportedEndpointStore,
+    endpoint_key: &str,
+) -> bool {
+    match unsupported_store.lock() {
+        Ok(guard) => guard.contains(endpoint_key),
+        Err(poisoned) => poisoned.into_inner().contains(endpoint_key),
+    }
+}
+
+fn mark_codex_fast_endpoint_unsupported(
+    unsupported_store: &CodexFastUnsupportedEndpointStore,
+    endpoint_key: &str,
+) {
+    match unsupported_store.lock() {
+        Ok(mut guard) => {
+            guard.insert(endpoint_key.to_string());
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.insert(endpoint_key.to_string());
+        }
+    }
+}
+
 fn extract_stateful_chain_hint(req: &Request<hyper::body::Incoming>) -> Option<String> {
     for name in STATEFUL_CHAIN_HINT_HEADERS {
         if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
@@ -605,7 +637,11 @@ fn derive_stateful_chain_key(
         .unwrap_or_default();
     let prefix_signature = build_message_prefix_signature(request);
     let fingerprint = hash_to_u64(&[converter, model, &system_text, &prefix_signature]);
-    format!("fallback:{}:{:016x}", converter.to_ascii_lowercase(), fingerprint)
+    format!(
+        "fallback:{}:{:016x}",
+        converter.to_ascii_lowercase(),
+        fingerprint
+    )
 }
 
 fn derive_skill_catalog_cache_key(hint: Option<&str>, request: &AnthropicRequest) -> String {
@@ -693,7 +729,9 @@ fn get_cached_skill_catalog_reminder(
     cache_key: &str,
 ) -> Option<String> {
     match reminder_store.lock() {
-        Ok(guard) => guard.get(cache_key).map(|entry| entry.reminder_text.clone()),
+        Ok(guard) => guard
+            .get(cache_key)
+            .map(|entry| entry.reminder_text.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
@@ -1956,6 +1994,24 @@ fn disable_parallel_tool_calls_in_upstream_body(body: &Value) -> Option<Value> {
     Some(next)
 }
 
+fn body_uses_priority_service_tier(body: &Value) -> bool {
+    body.get("service_tier")
+        .and_then(|v| v.as_str())
+        .map(|value| value.eq_ignore_ascii_case("priority"))
+        .unwrap_or(false)
+}
+
+fn remove_priority_service_tier_from_upstream_body(body: &Value) -> Option<Value> {
+    if !body_uses_priority_service_tier(body) {
+        return None;
+    }
+
+    let mut next = body.clone();
+    let obj = next.as_object_mut()?;
+    obj.remove("service_tier");
+    Some(next)
+}
+
 const RETRY_NO_TOOL_TEXT_MIX_GUARDRAIL_TAG: &str = "RETRY_GUARDRAIL_NO_TOOL_TEXT_MIX";
 const RETRY_NO_TOOL_TEXT_MIX_GUARDRAIL_INSTRUCTION: &str = r#"On retry, enforce strict tool/text channel separation:
 - Never emit tool protocol text in assistant natural-language output.
@@ -2793,7 +2849,8 @@ fn should_retry_codex_v1_path_with_legacy(status: u16, error_text: &str) -> bool
             || lower.contains("unknown route");
     }
 
-    if status == StatusCode::BAD_REQUEST.as_u16() || status == StatusCode::UNPROCESSABLE_ENTITY.as_u16()
+    if status == StatusCode::BAD_REQUEST.as_u16()
+        || status == StatusCode::UNPROCESSABLE_ENTITY.as_u16()
     {
         let lower = error_text.to_ascii_lowercase();
         return lower.contains("unsupported")
@@ -2804,6 +2861,31 @@ fn should_retry_codex_v1_path_with_legacy(status: u16, error_text: &str) -> bool
     }
 
     false
+}
+
+fn should_retry_codex_fast_without_service_tier(status: u16, error_text: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST.as_u16()
+        && status != StatusCode::UNPROCESSABLE_ENTITY.as_u16()
+    {
+        return false;
+    }
+
+    let lower = error_text.to_ascii_lowercase();
+    let mentions_service_tier = lower.contains("service_tier")
+        || lower.contains("service tier")
+        || (lower.contains("priority") && lower.contains("service"));
+    if !mentions_service_tier {
+        return false;
+    }
+
+    lower.contains("unsupported")
+        || lower.contains("unknown parameter")
+        || lower.contains("unknown field")
+        || lower.contains("invalid field")
+        || lower.contains("invalid value")
+        || lower.contains("unrecognized")
+        || lower.contains("additional properties are not allowed")
+        || lower.contains("extra inputs are not permitted")
 }
 
 fn resolve_upstream_url_with_codex_path_preference(
@@ -3080,6 +3162,7 @@ impl ProxyServer {
             max_concurrency: 0,
             ignore_probe_requests: false,
             allow_count_tokens_fallback_estimate: true,
+            enable_codex_fast_mode: true,
             force_stream_for_codex: true,
             enable_sse_frame_parser: true,
             enable_stream_heartbeat: true,
@@ -3160,6 +3243,11 @@ impl ProxyServer {
 
     pub fn with_allow_count_tokens_fallback_estimate(mut self, allow: bool) -> Self {
         self.allow_count_tokens_fallback_estimate = allow;
+        self
+    }
+
+    pub fn with_enable_codex_fast_mode(mut self, enable: bool) -> Self {
+        self.enable_codex_fast_mode = enable;
         self
     }
 
@@ -3301,10 +3389,12 @@ impl ProxyServer {
                 codex_model: self.codex_model.clone(),
                 gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),
                 enable_codex_tool_schema_compaction: self.enable_codex_tool_schema_compaction,
+                enable_codex_fast_mode: self.enable_codex_fast_mode,
                 enable_skill_routing_hint: self.enable_skill_routing_hint,
             },
             ignore_probe_requests: self.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: self.allow_count_tokens_fallback_estimate,
+            enable_codex_fast_mode: self.enable_codex_fast_mode,
             force_stream_for_codex: self.force_stream_for_codex,
             enable_sse_frame_parser: self.enable_sse_frame_parser,
             enable_stream_heartbeat: self.enable_stream_heartbeat,
@@ -3368,6 +3458,8 @@ impl ProxyServer {
         let stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
         let codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        let codex_fast_unsupported_endpoints: CodexFastUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
         let skill_catalog_reminders: SkillCatalogReminderStore =
             Arc::new(Mutex::new(HashMap::new()));
@@ -3434,6 +3526,8 @@ impl ProxyServer {
                                     Arc::clone(&stateful_chain_unsupported_endpoints);
                                 let codex_v1_unsupported_endpoints =
                                     Arc::clone(&codex_v1_unsupported_endpoints);
+                                let codex_fast_unsupported_endpoints =
+                                    Arc::clone(&codex_fast_unsupported_endpoints);
                                 let skill_catalog_reminders =
                                     Arc::clone(&skill_catalog_reminders);
                                 let runtime_handle = runtime_handle_for_server.clone();
@@ -3459,6 +3553,7 @@ impl ProxyServer {
                                             Arc::clone(&stateful_chain_store),
                                             Arc::clone(&stateful_chain_unsupported_endpoints),
                                             Arc::clone(&codex_v1_unsupported_endpoints),
+                                            Arc::clone(&codex_fast_unsupported_endpoints),
                                             Arc::clone(&skill_catalog_reminders),
                                             log_tx_for_request.clone(),
                                         )
@@ -3522,6 +3617,7 @@ async fn handle_request(
     stateful_chain_store: StatefulChainStore,
     stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore,
     codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore,
+    codex_fast_unsupported_endpoints: CodexFastUnsupportedEndpointStore,
     skill_catalog_reminders: SkillCatalogReminderStore,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
@@ -3587,6 +3683,7 @@ async fn handle_request(
     let mut ctx = runtime_state.ctx;
     // Keep transformer compaction behavior aligned with runtime switches even if context was stale.
     ctx.enable_codex_tool_schema_compaction = runtime_state.enable_codex_tool_schema_compaction;
+    ctx.enable_codex_fast_mode = runtime_state.enable_codex_fast_mode;
     ctx.enable_skill_routing_hint = runtime_state.enable_skill_routing_hint;
     let ignore_probe_requests = runtime_state.ignore_probe_requests;
     let allow_count_tokens_fallback_estimate = runtime_state.allow_count_tokens_fallback_estimate;
@@ -3721,16 +3818,16 @@ async fn handle_request(
     // 再解析为结构体用于日志统计、模型路由等逻辑
     let mut anthropic_body: AnthropicRequest =
         match serde_json::from_value(raw_request_body.clone()) {
-        Ok(body) => body,
-        Err(e) => {
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("Content-Type", "application/json")
-                .body(full_body(
-                    json!({"error": {"message": format!("Invalid JSON: {}", e)}}).to_string(),
-                ))
-                .unwrap());
-        }
+            Ok(body) => body,
+            Err(e) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(full_body(
+                        json!({"error": {"message": format!("Invalid JSON: {}", e)}}).to_string(),
+                    ))
+                    .unwrap());
+            }
         };
 
     let skill_catalog_cache_key =
@@ -3854,11 +3951,12 @@ async fn handle_request(
         } else {
             None
         };
-        let prefer_codex_v1_path_for_route = route_selection.converter.eq_ignore_ascii_case("codex")
-            && prefer_codex_v1_path
-            && codex_v1_endpoint_key.as_ref().map_or(true, |key| {
-                !is_codex_v1_endpoint_unsupported(&codex_v1_unsupported_endpoints, key)
-            });
+        let prefer_codex_v1_path_for_route =
+            route_selection.converter.eq_ignore_ascii_case("codex")
+                && prefer_codex_v1_path
+                && codex_v1_endpoint_key.as_ref().map_or(true, |key| {
+                    !is_codex_v1_endpoint_unsupported(&codex_v1_unsupported_endpoints, key)
+                });
         if route_selection.converter.eq_ignore_ascii_case("codex")
             && prefer_codex_v1_path
             && !prefer_codex_v1_path_for_route
@@ -4225,11 +4323,12 @@ async fn handle_request(
         } else {
             None
         };
-        let prefer_codex_v1_path_for_route = route_selection.converter.eq_ignore_ascii_case("codex")
-            && prefer_codex_v1_path
-            && codex_v1_endpoint_key.as_ref().map_or(true, |key| {
-                !is_codex_v1_endpoint_unsupported(&codex_v1_unsupported_endpoints, key)
-            });
+        let prefer_codex_v1_path_for_route =
+            route_selection.converter.eq_ignore_ascii_case("codex")
+                && prefer_codex_v1_path
+                && codex_v1_endpoint_key.as_ref().map_or(true, |key| {
+                    !is_codex_v1_endpoint_unsupported(&codex_v1_unsupported_endpoints, key)
+                });
         if route_selection.converter.eq_ignore_ascii_case("codex")
             && prefer_codex_v1_path
             && !prefer_codex_v1_path_for_route
@@ -4239,6 +4338,7 @@ async fn handle_request(
                 request_id
             ));
         }
+        let codex_fast_endpoint_key = codex_v1_endpoint_key.clone();
         let mut resolved_target_url = resolve_upstream_url_with_codex_path_preference(
             &route_selection.converter,
             &route_selection.target_url,
@@ -4414,6 +4514,34 @@ async fn handle_request(
             "skipped_not_applicable".to_string()
         };
 
+        let mut codex_fast_mode = if !route_selection.converter.eq_ignore_ascii_case("codex") {
+            "not_applicable".to_string()
+        } else if !ctx.enable_codex_fast_mode {
+            "disabled_by_config".to_string()
+        } else {
+            "enabled".to_string()
+        };
+
+        if route_selection.converter.eq_ignore_ascii_case("codex") && ctx.enable_codex_fast_mode {
+            let fast_cached_unsupported = codex_fast_endpoint_key.as_ref().map_or(false, |key| {
+                is_codex_fast_endpoint_unsupported(&codex_fast_unsupported_endpoints, key)
+            });
+            if fast_cached_unsupported {
+                if let Some(standard_body) =
+                    remove_priority_service_tier_from_upstream_body(&upstream_body)
+                {
+                    upstream_body = standard_body;
+                }
+                codex_fast_mode = "skipped_endpoint_unsupported".to_string();
+                let _ = log_tx.send(format!(
+                    "[Route] #{} codex_fast_mode=skipped_endpoint_unsupported",
+                    request_id
+                ));
+            } else if !body_uses_priority_service_tier(&upstream_body) {
+                codex_fast_mode = "disabled_not_in_body".to_string();
+            }
+        }
+
         if route_selection.converter.eq_ignore_ascii_case("codex") {
             if let Some(remaining_secs) = get_parallel_tool_degrade_remaining_seconds(
                 &parallel_tool_degrade_until,
@@ -4454,7 +4582,7 @@ async fn handle_request(
                 .unwrap_or(0);
             let resolved_url_path = extract_url_path(&resolved_target_url);
             let _ = log_tx.send(format!(
-                "[ReqPayload] #{} keys={} input_items={} resolved_url_path={} request_body_bytes={} tools_bytes_before={} tools_bytes_after={} stateful_chain_mode={} summary={}",
+                "[ReqPayload] #{} keys={} input_items={} resolved_url_path={} request_body_bytes={} tools_bytes_before={} tools_bytes_after={} stateful_chain_mode={} codex_fast_mode={} summary={}",
                 request_id,
                 top_keys,
                 input_items,
@@ -4463,6 +4591,7 @@ async fn handle_request(
                 tools_bytes_before,
                 tools_bytes_after,
                 stateful_chain_mode,
+                codex_fast_mode,
                 tail_chars(&input_summary, 320),
             ));
         }
@@ -4561,6 +4690,7 @@ async fn handle_request(
             let mut error_text = response.text().await.unwrap_or_default();
             let mut recovered_response: Option<reqwest::Response> = None;
             let mut used_legacy_codex_route = false;
+            let mut used_fast_codex_fallback = false;
 
             if route_selection.converter.eq_ignore_ascii_case("codex")
                 && is_codex_v1_responses_path(&resolved_target_url)
@@ -4667,16 +4797,105 @@ async fn handle_request(
                 }
             }
 
-            let can_retry_without_previous_response_id = route_selection
-                .converter
-                .eq_ignore_ascii_case("codex")
+            if route_selection.converter.eq_ignore_ascii_case("codex")
                 && recovered_response.is_none()
-                && upstream_body
-                    .get("previous_response_id")
-                    .and_then(|v| v.as_str())
-                    .is_some()
-                && stateful_chain_meta_for_attempt.is_some()
-                && is_previous_response_id_unsupported_error(status, &error_text);
+                && body_uses_priority_service_tier(&upstream_body)
+                && should_retry_codex_fast_without_service_tier(status, &error_text)
+            {
+                if let Some(fallback_body) =
+                    remove_priority_service_tier_from_upstream_body(&upstream_body)
+                {
+                    emit_stream_diag(
+                        &log_tx,
+                        &logger,
+                        format!(
+                            "[Route] #{} codex_fast_fallback=true resolved_url_path={}",
+                            request_id,
+                            extract_url_path(&resolved_target_url),
+                        ),
+                    );
+                    upstream_body = fallback_body;
+
+                    if let Some(ref l) = logger {
+                        let headers = vec![
+                            ("Content-Type", "application/json"),
+                            ("Authorization", "Bearer <API_KEY>"),
+                            ("User-Agent", "Anthropic-Node/0.3.4"),
+                            ("x-anthropic-version", &anthropic_version),
+                            ("Accept", "text/event-stream"),
+                            ("session_id", &session_id),
+                        ];
+                        l.log_curl_request(
+                            "POST",
+                            &resolved_target_url,
+                            &headers,
+                            &upstream_body,
+                            backend_label_by_converter(&route_selection.converter),
+                        );
+                    }
+
+                    let fallback_req = request_backend.build_upstream_request(
+                        &http_client,
+                        &resolved_target_url,
+                        &route_selection.api_key,
+                        &upstream_body,
+                        &session_id,
+                        &anthropic_version,
+                    );
+
+                    let fallback_req = if let Some(beta) = &anthropic_beta {
+                        fallback_req.header("anthropic-beta", beta)
+                    } else {
+                        fallback_req
+                    };
+
+                    match fallback_req.send().await {
+                        Ok(fallback_resp) if fallback_resp.status().is_success() => {
+                            used_fast_codex_fallback = true;
+                            codex_fast_mode = "fallback_succeeded".to_string();
+                            if let Some(endpoint_key) = codex_fast_endpoint_key.as_ref() {
+                                mark_codex_fast_endpoint_unsupported(
+                                    &codex_fast_unsupported_endpoints,
+                                    endpoint_key,
+                                );
+                            }
+                            recovered_response = Some(fallback_resp);
+                        }
+                        Ok(fallback_resp) => {
+                            retry_after = fallback_resp
+                                .headers()
+                                .get("retry-after")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("-")
+                                .to_string();
+                            status = fallback_resp.status().as_u16();
+                            error_text = fallback_resp.text().await.unwrap_or_default();
+                            codex_fast_mode = "fallback_failed".to_string();
+                        }
+                        Err(fallback_err) => {
+                            retry_after = "-".to_string();
+                            status = StatusCode::BAD_GATEWAY.as_u16();
+                            error_text = json!({
+                                "error": {
+                                    "message": format!("Upstream error after codex_fast_fallback: {}", fallback_err)
+                                }
+                            })
+                            .to_string();
+                            codex_fast_mode = "fallback_failed".to_string();
+                        }
+                    }
+                }
+            }
+
+            let can_retry_without_previous_response_id =
+                route_selection.converter.eq_ignore_ascii_case("codex")
+                    && recovered_response.is_none()
+                    && upstream_body
+                        .get("previous_response_id")
+                        .and_then(|v| v.as_str())
+                        .is_some()
+                    && stateful_chain_meta_for_attempt.is_some()
+                    && is_previous_response_id_unsupported_error(status, &error_text);
 
             if can_retry_without_previous_response_id {
                 let mut retry_body = upstream_body.clone();
@@ -4777,6 +4996,13 @@ async fn handle_request(
                 if used_legacy_codex_route {
                     let _ = log_tx.send(format!(
                         "[Route] #{} codex_v1_fallback_result=succeeded resolved_url_path={}",
+                        request_id,
+                        extract_url_path(&resolved_target_url),
+                    ));
+                }
+                if used_fast_codex_fallback {
+                    let _ = log_tx.send(format!(
+                        "[Route] #{} codex_fast_fallback_result=succeeded resolved_url_path={}",
                         request_id,
                         extract_url_path(&resolved_target_url),
                     ));
@@ -5270,7 +5496,8 @@ async fn handle_request(
 
                             if stream_opts_for_task.enable_sse_frame_parser {
                                 for frame in frame_parser.push_chunk(&chunk_text) {
-                                    if let Some(response_id) = extract_upstream_response_id(&frame) {
+                                    if let Some(response_id) = extract_upstream_response_id(&frame)
+                                    {
                                         latest_upstream_response_id = Some(response_id);
                                     }
                                     let mut emitted_output_for_frame = false;
@@ -6126,7 +6353,10 @@ async fn handle_request(
             );
         }
 
-        if stateful_chain_enabled_for_stream && decision.saw_response_completed && !decision.saw_response_failed {
+        if stateful_chain_enabled_for_stream
+            && decision.saw_response_completed
+            && !decision.saw_response_failed
+        {
             if let (Some(meta), Some(response_id)) = (
                 stateful_chain_meta_for_stream.as_ref(),
                 latest_upstream_response_id.as_deref(),
@@ -6291,23 +6521,27 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
-        build_parallel_tool_degrade_key, chunk_contains_sibling_tool_call_error,
-        classify_connection_error, collect_skill_catalog_reminder_blocks,
-        derive_skill_catalog_cache_key, derive_stateful_chain_key, derive_stream_close_cause,
-        disable_parallel_tool_calls_in_upstream_body, extract_tool_leak_retry_signal,
-        extract_upstream_response_id,
-        ensure_skill_catalog_context_for_codex, get_cached_skill_catalog_reminder,
-        get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
-        is_business_stream_output, is_codex_v1_responses_path,
-        leaked_tool_text_retry_skip_reason, mark_parallel_tool_degrade,
+        body_uses_priority_service_tier, build_parallel_tool_degrade_key,
+        chunk_contains_sibling_tool_call_error, classify_connection_error,
+        collect_skill_catalog_reminder_blocks, derive_skill_catalog_cache_key,
+        derive_stateful_chain_key, derive_stream_close_cause,
+        disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
+        extract_tool_leak_retry_signal, extract_upstream_response_id,
+        get_cached_skill_catalog_reminder, get_parallel_tool_degrade_remaining_seconds,
+        inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
+        is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
+        is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
+        mark_codex_fast_endpoint_unsupported, mark_parallel_tool_degrade,
         observe_upstream_chunk_events, prepare_stateful_chain_request, record_stateful_chain_entry,
-        resolve_effective_stream, resolve_upstream_url,
-        resolve_upstream_url_with_codex_path_preference, should_retry_codex_v1_path_with_legacy,
-        should_drop_post_message_stop_output, should_suppress_premature_message_stop,
-        sibling_tool_error_retry_skip_reason, ConnErrorClass, StatefulChainEntry,
-        StatefulChainRequestMeta, StatefulChainStore, StatefulChainUnsupportedEndpointStore,
-        SkillCatalogReminderStore, SseFrameParser, StreamEventCounters, StreamRuntimeOptions,
-        UpstreamOperation, is_previous_response_id_unsupported_error, upsert_skill_catalog_reminder,
+        remove_priority_service_tier_from_upstream_body, resolve_effective_stream,
+        resolve_upstream_url, resolve_upstream_url_with_codex_path_preference,
+        should_drop_post_message_stop_output, should_retry_codex_fast_without_service_tier,
+        should_retry_codex_v1_path_with_legacy, should_suppress_premature_message_stop,
+        sibling_tool_error_retry_skip_reason, upsert_skill_catalog_reminder,
+        CodexFastUnsupportedEndpointStore, ConnErrorClass, SkillCatalogReminderStore,
+        SseFrameParser, StatefulChainEntry, StatefulChainRequestMeta, StatefulChainStore,
+        StatefulChainUnsupportedEndpointStore, StreamEventCounters, StreamRuntimeOptions,
+        UpstreamOperation,
     };
     use crate::models::AnthropicRequest;
     use serde_json::{json, Value};
@@ -6402,8 +6636,8 @@ mod tests {
             &broadcast::channel(8).0,
             &None,
         );
-        let injected_text = super::extract_message_text(&request_without_catalog.messages[0])
-            .unwrap_or_default();
+        let injected_text =
+            super::extract_message_text(&request_without_catalog.messages[0]).unwrap_or_default();
         assert!(injected_text.contains("The following skills are available"));
         assert!(injected_text.contains("- pdf: Read PDF files"));
 
@@ -6501,6 +6735,47 @@ mod tests {
         assert!(!is_codex_v1_responses_path(
             "https://example.com/openai/responses"
         ));
+    }
+
+    #[test]
+    fn test_should_retry_codex_fast_without_service_tier_matcher() {
+        assert!(should_retry_codex_fast_without_service_tier(
+            400,
+            r#"{"error":{"message":"Unknown field service_tier for priority processing"}}"#
+        ));
+        assert!(should_retry_codex_fast_without_service_tier(
+            422,
+            r#"{"error":{"message":"additional properties are not allowed: service_tier"}}"#
+        ));
+        assert!(!should_retry_codex_fast_without_service_tier(
+            429,
+            r#"{"error":{"message":"rate limit exceeded"}}"#
+        ));
+    }
+
+    #[test]
+    fn test_remove_priority_service_tier_from_upstream_body() {
+        let original = json!({
+            "model": "gpt-5.3-codex",
+            "service_tier": "priority",
+            "stream": true
+        });
+
+        assert!(body_uses_priority_service_tier(&original));
+        let rewritten = remove_priority_service_tier_from_upstream_body(&original)
+            .expect("should remove priority service tier");
+        assert!(rewritten.get("service_tier").is_none());
+        assert_eq!(rewritten.get("model"), original.get("model"));
+    }
+
+    #[test]
+    fn test_codex_fast_unsupported_endpoint_store_helpers() {
+        let store: CodexFastUnsupportedEndpointStore = Arc::new(Mutex::new(HashSet::new()));
+        let endpoint_key = "codex:deadbeef";
+
+        assert!(!is_codex_fast_endpoint_unsupported(&store, endpoint_key));
+        mark_codex_fast_endpoint_unsupported(&store, endpoint_key);
+        assert!(is_codex_fast_endpoint_unsupported(&store, endpoint_key));
     }
 
     #[test]
@@ -6886,9 +7161,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             .unwrap_or_default();
         assert_eq!(input.len(), 1, "only incremental suffix should remain");
         assert_eq!(
-            input[0]
-                .pointer("/content/0/text")
-                .and_then(|v| v.as_str()),
+            input[0].pointer("/content/0/text").and_then(|v| v.as_str()),
             Some("next")
         );
         assert_eq!(meta.full_input.len(), 3);
@@ -6980,12 +7253,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             "stream": true
         }))
         .expect("request");
-        let key = derive_stateful_chain_key(
-            Some("session-123"),
-            "codex",
-            "gpt-5.3-codex",
-            &request,
-        );
+        let key =
+            derive_stateful_chain_key(Some("session-123"), "codex", "gpt-5.3-codex", &request);
         assert_eq!(key, "hint:codex:session-123");
     }
 

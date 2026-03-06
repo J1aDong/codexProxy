@@ -96,6 +96,8 @@ export default {
     advancedIgnoreProbeTip: '仅对短探测请求本地快速返回，减少无意义上游调用与 429 风险。',
     advancedCountTokensFallbackLabel: 'count_tokens 失败时允许估算回退',
     advancedCountTokensFallbackTip: '开启后更稳定；关闭后会在上游失败时直接返回错误，便于排查。',
+    advancedCodexFastModeLabel: '启用 Codex Fast 模式（Priority processing）',
+    advancedCodexFastModeTip: '仅对 Codex 转换层生效。开启后会向 Responses 请求注入 service_tier=priority；更快，但部分第三方网关可能不支持并会自动回退。',
     advancedAllowExternalAccessLabel: '允许外网访问（监听 0.0.0.0）',
     advancedAllowExternalAccessTip: '开启后将接受非本机连接。若代理正在运行，保存时会自动重启以应用监听地址。',
     advancedCodexCapabilityPresetLabel: 'Codex 模型-强度预设(JSON)',

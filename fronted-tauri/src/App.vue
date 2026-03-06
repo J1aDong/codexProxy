@@ -152,6 +152,17 @@
           class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer dark:border-dark-border"
           :class="form.proxyMode === 'load_balancer' ? 'border-dark-border' : 'border-gray-200'"
         >
+          <input v-model="localEnableCodexFastMode" type="checkbox" class="mt-1" />
+          <div class="flex-1">
+            <div class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedCodexFastModeLabel') }}</div>
+            <div class="text-xs text-apple-text-secondary dark:text-dark-text-secondary mt-1">{{ t('advancedCodexFastModeTip') }}</div>
+          </div>
+        </label>
+
+        <label
+          class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer dark:border-dark-border"
+          :class="form.proxyMode === 'load_balancer' ? 'border-dark-border' : 'border-gray-200'"
+        >
           <input v-model="localAllowExternalAccess" type="checkbox" class="mt-1" />
           <div class="flex-1">
             <div class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedAllowExternalAccessLabel') }}</div>
@@ -278,6 +289,7 @@ const localLbModelCooldownSeconds = ref<number | null>(3600)
 const localLbTransientBackoffSeconds = ref<number | null>(6)
 const localIgnoreProbeRequests = ref(false)
 const localAllowCountTokensFallbackEstimate = ref(true)
+const localEnableCodexFastMode = ref(true)
 const localAllowExternalAccess = ref(false)
 const localCodexCapabilityJson = ref('')
 const localGeminiModelPresetJson = ref('')
@@ -370,6 +382,7 @@ const DEFAULT_CONFIG = {
   lbTransientBackoffSeconds: 6,
   ignoreProbeRequests: false,
   allowCountTokensFallbackEstimate: true,
+  enableCodexFastMode: true,
   allowExternalAccess: false,
   reasoningEffort: {
     opus: 'xhigh',
@@ -400,6 +413,7 @@ const form = reactive({
   lbTransientBackoffSeconds: DEFAULT_CONFIG.lbTransientBackoffSeconds,
   ignoreProbeRequests: DEFAULT_CONFIG.ignoreProbeRequests,
   allowCountTokensFallbackEstimate: DEFAULT_CONFIG.allowCountTokensFallbackEstimate,
+  enableCodexFastMode: DEFAULT_CONFIG.enableCodexFastMode,
   allowExternalAccess: DEFAULT_CONFIG.allowExternalAccess,
   reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort },
   converter: DEFAULT_CONFIG.converter,
@@ -549,6 +563,7 @@ const openAdvancedSettings = () => {
   localLbTransientBackoffSeconds.value = form.lbTransientBackoffSeconds
   localIgnoreProbeRequests.value = form.ignoreProbeRequests
   localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
+  localEnableCodexFastMode.value = form.enableCodexFastMode
   localAllowExternalAccess.value = form.allowExternalAccess
   localCodexCapabilityJson.value = JSON.stringify(form.codexEffortCapabilityMap, null, 2)
   localGeminiModelPresetJson.value = JSON.stringify(form.geminiModelPreset, null, 2)
@@ -581,6 +596,7 @@ const saveAdvancedSettings = async () => {
   form.lbTransientBackoffSeconds = Math.max(1, Math.floor(localLbTransientBackoffSeconds.value ?? DEFAULT_CONFIG.lbTransientBackoffSeconds))
   form.ignoreProbeRequests = localIgnoreProbeRequests.value
   form.allowCountTokensFallbackEstimate = localAllowCountTokensFallbackEstimate.value
+  form.enableCodexFastMode = localEnableCodexFastMode.value
   const bindModeChanged = form.allowExternalAccess !== localAllowExternalAccess.value
   form.allowExternalAccess = localAllowExternalAccess.value
   showAdvancedSettings.value = false
@@ -722,6 +738,9 @@ const handleConfigImported = async () => {
     }
     if (typeof savedConfig.allowCountTokensFallbackEstimate === 'boolean') {
       form.allowCountTokensFallbackEstimate = savedConfig.allowCountTokensFallbackEstimate
+    }
+    if (typeof savedConfig.enableCodexFastMode === 'boolean') {
+      form.enableCodexFastMode = savedConfig.enableCodexFastMode
     }
     if (typeof savedConfig.allowExternalAccess === 'boolean') {
       form.allowExternalAccess = savedConfig.allowExternalAccess
@@ -965,6 +984,7 @@ const resetDefaults = () => {
   form.lbTransientBackoffSeconds = DEFAULT_CONFIG.lbTransientBackoffSeconds
   form.ignoreProbeRequests = DEFAULT_CONFIG.ignoreProbeRequests
   form.allowCountTokensFallbackEstimate = DEFAULT_CONFIG.allowCountTokensFallbackEstimate
+  form.enableCodexFastMode = DEFAULT_CONFIG.enableCodexFastMode
   form.allowExternalAccess = DEFAULT_CONFIG.allowExternalAccess
   form.proxyMode = DEFAULT_PROXY_CONFIG_V2.proxyMode
   form.loadBalancer = {
@@ -992,6 +1012,7 @@ const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   lbTransientBackoffSeconds: form.lbTransientBackoffSeconds,
   ignoreProbeRequests: form.ignoreProbeRequests,
   allowCountTokensFallbackEstimate: form.allowCountTokensFallbackEstimate,
+  enableCodexFastMode: form.enableCodexFastMode,
   allowExternalAccess: form.allowExternalAccess,
   reasoningEffort: form.reasoningEffort,
   geminiReasoningEffort: form.geminiReasoningEffort,
@@ -1246,6 +1267,9 @@ onMounted(() => {
         if (typeof savedConfig.allowCountTokensFallbackEstimate === 'boolean') {
           form.allowCountTokensFallbackEstimate = savedConfig.allowCountTokensFallbackEstimate
         }
+        if (typeof savedConfig.enableCodexFastMode === 'boolean') {
+          form.enableCodexFastMode = savedConfig.enableCodexFastMode
+        }
         if (typeof savedConfig.allowExternalAccess === 'boolean') {
           form.allowExternalAccess = savedConfig.allowExternalAccess
         }
@@ -1254,6 +1278,7 @@ onMounted(() => {
         localLbTransientBackoffSeconds.value = form.lbTransientBackoffSeconds
         localIgnoreProbeRequests.value = form.ignoreProbeRequests
         localAllowCountTokensFallbackEstimate.value = form.allowCountTokensFallbackEstimate
+        localEnableCodexFastMode.value = form.enableCodexFastMode
         localAllowExternalAccess.value = form.allowExternalAccess
       } else {
         syncEndpointFromSelection()

@@ -96,6 +96,8 @@ export default {
     advancedIgnoreProbeTip: 'Return locally for probe-like requests to reduce pointless upstream calls and 429 risk.',
     advancedCountTokensFallbackLabel: 'Allow estimate fallback when count_tokens fails',
     advancedCountTokensFallbackTip: 'Enabled is more stable; disable to surface upstream failures for debugging.',
+    advancedCodexFastModeLabel: 'Enable Codex Fast Mode (Priority processing)',
+    advancedCodexFastModeTip: 'Only affects the Codex converter. When enabled, Responses requests include service_tier=priority for lower latency; unsupported third-party gateways auto-fallback.',
     advancedAllowExternalAccessLabel: 'Allow external access (bind 0.0.0.0)',
     advancedAllowExternalAccessTip: 'Accept non-localhost connections. If proxy is running, saving will auto-restart to apply bind address.',
     advancedCodexCapabilityPresetLabel: 'Codex Model-Effort Preset (JSON)',

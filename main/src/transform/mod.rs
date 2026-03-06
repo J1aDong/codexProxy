@@ -22,6 +22,7 @@ pub struct TransformContext {
     pub codex_model: String,
     pub gemini_reasoning_effort: GeminiReasoningEffortMapping,
     pub enable_codex_tool_schema_compaction: bool,
+    pub enable_codex_fast_mode: bool,
     pub enable_skill_routing_hint: bool,
 }
 
