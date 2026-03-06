@@ -583,14 +583,77 @@ watch(() => props.form.loadBalancer.selectedLbProfileId, () => {
   closeAddMenu()
 })
 
-const codexModelOptions = computed(() => [
-  { value: 'gpt-5.3-codex', label: t('modelRecommended') },
-  { value: 'gpt-5.2-codex', label: 'GPT-5.2-Codex' },
-  { value: 'gpt-5-codex', label: 'GPT-5-Codex' },
-  { value: 'gpt-5.1-codex-max', label: 'GPT-5.1-Codex-Max' },
-  { value: 'gpt-5.1-codex', label: 'GPT-5.1-Codex' },
-  { value: 'gpt-5.1-codex-mini', label: 'GPT-5.1-Codex-Mini' },
-])
+const BASE_CODEX_MODELS = [
+  'gpt-5.3-codex',
+  'gpt-5.2-codex',
+  'gpt-5-codex',
+  'gpt-5.1-codex-max',
+  'gpt-5.1-codex',
+  'gpt-5.1-codex-mini',
+]
+
+const normalizeModelText = (model: string) => model.trim()
+const normalizeModelKey = (model: string) => normalizeModelText(model).toLowerCase()
+
+const formatCodexModelLabel = (model: string): string => {
+  const normalized = normalizeModelText(model)
+  if (!normalized) return ''
+  return normalized
+    .replace(/^gpt/i, 'GPT')
+    .replace(/codex/gi, 'Codex')
+    .replace(/mini/gi, 'Mini')
+    .replace(/max/gi, 'Max')
+}
+
+const codexModelOptions = computed(() => {
+  const options: Array<{ value: string; label: string }> = []
+  const seen = new Set<string>()
+  const dynamicByKey = new Map<string, string>()
+
+  const pushOption = (rawModel: string) => {
+    const model = normalizeModelText(rawModel)
+    if (!model) return
+    const key = normalizeModelKey(model)
+    if (seen.has(key)) return
+    seen.add(key)
+    options.push({ value: model, label: formatCodexModelLabel(model) })
+  }
+
+  const collectDynamicModel = (rawModel?: string) => {
+    if (typeof rawModel !== 'string') return
+    const model = normalizeModelText(rawModel)
+    if (!model) return
+    const key = normalizeModelKey(model)
+    if (seen.has(key) || dynamicByKey.has(key)) return
+    dynamicByKey.set(key, model)
+  }
+
+  BASE_CODEX_MODELS.forEach(pushOption)
+
+  Object.keys(props.form.codexEffortCapabilityMap || {}).forEach(collectDynamicModel)
+  Object.values(props.form.codexModelMapping || {}).forEach(collectDynamicModel)
+
+  props.form.loadBalancer.lbProfiles.forEach((profile) => {
+    ;(['opus', 'sonnet', 'haiku'] as const).forEach((slot) => {
+      const candidates = profile.modelMapping?.[slot] || []
+      candidates.forEach((candidate) => {
+        const endpoint = props.form.endpointOptions.find((item) => item.id === candidate.endpointId)
+        const converterSource = candidate.converterOverride || endpoint?.converter || props.form.converter
+        const converter = converterSource === 'gemini' || converterSource === 'anthropic'
+          ? converterSource
+          : 'codex'
+        if (converter !== 'codex') return
+        collectDynamicModel(candidate.customModelName)
+      })
+    })
+  })
+
+  Array.from(dynamicByKey.values())
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+    .forEach(pushOption)
+
+  return options
+})
 
 const geminiModelOptions = computed(() => [
   ...props.form.geminiModelPreset.map((model) => ({

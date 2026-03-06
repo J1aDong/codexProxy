@@ -350,6 +350,7 @@ const DEFAULT_CONFIG = {
   } as AnthropicModelMapping,
   codexEffortCapabilityMap: {
     'gpt-5.3-codex': ['low', 'medium', 'high', 'xhigh'],
+    'gpt-5.4': ['low', 'medium', 'high', 'xhigh'],
     'gpt-5.2-codex': ['low', 'medium', 'high', 'xhigh'],
     'gpt-5-codex': ['medium', 'high'],
     'gpt-5.1-codex-max': ['low', 'medium', 'high', 'xhigh'],

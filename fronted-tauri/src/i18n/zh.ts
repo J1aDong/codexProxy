@@ -99,7 +99,7 @@ export default {
     advancedAllowExternalAccessLabel: '允许外网访问（监听 0.0.0.0）',
     advancedAllowExternalAccessTip: '开启后将接受非本机连接。若代理正在运行，保存时会自动重启以应用监听地址。',
     advancedCodexCapabilityPresetLabel: 'Codex 模型-强度预设(JSON)',
-    advancedCodexCapabilityPresetTip: '键为模型名，值为允许强度数组（low/medium/high/xhigh）。保存时会自动规范化。',
+    advancedCodexCapabilityPresetTip: '键为模型名，值为允许强度数组（low/medium/high/xhigh）。保存时会自动规范化，并扩展 Codex 模型下拉选项（不会自动替换当前 Opus/Sonnet/Haiku 已选模型）。',
     advancedGeminiModelPresetLabel: 'Gemini 模型预设(JSON)',
     advancedGeminiModelPresetTip: '值为模型名称数组，用于 Gemini 转换器下拉选项。保存时会去重并过滤空值。',
     advancedCapabilityJsonError: 'JSON 格式错误，请检查后重试。',

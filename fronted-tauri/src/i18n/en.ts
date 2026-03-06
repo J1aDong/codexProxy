@@ -99,7 +99,7 @@ export default {
     advancedAllowExternalAccessLabel: 'Allow external access (bind 0.0.0.0)',
     advancedAllowExternalAccessTip: 'Accept non-localhost connections. If proxy is running, saving will auto-restart to apply bind address.',
     advancedCodexCapabilityPresetLabel: 'Codex Model-Effort Preset (JSON)',
-    advancedCodexCapabilityPresetTip: 'Keys are model names, values are allowed efforts (low/medium/high/xhigh). Saved value is normalized automatically.',
+    advancedCodexCapabilityPresetTip: 'Keys are model names, values are allowed efforts (low/medium/high/xhigh). Saved value is normalized automatically and expands the Codex model dropdown (without auto-replacing current Opus/Sonnet/Haiku selections).',
     advancedGeminiModelPresetLabel: 'Gemini Model Preset (JSON)',
     advancedGeminiModelPresetTip: 'Array of model names used for Gemini converter dropdown options. Empty values are removed and duplicates are deduplicated.',
     advancedCapabilityJsonError: 'Invalid JSON format. Please fix and try again.',
