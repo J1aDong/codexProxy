@@ -606,3 +606,46 @@ fn terminal_invariant_violation_emits_controlled_error_and_stop() {
     assert!(joined.contains("\"code\":\"terminal_invariant_violation\""));
     assert!(joined.contains("\"type\":\"message_stop\""));
 }
+
+#[test]
+fn skill_tool_command_payload_is_normalized_before_emitting_tool_use() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_skill_1",
+                "type": "function_call",
+                "call_id": "call_skill_1",
+                "name": "Skill"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_skill_1",
+                "type": "function_call",
+                "call_id": "call_skill_1",
+                "name": "Skill",
+                "arguments": "{\"command\":\"review-pr 123\"}"
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("\"name\":\"Skill\""));
+    assert!(joined.contains(r#"\"skill\":\"review-pr\""#));
+    assert!(joined.contains(r#"\"args\":\"123\""#));
+    assert!(!joined.contains(r#"\"command\":\"review-pr 123\""#));
+}

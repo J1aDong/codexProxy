@@ -2069,6 +2069,64 @@ impl TransformResponse {
         }
     }
 
+    fn normalize_skill_tool_arguments(arguments: &str) -> Option<String> {
+        let mut parsed = serde_json::from_str::<Value>(arguments).ok()?;
+        let obj = parsed.as_object_mut()?;
+
+        let has_skill = obj
+            .get("skill")
+            .and_then(|value| value.as_str())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if has_skill {
+            return None;
+        }
+
+        let command = obj
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())?;
+
+        let mut parts = command.splitn(2, char::is_whitespace);
+        let skill = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())?;
+        let args = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        obj.remove("command");
+        obj.insert("skill".to_string(), Value::String(skill));
+        match args {
+            Some(value) => {
+                obj.insert("args".to_string(), Value::String(value));
+            }
+            None => {
+                obj.remove("args");
+            }
+        }
+
+        serde_json::to_string(&parsed).ok()
+    }
+
+    fn normalized_tool_arguments(&mut self, tool: &BufferedToolCall) -> String {
+        if tool.name.eq_ignore_ascii_case("skill") {
+            if let Some(normalized) = Self::normalize_skill_tool_arguments(&tool.arguments_buffer) {
+                self.logger
+                    .log_raw("[Info] Normalized Skill tool arguments from legacy command payload");
+                return normalized;
+            }
+        }
+
+        tool.arguments_buffer.clone()
+    }
+
     fn emit_serialized_tool_call(&mut self, output: &mut Vec<String>, tool: &BufferedToolCall) {
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
@@ -2090,8 +2148,9 @@ impl TransformResponse {
             })
         ));
 
-        if !tool.arguments_buffer.is_empty() {
-            self.emit_tool_json_delta(output, idx, tool.arguments_buffer.clone());
+        let arguments = self.normalized_tool_arguments(tool);
+        if !arguments.is_empty() {
+            self.emit_tool_json_delta(output, idx, arguments);
         }
 
         output.push(format!(

@@ -13,6 +13,57 @@ const SKILL_TRUNCATION_MARKER: &str = "\n[skill content truncated]";
 pub struct MessageProcessor;
 
 impl MessageProcessor {
+    fn normalize_skill_tool_input_for_history(input: &mut Value) {
+        let Some(obj) = input.as_object_mut() else {
+            return;
+        };
+
+        if obj
+            .get("skill")
+            .and_then(|value| value.as_str())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let Some(command) = obj
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+        else {
+            return;
+        };
+
+        let mut parts = command.splitn(2, char::is_whitespace);
+        let Some(skill) = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+        else {
+            return;
+        };
+        let args = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        obj.remove("command");
+        obj.insert("skill".to_string(), Value::String(skill));
+        match args {
+            Some(value) => {
+                obj.insert("args".to_string(), Value::String(value));
+            }
+            None => {
+                obj.remove("args");
+            }
+        }
+    }
+
     pub fn transform_messages(
         messages: &[Message],
         log_tx: Option<&broadcast::Sender<String>>,
@@ -270,30 +321,10 @@ impl MessageProcessor {
                                 }
 
                                 let mut final_tool_input = tool_input.clone();
-                                if name.to_lowercase() == "skill" {
-                                    if let serde_json::Value::Object(ref mut obj) = final_tool_input
-                                    {
-                                        if let Some(skill_name) = obj
-                                            .get("skill")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string())
-                                        {
-                                            let mut cmd = skill_name;
-                                            if let Some(args) =
-                                                obj.get("args").and_then(|v| v.as_str())
-                                            {
-                                                if !args.is_empty() {
-                                                    cmd.push(' ');
-                                                    cmd.push_str(args);
-                                                }
-                                            }
-                                            obj.clear();
-                                            obj.insert(
-                                                "command".to_string(),
-                                                serde_json::Value::String(cmd),
-                                            );
-                                        }
-                                    }
+                                if name.eq_ignore_ascii_case("skill") {
+                                    Self::normalize_skill_tool_input_for_history(
+                                        &mut final_tool_input,
+                                    );
                                 }
 
                                 input.push(json!({

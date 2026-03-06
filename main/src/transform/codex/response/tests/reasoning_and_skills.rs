@@ -150,7 +150,9 @@ fn test_skill_transformation() {
     assert_eq!(func_call["name"], "skill");
     let args_str = func_call["arguments"].as_str().unwrap();
     let args: Value = serde_json::from_str(args_str).unwrap();
-    assert_eq!(args["command"], "test-skill arg1");
+    assert_eq!(args["skill"], "test-skill");
+    assert_eq!(args["args"], "arg1");
+    assert!(args.get("command").is_none());
 
     // Find function_call_output
     let func_out = input
@@ -158,6 +160,29 @@ fn test_skill_transformation() {
         .find(|v| v["type"] == "function_call_output")
         .expect("Should have function_call_output");
     assert_eq!(func_out["output"], "Skill 'test-skill' loaded.");
+}
+
+#[test]
+fn test_legacy_skill_command_is_normalized_in_history() {
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Some(MessageContent::Blocks(vec![create_tool_use(
+            "call_legacy",
+            "skill",
+            json!({"command": "review-pr 123"}),
+        )])),
+    }];
+
+    let (input, _) = MessageProcessor::transform_messages(&messages, None);
+    let func_call = input
+        .iter()
+        .find(|v| v["type"] == "function_call")
+        .expect("Should have function_call");
+    let args: Value = serde_json::from_str(func_call["arguments"].as_str().unwrap()).unwrap();
+
+    assert_eq!(args["skill"], "review-pr");
+    assert_eq!(args["args"], "123");
+    assert!(args.get("command").is_none());
 }
 
 #[test]

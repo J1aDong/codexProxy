@@ -20,7 +20,6 @@ const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
 const ENV_REASONING_SUMMARY_MODE: &str = "CODEX_PROXY_REASONING_SUMMARY";
 const ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT: &str =
     "CODEX_PROXY_INCLUDE_REASONING_ENCRYPTED_CONTENT";
-const ENV_FORCE_STATIC_CODEX_INSTRUCTIONS: &str = "CODEX_PROXY_FORCE_STATIC_INSTRUCTIONS";
 
 fn bool_env_enabled(name: &str) -> bool {
     std::env::var(name)
@@ -48,24 +47,6 @@ fn resolve_reasoning_summary_mode() -> String {
 
 fn resolve_include_reasoning_encrypted_content() -> bool {
     bool_env_enabled(ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT)
-}
-
-fn system_looks_like_codex_harness_instructions(system_text: &str) -> bool {
-    let lower = system_text.to_ascii_lowercase();
-    (lower.contains("you are codex") || lower.contains("codex cli"))
-        && (lower.contains("editing constraints")
-            || lower.contains("plan tool")
-            || lower.contains("presenting your work"))
-}
-
-fn should_include_static_codex_instructions(system_text: Option<&str>) -> bool {
-    if bool_env_enabled(ENV_FORCE_STATIC_CODEX_INSTRUCTIONS) {
-        return true;
-    }
-    match system_text {
-        Some(text) => !system_looks_like_codex_harness_instructions(text),
-        None => true,
-    }
 }
 
 fn is_wrapped_agents_instructions(system_text: &str) -> bool {
@@ -1007,9 +988,6 @@ impl TransformRequest {
         let request_text_corpus = collect_request_text_corpus(anthropic_body);
         let request_cwd = extract_request_cwd(&request_text_corpus);
         let mut system_text_for_cache_key = None::<String>;
-        let include_static_codex_instructions =
-            should_include_static_codex_instructions(Some(&request_text_corpus));
-
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let system_text = system.to_string();
@@ -1153,12 +1131,8 @@ impl TransformRequest {
                 obj.insert("service_tier".to_string(), json!("priority"));
             }
         }
-        if include_static_codex_instructions {
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("instructions".to_string(), json!(CODEX_INSTRUCTIONS));
-            }
-        } else {
-            log("📋 [Transform] Skip static instructions injection (already present in system)");
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("instructions".to_string(), json!(CODEX_INSTRUCTIONS));
         }
         if include_reasoning_encrypted_content {
             if let Some(obj) = body.as_object_mut() {
@@ -1170,6 +1144,50 @@ impl TransformRequest {
         }
 
         (body, session_id.clone())
+    }
+
+    fn tool_name(tool: &Value) -> Option<&str> {
+        tool.get("name")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                tool.get("function")
+                    .and_then(|value| value.get("name"))
+                    .and_then(|value| value.as_str())
+            })
+    }
+
+    fn tool_parameters_schema(tool: &Value) -> Option<&Value> {
+        tool.get("input_schema").or_else(|| {
+            tool.get("function")
+                .and_then(|value| value.get("parameters"))
+        })
+    }
+
+    fn is_anthropic_web_search_tool(tool: &Value) -> bool {
+        let Some(name) = Self::tool_name(tool) else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("WebSearch") {
+            return false;
+        }
+
+        let Some(schema) = Self::tool_parameters_schema(tool) else {
+            return false;
+        };
+
+        schema
+            .get("properties")
+            .and_then(|value| value.get("query"))
+            .and_then(|value| value.get("type"))
+            .and_then(|value| value.as_str())
+            == Some("string")
+    }
+
+    fn build_native_web_search_tool() -> Value {
+        json!({
+            "type": "web_search",
+            "external_web_access": true
+        })
     }
 
     fn sanitize_input_for_codex(input: &mut Vec<Value>) {
@@ -1333,97 +1351,28 @@ impl TransformRequest {
         log(&format!("🔧 [Tools] Processing {} tools", tools.len()));
         let before_bytes = serde_json::to_vec(tools).map(|buf| buf.len()).unwrap_or(0);
 
-        let transformed: Vec<Value> = tools
-            .iter()
-            .map(|tool| {
-// Claude Code 格式: { name, description, input_schema }
-                if tool.get("name").is_some() && tool.get("type").is_none() {
-                    let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                    log(&format!("🔧 [Tools] {} (Claude Code format)", name));
+        let mut transformed = Vec::with_capacity(tools.len());
+        let mut native_web_search_added = false;
 
-                    let mut parameters = tool.get("input_schema").cloned().unwrap_or_else(|| {
-                        json!({
-                            "type": "object",
-                            "properties": {}
-                        })
-                    });
-
-                    if let Some(obj) = parameters.as_object_mut() {
-                        obj.entry("properties").or_insert_with(|| json!({}));
-                    }
-                    if enable_tool_schema_compaction {
-                        compact_tool_parameters_schema(&mut parameters);
-                    }
-
-                    return json!({
-                        "type": "function",
-                        "name": name,
-                        "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
-                        "strict": false,
-                        "parameters": parameters
-                    });
+        for tool in tools {
+            if Self::is_anthropic_web_search_tool(tool) {
+                if native_web_search_added {
+                    log("🔧 [Tools] WebSearch duplicate skipped after native mapping");
+                } else {
+                    log("🔧 [Tools] WebSearch (Anthropic official) -> native web_search");
+                    transformed.push(Self::build_native_web_search_tool());
+                    native_web_search_added = true;
                 }
+                continue;
+            }
 
-                // Anthropic 格式: { type: "tool", name, ... }
-                if tool.get("type").and_then(|t| t.as_str()) == Some("tool") {
-                    let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                    log(&format!("🔧 [Tools] {} (Anthropic format)", name));
-
-                    let mut parameters = tool.get("input_schema").cloned().unwrap_or_else(|| {
-                        json!({
-                            "type": "object",
-                            "properties": {}
-                        })
-                    });
-
-                    if let Some(obj) = parameters.as_object_mut() {
-                        obj.entry("properties").or_insert_with(|| json!({}));
-                    }
-                    if enable_tool_schema_compaction {
-                        compact_tool_parameters_schema(&mut parameters);
-                    }
-
-                    return json!({
-                        "type": "function",
-                        "name": name,
-                        "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
-                        "strict": false,
-                        "parameters": parameters
-                    });
-                }
-
-                // OpenAI 格式: { type: "function", function: {...} }
-                if tool.get("type").and_then(|t| t.as_str()) == Some("function") {
-                    let func = tool.get("function").unwrap_or(tool);
-                    let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                    log(&format!("🔧 [Tools] {} (OpenAI format)", name));
-
-                    let mut parameters = func.get("parameters").cloned().unwrap_or_else(|| {
-                        json!({
-                            "type": "object",
-                            "properties": {}
-                        })
-                    });
-
-                    if let Some(obj) = parameters.as_object_mut() {
-                        obj.entry("properties").or_insert_with(|| json!({}));
-                    }
-                    if enable_tool_schema_compaction {
-                        compact_tool_parameters_schema(&mut parameters);
-                    }
-
-                    return json!({
-                        "type": "function",
-                        "name": name,
-                        "description": compact_tool_description(func.get("description").and_then(|d| d.as_str())),
-                        "strict": false,
-                        "parameters": parameters
-                    });
-                }
-
-                // 未知格式
-                let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                log(&format!("🔧 [Tools] {} (unknown format)", name));
+            // Claude Code 格式: { name, description, input_schema }
+            if tool.get("name").is_some() && tool.get("type").is_none() {
+                let name = tool
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
+                log(&format!("🔧 [Tools] {} (Claude Code format)", name));
 
                 let mut parameters = tool.get("input_schema").cloned().unwrap_or_else(|| {
                     json!({
@@ -1439,15 +1388,117 @@ impl TransformRequest {
                     compact_tool_parameters_schema(&mut parameters);
                 }
 
-                json!({
+                transformed.push(json!({
                     "type": "function",
                     "name": name,
                     "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
                     "strict": false,
                     "parameters": parameters
+                }));
+                continue;
+            }
+
+            // Anthropic 格式: { type: "tool", name, ... }
+            if tool.get("type").and_then(|t| t.as_str()) == Some("tool") {
+                let name = tool
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
+                log(&format!("🔧 [Tools] {} (Anthropic format)", name));
+
+                let mut parameters = tool.get("input_schema").cloned().unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {}
+                    })
+                });
+
+                if let Some(obj) = parameters.as_object_mut() {
+                    obj.entry("properties").or_insert_with(|| json!({}));
+                }
+                if enable_tool_schema_compaction {
+                    compact_tool_parameters_schema(&mut parameters);
+                }
+
+                transformed.push(json!({
+                    "type": "function",
+                    "name": name,
+                    "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
+                    "strict": false,
+                    "parameters": parameters
+                }));
+                continue;
+            }
+
+            // OpenAI native web_search tool passthrough
+            if tool.get("type").and_then(|t| t.as_str()) == Some("web_search") {
+                log("🔧 [Tools] web_search (native passthrough)");
+                transformed.push(tool.clone());
+                continue;
+            }
+
+            // OpenAI 格式: { type: "function", function: {...} }
+            if tool.get("type").and_then(|t| t.as_str()) == Some("function") {
+                let func = tool.get("function").unwrap_or(tool);
+                let name = func
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
+                log(&format!("🔧 [Tools] {} (OpenAI format)", name));
+
+                let mut parameters = func.get("parameters").cloned().unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {}
+                    })
+                });
+
+                if let Some(obj) = parameters.as_object_mut() {
+                    obj.entry("properties").or_insert_with(|| json!({}));
+                }
+                if enable_tool_schema_compaction {
+                    compact_tool_parameters_schema(&mut parameters);
+                }
+
+                transformed.push(json!({
+                    "type": "function",
+                    "name": name,
+                    "description": compact_tool_description(func.get("description").and_then(|d| d.as_str())),
+                    "strict": false,
+                    "parameters": parameters
+                }));
+                continue;
+            }
+
+            // 未知格式
+            let name = tool
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown");
+            log(&format!("🔧 [Tools] {} (unknown format)", name));
+
+            let mut parameters = tool.get("input_schema").cloned().unwrap_or_else(|| {
+                json!({
+                    "type": "object",
+                    "properties": {}
                 })
-            })
-            .collect();
+            });
+
+            if let Some(obj) = parameters.as_object_mut() {
+                obj.entry("properties").or_insert_with(|| json!({}));
+            }
+            if enable_tool_schema_compaction {
+                compact_tool_parameters_schema(&mut parameters);
+            }
+
+            transformed.push(json!({
+                "type": "function",
+                "name": name,
+                "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
+                "strict": false,
+                "parameters": parameters
+            }));
+        }
 
         let after_bytes = serde_json::to_vec(&transformed)
             .map(|buf| buf.len())
@@ -1657,6 +1708,45 @@ mod tests {
         assert!(
             parameters_obj.contains_key("examples"),
             "examples should be kept when schema compaction disabled"
+        );
+    }
+
+    #[test]
+    fn transform_tools_maps_official_websearch_to_native_web_search() {
+        let tools = vec![json!({
+            "name": "WebSearch",
+            "description": "Search the web",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "allowed_domains": {"type": "array", "items": {"type": "string"}},
+                    "blocked_domains": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["query"]
+            }
+        })];
+
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        assert_eq!(
+            transformed.len(),
+            1,
+            "web search tool should remain singular after mapping"
+        );
+        assert_eq!(
+            transformed[0].get("type").and_then(|value| value.as_str()),
+            Some("web_search")
+        );
+        assert_eq!(
+            transformed[0]
+                .get("external_web_access")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "native web_search should enable live web access"
+        );
+        assert!(
+            transformed[0].get("name").is_none(),
+            "native web_search should not be serialized as a generic function tool"
         );
     }
 
@@ -1926,33 +2016,32 @@ mod tests {
     }
 
     #[test]
-    fn skips_static_instructions_when_system_already_contains_codex_harness_rules() {
-        let request: AnthropicRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4-5",
-            "messages": [{"role":"user","content":"hi"}],
-            "system": "You are Codex, based on GPT-5.\n## Editing constraints\n## Plan tool\n",
-            "stream": true
-        }))
-        .expect("valid anthropic request");
+    fn includes_static_instructions_for_plain_requests() {
+        let request = sample_request();
         let mapping = ReasoningEffortMapping::default();
 
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
+        let instructions = body
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         assert!(
-            body.get("instructions").is_none(),
-            "static instructions should be omitted when equivalent system guidance already exists"
+            instructions.starts_with("You are a coding agent running in the Codex CLI"),
+            "default codex request should carry the official static instructions"
         );
     }
 
     #[test]
-    fn skips_static_instructions_when_messages_already_contain_codex_harness_rules() {
+    fn includes_static_instructions_even_when_request_contains_codex_harness_rules() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
             "messages": [{
                 "role":"user",
                 "content":"You are Codex, based on GPT-5.\n## Editing constraints\n## Plan tool\n## Presenting your work"
             }],
+            "system": "You are Codex, based on GPT-5.\n## Editing constraints\n## Presenting your work",
             "stream": true
         }))
         .expect("valid anthropic request");
@@ -1961,9 +2050,13 @@ mod tests {
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
+        let instructions = body
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         assert!(
-            body.get("instructions").is_none(),
-            "static instructions should be omitted when equivalent guidance exists in messages"
+            instructions.starts_with("You are a coding agent running in the Codex CLI"),
+            "static instructions should still be present alongside wrapped system content"
         );
     }
 
