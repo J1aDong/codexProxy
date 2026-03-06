@@ -33,6 +33,13 @@ enum TextRoutingDecision {
     DeferUntilToolWindowCloses,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WebSearchProgressStage {
+    Started,
+    Searching,
+    Completed,
+}
+
 #[derive(Default)]
 struct TransformDiagnostics {
     deferred_unscoped_text_chunks: u64,
@@ -428,6 +435,10 @@ pub struct TransformResponse {
     had_reasoning_in_response: bool,
     // Track if we've seen a message-type output_item.added (means phase detection is explicit)
     saw_message_item_added: bool,
+    web_search_started_announced: bool,
+    web_search_searching_announced: bool,
+    web_search_completion_pending: bool,
+    web_search_completion_announced: bool,
     high_risk_leak_question_emitted: bool,
     last_terminal_event: Option<String>,
     diagnostics: TransformDiagnostics,
@@ -1410,6 +1421,10 @@ impl TransformResponse {
             in_commentary_phase: false,
             had_reasoning_in_response: false,
             saw_message_item_added: false,
+            web_search_started_announced: false,
+            web_search_searching_announced: false,
+            web_search_completion_pending: false,
+            web_search_completion_announced: false,
             high_risk_leak_question_emitted: false,
             last_terminal_event: None,
             diagnostics: TransformDiagnostics::default(),
@@ -2127,6 +2142,63 @@ impl TransformResponse {
         tool.arguments_buffer.clone()
     }
 
+    fn build_background_task_progress_message(tool_name: &str, arguments: &str) -> Option<String> {
+        let parsed = serde_json::from_str::<Value>(arguments).ok()?;
+        let input = parsed.as_object()?;
+
+        if tool_name.eq_ignore_ascii_case("Agent") {
+            if !input
+                .get("run_in_background")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+
+            let description = input
+                .get("description")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+
+            return Some(match description {
+                Some(value) => format!("已启动后台 explorer：{value}…"),
+                None => "已启动后台 explorer，正在处理中…".to_string(),
+            });
+        }
+
+        if tool_name.eq_ignore_ascii_case("TaskOutput") {
+            let is_non_blocking = !input
+                .get("block")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+
+            return Some(if is_non_blocking {
+                "正在轮询后台任务结果…".to_string()
+            } else {
+                "正在等待后台任务返回结果…".to_string()
+            });
+        }
+
+        None
+    }
+
+    fn emit_background_task_progress(
+        &mut self,
+        output: &mut Vec<String>,
+        tool_name: &str,
+        arguments: &str,
+    ) {
+        let Some(message) = Self::build_background_task_progress_message(tool_name, arguments)
+        else {
+            return;
+        };
+
+        self.open_thinking_block_if_needed(output);
+        self.emit_thinking_delta(output, message.as_str());
+        self.emit_thinking_delta(output, "\n");
+    }
+
     fn emit_serialized_tool_call(&mut self, output: &mut Vec<String>, tool: &BufferedToolCall) {
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
@@ -2150,13 +2222,15 @@ impl TransformResponse {
 
         let arguments = self.normalized_tool_arguments(tool);
         if !arguments.is_empty() {
-            self.emit_tool_json_delta(output, idx, arguments);
+            self.emit_tool_json_delta(output, idx, arguments.clone());
         }
 
         output.push(format!(
             "event: content_block_stop\ndata: {}\n\n",
             json!({ "type": "content_block_stop", "index": idx })
         ));
+
+        self.emit_background_task_progress(output, tool.name.as_str(), arguments.as_str());
     }
 
     fn flush_serialized_tool_calls(
@@ -2253,6 +2327,58 @@ impl TransformResponse {
         }
     }
 
+    fn emit_web_search_progress(
+        &mut self,
+        output: &mut Vec<String>,
+        stage: WebSearchProgressStage,
+    ) {
+        let message = match stage {
+            WebSearchProgressStage::Started => {
+                if self.web_search_started_announced {
+                    return;
+                }
+                self.web_search_started_announced = true;
+                "正在发起网页搜索…"
+            }
+            WebSearchProgressStage::Searching => {
+                if self.web_search_searching_announced {
+                    return;
+                }
+                self.web_search_searching_announced = true;
+                "正在检索搜索结果…"
+            }
+            WebSearchProgressStage::Completed => {
+                if self.web_search_completion_announced {
+                    return;
+                }
+                self.web_search_completion_announced = true;
+                self.web_search_completion_pending = false;
+                "已拿到搜索结果，继续整理…"
+            }
+        };
+
+        self.open_thinking_block_if_needed(output);
+        self.emit_thinking_delta(output, message);
+        self.emit_thinking_delta(output, "\n");
+    }
+
+    fn mark_web_search_completion_pending(&mut self) {
+        if self.web_search_completion_announced {
+            return;
+        }
+        self.web_search_completion_pending = true;
+    }
+
+    fn maybe_emit_pending_web_search_completion_before_visible_output(
+        &mut self,
+        output: &mut Vec<String>,
+    ) {
+        if !self.web_search_completion_pending || self.web_search_completion_announced {
+            return;
+        }
+        self.emit_web_search_progress(output, WebSearchProgressStage::Completed);
+    }
+
     fn extract_content_part_text<'a>(data: &'a Value) -> Option<&'a str> {
         data.get("part")
             .and_then(|part| {
@@ -2318,6 +2444,84 @@ impl TransformResponse {
     fn reset_text_dedupe_state(&mut self) {
         self.text_dedupe_by_part.clear();
         self.active_text_parts.clear();
+    }
+
+    fn extract_xml_tag_body<'a>(fragment: &'a str, tag: &str) -> Option<&'a str> {
+        let start_marker = format!("<{tag}>");
+        let end_marker = format!("</{tag}>");
+        let start = fragment.find(start_marker.as_str())? + start_marker.len();
+        let end = fragment[start..].find(end_marker.as_str())? + start;
+        Some(fragment[start..end].trim())
+    }
+
+    fn compact_task_completion_summary(summary: &str) -> String {
+        let trimmed = summary.trim();
+        if let Some(rest) = trimmed.strip_prefix("Agent \"") {
+            if let Some(end_quote) = rest.find('"') {
+                let name = rest[..end_quote].trim();
+                if !name.is_empty() {
+                    return format!("后台 explorer 已完成：{name}…");
+                }
+            }
+        }
+
+        if trimmed.is_empty() {
+            "后台任务已完成，正在汇总结果…".to_string()
+        } else {
+            format!("后台任务已完成：{trimmed}…")
+        }
+    }
+
+    fn build_task_lifecycle_progress_message(fragment: &str) -> Option<String> {
+        let trimmed = fragment.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if trimmed.starts_with("<retrieval_status>") {
+            let status = Self::extract_xml_tag_body(trimmed, "retrieval_status")?;
+            return Some(match status {
+                "timeout" | "running" => "某个 explorer 仍在运行，我继续等待结果…".to_string(),
+                other if !other.is_empty() => format!("后台任务状态更新：{other}…"),
+                _ => return None,
+            });
+        }
+
+        if trimmed.starts_with("<task-notification>") {
+            let status = Self::extract_xml_tag_body(trimmed, "status").unwrap_or("");
+            let summary = Self::extract_xml_tag_body(trimmed, "summary").unwrap_or("");
+            return Some(match status {
+                "completed" => Self::compact_task_completion_summary(summary),
+                "failed" => {
+                    if summary.trim().is_empty() {
+                        "后台任务执行失败，我继续处理剩余结果…".to_string()
+                    } else {
+                        format!("后台任务失败：{}…", summary.trim())
+                    }
+                }
+                _ => {
+                    if summary.trim().is_empty() {
+                        "收到后台任务进度更新…".to_string()
+                    } else {
+                        format!("后台任务进度更新：{}…", summary.trim())
+                    }
+                }
+            });
+        }
+
+        if trimmed.starts_with("Task is still running") {
+            return Some("某个 explorer 仍在运行，我继续等待结果…".to_string());
+        }
+
+        if trimmed.starts_with("No task output available") {
+            return Some("后台任务暂时还没有新输出，我继续等待…".to_string());
+        }
+
+        if trimmed.starts_with("Error: No task found with ID:") {
+            return Some("某个后台任务已结束或状态失效，我继续汇总现有结果…".to_string());
+        }
+
+        None
     }
 
     fn handle_text_fragment(
@@ -2402,6 +2606,16 @@ impl TransformResponse {
             merged.push_str(fragment);
             merged
         };
+
+        if let Some(message) = Self::build_task_lifecycle_progress_message(&combined) {
+            self.logger
+                .log_raw("[Info] Bridged background-task lifecycle text into thinking progress");
+            self.open_thinking_block_if_needed(output);
+            self.emit_thinking_delta(output, message.as_str());
+            self.emit_thinking_delta(output, "
+");
+            return;
+        }
 
         if self.in_markdown_bash {
             self.markdown_bash_buffer.push_str(&combined);
@@ -3176,6 +3390,8 @@ impl TransformResponse {
                     return output;
                 }
 
+                self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
+
                 // Only close thinking block if text will NOT be redirected to thinking
                 // (avoids unnecessary open/close cycles during commentary)
                 let redirect_to_thinking = self.in_commentary_phase
@@ -3206,6 +3422,8 @@ impl TransformResponse {
                             self.buffer_deferred_unscoped_text(&text);
                             return output;
                         }
+
+                        self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
 
                         let redirect_to_thinking = self.in_commentary_phase
                             || (self.had_reasoning_in_response && !self.saw_message_item_added);
@@ -3388,9 +3606,27 @@ impl TransformResponse {
                                 self.in_commentary_phase = false;
                             }
                         }
+                        "web_search_call" => {
+                            self.emit_web_search_progress(
+                                &mut output,
+                                WebSearchProgressStage::Started,
+                            );
+                        }
                         _ => {}
                     }
                 }
+            }
+
+            "response.web_search_call.in_progress" => {
+                self.emit_web_search_progress(&mut output, WebSearchProgressStage::Started);
+            }
+
+            "response.web_search_call.searching" => {
+                self.emit_web_search_progress(&mut output, WebSearchProgressStage::Searching);
+            }
+
+            "response.web_search_call.completed" => {
+                self.mark_web_search_completion_pending();
             }
 
             // 工具参数增量更新
@@ -3504,6 +3740,9 @@ impl TransformResponse {
                         // block before subsequent function_call items arrive.
                         self.close_open_text_block(&mut output);
                     }
+                    "web_search_call" => {
+                        self.mark_web_search_completion_pending();
+                    }
                     _ => {
                         // 兼容旧流：没有 item 元数据时回退关闭最近缓冲的 tool call
                         if item.is_none() {
@@ -3526,16 +3765,19 @@ impl TransformResponse {
 
             // 响应完成 - 关键：确保完整的事件序列
             "response.completed" => {
+                self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
                 self.emit_terminal_events(&mut output, &data, false);
             }
 
             // 上游别名事件：与 response.completed 语义等价
             "response.done" => {
+                self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
                 self.emit_terminal_events(&mut output, &data, false);
             }
 
             // 响应不完整但已终止（例如 max_output_tokens / context limit）
             "response.incomplete" => {
+                self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
                 self.emit_terminal_events(&mut output, &data, true);
             }
 

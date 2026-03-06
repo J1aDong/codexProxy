@@ -1,6 +1,5 @@
 use super::*;
 use serde_json::json;
-
 #[test]
 fn response_incomplete_emits_terminal_events_with_max_tokens() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
@@ -328,6 +327,87 @@ fn response_refusal_stream_maps_to_text_blocks_and_refusal_stop_reason() {
 }
 
 #[test]
+fn web_search_call_progress_events_surface_as_thinking_updates() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let search_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "in_progress"
+            }
+        })
+    );
+    let search_searching = format!(
+        "data: {}",
+        json!({
+            "type": "response.web_search_call.searching",
+            "output_index": 1,
+            "item_id": "ws_1"
+        })
+    );
+    let search_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "popular ai tools"
+                }
+            }
+        })
+    );
+    let final_message_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {
+                "id": "msg_1",
+                "type": "message",
+                "status": "in_progress",
+                "phase": "final_answer",
+                "content": [],
+                "role": "assistant"
+            }
+        })
+    );
+    let final_text = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": 2,
+            "item_id": "msg_1",
+            "content_index": 0,
+            "delta": "整理好了"
+        })
+    );
+
+    let mut events = Vec::new();
+    events.extend(transformer.transform_sse_line(&search_added));
+    events.extend(transformer.transform_sse_line(&search_searching));
+    events.extend(transformer.transform_sse_line(&search_done));
+    events.extend(transformer.transform_sse_line(&final_message_added));
+    events.extend(transformer.transform_sse_line(&final_text));
+    let joined = events.join("");
+
+    assert!(joined.contains("正在发起网页搜索"));
+    assert!(joined.contains("正在检索搜索结果"));
+    assert!(joined.contains("已拿到搜索结果，继续整理"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+    assert!(joined.contains("整理好了"));
+}
+
+#[test]
 fn response_failed_emits_error_with_upstream_message_and_code() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
@@ -605,6 +685,192 @@ fn terminal_invariant_violation_emits_controlled_error_and_stop() {
     assert!(joined.contains("event: error"));
     assert!(joined.contains("\"code\":\"terminal_invariant_violation\""));
     assert!(joined.contains("\"type\":\"message_stop\""));
+}
+
+#[test]
+fn serialized_agent_tool_use_emits_background_progress_hint() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_1",
+                "type": "function_call",
+                "call_id": "call_agent_1",
+                "name": "Agent"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_1",
+                "type": "function_call",
+                "call_id": "call_agent_1",
+                "name": "Agent",
+                "arguments": r#"{"description":"Search remote Claude Code tools","prompt":"Find remote wrappers","run_in_background":true}"#
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("已启动后台 explorer：Search remote Claude Code tools"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+}
+
+#[test]
+fn serialized_task_output_tool_use_emits_polling_progress_hint() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_task_output_1",
+                "type": "function_call",
+                "call_id": "call_task_output_1",
+                "name": "TaskOutput"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_task_output_1",
+                "type": "function_call",
+                "call_id": "call_task_output_1",
+                "name": "TaskOutput",
+                "arguments": r#"{"task_id":"task_123","block":false,"timeout":5000}"#
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("正在轮询后台任务结果"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+}
+
+#[test]
+fn retrieval_status_timeout_text_is_bridged_to_thinking_progress() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let timeout_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": r#"<retrieval_status>timeout</retrieval_status>
+
+<system-reminder>ignore me</system-reminder>"#
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&timeout_line).join("");
+
+    assert!(joined.contains("某个 explorer 仍在运行，我继续等待结果"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+    assert!(!joined.contains("retrieval_status"));
+    assert!(!joined.contains("system-reminder"));
+}
+
+#[test]
+fn task_notification_completion_text_is_bridged_to_thinking_progress() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let notification_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": r#"<task-notification>
+<task-id>task_123</task-id>
+<status>completed</status>
+<summary>Agent "Search remote Claude Code tools" completed</summary>
+</task-notification>
+Full transcript available at: /tmp/task_123.output"#
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&notification_line).join("");
+
+    assert!(joined.contains("后台 explorer 已完成：Search remote Claude Code tools"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+    assert!(!joined.contains("task-notification"));
+    assert!(!joined.contains("Full transcript available"));
+}
+
+#[test]
+fn task_output_running_text_is_bridged_to_thinking_progress() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let running_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Task is still running…"
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&running_line).join("");
+
+    assert!(joined.contains("某个 explorer 仍在运行，我继续等待结果"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+    assert!(!joined.contains("Task is still running"));
+}
+
+#[test]
+fn task_output_no_output_text_is_bridged_to_thinking_progress() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let no_output_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "No task output available"
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&no_output_line).join("");
+
+    assert!(joined.contains("后台任务暂时还没有新输出，我继续等待"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+    assert!(!joined.contains("No task output available"));
+}
+
+#[test]
+fn task_output_missing_task_text_is_bridged_to_thinking_progress() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let missing_task_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Error: No task found with ID: a20f0fd7a883a0782"
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&missing_task_line).join("");
+
+    assert!(joined.contains("某个后台任务已结束或状态失效，我继续汇总现有结果"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+    assert!(!joined.contains("No task found with ID"));
 }
 
 #[test]
