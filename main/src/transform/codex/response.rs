@@ -191,6 +191,10 @@ struct BufferedToolCall {
     arguments_buffer: String,
     consecutive_whitespace_run: usize,
     done_flag: bool,
+    start_emitted: bool,
+    content_block_index: Option<usize>,
+    emitted_arguments_len: usize,
+    last_progress_message: Option<String>,
 }
 
 enum PendingToolArgumentUpdateKind {
@@ -439,6 +443,8 @@ pub struct TransformResponse {
     web_search_searching_announced: bool,
     web_search_completion_pending: bool,
     web_search_completion_announced: bool,
+    response_created_announced: bool,
+    response_in_progress_announced: bool,
     high_risk_leak_question_emitted: bool,
     last_terminal_event: Option<String>,
     diagnostics: TransformDiagnostics,
@@ -963,6 +969,10 @@ impl TransformResponse {
             arguments_buffer: input.to_string(),
             consecutive_whitespace_run: 0,
             done_flag: true,
+            start_emitted: false,
+            content_block_index: None,
+            emitted_arguments_len: 0,
+            last_progress_message: None,
         };
         self.emit_serialized_tool_call(output, &tool);
     }
@@ -1025,6 +1035,10 @@ impl TransformResponse {
                 arguments_buffer: arguments,
                 consecutive_whitespace_run: 0,
                 done_flag: true,
+                start_emitted: false,
+                content_block_index: None,
+                emitted_arguments_len: 0,
+                last_progress_message: None,
             });
         }
 
@@ -1425,6 +1439,8 @@ impl TransformResponse {
             web_search_searching_announced: false,
             web_search_completion_pending: false,
             web_search_completion_announced: false,
+            response_created_announced: false,
+            response_in_progress_announced: false,
             high_risk_leak_question_emitted: false,
             last_terminal_event: None,
             diagnostics: TransformDiagnostics::default(),
@@ -1832,6 +1848,10 @@ impl TransformResponse {
             arguments_buffer: String::new(),
             consecutive_whitespace_run: 0,
             done_flag: false,
+            start_emitted: false,
+            content_block_index: None,
+            emitted_arguments_len: 0,
+            last_progress_message: None,
         });
         self.sort_buffered_tools();
         self.saw_tool_call = true;
@@ -2199,6 +2219,239 @@ impl TransformResponse {
         self.emit_thinking_delta(output, "\n");
     }
 
+    fn emit_response_lifecycle_progress(
+        &mut self,
+        output: &mut Vec<String>,
+        message: &str,
+    ) {
+        self.open_thinking_block_if_needed(output);
+        self.emit_thinking_delta(output, message);
+        self.emit_thinking_delta(output, "\n");
+    }
+
+    fn emit_ephemeral_thinking_progress(
+        &mut self,
+        output: &mut Vec<String>,
+        message: &str,
+    ) {
+        if message.is_empty() {
+            return;
+        }
+
+        self.close_open_text_block(output);
+        self.close_open_thinking_block(output);
+
+        let idx = self.content_index;
+        self.content_index += 1;
+
+        output.push(format!(
+            "event: content_block_start
+data: {}
+
+",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": { "type": "thinking", "thinking": "" }
+            })
+        ));
+        output.push(format!(
+            "event: content_block_delta
+data: {}
+
+",
+            json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "thinking_delta", "thinking": message }
+            })
+        ));
+        output.push(format!(
+            "event: content_block_delta
+data: {}
+
+",
+            json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "thinking_delta", "thinking": "
+" }
+            })
+        ));
+        output.push(format!(
+            "event: content_block_stop
+data: {}
+
+",
+            json!({ "type": "content_block_stop", "index": idx })
+        ));
+    }
+
+    fn build_generic_background_task_progress_message(tool_name: &str) -> Option<&'static str> {
+        if tool_name.eq_ignore_ascii_case("Agent") {
+            Some("正在启动后台 explorer…")
+        } else if tool_name.eq_ignore_ascii_case("TaskOutput") {
+            Some("正在检查后台任务输出…")
+        } else {
+            None
+        }
+    }
+
+    fn maybe_emit_front_buffered_tool_progress(&mut self, output: &mut Vec<String>) {
+        let message = {
+            let Some(tool) = self.buffered_tool_calls.first_mut() else {
+                return;
+            };
+            if tool.start_emitted {
+                return;
+            }
+
+            let next_message = Self::build_background_task_progress_message(
+                tool.name.as_str(),
+                tool.arguments_buffer.as_str(),
+            )
+            .or_else(|| {
+                Self::build_generic_background_task_progress_message(tool.name.as_str())
+                    .map(|value| value.to_string())
+            });
+
+            match next_message {
+                Some(message)
+                    if tool.last_progress_message.as_deref() != Some(message.as_str()) =>
+                {
+                    tool.last_progress_message = Some(message.clone());
+                    Some(message)
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(message) = message {
+            self.emit_ephemeral_thinking_progress(output, message.as_str());
+        }
+    }
+
+    fn tool_supports_live_argument_stream(name: &str) -> bool {
+        !name.eq_ignore_ascii_case("Skill")
+    }
+
+    fn maybe_emit_front_buffered_tool_start(&mut self, output: &mut Vec<String>) {
+        let should_emit = self
+            .buffered_tool_calls
+            .first()
+            .map(|tool| !tool.start_emitted)
+            .unwrap_or(false);
+        if !should_emit {
+            return;
+        }
+
+        self.maybe_emit_front_buffered_tool_progress(output);
+        self.close_open_text_block(output);
+        self.close_open_thinking_block(output);
+
+        let idx = self.content_index;
+        self.content_index += 1;
+
+        let (call_id, name, initial_delta) = {
+            let tool = self
+                .buffered_tool_calls
+                .first_mut()
+                .expect("front buffered tool exists");
+            tool.start_emitted = true;
+            tool.content_block_index = Some(idx);
+
+            let initial_delta = if Self::tool_supports_live_argument_stream(tool.name.as_str()) {
+                tool.emitted_arguments_len = tool.arguments_buffer.len();
+                tool.arguments_buffer.clone()
+            } else {
+                tool.emitted_arguments_len = 0;
+                String::new()
+            };
+
+            (tool.call_id.clone(), tool.name.clone(), initial_delta)
+        };
+
+        output.push(format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": {}
+                }
+            })
+        ));
+
+        if !initial_delta.is_empty() {
+            self.emit_tool_json_delta(output, idx, initial_delta);
+        }
+    }
+
+    fn maybe_emit_front_buffered_tool_argument_delta(&mut self, output: &mut Vec<String>) {
+        let pending = {
+            let Some(tool) = self.buffered_tool_calls.first_mut() else {
+                return;
+            };
+            if !tool.start_emitted || !Self::tool_supports_live_argument_stream(tool.name.as_str()) {
+                return;
+            }
+            let Some(idx) = tool.content_block_index else {
+                return;
+            };
+            if tool.arguments_buffer.len() <= tool.emitted_arguments_len {
+                return;
+            }
+
+            let delta = tool.arguments_buffer[tool.emitted_arguments_len..].to_string();
+            tool.emitted_arguments_len = tool.arguments_buffer.len();
+            Some((idx, delta))
+        };
+
+        if let Some((idx, delta)) = pending {
+            self.emit_tool_json_delta(output, idx, delta);
+        }
+    }
+
+    fn emit_started_tool_call_completion(
+        &mut self,
+        output: &mut Vec<String>,
+        tool: &BufferedToolCall,
+    ) {
+        let Some(idx) = tool.content_block_index else {
+            self.emit_serialized_tool_call(output, tool);
+            return;
+        };
+
+        let arguments = self.normalized_tool_arguments(tool);
+        let suffix = if Self::tool_supports_live_argument_stream(tool.name.as_str()) {
+            arguments
+                .get(tool.emitted_arguments_len..)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            arguments.clone()
+        };
+
+        if !suffix.is_empty() {
+            self.emit_tool_json_delta(output, idx, suffix);
+        }
+
+        output.push(format!(
+            "event: content_block_stop\ndata: {}\n\n",
+            json!({ "type": "content_block_stop", "index": idx })
+        ));
+
+        if Self::build_background_task_progress_message(tool.name.as_str(), arguments.as_str())
+            .as_deref()
+            != tool.last_progress_message.as_deref()
+        {
+            self.emit_background_task_progress(output, tool.name.as_str(), arguments.as_str());
+        }
+    }
+
     fn emit_serialized_tool_call(&mut self, output: &mut Vec<String>, tool: &BufferedToolCall) {
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
@@ -2252,8 +2505,16 @@ impl TransformResponse {
             }
 
             let tool = self.buffered_tool_calls.remove(0);
-            self.emit_serialized_tool_call(output, &tool);
+            if tool.start_emitted {
+                self.emit_started_tool_call_completion(output, &tool);
+            } else {
+                self.emit_serialized_tool_call(output, &tool);
+            }
             self.cleanup_tool_mappings(&tool);
+        }
+        if !include_incomplete {
+            self.maybe_emit_front_buffered_tool_start(output);
+            self.maybe_emit_front_buffered_tool_progress(output);
         }
         self.sync_phase_from_runtime();
         if !self.has_open_tool_block() {
@@ -2937,6 +3198,10 @@ impl TransformResponse {
             arguments_buffer: arguments,
             consecutive_whitespace_run: 0,
             done_flag: true,
+            start_emitted: false,
+            content_block_index: None,
+            emitted_arguments_len: 0,
+            last_progress_message: None,
         };
         self.saw_tool_call = true;
         self.emit_serialized_tool_call(output, &synthetic_tool);
@@ -3528,6 +3793,23 @@ impl TransformResponse {
                 }
             }
 
+            "response.created" => {
+                if !self.response_created_announced {
+                    self.response_created_announced = true;
+                    self.emit_response_lifecycle_progress(
+                        &mut output,
+                        "请求已发送，正在等待上游开始输出…",
+                    );
+                }
+            }
+
+            "response.in_progress" => {
+                if !self.response_in_progress_announced {
+                    self.response_in_progress_announced = true;
+                    self.emit_response_lifecycle_progress(&mut output, "模型正在处理中…");
+                }
+            }
+
             // 工具调用开始 / 消息项开始 - 严格按照 OpenAI Responses 格式解析
             "response.output_item.added" => {
                 self.flush_text_carryover(&mut output);
@@ -3592,6 +3874,7 @@ impl TransformResponse {
                                 self.emit_function_args_whitespace_overflow_error(&mut output);
                                 return output;
                             }
+                            self.maybe_emit_front_buffered_tool_start(&mut output);
                         }
                         "message" => {
                             self.saw_message_item_added = true;
@@ -3646,6 +3929,8 @@ impl TransformResponse {
                             self.emit_function_args_whitespace_overflow_error(&mut output);
                             return output;
                         }
+                        self.maybe_emit_front_buffered_tool_start(&mut output);
+                        self.maybe_emit_front_buffered_tool_argument_delta(&mut output);
                     } else {
                         self.queue_pending_tool_argument_update(
                             &data,
@@ -3666,6 +3951,8 @@ impl TransformResponse {
                             self.emit_function_args_whitespace_overflow_error(&mut output);
                             return output;
                         }
+                        self.maybe_emit_front_buffered_tool_start(&mut output);
+                        self.maybe_emit_front_buffered_tool_argument_delta(&mut output);
                     } else {
                         self.queue_pending_tool_argument_update(
                             &data,

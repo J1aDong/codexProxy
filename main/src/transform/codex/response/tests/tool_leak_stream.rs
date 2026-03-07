@@ -597,6 +597,77 @@ fn planning_meta_prefix_before_raw_grep_json_is_trimmed() {
 }
 
 #[test]
+fn function_call_added_emits_tool_start_before_done() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let add_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_progress_1",
+                "type": "function_call",
+                "call_id": "call_progress_1",
+                "name": "Read"
+            }
+        })
+    );
+    let delta_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_progress_1",
+            "call_id": "call_progress_1",
+            "delta": "{\"file_path\":\"/tmp/progress.txt\"}"
+        })
+    );
+    let done_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_progress_1",
+                "type": "function_call",
+                "call_id": "call_progress_1",
+                "name": "Read"
+            }
+        })
+    );
+
+    let add_events = transformer.transform_sse_line(&add_line).join("");
+    let delta_events = transformer.transform_sse_line(&delta_line).join("");
+    let done_events = transformer.transform_sse_line(&done_line).join("");
+
+    assert!(
+        add_events.contains("\"type\":\"content_block_start\"")
+            && add_events.contains("\"type\":\"tool_use\"")
+            && add_events.contains("\"id\":\"call_progress_1\"")
+            && add_events.contains("\"name\":\"Read\""),
+        "function_call added should immediately surface a tool_use start"
+    );
+    assert!(
+        !add_events.contains("\"type\":\"content_block_stop\""),
+        "tool_use block should stay open until the function_call is done"
+    );
+    assert!(
+        delta_events.contains("\"type\":\"input_json_delta\"")
+            && delta_events.contains("progress.txt"),
+        "argument deltas should stream while the tool_use block is open"
+    );
+    assert!(
+        done_events.contains("\"type\":\"content_block_stop\""),
+        "function_call done should close the existing tool_use block"
+    );
+    assert!(
+        !done_events.contains("\"type\":\"content_block_start\""),
+        "done should not re-emit a duplicate tool_use start"
+    );
+}
+
+#[test]
 fn structured_function_call_events_still_produce_tool_use() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
@@ -739,20 +810,21 @@ fn orphan_delta_before_output_item_added_is_replayed_after_binding() {
     );
 
     let orphan_events = transformer.transform_sse_line(&orphan_delta).join("");
-    let _ = transformer.transform_sse_line(&add_line);
+    let add_events = transformer.transform_sse_line(&add_line).join("");
     let done_events = transformer.transform_sse_line(&done_line).join("");
+    let all_events = format!("{add_events}{done_events}");
 
     assert!(
         !orphan_events.contains("late-bind.ts"),
         "orphan delta should stay buffered until it can be bound to a function_call"
     );
     assert!(
-        done_events.contains("\"type\":\"tool_use\"")
-            && done_events.contains("\"id\":\"call_late_bind\""),
+        all_events.contains("\"type\":\"tool_use\"")
+            && all_events.contains("\"id\":\"call_late_bind\""),
         "late-bound function_call should still produce tool_use"
     );
     assert!(
-        done_events.contains("late-bind.ts"),
+        all_events.contains("late-bind.ts"),
         "queued delta should replay once the function_call binding exists"
     );
 }
@@ -799,20 +871,21 @@ fn orphan_done_arguments_before_output_item_added_is_replayed_after_binding() {
     );
 
     let orphan_events = transformer.transform_sse_line(&orphan_done_args).join("");
-    let _ = transformer.transform_sse_line(&add_line);
+    let add_events = transformer.transform_sse_line(&add_line).join("");
     let done_events = transformer.transform_sse_line(&done_line).join("");
+    let all_events = format!("{add_events}{done_events}");
 
     assert!(
         !orphan_events.contains("late-done.ts"),
         "orphan done-arguments should be buffered until function_call exists"
     );
     assert!(
-        done_events.contains("\"type\":\"tool_use\"")
-            && done_events.contains("\"id\":\"call_late_done\""),
+        all_events.contains("\"type\":\"tool_use\"")
+            && all_events.contains("\"id\":\"call_late_done\""),
         "late-bound function_call should still produce tool_use"
     );
     assert!(
-        done_events.contains("late-done.ts"),
+        all_events.contains("late-done.ts"),
         "queued done-arguments snapshot should replay once binding exists"
     );
 }
@@ -868,9 +941,9 @@ fn duplicate_active_call_id_is_idempotent_and_does_not_create_extra_tool_use() {
         })
     );
 
-    let _ = transformer.transform_sse_line(&add_first);
-    let _ = transformer.transform_sse_line(&add_duplicate);
-    let mut events = transformer.transform_sse_line(&done);
+    let mut events = transformer.transform_sse_line(&add_first);
+    events.extend(transformer.transform_sse_line(&add_duplicate));
+    events.extend(transformer.transform_sse_line(&done));
     events.extend(transformer.transform_sse_line(&completed));
     let joined = events.join("");
 
@@ -958,11 +1031,11 @@ fn call_id_precedence_prevents_output_index_conflict_argument_hijack() {
         })
     );
 
-    let _ = transformer.transform_sse_line(&add_first);
-    let _ = transformer.transform_sse_line(&add_second_conflict);
-    let _ = transformer.transform_sse_line(&delta_first);
-    let _ = transformer.transform_sse_line(&delta_second);
-    let mut events = transformer.transform_sse_line(&done_first);
+    let mut events = transformer.transform_sse_line(&add_first);
+    events.extend(transformer.transform_sse_line(&add_second_conflict));
+    events.extend(transformer.transform_sse_line(&delta_first));
+    events.extend(transformer.transform_sse_line(&delta_second));
+    events.extend(transformer.transform_sse_line(&done_first));
     events.extend(transformer.transform_sse_line(&done_second));
     let joined = events.join("");
 
@@ -1562,10 +1635,10 @@ fn out_of_order_done_events_wait_for_head_then_flush_in_order() {
         })
     );
 
-    let _ = transformer.transform_sse_line(&add_1);
-    let _ = transformer.transform_sse_line(&add_2);
-    let _ = transformer.transform_sse_line(&delta_1);
-    let _ = transformer.transform_sse_line(&delta_2);
+    let add_1_events = transformer.transform_sse_line(&add_1).join("");
+    let add_2_events = transformer.transform_sse_line(&add_2).join("");
+    let delta_1_events = transformer.transform_sse_line(&delta_1).join("");
+    let delta_2_events = transformer.transform_sse_line(&delta_2).join("");
 
     let done_2_events = transformer.transform_sse_line(&done_2).join("");
     assert!(
@@ -1574,15 +1647,16 @@ fn out_of_order_done_events_wait_for_head_then_flush_in_order() {
     );
 
     let done_1_events = transformer.transform_sse_line(&done_1).join("");
-    let tool_use_count = done_1_events.matches("\"type\":\"tool_use\"").count();
+    let all_events = format!("{add_1_events}{add_2_events}{delta_1_events}{delta_2_events}{done_1_events}");
+    let tool_use_count = all_events.matches("\"type\":\"tool_use\"").count();
     assert_eq!(
         tool_use_count, 2,
         "once head completes, both buffered calls should flush in order"
     );
-    let head_pos = done_1_events
+    let head_pos = all_events
         .find("\"id\":\"call_head\"")
         .expect("head call should exist");
-    let tail_pos = done_1_events
+    let tail_pos = all_events
         .find("\"id\":\"call_tail\"")
         .expect("tail call should exist");
     assert!(
@@ -1590,7 +1664,7 @@ fn out_of_order_done_events_wait_for_head_then_flush_in_order() {
         "buffer flush order must follow tool queue order"
     );
     assert!(
-        done_1_events.contains("head.ts") && done_1_events.contains("tail.ts"),
+        all_events.contains("head.ts") && all_events.contains("tail.ts"),
         "buffered arguments must remain attached to their original calls"
     );
 }
@@ -1629,19 +1703,23 @@ fn completed_event_flushes_incomplete_buffered_tool_call() {
         })
     );
 
-    let _ = transformer.transform_sse_line(&add);
-    let _ = transformer.transform_sse_line(&delta);
+    let add_events = transformer.transform_sse_line(&add).join("");
+    let delta_events = transformer.transform_sse_line(&delta).join("");
     let completed_events = transformer.transform_sse_line(&completed).join("");
 
     assert!(
-        completed_events.contains("\"type\":\"tool_use\"")
-            && completed_events.contains("\"id\":\"call_incomplete\""),
-        "response.completed must flush buffered tool_use blocks even if item.done is missing"
+        add_events.contains("\"type\":\"tool_use\"")
+            && add_events.contains("\"id\":\"call_incomplete\""),
+        "function_call added should already surface the incomplete tool_use block"
     );
     assert!(
-        completed_events.contains("\"type\":\"input_json_delta\"")
-            && completed_events.contains("incomplete.ts"),
-        "response.completed flush must preserve buffered arguments"
+        delta_events.contains("\"type\":\"input_json_delta\"")
+            && delta_events.contains("incomplete.ts"),
+        "buffered arguments should stream before response.completed arrives"
+    );
+    assert!(
+        completed_events.contains("\"type\":\"content_block_stop\""),
+        "response.completed must still close the open tool_use block if item.done is missing"
     );
     assert!(
         completed_events.contains("\"type\":\"message_stop\""),
@@ -2142,10 +2220,10 @@ fn ambiguous_parallel_delta_without_metadata_is_not_attached() {
         })
     );
 
-    let _ = transformer.transform_sse_line(&add_1);
-    let _ = transformer.transform_sse_line(&add_2);
-    let _ = transformer.transform_sse_line(&ambiguous_delta);
-    let mut events = transformer.transform_sse_line(&done_1);
+    let mut events = transformer.transform_sse_line(&add_1);
+    events.extend(transformer.transform_sse_line(&add_2));
+    events.extend(transformer.transform_sse_line(&ambiguous_delta));
+    events.extend(transformer.transform_sse_line(&done_1));
     events.extend(transformer.transform_sse_line(&done_2));
     events.extend(transformer.transform_sse_line(&completed));
 
@@ -2198,18 +2276,19 @@ fn unscoped_text_delta_is_deferred_until_tool_window_closes() {
         })
     );
 
-    let _ = transformer.transform_sse_line(&add);
+    let add_events = transformer.transform_sse_line(&add).join("");
     let during_tool_window = transformer.transform_sse_line(&unscoped_text).join("");
     let after_tool_window = transformer.transform_sse_line(&done).join("");
+    let all_events = format!("{add_events}{after_tool_window}");
 
     assert!(
         !during_tool_window.contains("I will summarize"),
         "unscoped text should be buffered while tool window is still open"
     );
     assert!(
-        after_tool_window.contains("\"type\":\"tool_use\"")
-            && after_tool_window.contains("\"id\":\"call_defer_text\""),
-        "tool use should still be emitted when the call completes"
+        all_events.contains("\"type\":\"tool_use\"")
+            && all_events.contains("\"id\":\"call_defer_text\""),
+        "tool use should still be emitted across the add/done lifecycle"
     );
     assert!(
         after_tool_window.contains("I will summarize once the tool call is done."),

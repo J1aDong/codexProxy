@@ -327,6 +327,52 @@ fn response_refusal_stream_maps_to_text_blocks_and_refusal_stop_reason() {
 }
 
 #[test]
+fn agent_tool_start_emits_generic_background_progress_before_done() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_generic_1",
+                "type": "function_call",
+                "call_id": "call_agent_generic_1",
+                "name": "Agent"
+            }
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&tool_added).join("");
+    println!("JOINED={}", joined);
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("正在启动后台 explorer"));
+    assert!(joined.contains("\"type\":\"thinking_delta\""));
+}
+
+#[test]
+fn response_in_progress_emits_single_lifecycle_heartbeat() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let in_progress = format!(
+        "data: {}",
+        json!({
+            "type": "response.in_progress",
+            "response": { "status": "in_progress" }
+        })
+    );
+
+    let first = transformer.transform_sse_line(&in_progress).join("");
+    let second = transformer.transform_sse_line(&in_progress).join("");
+
+    assert!(first.contains("模型正在处理中"));
+    assert!(first.contains("\"type\":\"thinking_delta\""));
+    assert!(!second.contains("模型正在处理中"));
+}
+
+#[test]
 fn web_search_call_progress_events_surface_as_thinking_updates() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
@@ -556,9 +602,10 @@ fn mismatched_item_id_is_normalized_by_output_index_for_tool_arguments() {
         })
     );
 
-    let _ = transformer.transform_sse_line(&add);
-    let _ = transformer.transform_sse_line(&mismatched_delta);
-    let joined = transformer.transform_sse_line(&done).join("");
+    let add_events = transformer.transform_sse_line(&add).join("");
+    let delta_events = transformer.transform_sse_line(&mismatched_delta).join("");
+    let done_events = transformer.transform_sse_line(&done).join("");
+    let joined = format!("{add_events}{delta_events}{done_events}");
 
     assert!(
         joined.contains("\"type\":\"tool_use\"") && joined.contains("\"id\":\"call_sync_primary\""),
