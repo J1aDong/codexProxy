@@ -74,6 +74,94 @@ fn request_contains_environment_context(request_text_corpus: &str) -> bool {
         .contains("<environment_context>")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestAugmentationMode {
+    Agent,
+    Passthrough,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestAugmentationDecision {
+    mode: RequestAugmentationMode,
+    reasons: Vec<&'static str>,
+}
+
+impl RequestAugmentationDecision {
+    fn is_agent(&self) -> bool {
+        matches!(self.mode, RequestAugmentationMode::Agent)
+    }
+
+    fn mode_label(&self) -> &'static str {
+        match self.mode {
+            RequestAugmentationMode::Agent => "agent",
+            RequestAugmentationMode::Passthrough => "passthrough",
+        }
+    }
+}
+
+fn message_contains_agentic_tool_state(message: &crate::models::Message) -> bool {
+    let Some(MessageContent::Blocks(blocks)) = message.content.as_ref() else {
+        return false;
+    };
+
+    blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+        )
+    })
+}
+
+fn decide_request_augmentation(
+    request: &AnthropicRequest,
+    request_text_corpus: &str,
+) -> RequestAugmentationDecision {
+    let mut reasons = Vec::new();
+
+    if request
+        .system
+        .as_ref()
+        .map(|system| !system.to_string().trim().is_empty())
+        .unwrap_or(false)
+    {
+        reasons.push("system");
+    }
+
+    if request
+        .tools
+        .as_ref()
+        .map(|tools| !tools.is_empty())
+        .unwrap_or(false)
+    {
+        reasons.push("tools");
+    }
+
+    if request.messages.iter().any(message_contains_agentic_tool_state) {
+        reasons.push("tool_state");
+    }
+
+    if request_contains_environment_context(request_text_corpus) {
+        reasons.push("environment_context");
+    }
+
+    if request
+        .system
+        .as_ref()
+        .map(|system| is_wrapped_agents_instructions(&system.to_string()))
+        .unwrap_or(false)
+    {
+        reasons.push("wrapped_agents_system");
+    }
+
+    let mode = if reasons.is_empty() {
+        RequestAugmentationMode::Passthrough
+    } else {
+        RequestAugmentationMode::Agent
+    };
+
+    RequestAugmentationDecision { mode, reasons }
+}
+
 fn collect_request_text_corpus(request: &AnthropicRequest) -> String {
     let mut parts = Vec::new();
 
@@ -409,13 +497,18 @@ fn sanitize_cache_key_segment(input: &str, max_len: usize) -> String {
 fn build_prompt_cache_key(
     request_cwd: Option<&str>,
     codex_model: &str,
-    custom_injection_prompt: &str,
+    applied_custom_injection_prompt: Option<&str>,
+    applied_static_instructions: Option<&str>,
     system_text: Option<&str>,
 ) -> String {
     let mut key_material = Vec::new();
-    key_material.extend_from_slice(CODEX_INSTRUCTIONS.as_bytes());
+    if let Some(instructions) = applied_static_instructions {
+        key_material.extend_from_slice(instructions.as_bytes());
+    }
     key_material.push(PROMPT_CACHE_KEY_SEP);
-    key_material.extend_from_slice(custom_injection_prompt.trim().as_bytes());
+    if let Some(custom_prompt) = applied_custom_injection_prompt {
+        key_material.extend_from_slice(custom_prompt.trim().as_bytes());
+    }
     key_material.push(PROMPT_CACHE_KEY_SEP);
     if let Some(system) = system_text {
         key_material.extend_from_slice(system.trim().as_bytes());
@@ -942,6 +1035,7 @@ impl TransformRequest {
             true,
             true,
             false,
+            anthropic_body.stream,
         )
     }
 
@@ -954,6 +1048,7 @@ impl TransformRequest {
         enable_tool_schema_compaction: bool,
         enable_codex_fast_mode: bool,
         enable_skill_routing_hint: bool,
+        _effective_stream: bool,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
 
@@ -999,6 +1094,17 @@ impl TransformRequest {
 
         let request_text_corpus = collect_request_text_corpus(anthropic_body);
         let request_cwd = extract_request_cwd(&request_text_corpus);
+        let augmentation = decide_request_augmentation(anthropic_body, &request_text_corpus);
+        let apply_agent_augmentations = augmentation.is_agent();
+        let augmentation_reasons = if augmentation.reasons.is_empty() {
+            "none".to_string()
+        } else {
+            augmentation.reasons.join(",")
+        };
+        log(&format!(
+            "🧩 [Transform] request_augmentation_mode={} augmentation_reasons=[{}]",
+            augmentation.mode_label(), augmentation_reasons
+        ));
         let mut system_text_for_cache_key = None::<String>;
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
@@ -1056,7 +1162,9 @@ impl TransformRequest {
             }
         }
 
-        if !custom_injection_prompt.trim().is_empty() {
+        let trimmed_custom_injection_prompt = custom_injection_prompt.trim();
+        let custom_prompt_applied = apply_agent_augmentations && !trimmed_custom_injection_prompt.is_empty();
+        if custom_prompt_applied {
             log(&format!(
                 "🎯 [Transform] Injecting custom global prompt ({} chars)",
                 custom_injection_prompt.len()
@@ -1073,7 +1181,7 @@ impl TransformRequest {
 
         // 追加对话历史
         final_input.extend(chat_messages);
-        if enable_skill_routing_hint {
+        if apply_agent_augmentations && enable_skill_routing_hint {
             if let Some(skill_name) = detect_requested_skill_name(anthropic_body) {
                 log(&format!(
                     "🎯 [Transform] Skill intent matched, nudging Skill tool: {}",
@@ -1116,10 +1224,12 @@ impl TransformRequest {
             parallel_tool_calls,
             transformed_tools.len()
         ));
+        let static_instructions_applied = apply_agent_augmentations;
         let prompt_cache_key = build_prompt_cache_key(
             request_cwd.as_deref(),
             final_codex_model,
-            custom_injection_prompt,
+            custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
+            static_instructions_applied.then_some(CODEX_INSTRUCTIONS),
             system_text_for_cache_key.as_deref(),
         );
         let thinking_disabled = anthropic_body.is_thinking_disabled();
@@ -1137,6 +1247,11 @@ impl TransformRequest {
             reasoning_summary_requested,
             reasoning_summary_mode.as_deref().unwrap_or("omitted"),
             include_reasoning_encrypted_content
+        ));
+        log(&format!(
+            "🧩 [Transform] custom_prompt_applied={} static_instructions_applied={}",
+            custom_prompt_applied,
+            static_instructions_applied
         ));
 
         let mut reasoning = json!({ "effort": reasoning_effort.as_str() });
@@ -1166,8 +1281,10 @@ impl TransformRequest {
                 obj.insert("service_tier".to_string(), json!("priority"));
             }
         }
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("instructions".to_string(), json!(CODEX_INSTRUCTIONS));
+        if static_instructions_applied {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("instructions".to_string(), json!(CODEX_INSTRUCTIONS));
+            }
         }
         if include_reasoning_encrypted_content {
             if let Some(obj) = body.as_object_mut() {
@@ -1704,11 +1821,11 @@ impl TransformRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_tool_description, detect_requested_skill_name, extract_request_cwd,
-        TransformRequest,
+        compact_tool_description, decide_request_augmentation, detect_requested_skill_name,
+        extract_request_cwd, RequestAugmentationMode, TransformRequest,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn sample_request() -> AnthropicRequest {
         serde_json::from_value(json!({
@@ -1723,6 +1840,31 @@ mod tests {
             "stream": true
         }))
         .expect("valid anthropic request")
+    }
+
+    fn sample_passthrough_request() -> AnthropicRequest {
+        serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type":"text","text":"hello"}]
+                }
+            ]
+        }))
+        .expect("valid anthropic request")
+    }
+
+    fn input_texts(body: &Value) -> Vec<String> {
+        body.get("input")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flat_map(|blocks| blocks.iter())
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .map(|text| text.to_string())
+            .collect()
     }
 
     #[test]
@@ -2275,6 +2417,102 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn tool_requests_remain_agent_shaped_when_thinking_disabled() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "name": "Read",
+                "description": "Read files",
+                "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+            }],
+            "thinking": {"type": "disabled"},
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+        let augmentation = decide_request_augmentation(&request, "hello");
+
+        assert_eq!(augmentation.mode, RequestAugmentationMode::Agent);
+        assert!(augmentation.reasons.contains(&"tools"));
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert!(
+            body.get("instructions").is_some(),
+            "tool-capable requests should still receive agent instructions"
+        );
+        assert!(
+            body.pointer("/reasoning/summary").is_none(),
+            "thinking.disabled should still suppress visible reasoning summary"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_ignores_inactive_agent_prefixes_for_passthrough_requests() {
+        let request = sample_passthrough_request();
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body_a, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt A",
+            "gpt-5.3-codex",
+        );
+        let (body_b, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt B",
+            "gpt-5.3-codex",
+        );
+
+        assert_eq!(
+            body_a.get("prompt_cache_key"),
+            body_b.get("prompt_cache_key"),
+            "passthrough cache key should ignore inactive static prefixes"
+        );
+    }
+
+    #[test]
+    fn title_like_meta_requests_stay_passthrough_without_agent_prefixes() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": "根据用户的第一条消息，生成一个简短的对话标题（10字以内）。只输出标题，不要有任何其他内容、标点符号或引号。
+
+用户消息：你好啊"
+            }],
+            "thinking": {"type": "disabled"},
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+        let augmentation = decide_request_augmentation(
+            &request,
+            "根据用户的第一条消息，生成一个简短的对话标题（10字以内）。只输出标题，不要有任何其他内容、标点符号或引号。
+
+用户消息：你好啊",
+        );
+
+        assert_eq!(augmentation.mode, RequestAugmentationMode::Passthrough);
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+        assert!(body.get("instructions").is_none());
+        let texts = input_texts(&body);
+        assert_eq!(texts.len(), 1, "meta request should keep a single original user text item");
+        assert!(
+            texts[0].contains("用户消息：你好啊"),
+            "original request text should pass through untouched"
+        );
+    }
+
     #[test]
     fn codex_fast_mode_defaults_to_priority_service_tier() {
         let request = sample_request();
@@ -2302,6 +2540,7 @@ mod tests {
             true,
             false,
             false,
+            true,
         );
 
         assert!(
@@ -2310,10 +2549,63 @@ mod tests {
         );
     }
 
+
     #[test]
-    fn includes_static_instructions_for_plain_requests() {
+    fn codex_request_upstream_transport_remains_streaming_for_non_stream_clients() {
+        let request = sample_passthrough_request();
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        assert_eq!(
+            body.get("stream").and_then(|v| v.as_bool()),
+            Some(true),
+            "codex upstream transport should stay streaming even for non-stream clients"
+        );
+    }
+
+    #[test]
+    fn codex_request_upstream_transport_stays_streaming_for_stream_clients() {
         let request = sample_request();
         let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        assert_eq!(
+            body.get("stream").and_then(|v| v.as_bool()),
+            Some(true),
+            "codex upstream transport should keep stream=true requests streaming"
+        );
+    }
+
+    #[test]
+    fn plain_text_requests_use_passthrough_augmentation_and_skip_agent_prefixes() {
+        let request = sample_passthrough_request();
+        let mapping = ReasoningEffortMapping::default();
+        let augmentation = decide_request_augmentation(&request, "hello");
+
+        assert_eq!(augmentation.mode, RequestAugmentationMode::Passthrough);
+        assert!(augmentation.reasons.is_empty(), "plain text request should not have agent reasons");
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert!(
+            body.get("instructions").is_none(),
+            "passthrough requests should not carry static codex instructions"
+        );
+        assert_eq!(input_texts(&body), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn system_requests_include_agent_prefixes() {
+        let request = sample_request();
+        let mapping = ReasoningEffortMapping::default();
+        let augmentation = decide_request_augmentation(&request, "System prompt
+hello");
+
+        assert_eq!(augmentation.mode, RequestAugmentationMode::Agent);
+        assert!(augmentation.reasons.contains(&"system"));
 
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
@@ -2324,7 +2616,11 @@ mod tests {
             .unwrap_or_default();
         assert!(
             instructions.starts_with("You are a coding agent running in the Codex CLI"),
-            "default codex request should carry the official static instructions"
+            "agent-shaped requests should carry the official static instructions"
+        );
+        assert!(
+            input_texts(&body).iter().any(|text| text == "global prompt"),
+            "agent-shaped requests should inject the custom global prompt"
         );
     }
 
@@ -2524,6 +2820,7 @@ mod tests {
             &mapping,
             "",
             "gpt-5.3-codex",
+            true,
             true,
             true,
             true,

@@ -257,6 +257,7 @@ impl TransformBackend for GeminiBackend {
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
         _ctx: &TransformContext,
+        _effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();

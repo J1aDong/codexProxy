@@ -373,7 +373,7 @@ fn response_in_progress_emits_single_lifecycle_heartbeat() {
 }
 
 #[test]
-fn web_search_progress_is_suppressed_when_visible_thinking_disabled() {
+fn web_search_tool_stream_is_still_visible_when_thinking_disabled() {
     let mut transformer = TransformResponse::new_with_visible_thinking("gpt-5.3-codex", false);
 
     let search_added = format!(
@@ -388,29 +388,45 @@ fn web_search_progress_is_suppressed_when_visible_thinking_disabled() {
             }
         })
     );
-    let search_searching = format!(
+    let search_done = format!(
         "data: {}",
         json!({
-            "type": "response.web_search_call.searching",
+            "type": "response.output_item.done",
             "output_index": 1,
-            "item_id": "ws_1"
+            "item": {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "popular ai tools",
+                    "sources": [
+                        {
+                            "type": "url",
+                            "url": "https://example.com/tools",
+                            "title": "Popular AI Tools"
+                        }
+                    ]
+                }
+            }
         })
     );
 
     let joined = format!(
         "{}{}",
         transformer.transform_sse_line(&search_added).join(""),
-        transformer.transform_sse_line(&search_searching).join("")
+        transformer.transform_sse_line(&search_done).join("")
     );
 
-    assert!(
-        !joined.contains("\"type\":\"thinking_delta\""),
-        "thinking-disabled requests should suppress web search progress updates"
-    );
+    assert!(joined.contains("\"type\":\"server_tool_use\""));
+    assert!(joined.contains("\"type\":\"input_json_delta\""));
+    assert!(joined.contains("popular ai tools"));
+    assert!(joined.contains("\"type\":\"web_search_tool_result\""));
+    assert!(!joined.contains("\"type\":\"thinking_delta\""));
 }
 
 #[test]
-fn web_search_call_progress_events_surface_as_thinking_updates() {
+fn web_search_call_emits_server_tool_use_and_result_blocks() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
     let search_added = format!(
@@ -444,7 +460,18 @@ fn web_search_call_progress_events_surface_as_thinking_updates() {
                 "status": "completed",
                 "action": {
                     "type": "search",
-                    "query": "popular ai tools"
+                    "query": "popular ai tools",
+                    "sources": [
+                        {
+                            "type": "url",
+                            "url": "https://example.com/tools",
+                            "title": "Popular AI Tools"
+                        },
+                        {
+                            "type": "url",
+                            "url": "https://example.com/trends"
+                        }
+                    ]
                 }
             }
         })
@@ -483,10 +510,17 @@ fn web_search_call_progress_events_surface_as_thinking_updates() {
     events.extend(transformer.transform_sse_line(&final_text));
     let joined = events.join("");
 
-    assert!(joined.contains("正在发起网页搜索"));
-    assert!(joined.contains("正在检索搜索结果"));
-    assert!(joined.contains("已拿到搜索结果，继续整理"));
-    assert!(joined.contains("\"type\":\"thinking_delta\""));
+    assert!(joined.contains("\"type\":\"server_tool_use\""));
+    assert!(joined.contains("\"name\":\"web_search\""));
+    assert!(joined.contains("\"type\":\"input_json_delta\""));
+    assert!(joined.contains("popular ai tools"));
+    assert!(joined.contains("\"type\":\"web_search_tool_result\""));
+    assert!(joined.contains("https://example.com/tools"));
+    assert!(joined.contains("https://example.com/trends"));
+    assert!(!joined.contains("正在发起网页搜索"));
+    assert!(!joined.contains("正在检索搜索结果"));
+    assert!(!joined.contains("已拿到搜索结果，继续整理"));
+    assert!(!joined.contains("\"type\":\"thinking_delta\""));
     assert!(joined.contains("整理好了"));
 }
 

@@ -47,6 +47,7 @@ impl TransformBackend for AnthropicBackend {
         anthropic_body: &AnthropicRequest,
         _log_tx: Option<&broadcast::Sender<String>>,
         _ctx: &TransformContext,
+        _effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();

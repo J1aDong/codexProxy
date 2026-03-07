@@ -33,11 +33,12 @@ enum TextRoutingDecision {
     DeferUntilToolWindowCloses,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WebSearchProgressStage {
-    Started,
-    Searching,
-    Completed,
+#[derive(Clone)]
+struct ActiveWebSearchCall {
+    output_index: Option<u64>,
+    item_id: Option<String>,
+    content_block_index: usize,
+    input_closed: bool,
 }
 
 #[derive(Default)]
@@ -440,10 +441,10 @@ pub struct TransformResponse {
     had_reasoning_in_response: bool,
     // Track if we've seen a message-type output_item.added (means phase detection is explicit)
     saw_message_item_added: bool,
-    web_search_started_announced: bool,
-    web_search_searching_announced: bool,
-    web_search_completion_pending: bool,
-    web_search_completion_announced: bool,
+    next_server_tool_use_seq: u64,
+    active_web_search_calls: HashMap<String, ActiveWebSearchCall>,
+    web_search_call_by_output_index: HashMap<u64, String>,
+    web_search_call_by_item_id: HashMap<String, String>,
     response_created_announced: bool,
     response_in_progress_announced: bool,
     high_risk_leak_question_emitted: bool,
@@ -1441,10 +1442,10 @@ impl TransformResponse {
             in_commentary_phase: false,
             had_reasoning_in_response: false,
             saw_message_item_added: false,
-            web_search_started_announced: false,
-            web_search_searching_announced: false,
-            web_search_completion_pending: false,
-            web_search_completion_announced: false,
+            next_server_tool_use_seq: 0,
+            active_web_search_calls: HashMap::new(),
+            web_search_call_by_output_index: HashMap::new(),
+            web_search_call_by_item_id: HashMap::new(),
             response_created_announced: false,
             response_in_progress_announced: false,
             high_risk_leak_question_emitted: false,
@@ -2865,56 +2866,215 @@ data: {}
         }
     }
 
-    fn emit_web_search_progress(
+    fn lookup_active_web_search_call_id(
+        &self,
+        output_index: Option<u64>,
+        item_id: Option<&str>,
+    ) -> Option<String> {
+        output_index
+            .and_then(|idx| self.web_search_call_by_output_index.get(&idx).cloned())
+            .or_else(|| {
+                item_id.and_then(|id| self.web_search_call_by_item_id.get(id).cloned())
+            })
+    }
+
+    fn clear_active_web_search_call(&mut self, server_tool_use_id: &str) {
+        if let Some(call) = self.active_web_search_calls.remove(server_tool_use_id) {
+            if let Some(output_index) = call.output_index {
+                self.web_search_call_by_output_index.remove(&output_index);
+            }
+            if let Some(item_id) = call.item_id {
+                self.web_search_call_by_item_id.remove(&item_id);
+            }
+        }
+    }
+
+    fn register_active_web_search_call(
         &mut self,
         output: &mut Vec<String>,
-        stage: WebSearchProgressStage,
-    ) {
-        let message = match stage {
-            WebSearchProgressStage::Started => {
-                if self.web_search_started_announced {
-                    return;
+        output_index: Option<u64>,
+        item_id: Option<&str>,
+    ) -> String {
+        if let Some(existing) = self.lookup_active_web_search_call_id(output_index, item_id) {
+            return existing;
+        }
+
+        self.close_open_text_block(output);
+        self.close_open_thinking_block(output);
+
+        let idx = self.content_index;
+        self.content_index += 1;
+        self.next_server_tool_use_seq += 1;
+        let server_tool_use_id = format!(
+            "srvtoolu_{}_{}",
+            chrono::Utc::now().timestamp_millis(),
+            self.next_server_tool_use_seq
+        );
+
+        output.push(format!(
+            "event: content_block_start
+data: {}
+
+",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": server_tool_use_id,
+                    "name": "web_search",
+                    "input": {},
+                    "caller": { "type": "direct" }
                 }
-                self.web_search_started_announced = true;
-                "正在发起网页搜索…"
-            }
-            WebSearchProgressStage::Searching => {
-                if self.web_search_searching_announced {
-                    return;
-                }
-                self.web_search_searching_announced = true;
-                "正在检索搜索结果…"
-            }
-            WebSearchProgressStage::Completed => {
-                if self.web_search_completion_announced {
-                    return;
-                }
-                self.web_search_completion_announced = true;
-                self.web_search_completion_pending = false;
-                "已拿到搜索结果，继续整理…"
-            }
+            })
+        ));
+        self.emit_tool_json_delta(output, idx, String::new());
+
+        let call = ActiveWebSearchCall {
+            output_index,
+            item_id: item_id.map(|value| value.to_string()),
+            content_block_index: idx,
+            input_closed: false,
         };
 
-        self.open_thinking_block_if_needed(output);
-        self.emit_thinking_delta(output, message);
-        self.emit_thinking_delta(output, "\n");
-    }
-
-    fn mark_web_search_completion_pending(&mut self) {
-        if self.web_search_completion_announced {
-            return;
+        if let Some(output_index) = output_index {
+            self.web_search_call_by_output_index
+                .insert(output_index, server_tool_use_id.clone());
         }
-        self.web_search_completion_pending = true;
+        if let Some(item_id) = item_id {
+            self.web_search_call_by_item_id
+                .insert(item_id.to_string(), server_tool_use_id.clone());
+        }
+        self.active_web_search_calls
+            .insert(server_tool_use_id.clone(), call);
+
+        server_tool_use_id
     }
 
-    fn maybe_emit_pending_web_search_completion_before_visible_output(
+    fn build_web_search_result_entries(action: &Value) -> Vec<Value> {
+        action
+            .get("sources")
+            .and_then(|value| value.as_array())
+            .map(|sources| {
+                sources
+                    .iter()
+                    .filter_map(|source| {
+                        let url = source.get("url").and_then(|value| value.as_str())?;
+                        let title = source
+                            .get("title")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(url);
+                        let page_age = source
+                            .get("page_age")
+                            .or_else(|| source.get("pageAge"))
+                            .and_then(|value| value.as_str());
+                        let encrypted_content = source
+                            .get("encrypted_content")
+                            .or_else(|| source.get("encryptedContent"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+
+                        Some(json!({
+                            "type": "web_search_result",
+                            "title": title,
+                            "url": url,
+                            "encrypted_content": encrypted_content,
+                            "page_age": page_age
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn emit_web_search_tool_completion(
         &mut self,
         output: &mut Vec<String>,
+        action: Option<&Value>,
+        output_index: Option<u64>,
+        item_id: Option<&str>,
     ) {
-        if !self.web_search_completion_pending || self.web_search_completion_announced {
-            return;
+        let server_tool_use_id = self.register_active_web_search_call(output, output_index, item_id);
+
+        let (content_block_index, already_closed) = match self.active_web_search_calls.get(&server_tool_use_id) {
+            Some(call) => (call.content_block_index, call.input_closed),
+            None => return,
+        };
+
+        if !already_closed {
+            let query = action
+                .and_then(|value| value.get("query"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !query.is_empty() {
+                self.emit_tool_json_delta(
+                    output,
+                    content_block_index,
+                    json!({ "query": query }).to_string(),
+                );
+            }
+            output.push(format!(
+                "event: content_block_stop
+data: {}
+
+",
+                json!({ "type": "content_block_stop", "index": content_block_index })
+            ));
+            if let Some(call) = self.active_web_search_calls.get_mut(&server_tool_use_id) {
+                call.input_closed = true;
+            }
         }
-        self.emit_web_search_progress(output, WebSearchProgressStage::Completed);
+
+        let results = action
+            .map(Self::build_web_search_result_entries)
+            .unwrap_or_default();
+        if !results.is_empty() {
+            let idx = self.content_index;
+            self.content_index += 1;
+            output.push(format!(
+                "event: content_block_start
+data: {}
+
+",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": server_tool_use_id,
+                        "content": results
+                    }
+                })
+            ));
+            output.push(format!(
+                "event: content_block_stop
+data: {}
+
+",
+                json!({ "type": "content_block_stop", "index": idx })
+            ));
+        }
+
+        self.clear_active_web_search_call(&server_tool_use_id);
+    }
+
+    fn close_open_web_search_calls(&mut self, output: &mut Vec<String>) {
+        let active_ids: Vec<String> = self.active_web_search_calls.keys().cloned().collect();
+        for server_tool_use_id in active_ids {
+            let Some(call) = self.active_web_search_calls.get(&server_tool_use_id).cloned() else {
+                continue;
+            };
+            if !call.input_closed {
+                output.push(format!(
+                    "event: content_block_stop
+data: {}
+
+",
+                    json!({ "type": "content_block_stop", "index": call.content_block_index })
+                ));
+            }
+            self.clear_active_web_search_call(&server_tool_use_id);
+        }
     }
 
     fn extract_content_part_text<'a>(data: &'a Value) -> Option<&'a str> {
@@ -3738,6 +3898,7 @@ data: {}
 
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
+        self.close_open_web_search_calls(output);
         if self.flush_serialized_tool_calls(output, true) {
             self.emit_function_args_whitespace_overflow_error(output);
             return;
@@ -3828,6 +3989,7 @@ data: {}
 
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
+        self.close_open_web_search_calls(output);
         let _ = self.flush_serialized_tool_calls(output, true);
         self.flush_deferred_unscoped_text(output, true);
         self.close_open_text_block(output);
@@ -3934,9 +4096,7 @@ data: {}
                     return output;
                 }
 
-                self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
-
-                // Only close thinking block if text will NOT be redirected to thinking
+                                // Only close thinking block if text will NOT be redirected to thinking
                 // (avoids unnecessary open/close cycles during commentary)
                 let redirect_to_thinking = self.in_commentary_phase
                     || (self.had_reasoning_in_response && !self.saw_message_item_added);
@@ -3967,11 +4127,7 @@ data: {}
                             return output;
                         }
 
-                        self.maybe_emit_pending_web_search_completion_before_visible_output(
-                            &mut output,
-                        );
-
-                        let redirect_to_thinking = self.in_commentary_phase
+                                                let redirect_to_thinking = self.in_commentary_phase
                             || (self.had_reasoning_in_response && !self.saw_message_item_added);
                         if !redirect_to_thinking {
                             self.close_open_thinking_block(&mut output);
@@ -4171,9 +4327,10 @@ data: {}
                             }
                         }
                         "web_search_call" => {
-                            self.emit_web_search_progress(
+                            self.register_active_web_search_call(
                                 &mut output,
-                                WebSearchProgressStage::Started,
+                                output_index,
+                                item_id,
                             );
                         }
                         _ => {}
@@ -4181,17 +4338,16 @@ data: {}
                 }
             }
 
-            "response.web_search_call.in_progress" => {
-                self.emit_web_search_progress(&mut output, WebSearchProgressStage::Started);
+            "response.web_search_call.in_progress" | "response.web_search_call.searching" => {
+                let metadata = self.normalized_event_metadata(&data);
+                self.register_active_web_search_call(
+                    &mut output,
+                    metadata.output_index,
+                    metadata.item_id.as_deref(),
+                );
             }
 
-            "response.web_search_call.searching" => {
-                self.emit_web_search_progress(&mut output, WebSearchProgressStage::Searching);
-            }
-
-            "response.web_search_call.completed" => {
-                self.mark_web_search_completion_pending();
-            }
+            "response.web_search_call.completed" => {}
 
             // 工具参数增量更新
             "response.function_call_arguments.delta" | "response.function_call_arguments_delta" => {
@@ -4309,7 +4465,13 @@ data: {}
                         self.close_open_text_block(&mut output);
                     }
                     "web_search_call" => {
-                        self.mark_web_search_completion_pending();
+                        let action = item.and_then(|it| it.get("action"));
+                        self.emit_web_search_tool_completion(
+                            &mut output,
+                            action,
+                            output_index,
+                            item_id,
+                        );
                     }
                     _ => {
                         // 兼容旧流：没有 item 元数据时回退关闭最近缓冲的 tool call
@@ -4333,19 +4495,16 @@ data: {}
 
             // 响应完成 - 关键：确保完整的事件序列
             "response.completed" => {
-                self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
                 self.emit_terminal_events(&mut output, &data, false);
             }
 
             // 上游别名事件：与 response.completed 语义等价
             "response.done" => {
-                self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
                 self.emit_terminal_events(&mut output, &data, false);
             }
 
             // 响应不完整但已终止（例如 max_output_tokens / context limit）
             "response.incomplete" => {
-                self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
                 self.emit_terminal_events(&mut output, &data, true);
             }
 

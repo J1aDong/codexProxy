@@ -39,6 +39,7 @@ pub trait TransformBackend: Send + Sync {
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
         ctx: &TransformContext,
+        effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String);
 

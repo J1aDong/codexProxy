@@ -15,6 +15,7 @@ impl TransformBackend for CodexBackend {
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
         ctx: &TransformContext,
+        effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
         TransformRequest::transform_with_options(
@@ -26,6 +27,7 @@ impl TransformBackend for CodexBackend {
             ctx.enable_codex_tool_schema_compaction,
             ctx.enable_codex_fast_mode,
             ctx.enable_skill_routing_hint,
+            effective_stream,
         )
     }
 

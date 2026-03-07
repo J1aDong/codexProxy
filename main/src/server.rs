@@ -298,6 +298,7 @@ fn transform_request_with_optional_codex_effort_override(
     ctx: &TransformContext,
     model_name: &str,
     reasoning_effort_override: Option<ReasoningEffort>,
+    effective_stream: bool,
 ) -> (Value, String) {
     if converter.eq_ignore_ascii_case("codex") {
         if let Some(override_effort) = reasoning_effort_override {
@@ -314,6 +315,7 @@ fn transform_request_with_optional_codex_effort_override(
                 ctx.enable_codex_tool_schema_compaction,
                 ctx.enable_codex_fast_mode,
                 ctx.enable_skill_routing_hint,
+                effective_stream,
             );
         }
     }
@@ -322,6 +324,7 @@ fn transform_request_with_optional_codex_effort_override(
         anthropic_body,
         Some(log_tx),
         ctx,
+        effective_stream,
         Some(model_name.to_string()),
     )
 }
@@ -386,6 +389,7 @@ fn summarize_request_messages(messages: &[Message]) -> String {
 
 #[derive(Clone, Copy)]
 struct StreamRuntimeOptions {
+    #[allow(dead_code)]
     force_stream_for_codex: bool,
     enable_sse_frame_parser: bool,
     enable_stream_heartbeat: bool,
@@ -1527,38 +1531,13 @@ fn drain_complete_lines(buffer: &mut String) -> Vec<String> {
     lines
 }
 
-fn accept_header_allows_sse(accept_header: Option<&str>) -> bool {
-    let Some(value) = accept_header else {
-        return false;
-    };
-    let normalized = value.to_ascii_lowercase();
-    normalized.contains("text/event-stream") || normalized.contains("*/*")
-}
-
-fn accept_header_explicit_json_only(accept_header: Option<&str>) -> bool {
-    let Some(value) = accept_header else {
-        return false;
-    };
-    let normalized = value.to_ascii_lowercase();
-    normalized.contains("application/json") && !normalized.contains("text/event-stream")
-}
-
 fn resolve_effective_stream(
     requested_stream: bool,
-    converter: &str,
-    accept_header: Option<&str>,
-    opts: StreamRuntimeOptions,
+    _converter: &str,
+    _accept_header: Option<&str>,
+    _opts: StreamRuntimeOptions,
 ) -> bool {
-    if requested_stream {
-        return true;
-    }
-    if !opts.force_stream_for_codex || !converter.eq_ignore_ascii_case("codex") {
-        return false;
-    }
-    if accept_header_explicit_json_only(accept_header) {
-        return false;
-    }
-    accept_header_allows_sse(accept_header)
+    requested_stream
 }
 
 fn parse_sse_chunk(chunk: &str) -> Option<(String, Value)> {
@@ -1597,6 +1576,22 @@ fn extract_upstream_response_id(chunk: &str) -> Option<String> {
         .or_else(|| payload.get("id"))
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
+}
+
+fn extract_codex_terminal_response_snapshot(chunk: &str) -> Option<Value> {
+    let (event, payload) = parse_sse_chunk(chunk)?;
+    let normalized_event = event.trim();
+    if normalized_event != "response.completed"
+        && normalized_event != "response.done"
+        && normalized_event != "response.incomplete"
+    {
+        return None;
+    }
+
+    payload
+        .get("response")
+        .cloned()
+        .or_else(|| payload.get("output").map(|_| payload.clone()))
 }
 
 fn upstream_chunk_indicates_done(chunk: &str) -> bool {
@@ -1981,6 +1976,147 @@ fn contains_tool_call_text_leak(content: &Value) -> bool {
             || text.contains("to=multi_tool_use.parallel")
             || text.contains("to=functions.")
     })
+}
+
+fn extract_assistant_preview_from_content(content: &Value) -> Option<String> {
+    let blocks = content.as_array()?;
+    let preview = blocks
+        .iter()
+        .filter_map(|block| {
+            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match block_type {
+                "text" => block.get("text").and_then(|v| v.as_str()).map(|text| text.to_string()),
+                "tool_use" => block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|name| format!("[tool_use:{}]", name)),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = preview.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn log_non_stream_assistant_preview(
+    log_tx: &broadcast::Sender<String>,
+    request_id: &str,
+    payload: &Value,
+) {
+    let preview = payload
+        .get("content")
+        .and_then(extract_assistant_preview_from_content)
+        .unwrap_or_else(|| "<empty>".to_string());
+    let _ = log_tx.send(format!(
+        "[NonStream] #{} assistant_preview={}",
+        request_id,
+        head_chars(&preview, 120),
+    ));
+}
+
+fn build_anthropic_message_from_codex_json_response(response: &Value, fallback_model: &str) -> Value {
+    let mut content = Vec::new();
+    let mut first_message_id: Option<String> = None;
+
+    if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
+        for item in output {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match item_type {
+                "message" => {
+                    if item.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    if first_message_id.is_none() {
+                        first_message_id = item
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|value| value.to_string());
+                    }
+                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+                        for part in parts {
+                            let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if matches!(part_type, "output_text" | "text" | "refusal") {
+                                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                    if !text.is_empty() {
+                                        content.push(json!({ "type": "text", "text": text }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "function_call" => {
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let tool_use_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|v| v.as_str())
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
+                    let input = item
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                        .unwrap_or_else(|| json!({}));
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": name,
+                        "input": input,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let stop_reason = if content.iter().any(|block| {
+        block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+    }) {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+
+    json!({
+        "id": first_message_id.unwrap_or_else(|| format!("msg_{}", chrono::Utc::now().timestamp_millis())),
+        "type": "message",
+        "role": "assistant",
+        "model": response
+            .get("model")
+            .cloned()
+            .unwrap_or_else(|| json!(fallback_model)),
+        "content": content,
+        "stop_reason": stop_reason,
+        "usage": response.get("usage").cloned().unwrap_or_else(|| json!({"input_tokens":0,"output_tokens":0})),
+    })
+}
+
+fn backfill_non_stream_payload_from_codex_snapshot(
+    payload: Value,
+    snapshot: Option<&Value>,
+    fallback_model: &str,
+) -> Value {
+    let has_content = payload
+        .get("content")
+        .and_then(|value| value.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    if has_content {
+        return payload;
+    }
+
+    let Some(snapshot) = snapshot else {
+        return payload;
+    };
+
+    build_anthropic_message_from_codex_json_response(snapshot, fallback_model)
 }
 
 fn disable_parallel_tool_calls_in_upstream_body(body: &Value) -> Option<Value> {
@@ -4070,6 +4206,7 @@ async fn handle_request(
                 &ctx,
                 &route_selection.model_name,
                 route_selection.reasoning_effort_override,
+                false,
             );
 
             let request = http_client
@@ -4256,6 +4393,7 @@ async fn handle_request(
     let mut successful_parallel_tool_degrade_key: Option<String> = None;
     let mut successful_session_id = String::new();
     let mut successful_stateful_chain_meta: Option<StatefulChainRequestMeta> = None;
+    let mut successful_effective_stream = anthropic_body.stream;
 
     while attempt_index < max_lb_attempts {
         attempt_index += 1;
@@ -4353,18 +4491,21 @@ async fn handle_request(
             &route_selection.model_name,
         );
 
+        let effective_stream_for_attempt = resolve_effective_stream(
+            anthropic_body.stream,
+            &route_selection.converter,
+            accept_header.as_deref(),
+            stream_opts,
+        );
+
         let _ = log_tx.send(format!(
-            "[Req] #{} in={} out={} msgs={} stream={} tools={} system_chars={} summary={}",
+            "[Req] #{} in={} out={} msgs={} requested_stream={} effective_stream={} tools={} system_chars={} summary={}",
             request_id,
             input_model,
             route_selection.model_name,
             anthropic_body.messages.len(),
-            resolve_effective_stream(
-                anthropic_body.stream,
-                &route_selection.converter,
-                accept_header.as_deref(),
-                stream_opts,
-            ),
+            anthropic_body.stream,
+            effective_stream_for_attempt,
             tool_count,
             system_chars,
             display_summary,
@@ -4459,6 +4600,7 @@ async fn handle_request(
                     &ctx,
                     &route_selection.model_name,
                     route_selection.reasoning_effort_override,
+                    effective_stream_for_attempt,
                 )
             };
 
@@ -4581,12 +4723,20 @@ async fn handle_request(
                 .map(|buf| buf.len())
                 .unwrap_or(0);
             let resolved_url_path = extract_url_path(&resolved_target_url);
+            let upstream_body_stream = upstream_body
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
             let _ = log_tx.send(format!(
-                "[ReqPayload] #{} keys={} input_items={} resolved_url_path={} request_body_bytes={} tools_bytes_before={} tools_bytes_after={} stateful_chain_mode={} codex_fast_mode={} summary={}",
+                "[ReqPayload] #{} keys={} input_items={} resolved_url_path={} requested_stream={} effective_stream={} upstream_body_stream={} request_body_bytes={} tools_bytes_before={} tools_bytes_after={} stateful_chain_mode={} codex_fast_mode={} summary={}",
                 request_id,
                 top_keys,
                 input_items,
                 resolved_url_path,
+                anthropic_body.stream,
+                effective_stream_for_attempt,
+                upstream_body_stream,
                 request_body_bytes,
                 tools_bytes_before,
                 tools_bytes_after,
@@ -5103,6 +5253,7 @@ async fn handle_request(
         successful_parallel_tool_degrade_key = Some(parallel_tool_degrade_key);
         successful_session_id = session_id.clone();
         successful_stateful_chain_meta = stateful_chain_meta_for_attempt;
+        successful_effective_stream = effective_stream_for_attempt;
         break;
     }
 
@@ -5121,12 +5272,7 @@ async fn handle_request(
     let stateful_chain_meta_for_request = successful_stateful_chain_meta;
     let _lb_permit = successful_lb_permit;
     let allow_visible_thinking_for_request = !anthropic_body.is_thinking_disabled();
-    let effective_stream = resolve_effective_stream(
-        anthropic_body.stream,
-        &request_converter,
-        accept_header.as_deref(),
-        stream_opts,
-    );
+    let effective_stream = successful_effective_stream;
 
     let _ = log_tx.send(format!(
         "[System] #{} Request transformed and forwarding to upstream API",
@@ -5166,6 +5312,72 @@ async fn handle_request(
 
     // 非流式：把上游 SSE 聚合成 Anthropic JSON
     if !effective_stream {
+        let response_content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        if request_converter.eq_ignore_ascii_case("codex")
+            && response_content_type
+                .to_ascii_lowercase()
+                .contains("application/json")
+        {
+            let body_text = response.text().await.unwrap_or_default();
+            if let Some(ref l) = logger {
+                l.log_upstream_response(upstream_status, &body_text);
+            }
+            let parsed = match serde_json::from_str::<Value>(&body_text) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = log_tx.send(format!(
+                        "[Error] #{} Failed to parse non-stream Codex JSON response: {}",
+                        request_id, error
+                    ));
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .header("Content-Type", "application/json")
+                        .body(full_body(
+                            json!({"error": {"message": format!("Failed to parse non-stream Codex response: {}", error)}}).to_string(),
+                        ))
+                        .unwrap());
+                }
+            };
+
+            let payload = build_anthropic_message_from_codex_json_response(&parsed, &model);
+            log_non_stream_assistant_preview(&log_tx, &request_id, &payload);
+
+            if request_converter.eq_ignore_ascii_case("codex") {
+                if let (Some(meta), Some(response_id)) = (
+                    stateful_chain_meta_for_request.as_ref(),
+                    parsed.get("id").and_then(|v| v.as_str()),
+                ) {
+                    record_stateful_chain_entry(&stateful_chain_store, meta, response_id);
+                    emit_stream_diag(
+                        &log_tx,
+                        &logger,
+                        format!(
+                            "[StatefulChain] #{} stored response_id={} mode=non_stream",
+                            request_id, response_id
+                        ),
+                    );
+                }
+            }
+
+            if let Some(ref l) = AppLogger::get() {
+                l.log("════════════════════════════════════════════════════════════════");
+                l.log("✅ Request completed");
+                l.log("════════════════════════════════════════════════════════════════");
+            }
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("Access-Control-Allow-Origin", "*")
+                .body(full_body(payload.to_string()))
+                .unwrap());
+        }
+
         let mut stream = response.bytes_stream();
         let mut line_buffer = String::new();
         let mut frame_parser = SseFrameParser::default();
@@ -5180,6 +5392,7 @@ async fn handle_request(
         let mut usage_input_tokens: u64 = 0;
         let mut usage_output_tokens: u64 = 0;
         let mut latest_upstream_response_id: Option<String> = None;
+        let mut latest_codex_terminal_snapshot: Option<Value> = None;
 
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(300), stream.next()).await {
@@ -5192,6 +5405,11 @@ async fn handle_request(
                             for frame in frame_parser.push_chunk(&chunk_text) {
                                 if let Some(response_id) = extract_upstream_response_id(&frame) {
                                     latest_upstream_response_id = Some(response_id);
+                                }
+                                if request_converter.eq_ignore_ascii_case("codex") {
+                                    if let Some(snapshot) = extract_codex_terminal_response_snapshot(&frame) {
+                                        latest_codex_terminal_snapshot = Some(snapshot);
+                                    }
                                 }
                                 if let Some(ref l) = logger {
                                     l.log_upstream_response(upstream_status, &frame);
@@ -5276,6 +5494,11 @@ async fn handle_request(
                 if let Some(response_id) = extract_upstream_response_id(&remaining) {
                     latest_upstream_response_id = Some(response_id);
                 }
+                if request_converter.eq_ignore_ascii_case("codex") {
+                    if let Some(snapshot) = extract_codex_terminal_response_snapshot(&remaining) {
+                        latest_codex_terminal_snapshot = Some(snapshot);
+                    }
+                }
                 if let Some(ref l) = logger {
                     l.log_upstream_response(upstream_status, &remaining);
                 }
@@ -5359,6 +5582,25 @@ async fn handle_request(
             "stop_reason": message.get("stop_reason").cloned().unwrap_or_else(|| json!("end_turn")),
             "usage": message.get("usage").cloned().unwrap_or_else(|| json!({"input_tokens":0,"output_tokens":0}))
         });
+
+        let payload = backfill_non_stream_payload_from_codex_snapshot(
+            payload,
+            latest_codex_terminal_snapshot.as_ref(),
+            &model,
+        );
+        if payload
+            .get("content")
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+            && latest_codex_terminal_snapshot.is_some()
+        {
+            let _ = log_tx.send(format!(
+                "[NonStream] #{} terminal_snapshot_backfill_applied=true",
+                request_id
+            ));
+        }
+        log_non_stream_assistant_preview(&log_tx, &request_id, &payload);
 
         if contains_tool_call_text_leak(payload.get("content").unwrap_or(&json!([]))) {
             let _ = log_tx.send(format!(
@@ -6527,12 +6769,14 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
-        body_uses_priority_service_tier, build_parallel_tool_degrade_key,
-        chunk_contains_sibling_tool_call_error, classify_connection_error,
-        collect_skill_catalog_reminder_blocks, derive_skill_catalog_cache_key,
-        derive_stateful_chain_key, derive_stream_close_cause,
+        body_uses_priority_service_tier, build_anthropic_message_from_codex_json_response,
+        build_parallel_tool_degrade_key, chunk_contains_sibling_tool_call_error,
+        classify_connection_error, collect_skill_catalog_reminder_blocks,
+        derive_skill_catalog_cache_key, derive_stateful_chain_key, derive_stream_close_cause,
+        backfill_non_stream_payload_from_codex_snapshot,
         disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
-        extract_tool_leak_retry_signal, extract_upstream_response_id,
+        extract_codex_terminal_response_snapshot, extract_tool_leak_retry_signal,
+        extract_upstream_response_id,
         get_cached_skill_catalog_reminder, get_parallel_tool_degrade_remaining_seconds,
         inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
         is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
@@ -6810,9 +7054,9 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_effective_stream_forced_for_codex_when_accepts_sse() {
+    fn test_resolve_effective_stream_respects_non_stream_requests_for_codex() {
         let opts = stream_opts();
-        assert!(resolve_effective_stream(
+        assert!(!resolve_effective_stream(
             false,
             "codex",
             Some("text/event-stream"),
@@ -6821,14 +7065,95 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_effective_stream_respects_explicit_json_only() {
+    fn test_resolve_effective_stream_keeps_stream_true_requests() {
         let opts = stream_opts();
-        assert!(!resolve_effective_stream(
-            false,
+        assert!(resolve_effective_stream(
+            true,
             "codex",
             Some("application/json"),
             opts
         ));
+    }
+
+    #[test]
+    fn test_extract_codex_terminal_response_snapshot_prefers_nested_response() {
+        let frame = concat!(
+            "event: response.completed
+",
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"问候交流"}]}]}}"#,
+            "
+
+"
+        );
+
+        let snapshot = extract_codex_terminal_response_snapshot(frame).expect("snapshot");
+        assert_eq!(snapshot.get("id").and_then(Value::as_str), Some("resp_1"));
+        assert_eq!(
+            snapshot.pointer("/output/0/content/0/text").and_then(Value::as_str),
+            Some("问候交流")
+        );
+    }
+
+    #[test]
+    fn test_backfill_non_stream_payload_from_codex_snapshot_uses_terminal_snapshot_when_empty() {
+        let payload = json!({
+            "id": "msg_empty",
+            "type": "message",
+            "role": "assistant",
+            "model": "gpt-5.4",
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        });
+        let snapshot = json!({
+            "id": "resp_title_2",
+            "model": "gpt-5.4",
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "output": [{
+                "id": "msg_title_2",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "问候交流"}]
+            }]
+        });
+
+        let filled = backfill_non_stream_payload_from_codex_snapshot(payload, Some(&snapshot), "gpt-5.4");
+        assert_eq!(
+            filled.pointer("/content/0/text").and_then(Value::as_str),
+            Some("问候交流")
+        );
+    }
+
+    #[test]
+    fn test_build_anthropic_message_from_codex_json_response_text() {
+        let response = json!({
+            "id": "resp_title_1",
+            "model": "gpt-5.4",
+            "usage": {"input_tokens": 12, "output_tokens": 3},
+            "output": [{
+                "id": "msg_title_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "问候交流"
+                }]
+            }]
+        });
+
+        let payload = build_anthropic_message_from_codex_json_response(&response, "gpt-5.4");
+        assert_eq!(
+            payload.pointer("/content/0/type").and_then(|v| v.as_str()),
+            Some("text")
+        );
+        assert_eq!(
+            payload.pointer("/content/0/text").and_then(|v| v.as_str()),
+            Some("问候交流")
+        );
+        assert_eq!(
+            payload.get("stop_reason").and_then(|v| v.as_str()),
+            Some("end_turn")
+        );
     }
 
     #[test]
