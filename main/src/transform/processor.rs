@@ -397,36 +397,20 @@ impl MessageProcessor {
                                     current_msg_content = Vec::new();
                                 }
 
-                                let result_text = if let Some(override_text) = override_result_text
+                                let result_output = if let Some(override_text) =
+                                    override_result_text
                                 {
-                                    override_text
+                                    Value::String(override_text)
                                 } else if let Some(cv) = tool_content {
-                                    match cv {
-                                        serde_json::Value::String(s) => s.clone(),
-                                        serde_json::Value::Array(arr) => arr
-                                            .iter()
-                                            .filter_map(|item| {
-                                                if let serde_json::Value::Object(obj) = item {
-                                                    if let Some(serde_json::Value::String(text)) =
-                                                        obj.get("text")
-                                                    {
-                                                        return Some(text.clone());
-                                                    }
-                                                }
-                                                None
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join("\n"),
-                                        _ => cv.to_string(),
-                                    }
+                                    Self::transform_tool_result_output(cv, &log, msg_idx, block_idx)
                                 } else {
-                                    String::new()
+                                    Value::String(String::new())
                                 };
 
                                 input.push(json!({
                                     "type": "function_call_output",
                                     "call_id": tool_use_id,
-                                    "output": result_text
+                                    "output": result_output
                                 }));
                             }
                             ContentBlock::Document { .. } => {
@@ -798,6 +782,157 @@ impl MessageProcessor {
         }
 
         Some((skill_name, skill_content))
+    }
+
+    fn transform_tool_result_output<F>(
+        content: &Value,
+        log: &F,
+        msg_idx: usize,
+        block_idx: usize,
+    ) -> Value
+    where
+        F: Fn(&str),
+    {
+        match content {
+            Value::String(text) => Value::String(text.clone()),
+            Value::Array(items) => {
+                let structured: Vec<Value> = items
+                    .iter()
+                    .map(|item| Self::transform_tool_result_part(item, log, msg_idx, block_idx))
+                    .collect();
+                if structured.is_empty() {
+                    Value::String(String::new())
+                } else {
+                    Value::Array(structured)
+                }
+            }
+            other => Value::String(other.to_string()),
+        }
+    }
+
+    fn transform_tool_result_part<F>(
+        item: &Value,
+        log: &F,
+        msg_idx: usize,
+        block_idx: usize,
+    ) -> Value
+    where
+        F: Fn(&str),
+    {
+        if let Some(image_url) = Self::extract_tool_result_image_url(item, log, msg_idx, block_idx)
+        {
+            return json!({
+                "type": "input_image",
+                "image_url": image_url
+            });
+        }
+
+        if let Some(file_part) = Self::extract_tool_result_file_part(item) {
+            return file_part;
+        }
+
+        match item {
+            Value::String(text) => json!({
+                "type": "input_text",
+                "text": text
+            }),
+            Value::Object(obj) => {
+                if let Some(text) = obj.get("text").and_then(|value| value.as_str()) {
+                    json!({
+                        "type": "input_text",
+                        "text": text
+                    })
+                } else {
+                    json!({
+                        "type": "input_text",
+                        "text": serde_json::to_string(item).unwrap_or_else(|_| "[unsupported tool result item]".to_string())
+                    })
+                }
+            }
+            other => json!({
+                "type": "input_text",
+                "text": other.to_string()
+            }),
+        }
+    }
+
+    fn extract_tool_result_image_url<F>(
+        item: &Value,
+        log: &F,
+        msg_idx: usize,
+        block_idx: usize,
+    ) -> Option<String>
+    where
+        F: Fn(&str),
+    {
+        let obj = item.as_object()?;
+        let raw_url = obj
+            .get("image_url")
+            .and_then(Self::extract_image_url_value)
+            .or_else(|| {
+                obj.get("url")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+            })
+            .or_else(|| obj.get("source").and_then(Self::extract_image_source_url));
+
+        let normalized = Self::normalize_image_url(raw_url?, None, log, msg_idx, block_idx);
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn extract_image_url_value(value: &Value) -> Option<String> {
+        match value {
+            Value::String(url) => Some(url.clone()),
+            Value::Object(obj) => obj
+                .get("url")
+                .or_else(|| obj.get("uri"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string()),
+            _ => None,
+        }
+    }
+
+    fn extract_image_source_url(value: &Value) -> Option<String> {
+        let obj = value.as_object()?;
+        obj.get("url")
+            .or_else(|| obj.get("uri"))
+            .or_else(|| obj.get("path"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+    }
+
+    fn extract_tool_result_file_part(item: &Value) -> Option<Value> {
+        let obj = item.as_object()?;
+        let source = obj.get("source")?.as_object()?;
+        let data = source
+            .get("data")
+            .or_else(|| source.get("file_data"))
+            .and_then(|value| value.as_str())?;
+        let media_type = source
+            .get("media_type")
+            .or_else(|| source.get("mime_type"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("application/octet-stream");
+        let filename = obj
+            .get("name")
+            .and_then(|value| value.as_str())
+            .or_else(|| source.get("filename").and_then(|value| value.as_str()))
+            .unwrap_or("data");
+        let file_data = if data.starts_with("data:") {
+            data.to_string()
+        } else {
+            format!("data:{};base64,{}", media_type, data)
+        };
+
+        Some(json!({
+            "type": "input_file",
+            "filename": filename,
+            "file_data": file_data
+        }))
     }
 
     pub fn convert_to_codex_skill_format(name: &str, content: &str) -> String {

@@ -5120,6 +5120,7 @@ async fn handle_request(
     let session_id_for_request = successful_session_id;
     let stateful_chain_meta_for_request = successful_stateful_chain_meta;
     let _lb_permit = successful_lb_permit;
+    let allow_visible_thinking_for_request = !anthropic_body.is_thinking_disabled();
     let effective_stream = resolve_effective_stream(
         anthropic_body.stream,
         &request_converter,
@@ -5168,7 +5169,8 @@ async fn handle_request(
         let mut stream = response.bytes_stream();
         let mut line_buffer = String::new();
         let mut frame_parser = SseFrameParser::default();
-        let mut transformer = request_backend.create_response_transformer(&model);
+        let mut transformer =
+            request_backend.create_response_transformer(&model, allow_visible_thinking_for_request);
         let mut metrics = StreamMetrics::new(request_started_at);
 
         let mut message_state: Option<Value> = None;
@@ -5445,8 +5447,8 @@ async fn handle_request(
     tokio::spawn(async move {
         let _permit_guard = permit_for_stream;
         let mut stream = response.bytes_stream();
-        let mut transformer =
-            request_backend_for_stream.create_response_transformer(&model_for_stream);
+        let mut transformer = request_backend_for_stream
+            .create_response_transformer(&model_for_stream, allow_visible_thinking_for_request);
         let mut active_upstream_body_for_stream = upstream_body_for_stream.clone();
         let mut active_session_id_for_stream = session_id_for_stream;
         let mut line_buffer = String::new();
@@ -5949,8 +5951,10 @@ async fn handle_request(
                     active_session_id_for_stream = retry.session_id;
                     current_upstream_status = retry.status;
                     stream = retry.response.bytes_stream();
-                    transformer =
-                        request_backend_for_stream.create_response_transformer(&model_for_stream);
+                    transformer = request_backend_for_stream.create_response_transformer(
+                        &model_for_stream,
+                        allow_visible_thinking_for_request,
+                    );
                     line_buffer.clear();
                     frame_parser = SseFrameParser::default();
                     decision.on_retry_success_reset();
@@ -6049,8 +6053,10 @@ async fn handle_request(
                     active_session_id_for_stream = retry.session_id;
                     current_upstream_status = retry.status;
                     stream = retry.response.bytes_stream();
-                    transformer =
-                        request_backend_for_stream.create_response_transformer(&model_for_stream);
+                    transformer = request_backend_for_stream.create_response_transformer(
+                        &model_for_stream,
+                        allow_visible_thinking_for_request,
+                    );
                     line_buffer.clear();
                     frame_parser = SseFrameParser::default();
                     decision.on_retry_success_reset();

@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -20,6 +20,18 @@ const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
 const ENV_REASONING_SUMMARY_MODE: &str = "CODEX_PROXY_REASONING_SUMMARY";
 const ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT: &str =
     "CODEX_PROXY_INCLUDE_REASONING_ENCRYPTED_CONTENT";
+const NATIVE_RESPONSES_TOOL_TYPES: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "code_interpreter",
+    "file_search",
+    "image_generation",
+    "mcp",
+    "apply_patch",
+    "local_shell",
+    "shell",
+    "custom",
+];
 
 fn bool_env_enabled(name: &str) -> bool {
     std::env::var(name)
@@ -1096,36 +1108,59 @@ impl TransformRequest {
             transformed_tools.len()
         ));
 
-        // 关键优化：无工具时强制 tool_choice: "none"，避免模型乱吐工具 JSON 到文本
-        let tool_choice = if transformed_tools.is_empty() {
-            json!("none")
-        } else {
-            json!("auto")
-        };
+        let tool_choice = Self::build_tool_choice(anthropic_body, &transformed_tools);
+        let parallel_tool_calls = Self::resolve_parallel_tool_calls(anthropic_body);
+        log(&format!(
+            "🧰 [Transform] Resolved tool_choice={} parallel_tool_calls={} (tools={})",
+            serde_json::to_string(&tool_choice).unwrap_or_else(|_| "\"auto\"".to_string()),
+            parallel_tool_calls,
+            transformed_tools.len()
+        ));
         let prompt_cache_key = build_prompt_cache_key(
             request_cwd.as_deref(),
             final_codex_model,
             custom_injection_prompt,
             system_text_for_cache_key.as_deref(),
         );
-        let reasoning_summary_mode = resolve_reasoning_summary_mode();
-        let include_reasoning_encrypted_content = resolve_include_reasoning_encrypted_content();
+        let thinking_disabled = anthropic_body.is_thinking_disabled();
+        let reasoning_summary_mode = if thinking_disabled {
+            None
+        } else {
+            Some(resolve_reasoning_summary_mode())
+        };
+        let include_reasoning_encrypted_content =
+            !thinking_disabled && resolve_include_reasoning_encrypted_content();
+        let reasoning_summary_requested = reasoning_summary_mode.is_some();
         log(&format!(
-            "🧠 [Transform] reasoning.summary={} include.reasoning.encrypted_content={}",
-            reasoning_summary_mode, include_reasoning_encrypted_content
+            "🧠 [Transform] thinking_disabled={} reasoning.summary_requested={} reasoning.summary={} include.reasoning.encrypted_content={}",
+            thinking_disabled,
+            reasoning_summary_requested,
+            reasoning_summary_mode.as_deref().unwrap_or("omitted"),
+            include_reasoning_encrypted_content
         ));
+
+        let mut reasoning = json!({ "effort": reasoning_effort.as_str() });
+        if let Some(summary_mode) = reasoning_summary_mode.as_deref() {
+            if let Some(reasoning_obj) = reasoning.as_object_mut() {
+                reasoning_obj.insert("summary".to_string(), json!(summary_mode));
+            }
+        }
 
         let mut body = json!({
             "model": final_codex_model,
             "input": final_input,
             "tools": transformed_tools,
-            "tool_choice": tool_choice,
-            "parallel_tool_calls": true,
-            "reasoning": { "effort": reasoning_effort.as_str(), "summary": reasoning_summary_mode },
+            "parallel_tool_calls": parallel_tool_calls,
+            "reasoning": reasoning,
             "store": false,
             "stream": true,
             "prompt_cache_key": prompt_cache_key
         });
+        if let Some(tool_choice) = tool_choice {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("tool_choice".to_string(), tool_choice);
+            }
+        }
         if enable_codex_fast_mode {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("service_tier".to_string(), json!("priority"));
@@ -1161,6 +1196,153 @@ impl TransformRequest {
             tool.get("function")
                 .and_then(|value| value.get("parameters"))
         })
+    }
+
+    fn tool_strict(tool: &Value) -> Option<bool> {
+        tool.get("function")
+            .and_then(|value| value.get("strict"))
+            .and_then(|value| value.as_bool())
+            .or_else(|| tool.get("strict").and_then(|value| value.as_bool()))
+    }
+
+    fn is_native_responses_tool_type(tool_type: &str) -> bool {
+        NATIVE_RESPONSES_TOOL_TYPES
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(tool_type))
+    }
+
+    fn build_function_tool(
+        name: &str,
+        description: Option<&str>,
+        parameters: Value,
+        strict: Option<bool>,
+    ) -> Value {
+        let mut tool = Map::new();
+        tool.insert("type".to_string(), json!("function"));
+        tool.insert("name".to_string(), json!(name));
+        tool.insert(
+            "description".to_string(),
+            json!(compact_tool_description(description)),
+        );
+        if let Some(strict) = strict {
+            tool.insert("strict".to_string(), json!(strict));
+        }
+        tool.insert("parameters".to_string(), parameters);
+        Value::Object(tool)
+    }
+
+    fn resolve_named_tool_choice(requested_name: &str, transformed_tools: &[Value]) -> Value {
+        let requested_name = requested_name.trim();
+        if requested_name.is_empty() {
+            return json!("auto");
+        }
+
+        let wants_native_web_search = requested_name.eq_ignore_ascii_case("WebSearch")
+            || requested_name.eq_ignore_ascii_case("web_search")
+            || requested_name.eq_ignore_ascii_case("web-search");
+        if wants_native_web_search
+            && transformed_tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(|value| value.as_str()) == Some("web_search"))
+        {
+            return json!({ "type": "web_search" });
+        }
+
+        for tool in transformed_tools {
+            let tool_type = tool.get("type").and_then(|value| value.as_str());
+            match tool_type {
+                Some("custom") => {
+                    if let Some(name) = tool.get("name").and_then(|value| value.as_str()) {
+                        if name.eq_ignore_ascii_case(requested_name) {
+                            return json!({ "type": "custom", "name": name });
+                        }
+                    }
+                }
+                Some(tool_type) if Self::is_native_responses_tool_type(tool_type) => {
+                    if tool_type.eq_ignore_ascii_case(requested_name) {
+                        return json!({ "type": tool_type });
+                    }
+                }
+                _ => {
+                    if let Some(name) = tool.get("name").and_then(|value| value.as_str()) {
+                        if name.eq_ignore_ascii_case(requested_name) {
+                            return json!({ "type": "function", "name": name });
+                        }
+                    }
+                }
+            }
+        }
+
+        if Self::is_native_responses_tool_type(requested_name)
+            && !requested_name.eq_ignore_ascii_case("custom")
+        {
+            return json!({ "type": requested_name });
+        }
+
+        json!({ "type": "function", "name": requested_name })
+    }
+
+    fn resolve_parallel_tool_calls(anthropic_body: &AnthropicRequest) -> bool {
+        anthropic_body
+            .tool_choice
+            .as_ref()
+            .and_then(|tool_choice| tool_choice.as_object())
+            .and_then(|tool_choice| tool_choice.get("disable_parallel_tool_use"))
+            .and_then(|value| value.as_bool())
+            .map(|disabled| !disabled)
+            .unwrap_or(true)
+    }
+
+    fn build_tool_choice(
+        anthropic_body: &AnthropicRequest,
+        transformed_tools: &[Value],
+    ) -> Option<Value> {
+        if transformed_tools.is_empty() {
+            return Some(json!("none"));
+        }
+
+        let Some(tool_choice) = anthropic_body.tool_choice.as_ref() else {
+            return None;
+        };
+
+        match tool_choice {
+            Value::String(choice) => match choice.trim().to_ascii_lowercase().as_str() {
+                "auto" => Some(json!("auto")),
+                "none" => Some(json!("none")),
+                "required" | "any" => Some(json!("required")),
+                _ => None,
+            },
+            Value::Object(object) => {
+                let choice_type = object
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim().to_ascii_lowercase());
+
+                match choice_type.as_deref() {
+                    Some("auto") => Some(json!("auto")),
+                    Some("none") => Some(json!("none")),
+                    Some("required") | Some("any") => Some(json!("required")),
+                    Some("tool") | Some("function") | Some("custom") => object
+                        .get("name")
+                        .or_else(|| object.get("tool_name"))
+                        .or_else(|| object.get("toolName"))
+                        .and_then(|value| value.as_str())
+                        .map(|name| Self::resolve_named_tool_choice(name, transformed_tools)),
+                    Some(tool_type) if Self::is_native_responses_tool_type(tool_type) => {
+                        if tool_type == "custom" {
+                            object
+                                .get("name")
+                                .and_then(|value| value.as_str())
+                                .map(|name| json!({ "type": "custom", "name": name }))
+                        } else {
+                            Some(json!({ "type": tool_type }))
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn is_anthropic_web_search_tool(tool: &Value) -> bool {
@@ -1366,6 +1548,24 @@ impl TransformRequest {
                 continue;
             }
 
+            if let Some(tool_type) = tool.get("type").and_then(|value| value.as_str()) {
+                if Self::is_native_responses_tool_type(tool_type) {
+                    if tool_type == "web_search" {
+                        if native_web_search_added {
+                            log("🔧 [Tools] web_search duplicate skipped after native mapping");
+                        } else {
+                            log("🔧 [Tools] web_search (native passthrough)");
+                            transformed.push(tool.clone());
+                            native_web_search_added = true;
+                        }
+                    } else {
+                        log(&format!("🔧 [Tools] {} (native passthrough)", tool_type));
+                        transformed.push(tool.clone());
+                    }
+                    continue;
+                }
+            }
+
             // Claude Code 格式: { name, description, input_schema }
             if tool.get("name").is_some() && tool.get("type").is_none() {
                 let name = tool
@@ -1388,13 +1588,12 @@ impl TransformRequest {
                     compact_tool_parameters_schema(&mut parameters);
                 }
 
-                transformed.push(json!({
-                    "type": "function",
-                    "name": name,
-                    "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
-                    "strict": false,
-                    "parameters": parameters
-                }));
+                transformed.push(Self::build_function_tool(
+                    name,
+                    tool.get("description").and_then(|d| d.as_str()),
+                    parameters,
+                    Self::tool_strict(tool),
+                ));
                 continue;
             }
 
@@ -1420,20 +1619,12 @@ impl TransformRequest {
                     compact_tool_parameters_schema(&mut parameters);
                 }
 
-                transformed.push(json!({
-                    "type": "function",
-                    "name": name,
-                    "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
-                    "strict": false,
-                    "parameters": parameters
-                }));
-                continue;
-            }
-
-            // OpenAI native web_search tool passthrough
-            if tool.get("type").and_then(|t| t.as_str()) == Some("web_search") {
-                log("🔧 [Tools] web_search (native passthrough)");
-                transformed.push(tool.clone());
+                transformed.push(Self::build_function_tool(
+                    name,
+                    tool.get("description").and_then(|d| d.as_str()),
+                    parameters,
+                    Self::tool_strict(tool),
+                ));
                 continue;
             }
 
@@ -1460,13 +1651,12 @@ impl TransformRequest {
                     compact_tool_parameters_schema(&mut parameters);
                 }
 
-                transformed.push(json!({
-                    "type": "function",
-                    "name": name,
-                    "description": compact_tool_description(func.get("description").and_then(|d| d.as_str())),
-                    "strict": false,
-                    "parameters": parameters
-                }));
+                transformed.push(Self::build_function_tool(
+                    name,
+                    func.get("description").and_then(|d| d.as_str()),
+                    parameters,
+                    Self::tool_strict(tool),
+                ));
                 continue;
             }
 
@@ -1491,13 +1681,12 @@ impl TransformRequest {
                 compact_tool_parameters_schema(&mut parameters);
             }
 
-            transformed.push(json!({
-                "type": "function",
-                "name": name,
-                "description": compact_tool_description(tool.get("description").and_then(|d| d.as_str())),
-                "strict": false,
-                "parameters": parameters
-            }));
+            transformed.push(Self::build_function_tool(
+                name,
+                tool.get("description").and_then(|d| d.as_str()),
+                parameters,
+                Self::tool_strict(tool),
+            ));
         }
 
         let after_bytes = serde_json::to_vec(&transformed)
@@ -1751,6 +1940,63 @@ mod tests {
     }
 
     #[test]
+    fn transform_tools_preserves_explicit_strict_flag() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "description": "Read file",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"]
+                }
+            }
+        })];
+
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        assert_eq!(
+            transformed[0]
+                .get("strict")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "explicit strict flag should be preserved"
+        );
+    }
+
+    #[test]
+    fn transform_tools_omits_strict_when_unspecified() {
+        let tools = vec![json!({
+            "name": "Read",
+            "description": "Read file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}}
+            }
+        })];
+
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        assert!(
+            transformed[0].get("strict").is_none(),
+            "strict should be omitted when upstream tool does not specify it"
+        );
+    }
+
+    #[test]
+    fn transform_tools_passthroughs_native_apply_patch_tool() {
+        let tools = vec![json!({
+            "type": "apply_patch"
+        })];
+
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        assert_eq!(
+            transformed, tools,
+            "native responses tools should pass through unchanged"
+        );
+    }
+
+    #[test]
     fn prompt_cache_key_is_stable_across_requests() {
         let request = sample_request();
         let mapping = ReasoningEffortMapping::default();
@@ -1963,6 +2209,26 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_request_parses_top_level_thinking_disabled() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {
+                "type": "disabled",
+                "budget_tokens": 0,
+                "unexpected": true
+            },
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+
+        assert!(
+            request.is_thinking_disabled(),
+            "top-level thinking.disabled should be preserved by request model"
+        );
+    }
+
+    #[test]
     fn reasoning_summary_default_is_auto_and_include_omitted() {
         let request = sample_request();
         let mapping = ReasoningEffortMapping::default();
@@ -1977,6 +2243,35 @@ mod tests {
         assert!(
             body.get("include").is_none(),
             "include should be omitted by default to avoid unnecessary response payload"
+        );
+    }
+
+    #[test]
+    fn thinking_disabled_omits_visible_reasoning_summary() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "disabled"},
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert!(
+            body.pointer("/reasoning/summary").is_none(),
+            "thinking.disabled should omit visible reasoning summary"
+        );
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some(crate::models::get_reasoning_effort("claude-sonnet-4-5", &mapping).as_str()),
+            "thinking.disabled should keep reasoning effort mapping"
+        );
+        assert!(
+            body.get("include").is_none(),
+            "thinking.disabled should not request reasoning include payloads"
         );
     }
 

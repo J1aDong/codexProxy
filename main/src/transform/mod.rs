@@ -54,7 +54,11 @@ pub trait TransformBackend: Send + Sync {
     ) -> reqwest::RequestBuilder;
 
     /// 创建响应转换器（有状态，每个请求一个实例）
-    fn create_response_transformer(&self, model: &str) -> Box<dyn ResponseTransformer>;
+    fn create_response_transformer(
+        &self,
+        model: &str,
+        allow_visible_thinking: bool,
+    ) -> Box<dyn ResponseTransformer>;
 }
 
 /// 响应转换器 trait —— 有状态，逐行处理 SSE

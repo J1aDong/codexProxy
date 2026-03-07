@@ -1647,7 +1647,8 @@ fn out_of_order_done_events_wait_for_head_then_flush_in_order() {
     );
 
     let done_1_events = transformer.transform_sse_line(&done_1).join("");
-    let all_events = format!("{add_1_events}{add_2_events}{delta_1_events}{delta_2_events}{done_1_events}");
+    let all_events =
+        format!("{add_1_events}{add_2_events}{delta_1_events}{delta_2_events}{done_1_events}");
     let tool_use_count = all_events.matches("\"type\":\"tool_use\"").count();
     assert_eq!(
         tool_use_count, 2,

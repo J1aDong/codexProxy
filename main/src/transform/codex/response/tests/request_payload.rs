@@ -24,6 +24,8 @@ fn test_codex_input_strips_signature_fields_and_normalizes_thinking_type() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -118,6 +120,8 @@ fn test_codex_input_normalizes_multiple_thinking_blocks() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -172,6 +176,8 @@ fn test_codex_input_sanitizes_function_call_name() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -228,6 +234,8 @@ fn test_codex_input_all_function_call_names_match_pattern() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -284,6 +292,8 @@ fn test_codex_input_strips_markerless_high_confidence_tool_json_tail() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -338,6 +348,8 @@ fn test_codex_input_strips_markerless_exec_command_json_tail() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -391,6 +403,8 @@ fn test_codex_request_without_tools_uses_none_tool_choice_and_empty_tools() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -417,6 +431,317 @@ fn test_codex_request_without_tools_uses_none_tool_choice_and_empty_tools() {
 }
 
 #[test]
+fn test_codex_request_omits_default_tool_choice_when_tools_present() {
+    let request: AnthropicRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run shell commands",
+            "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+        }],
+        "stream": true
+    }))
+    .expect("valid anthropic request");
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    assert!(
+        body.get("tool_choice").is_none(),
+        "implicit auto tool_choice should be omitted to align with AI SDK behavior"
+    );
+}
+
+#[test]
+fn test_codex_request_preserves_required_tool_choice() {
+    let request: AnthropicRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run shell commands",
+            "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+        }],
+        "tool_choice": "required",
+        "stream": true
+    }))
+    .expect("valid anthropic request");
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    assert_eq!(
+        body.get("tool_choice").and_then(|value| value.as_str()),
+        Some("required"),
+        "required tool_choice should be preserved"
+    );
+}
+
+#[test]
+fn test_codex_request_maps_named_tool_choice_to_function_tool() {
+    let request: AnthropicRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run shell commands",
+            "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+        }],
+        "tool_choice": {"type": "tool", "name": "Bash"},
+        "stream": true
+    }))
+    .expect("valid anthropic request");
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    assert_eq!(
+        body.pointer("/tool_choice/type")
+            .and_then(|value| value.as_str()),
+        Some("function")
+    );
+    assert_eq!(
+        body.pointer("/tool_choice/name")
+            .and_then(|value| value.as_str()),
+        Some("Bash")
+    );
+}
+
+#[test]
+fn test_codex_request_maps_websearch_tool_choice_to_native_web_search() {
+    let request: AnthropicRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "search latest news"}]}],
+        "tools": [{
+            "name": "WebSearch",
+            "description": "Search the web",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "allowed_domains": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["query"]
+            }
+        }],
+        "tool_choice": {"type": "tool", "name": "WebSearch"},
+        "stream": true
+    }))
+    .expect("valid anthropic request");
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    assert_eq!(
+        body.pointer("/tool_choice/type")
+            .and_then(|value| value.as_str()),
+        Some("web_search")
+    );
+    assert!(
+        body.pointer("/tool_choice/name").is_none(),
+        "native web_search tool choice should not be downgraded to function name"
+    );
+}
+
+#[test]
+fn test_codex_request_maps_any_tool_choice_to_required() {
+    let request: AnthropicRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run shell commands",
+            "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+        }],
+        "tool_choice": {"type": "any"},
+        "stream": true
+    }))
+    .expect("valid anthropic request");
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    assert_eq!(
+        body.get("tool_choice").and_then(|value| value.as_str()),
+        Some("required"),
+        "Anthropic tool_choice.any should map to required"
+    );
+}
+
+#[test]
+fn test_codex_request_honors_disable_parallel_tool_use() {
+    let request: AnthropicRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run shell commands",
+            "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+        }],
+        "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+        "stream": true
+    }))
+    .expect("valid anthropic request");
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    assert_eq!(
+        body.get("parallel_tool_calls")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "disable_parallel_tool_use should disable parallel_tool_calls"
+    );
+}
+
+#[test]
+fn test_codex_request_preserves_structured_tool_result_output() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_structured".to_string()),
+                    name: "Read".to_string(),
+                    input: json!({"file_path": "/tmp/a.txt"}),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_structured".to_string()),
+                    id: None,
+                    content: Some(json!([
+                        {"type": "text", "text": "line one"},
+                        {"type": "image_url", "image_url": "https://example.com/a.png"}
+                    ])),
+                }])),
+            },
+        ],
+        system: None,
+        stream: true,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+    let tool_output = input
+        .iter()
+        .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+        .expect("function_call_output should exist");
+
+    let output = tool_output
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("structured tool result should stay as output array");
+    assert_eq!(
+        output[0].get("type").and_then(|v| v.as_str()),
+        Some("input_text")
+    );
+    assert_eq!(
+        output[0].get("text").and_then(|v| v.as_str()),
+        Some("line one")
+    );
+    assert_eq!(
+        output[1].get("type").and_then(|v| v.as_str()),
+        Some("input_image")
+    );
+    assert_eq!(
+        output[1].get("image_url").and_then(|v| v.as_str()),
+        Some("https://example.com/a.png")
+    );
+}
+
+#[test]
+fn test_codex_request_maps_document_tool_result_to_input_file() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_file".to_string()),
+                    name: "Read".to_string(),
+                    input: json!({"file_path": "/tmp/a.pdf"}),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_file".to_string()),
+                    id: None,
+                    content: Some(json!([
+                        {
+                            "type": "document",
+                            "name": "sample.pdf",
+                            "source": {
+                                "media_type": "application/pdf",
+                                "data": "Zm9v"
+                            }
+                        }
+                    ])),
+                }])),
+            },
+        ],
+        system: None,
+        stream: true,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+    let tool_output = input
+        .iter()
+        .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+        .expect("function_call_output should exist");
+
+    let output = tool_output
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("document tool result should stay as output array");
+    assert_eq!(
+        output[0].get("type").and_then(|v| v.as_str()),
+        Some("input_file")
+    );
+    assert_eq!(
+        output[0].get("filename").and_then(|v| v.as_str()),
+        Some("sample.pdf")
+    );
+    assert_eq!(
+        output[0].get("file_data").and_then(|v| v.as_str()),
+        Some("data:application/pdf;base64,Zm9v")
+    );
+}
+
+#[test]
 fn test_codex_request_does_not_inject_template_input() {
     let request = AnthropicRequest {
         model: Some("claude-sonnet-4-5-20250929".to_string()),
@@ -429,6 +754,8 @@ fn test_codex_request_does_not_inject_template_input() {
         system: None,
         stream: true,
         tools: Some(vec![]),
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -472,6 +799,8 @@ fn test_codex_input_sanitizes_stuck_tool_json_and_drops_suggestion_prompt() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -560,6 +889,8 @@ fn test_codex_input_strips_system_reminder_from_function_call_output() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -606,6 +937,8 @@ fn test_codex_input_preserves_skill_system_reminder_in_assistant_text() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -664,6 +997,8 @@ fn test_codex_input_keeps_empty_function_call_output() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -709,6 +1044,8 @@ fn test_codex_input_strips_markerless_taskoutput_json_tail() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -762,6 +1099,8 @@ fn test_codex_input_strips_markerless_read_json_tail() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,
@@ -818,6 +1157,8 @@ fn test_codex_input_injects_missing_function_call_output_placeholder() {
         system: None,
         stream: true,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,

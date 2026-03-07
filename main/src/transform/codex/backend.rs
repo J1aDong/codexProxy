@@ -52,7 +52,14 @@ impl TransformBackend for CodexBackend {
             .body(body.to_string())
     }
 
-    fn create_response_transformer(&self, model: &str) -> Box<dyn ResponseTransformer> {
-        Box::new(TransformResponse::new(model))
+    fn create_response_transformer(
+        &self,
+        model: &str,
+        allow_visible_thinking: bool,
+    ) -> Box<dyn ResponseTransformer> {
+        Box::new(TransformResponse::new_with_visible_thinking(
+            model,
+            allow_visible_thinking,
+        ))
     }
 }

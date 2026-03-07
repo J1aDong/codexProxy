@@ -61,6 +61,49 @@ fn test_reasoning_summary_events_are_mapped_to_thinking_deltas() {
 }
 
 #[test]
+fn reasoning_summary_events_are_suppressed_when_visible_thinking_disabled() {
+    let mut transformer = TransformResponse::new_with_visible_thinking("gpt-5.3-codex", false);
+    let line_part_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.reasoning_summary_part.added",
+            "summary_index": 0
+        })
+    );
+    let line_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "summary_index": 0,
+            "delta": "先分析上下文。"
+        })
+    );
+    let line_part_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.reasoning_summary_part.done",
+            "summary_index": 0
+        })
+    );
+
+    let joined = format!(
+        "{}{}{}",
+        transformer.transform_sse_line(&line_part_added).join(""),
+        transformer.transform_sse_line(&line_delta).join(""),
+        transformer.transform_sse_line(&line_part_done).join("")
+    );
+
+    assert!(
+        !joined.contains("\"type\":\"thinking_delta\""),
+        "thinking-disabled requests should suppress reasoning_summary thinking deltas"
+    );
+    assert!(
+        !joined.contains("\"type\":\"content_block_start\""),
+        "thinking-disabled requests should not open thinking blocks for reasoning summaries"
+    );
+}
+
+#[test]
 fn test_reasoning_summary_block_closes_before_output_text() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line_part_added = format!(

@@ -79,7 +79,11 @@ impl TransformBackend for AnthropicBackend {
             .body(body.to_string())
     }
 
-    fn create_response_transformer(&self, _model: &str) -> Box<dyn ResponseTransformer> {
+    fn create_response_transformer(
+        &self,
+        _model: &str,
+        _allow_visible_thinking: bool,
+    ) -> Box<dyn ResponseTransformer> {
         Box::new(AnthropicPassthroughResponseTransformer::default())
     }
 }

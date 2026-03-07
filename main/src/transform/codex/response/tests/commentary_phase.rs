@@ -45,6 +45,42 @@ fn commentary_text_redirected_to_thinking_blocks() {
 }
 
 #[test]
+fn commentary_phase_text_is_suppressed_when_visible_thinking_disabled() {
+    let mut transformer = TransformResponse::new_with_visible_thinking("gpt-5.3-codex", false);
+
+    let item_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary"
+            }
+        })
+    );
+    let _ = transformer.transform_sse_line(&item_added);
+
+    let text_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Using the openspec-apply-change skill for this request."
+        })
+    );
+    let joined = transformer.transform_sse_line(&text_delta).join("");
+
+    assert!(
+        !joined.contains("\"type\":\"thinking_delta\""),
+        "thinking-disabled requests should suppress commentary thinking deltas"
+    );
+    assert!(
+        !joined.contains("\"type\":\"text_delta\""),
+        "commentary text should not leak as visible text when thinking is disabled"
+    );
+}
+
+#[test]
 fn final_answer_text_remains_as_text_blocks() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 

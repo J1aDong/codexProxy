@@ -373,6 +373,43 @@ fn response_in_progress_emits_single_lifecycle_heartbeat() {
 }
 
 #[test]
+fn web_search_progress_is_suppressed_when_visible_thinking_disabled() {
+    let mut transformer = TransformResponse::new_with_visible_thinking("gpt-5.3-codex", false);
+
+    let search_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "in_progress"
+            }
+        })
+    );
+    let search_searching = format!(
+        "data: {}",
+        json!({
+            "type": "response.web_search_call.searching",
+            "output_index": 1,
+            "item_id": "ws_1"
+        })
+    );
+
+    let joined = format!(
+        "{}{}",
+        transformer.transform_sse_line(&search_added).join(""),
+        transformer.transform_sse_line(&search_searching).join("")
+    );
+
+    assert!(
+        !joined.contains("\"type\":\"thinking_delta\""),
+        "thinking-disabled requests should suppress web search progress updates"
+    );
+}
+
+#[test]
 fn web_search_call_progress_events_surface_as_thinking_updates() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
@@ -864,6 +901,30 @@ Full transcript available at: /tmp/task_123.output"#
 }
 
 #[test]
+fn task_output_running_text_is_suppressed_when_visible_thinking_disabled() {
+    let mut transformer = TransformResponse::new_with_visible_thinking("gpt-5.3-codex", false);
+
+    let running_line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Task is still running…"
+        })
+    );
+
+    let joined = transformer.transform_sse_line(&running_line).join("");
+
+    assert!(
+        !joined.contains("\"type\":\"thinking_delta\""),
+        "thinking-disabled requests should suppress task progress thinking deltas"
+    );
+    assert!(
+        !joined.contains("某个 explorer 仍在运行，我继续等待结果"),
+        "suppressed task progress should not emit the rewritten waiting message"
+    );
+}
+
+#[test]
 fn task_output_running_text_is_bridged_to_thinking_progress() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
@@ -918,6 +979,191 @@ fn task_output_missing_task_text_is_bridged_to_thinking_progress() {
     assert!(joined.contains("某个后台任务已结束或状态失效，我继续汇总现有结果"));
     assert!(joined.contains("\"type\":\"thinking_delta\""));
     assert!(!joined.contains("No task found with ID"));
+}
+
+#[test]
+fn bash_tool_codex_exec_command_payload_is_normalized_before_emitting_tool_use() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_bash_1",
+                "type": "function_call",
+                "call_id": "call_bash_1",
+                "name": "Bash"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_bash_1",
+                "type": "function_call",
+                "call_id": "call_bash_1",
+                "name": "Bash",
+                "arguments": serde_json::to_string(&json!({
+                    "cmd": "ls -la",
+                    "workdir": "/tmp/demo dir",
+                    "justification": "List project files",
+                    "yield_time_ms": 1000,
+                    "max_output_tokens": 4000
+                })).unwrap()
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("\"name\":\"Bash\""));
+    assert!(joined.contains(r#"\"command\":\"cd '/tmp/demo dir' && ls -la\""#));
+    assert!(joined.contains(r#"\"description\":\"List project files\""#));
+    assert!(!joined.contains(r#"\"cmd\":"#));
+    assert!(!joined.contains(r#"\"workdir\":"#));
+    assert!(!joined.contains(r#"\"yield_time_ms\":"#));
+}
+
+#[test]
+fn bash_tool_argument_delta_does_not_stream_raw_exec_command_aliases() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_bash_stream_1",
+                "type": "function_call",
+                "call_id": "call_bash_stream_1",
+                "name": "Bash"
+            }
+        })
+    );
+    let tool_args_delta = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_bash_stream_1",
+            "call_id": "call_bash_stream_1",
+            "delta": "{\"cmd\":\"ls -la\",\"workdir\":\"/tmp/demo dir\"}"
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_args_delta));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("\"name\":\"Bash\""));
+    assert!(!joined.contains(r#"\"cmd\":"#));
+    assert!(!joined.contains(r#"\"workdir\":"#));
+}
+
+#[test]
+fn task_output_defaults_are_filled_before_emitting_tool_use() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_task_output_1",
+                "type": "function_call",
+                "call_id": "call_task_output_1",
+                "name": "TaskOutput"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_task_output_1",
+                "type": "function_call",
+                "call_id": "call_task_output_1",
+                "name": "TaskOutput",
+                "arguments": serde_json::to_string(&json!({
+                    "taskId": "task_123"
+                })).unwrap()
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("\"name\":\"TaskOutput\""));
+    assert!(joined.contains(r#"\"task_id\":\"task_123\""#));
+    assert!(joined.contains(r#"\"block\":true"#));
+    assert!(joined.contains(r#"\"timeout\":30000"#));
+    assert!(!joined.contains(r#"\"taskId\":"#));
+}
+
+#[test]
+fn edit_tool_aliases_are_normalized_before_emitting_tool_use() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_edit_1",
+                "type": "function_call",
+                "call_id": "call_edit_1",
+                "name": "Edit"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_edit_1",
+                "type": "function_call",
+                "call_id": "call_edit_1",
+                "name": "Edit",
+                "arguments": serde_json::to_string(&json!({
+                    "filePath": "/tmp/a.txt",
+                    "oldText": "a",
+                    "newText": "b"
+                })).unwrap()
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("\"name\":\"Edit\""));
+    assert!(joined.contains(r#"\"file_path\":\"/tmp/a.txt\""#));
+    assert!(joined.contains(r#"\"old_string\":\"a\""#));
+    assert!(joined.contains(r#"\"new_string\":\"b\""#));
+    assert!(!joined.contains(r#"\"filePath\":"#));
+    assert!(!joined.contains(r#"\"oldText\":"#));
+    assert!(!joined.contains(r#"\"newText\":"#));
 }
 
 #[test]

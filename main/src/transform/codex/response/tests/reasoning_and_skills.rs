@@ -262,6 +262,8 @@ fn test_custom_injection_prompt() {
         system: None,
         stream: false,
         tools: None,
+        tool_choice: None,
+        thinking: None,
         max_tokens: None,
         temperature: None,
         top_p: None,

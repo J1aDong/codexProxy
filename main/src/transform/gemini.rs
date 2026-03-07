@@ -382,7 +382,11 @@ impl TransformBackend for GeminiBackend {
             .body(upstream_body.to_string())
     }
 
-    fn create_response_transformer(&self, model: &str) -> Box<dyn ResponseTransformer> {
+    fn create_response_transformer(
+        &self,
+        model: &str,
+        _allow_visible_thinking: bool,
+    ) -> Box<dyn ResponseTransformer> {
         Box::new(GeminiResponseTransformer::new(model))
     }
 }

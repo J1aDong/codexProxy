@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// Anthropic 请求体
 #[derive(Debug, Deserialize, Serialize)]
@@ -8,6 +9,10 @@ pub struct AnthropicRequest {
     pub messages: Vec<Message>,
     pub system: Option<SystemContent>,
     pub tools: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub thinking: Option<RequestThinkingConfig>,
     #[serde(default = "default_stream")]
     pub stream: bool,
     pub max_tokens: Option<u32>,
@@ -19,6 +24,32 @@ pub struct AnthropicRequest {
 
 fn default_stream() -> bool {
     false
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct RequestThinkingConfig {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+impl RequestThinkingConfig {
+    pub fn is_disabled(&self) -> bool {
+        self.kind
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case("disabled"))
+            .unwrap_or(false)
+    }
+}
+
+impl AnthropicRequest {
+    pub fn is_thinking_disabled(&self) -> bool {
+        self.thinking
+            .as_ref()
+            .map(RequestThinkingConfig::is_disabled)
+            .unwrap_or(false)
+    }
 }
 
 /// system 字段可以是字符串或数组

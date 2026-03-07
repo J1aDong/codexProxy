@@ -1,6 +1,6 @@
 use crate::logger::AppLogger;
 use crate::transform::ResponseTransformer;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -400,6 +400,7 @@ pub struct TransformResponse {
     content_index: usize,
     open_text_index: Option<usize>,
     open_thinking_index: Option<usize>,
+    allow_visible_thinking: bool,
     phase: StreamPhase,
     next_tool_order_key: u64,
     next_tool_arrival_seq: u64,
@@ -1398,12 +1399,17 @@ impl TransformResponse {
     }
 
     pub fn new(model: &str) -> Self {
+        Self::new_with_visible_thinking(model, true)
+    }
+
+    pub fn new_with_visible_thinking(model: &str, allow_visible_thinking: bool) -> Self {
         Self {
             message_id: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
             model: model.to_string(),
             content_index: 0,
             open_text_index: None,
             open_thinking_index: None,
+            allow_visible_thinking,
             phase: StreamPhase::AwaitingContent,
             next_tool_order_key: 0,
             next_tool_arrival_seq: 0,
@@ -2150,11 +2156,220 @@ impl TransformResponse {
         serde_json::to_string(&parsed).ok()
     }
 
+    fn parse_tool_arguments_object(arguments: &str) -> Option<Map<String, Value>> {
+        serde_json::from_str::<Value>(arguments)
+            .ok()?
+            .as_object()
+            .cloned()
+    }
+
+    fn first_string_field(obj: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+        keys.iter()
+            .filter_map(|key| obj.get(*key))
+            .find_map(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    }
+
+    fn first_bool_field(obj: &Map<String, Value>, keys: &[&str]) -> Option<bool> {
+        keys.iter()
+            .filter_map(|key| obj.get(*key))
+            .find_map(|value| value.as_bool())
+    }
+
+    fn first_number_field(obj: &Map<String, Value>, keys: &[&str]) -> Option<Value> {
+        keys.iter()
+            .filter_map(|key| obj.get(*key))
+            .find(|value| value.is_number())
+            .cloned()
+    }
+
+    fn shell_escape_single_quotes(value: &str) -> String {
+        value.replace('\'', "'\"'\"'")
+    }
+
+    fn normalize_bash_tool_arguments(arguments: &str) -> Option<String> {
+        let obj = Self::parse_tool_arguments_object(arguments)?;
+        let mut normalized = Map::new();
+        let mut command = Self::first_string_field(&obj, &["command", "cmd"])?;
+        if let Some(workdir) = Self::first_string_field(&obj, &["workdir", "cwd"]) {
+            command = format!(
+                "cd '{}' && {}",
+                Self::shell_escape_single_quotes(&workdir),
+                command
+            );
+        }
+        normalized.insert("command".to_string(), Value::String(command));
+        if let Some(description) = Self::first_string_field(&obj, &["description", "justification"])
+        {
+            normalized.insert("description".to_string(), Value::String(description));
+        }
+        if let Some(timeout) = Self::first_number_field(&obj, &["timeout", "timeout_ms"]) {
+            normalized.insert("timeout".to_string(), timeout);
+        }
+        if let Some(run_in_background) =
+            Self::first_bool_field(&obj, &["run_in_background", "background"])
+        {
+            normalized.insert(
+                "run_in_background".to_string(),
+                Value::Bool(run_in_background),
+            );
+        }
+        if let Some(disable_sandbox) = Self::first_bool_field(
+            &obj,
+            &["dangerouslyDisableSandbox", "dangerously_disable_sandbox"],
+        ) {
+            normalized.insert(
+                "dangerouslyDisableSandbox".to_string(),
+                Value::Bool(disable_sandbox),
+            );
+        }
+        serde_json::to_string(&Value::Object(normalized)).ok()
+    }
+
+    fn normalize_read_tool_arguments(arguments: &str) -> Option<String> {
+        let obj = Self::parse_tool_arguments_object(arguments)?;
+        let mut normalized = Map::new();
+        normalized.insert(
+            "file_path".to_string(),
+            Value::String(Self::first_string_field(
+                &obj,
+                &["file_path", "filePath", "path"],
+            )?),
+        );
+        if let Some(offset) = Self::first_number_field(&obj, &["offset"]) {
+            normalized.insert("offset".to_string(), offset);
+        }
+        if let Some(limit) = Self::first_number_field(&obj, &["limit"]) {
+            normalized.insert("limit".to_string(), limit);
+        }
+        if let Some(pages) = Self::first_string_field(&obj, &["pages"]) {
+            normalized.insert("pages".to_string(), Value::String(pages));
+        }
+        serde_json::to_string(&Value::Object(normalized)).ok()
+    }
+
+    fn normalize_edit_tool_arguments(arguments: &str) -> Option<String> {
+        let obj = Self::parse_tool_arguments_object(arguments)?;
+        let mut normalized = Map::new();
+        normalized.insert(
+            "file_path".to_string(),
+            Value::String(Self::first_string_field(
+                &obj,
+                &["file_path", "filePath", "path"],
+            )?),
+        );
+        normalized.insert(
+            "old_string".to_string(),
+            Value::String(Self::first_string_field(
+                &obj,
+                &["old_string", "oldText", "old_text"],
+            )?),
+        );
+        normalized.insert(
+            "new_string".to_string(),
+            Value::String(Self::first_string_field(
+                &obj,
+                &["new_string", "newText", "new_text"],
+            )?),
+        );
+        if let Some(replace_all) = Self::first_bool_field(&obj, &["replace_all", "replaceAll"]) {
+            normalized.insert("replace_all".to_string(), Value::Bool(replace_all));
+        }
+        serde_json::to_string(&Value::Object(normalized)).ok()
+    }
+
+    fn normalize_write_tool_arguments(arguments: &str) -> Option<String> {
+        let obj = Self::parse_tool_arguments_object(arguments)?;
+        let mut normalized = Map::new();
+        normalized.insert(
+            "file_path".to_string(),
+            Value::String(Self::first_string_field(
+                &obj,
+                &["file_path", "filePath", "path"],
+            )?),
+        );
+        normalized.insert(
+            "content".to_string(),
+            Value::String(Self::first_string_field(
+                &obj,
+                &["content", "text", "new_string"],
+            )?),
+        );
+        serde_json::to_string(&Value::Object(normalized)).ok()
+    }
+
+    fn normalize_task_output_tool_arguments(arguments: &str) -> Option<String> {
+        let obj = Self::parse_tool_arguments_object(arguments)?;
+        let mut normalized = Map::new();
+        normalized.insert(
+            "task_id".to_string(),
+            Value::String(Self::first_string_field(
+                &obj,
+                &["task_id", "taskId", "id", "shell_id"],
+            )?),
+        );
+        normalized.insert(
+            "block".to_string(),
+            Value::Bool(Self::first_bool_field(&obj, &["block"]).unwrap_or(true)),
+        );
+        normalized.insert(
+            "timeout".to_string(),
+            Self::first_number_field(&obj, &["timeout", "timeout_ms"])
+                .unwrap_or_else(|| json!(30000)),
+        );
+        serde_json::to_string(&Value::Object(normalized)).ok()
+    }
+
+    fn normalize_task_stop_tool_arguments(arguments: &str) -> Option<String> {
+        let obj = Self::parse_tool_arguments_object(arguments)?;
+        let mut normalized = Map::new();
+        if let Some(task_id) =
+            Self::first_string_field(&obj, &["task_id", "taskId", "id", "shell_id"])
+        {
+            normalized.insert("task_id".to_string(), Value::String(task_id));
+        }
+        if let Some(shell_id) = Self::first_string_field(&obj, &["shell_id"]) {
+            normalized.insert("shell_id".to_string(), Value::String(shell_id));
+        }
+        serde_json::to_string(&Value::Object(normalized)).ok()
+    }
+
+    fn normalize_tool_arguments_by_name(tool_name: &str, arguments: &str) -> Option<String> {
+        if tool_name.eq_ignore_ascii_case("skill") {
+            return Self::normalize_skill_tool_arguments(arguments);
+        }
+        if tool_name.eq_ignore_ascii_case("bash") {
+            return Self::normalize_bash_tool_arguments(arguments);
+        }
+        if tool_name.eq_ignore_ascii_case("read") {
+            return Self::normalize_read_tool_arguments(arguments);
+        }
+        if tool_name.eq_ignore_ascii_case("edit") {
+            return Self::normalize_edit_tool_arguments(arguments);
+        }
+        if tool_name.eq_ignore_ascii_case("write") {
+            return Self::normalize_write_tool_arguments(arguments);
+        }
+        if tool_name.eq_ignore_ascii_case("taskoutput") {
+            return Self::normalize_task_output_tool_arguments(arguments);
+        }
+        if tool_name.eq_ignore_ascii_case("taskstop") {
+            return Self::normalize_task_stop_tool_arguments(arguments);
+        }
+        None
+    }
+
     fn normalized_tool_arguments(&mut self, tool: &BufferedToolCall) -> String {
-        if tool.name.eq_ignore_ascii_case("skill") {
-            if let Some(normalized) = Self::normalize_skill_tool_arguments(&tool.arguments_buffer) {
-                self.logger
-                    .log_raw("[Info] Normalized Skill tool arguments from legacy command payload");
+        if let Some(normalized) =
+            Self::normalize_tool_arguments_by_name(tool.name.as_str(), &tool.arguments_buffer)
+        {
+            if normalized != tool.arguments_buffer {
+                self.logger.log_raw(&format!(
+                    "[Info] Normalized {} tool arguments for Claude-compatible schema",
+                    tool.name
+                ));
                 return normalized;
             }
         }
@@ -2219,22 +2434,14 @@ impl TransformResponse {
         self.emit_thinking_delta(output, "\n");
     }
 
-    fn emit_response_lifecycle_progress(
-        &mut self,
-        output: &mut Vec<String>,
-        message: &str,
-    ) {
+    fn emit_response_lifecycle_progress(&mut self, output: &mut Vec<String>, message: &str) {
         self.open_thinking_block_if_needed(output);
         self.emit_thinking_delta(output, message);
         self.emit_thinking_delta(output, "\n");
     }
 
-    fn emit_ephemeral_thinking_progress(
-        &mut self,
-        output: &mut Vec<String>,
-        message: &str,
-    ) {
-        if message.is_empty() {
+    fn emit_ephemeral_thinking_progress(&mut self, output: &mut Vec<String>, message: &str) {
+        if !self.allow_visible_thinking || message.is_empty() {
             return;
         }
 
@@ -2275,7 +2482,7 @@ data: {}
                 "type": "content_block_delta",
                 "index": idx,
                 "delta": { "type": "thinking_delta", "thinking": "
-" }
+            " }
             })
         ));
         output.push(format!(
@@ -2335,6 +2542,64 @@ data: {}
         !name.eq_ignore_ascii_case("Skill")
     }
 
+    fn contains_any_json_key(arguments: &str, keys: &[&str]) -> bool {
+        keys.iter()
+            .map(|key| format!("\"{key}\""))
+            .any(|needle| arguments.contains(needle.as_str()))
+    }
+
+    fn tool_arguments_are_safe_for_live_stream(name: &str, arguments: &str) -> bool {
+        if arguments.is_empty() || !Self::tool_supports_live_argument_stream(name) {
+            return false;
+        }
+
+        if name.eq_ignore_ascii_case("bash") {
+            return !Self::contains_any_json_key(
+                arguments,
+                &[
+                    "cmd",
+                    "workdir",
+                    "cwd",
+                    "justification",
+                    "background",
+                    "dangerously_disable_sandbox",
+                ],
+            );
+        }
+
+        if name.eq_ignore_ascii_case("read") {
+            return !Self::contains_any_json_key(arguments, &["filePath", "path"]);
+        }
+
+        if name.eq_ignore_ascii_case("edit") {
+            return !Self::contains_any_json_key(
+                arguments,
+                &[
+                    "filePath",
+                    "path",
+                    "oldText",
+                    "old_text",
+                    "newText",
+                    "new_text",
+                    "replaceAll",
+                ],
+            );
+        }
+
+        if name.eq_ignore_ascii_case("write") {
+            return !Self::contains_any_json_key(arguments, &["filePath", "path", "text"]);
+        }
+
+        if name.eq_ignore_ascii_case("taskoutput") || name.eq_ignore_ascii_case("taskstop") {
+            return matches!(
+                Self::normalize_tool_arguments_by_name(name, arguments),
+                Some(normalized) if normalized == arguments
+            );
+        }
+
+        true
+    }
+
     fn maybe_emit_front_buffered_tool_start(&mut self, output: &mut Vec<String>) {
         let should_emit = self
             .buffered_tool_calls
@@ -2360,7 +2625,10 @@ data: {}
             tool.start_emitted = true;
             tool.content_block_index = Some(idx);
 
-            let initial_delta = if Self::tool_supports_live_argument_stream(tool.name.as_str()) {
+            let initial_delta = if Self::tool_arguments_are_safe_for_live_stream(
+                tool.name.as_str(),
+                tool.arguments_buffer.as_str(),
+            ) {
                 tool.emitted_arguments_len = tool.arguments_buffer.len();
                 tool.arguments_buffer.clone()
             } else {
@@ -2395,7 +2663,12 @@ data: {}
             let Some(tool) = self.buffered_tool_calls.first_mut() else {
                 return;
             };
-            if !tool.start_emitted || !Self::tool_supports_live_argument_stream(tool.name.as_str()) {
+            if !tool.start_emitted
+                || !Self::tool_arguments_are_safe_for_live_stream(
+                    tool.name.as_str(),
+                    tool.arguments_buffer.as_str(),
+                )
+            {
                 return;
             }
             let Some(idx) = tool.content_block_index else {
@@ -2547,6 +2820,10 @@ data: {}
     }
 
     fn open_thinking_block_if_needed(&mut self, output: &mut Vec<String>) {
+        if !self.allow_visible_thinking {
+            return;
+        }
+
         if self.has_open_tool_block() {
             return;
         }
@@ -2572,7 +2849,7 @@ data: {}
     }
 
     fn emit_thinking_delta(&self, output: &mut Vec<String>, delta: &str) {
-        if delta.is_empty() {
+        if !self.allow_visible_thinking || delta.is_empty() {
             return;
         }
 
@@ -2873,8 +3150,10 @@ data: {}
                 .log_raw("[Info] Bridged background-task lifecycle text into thinking progress");
             self.open_thinking_block_if_needed(output);
             self.emit_thinking_delta(output, message.as_str());
-            self.emit_thinking_delta(output, "
-");
+            self.emit_thinking_delta(
+                output, "
+",
+            );
             return;
         }
 
@@ -3688,7 +3967,9 @@ data: {}
                             return output;
                         }
 
-                        self.maybe_emit_pending_web_search_completion_before_visible_output(&mut output);
+                        self.maybe_emit_pending_web_search_completion_before_visible_output(
+                            &mut output,
+                        );
 
                         let redirect_to_thinking = self.in_commentary_phase
                             || (self.had_reasoning_in_response && !self.saw_message_item_added);
@@ -3746,7 +4027,7 @@ data: {}
 
             // 推理摘要分片：映射为 Anthropic thinking 增量事件，避免长阶段无可见流输出
             "response.reasoning_summary_part.added" => {
-                self.had_reasoning_in_response = true;
+                self.had_reasoning_in_response = self.allow_visible_thinking;
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 self.close_open_thinking_block(&mut output);
@@ -3754,7 +4035,7 @@ data: {}
             }
 
             "response.reasoning_summary_text.delta" => {
-                self.had_reasoning_in_response = true;
+                self.had_reasoning_in_response = self.allow_visible_thinking;
                 self.flush_text_carryover(&mut output);
                 self.flush_pending_tool_text(&mut output);
                 self.open_thinking_block_if_needed(&mut output);
