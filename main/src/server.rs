@@ -445,6 +445,8 @@ struct StatefulChainRequestMeta {
     chain_key: String,
     endpoint_key: String,
     full_input: Vec<Value>,
+    static_prefix_summary: Option<String>,
+    static_prefix_same_as_prior: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -452,6 +454,7 @@ struct StatefulChainEntry {
     response_id: String,
     endpoint_key: String,
     full_input: Vec<Value>,
+    static_prefix_summary: Option<String>,
     updated_at: Instant,
 }
 
@@ -854,6 +857,18 @@ fn common_prefix_len(a: &[Value], b: &[Value]) -> usize {
     len
 }
 
+fn derive_static_prefix_summary_from_upstream_body(body: &Value) -> Option<String> {
+    body.get("prompt_cache_key")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn format_optional_bool_for_log(value: Option<bool>) -> String {
+    value
+        .map(|flag| flag.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn prepare_stateful_chain_request(
     body: &mut Value,
     chain_store: &StatefulChainStore,
@@ -864,6 +879,7 @@ fn prepare_stateful_chain_request(
     log_tx: &broadcast::Sender<String>,
     logger: &Option<Arc<AppLogger>>,
 ) -> Option<StatefulChainRequestMeta> {
+    let static_prefix_summary = derive_static_prefix_summary_from_upstream_body(body);
     let obj = body.as_object_mut()?;
     let full_input = obj.get("input").and_then(|v| v.as_array()).cloned()?;
     obj.insert("store".to_string(), json!(true));
@@ -873,7 +889,7 @@ fn prepare_stateful_chain_request(
             log_tx,
             logger,
             format!(
-                "[StatefulChain] #{} previous_response_id_skipped reason=endpoint_unsupported",
+                "[StatefulChain] #{} previous_response_id_skipped reason=endpoint_unsupported static_prefix_same_as_prior=unknown",
                 request_id
             ),
         );
@@ -881,6 +897,8 @@ fn prepare_stateful_chain_request(
             chain_key: chain_key.to_string(),
             endpoint_key: endpoint_key.to_string(),
             full_input,
+            static_prefix_summary,
+            static_prefix_same_as_prior: None,
         });
     }
 
@@ -888,6 +906,22 @@ fn prepare_stateful_chain_request(
         Ok(guard) => guard.get(chain_key).cloned(),
         Err(poisoned) => poisoned.into_inner().get(chain_key).cloned(),
     };
+
+    let static_prefix_same_as_prior = existing_entry
+        .as_ref()
+        .and_then(|entry| entry.static_prefix_summary.as_ref())
+        .zip(static_prefix_summary.as_ref())
+        .map(|(previous, current)| previous == current);
+
+    emit_stream_diag(
+        log_tx,
+        logger,
+        format!(
+            "[StatefulChain] #{} static_prefix_same_as_prior={}",
+            request_id,
+            format_optional_bool_for_log(static_prefix_same_as_prior)
+        ),
+    );
 
     if let Some(entry) = existing_entry {
         if entry.endpoint_key == endpoint_key {
@@ -948,6 +982,8 @@ fn prepare_stateful_chain_request(
         chain_key: chain_key.to_string(),
         endpoint_key: endpoint_key.to_string(),
         full_input,
+        static_prefix_summary,
+        static_prefix_same_as_prior,
     })
 }
 
@@ -977,6 +1013,7 @@ fn record_stateful_chain_entry(
             response_id: response_id.to_string(),
             endpoint_key: meta.endpoint_key.clone(),
             full_input: meta.full_input.clone(),
+            static_prefix_summary: meta.static_prefix_summary.clone(),
             updated_at: Instant::now(),
         },
     );
@@ -2117,6 +2154,27 @@ fn backfill_non_stream_payload_from_codex_snapshot(
     };
 
     build_anthropic_message_from_codex_json_response(snapshot, fallback_model)
+}
+
+fn extract_cached_input_tokens_from_response_usage(usage: &Value) -> Option<u64> {
+    usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(|value| value.as_u64())
+}
+
+fn log_prompt_cache_observation(
+    log_tx: &broadcast::Sender<String>,
+    request_id: &str,
+    cached_input_tokens: Option<u64>,
+    static_prefix_same_as_prior: Option<bool>,
+) {
+    let _ = log_tx.send(format!(
+        "[PromptCache] #{} prompt_cache_observed={} cached_input_tokens={} static_prefix_same_as_prior={}",
+        request_id,
+        cached_input_tokens.is_some(),
+        cached_input_tokens.unwrap_or(0),
+        format_optional_bool_for_log(static_prefix_same_as_prior)
+    ));
 }
 
 fn disable_parallel_tool_calls_in_upstream_body(body: &Value) -> Option<Value> {
@@ -5346,6 +5404,14 @@ async fn handle_request(
             };
 
             let payload = build_anthropic_message_from_codex_json_response(&parsed, &model);
+            log_prompt_cache_observation(
+                &log_tx,
+                &request_id,
+                parsed.get("usage").and_then(extract_cached_input_tokens_from_response_usage),
+                stateful_chain_meta_for_request
+                    .as_ref()
+                    .and_then(|meta| meta.static_prefix_same_as_prior),
+            );
             log_non_stream_assistant_preview(&log_tx, &request_id, &payload);
 
             if request_converter.eq_ignore_ascii_case("codex") {
@@ -5588,6 +5654,17 @@ async fn handle_request(
             latest_codex_terminal_snapshot.as_ref(),
             &model,
         );
+        log_prompt_cache_observation(
+            &log_tx,
+            &request_id,
+            latest_codex_terminal_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("usage"))
+                .and_then(extract_cached_input_tokens_from_response_usage),
+            stateful_chain_meta_for_request
+                .as_ref()
+                .and_then(|meta| meta.static_prefix_same_as_prior),
+        );
         if payload
             .get("content")
             .and_then(|value| value.as_array())
@@ -5716,6 +5793,7 @@ async fn handle_request(
         let mut current_upstream_status = upstream_status;
         let mut decision = StreamDecisionState::default();
         let mut latest_upstream_response_id: Option<String> = None;
+        let mut latest_codex_terminal_snapshot: Option<Value> = None;
         let mut silence_warn_logged = false;
         let mut silence_error_logged = false;
         let mut endpoint_parallel_degrade_marked = false;
@@ -5743,6 +5821,11 @@ async fn handle_request(
                                     if let Some(response_id) = extract_upstream_response_id(&frame)
                                     {
                                         latest_upstream_response_id = Some(response_id);
+                                    }
+                                    if is_codex_stream_for_task {
+                                        if let Some(snapshot) = extract_codex_terminal_response_snapshot(&frame) {
+                                            latest_codex_terminal_snapshot = Some(snapshot);
+                                        }
                                     }
                                     let mut emitted_output_for_frame = false;
                                     maybe_log_stream_upstream(
@@ -6015,6 +6098,11 @@ async fn handle_request(
                     if let Some(response_id) = extract_upstream_response_id(&remaining) {
                         latest_upstream_response_id = Some(response_id);
                     }
+                    if is_codex_stream_for_task {
+                        if let Some(snapshot) = extract_codex_terminal_response_snapshot(&remaining) {
+                            latest_codex_terminal_snapshot = Some(snapshot);
+                        }
+                    }
                     maybe_log_stream_upstream(
                         &logger_for_stream,
                         current_upstream_status,
@@ -6070,6 +6158,11 @@ async fn handle_request(
             } else if !line_buffer.trim().is_empty() {
                 if let Some(response_id) = extract_upstream_response_id(&line_buffer) {
                     latest_upstream_response_id = Some(response_id);
+                }
+                if is_codex_stream_for_task {
+                    if let Some(snapshot) = extract_codex_terminal_response_snapshot(&line_buffer) {
+                        latest_codex_terminal_snapshot = Some(snapshot);
+                    }
                 }
                 maybe_log_stream_upstream(
                     &logger_for_stream,
@@ -6601,6 +6694,18 @@ async fn handle_request(
             );
         }
 
+        log_prompt_cache_observation(
+            &log_tx_clone,
+            &request_id_for_stream,
+            latest_codex_terminal_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("usage"))
+                .and_then(extract_cached_input_tokens_from_response_usage),
+            stateful_chain_meta_for_stream
+                .as_ref()
+                .and_then(|meta| meta.static_prefix_same_as_prior),
+        );
+
         if stateful_chain_enabled_for_stream
             && decision.saw_response_completed
             && !decision.saw_response_failed
@@ -6775,6 +6880,7 @@ mod tests {
         derive_skill_catalog_cache_key, derive_stateful_chain_key, derive_stream_close_cause,
         backfill_non_stream_payload_from_codex_snapshot,
         disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
+        extract_cached_input_tokens_from_response_usage,
         extract_codex_terminal_response_snapshot, extract_tool_leak_retry_signal,
         extract_upstream_response_id,
         get_cached_skill_catalog_reminder, get_parallel_tool_degrade_remaining_seconds,
@@ -7451,6 +7557,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                         json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
                         json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}),
                     ],
+                    static_prefix_summary: Some("pk_same".to_string()),
                     updated_at: Instant::now(),
                 },
             );
@@ -7496,6 +7603,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             Some("next")
         );
         assert_eq!(meta.full_input.len(), 3);
+        assert_eq!(meta.static_prefix_same_as_prior, None);
     }
 
     #[test]
@@ -7517,6 +7625,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     full_input: vec![
                         json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
                     ],
+                    static_prefix_summary: Some("pk_unsupported".to_string()),
                     updated_at: Instant::now(),
                 },
             );
@@ -7556,6 +7665,104 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             .cloned()
             .unwrap_or_default();
         assert_eq!(input.len(), 2, "input should remain full when skipped");
+        assert_eq!(_meta.static_prefix_same_as_prior, None);
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_marks_static_prefix_changed_when_prompt_cache_key_differs() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: vec![json!("x")],
+                    static_prefix_summary: Some("pk_old".to_string()),
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [json!("x"), json!("y")],
+            "store": false,
+            "prompt_cache_key": "pk_new"
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let meta = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            "test-chain",
+            "ep_1",
+            "req_changed",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert_eq!(meta.static_prefix_same_as_prior, Some(false));
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_marks_static_prefix_same_when_prompt_cache_key_matches() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: vec![json!("x")],
+                    static_prefix_summary: Some("pk_same".to_string()),
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [json!("x"), json!("y")],
+            "store": false,
+            "prompt_cache_key": "pk_same"
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let meta = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            "test-chain",
+            "ep_1",
+            "req_same",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert_eq!(meta.static_prefix_same_as_prior, Some(true));
+    }
+
+    #[test]
+    fn test_extract_cached_input_tokens_from_response_usage_reads_nested_details() {
+        let usage = json!({
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 88},
+            "output_tokens": 5
+        });
+
+        assert_eq!(extract_cached_input_tokens_from_response_usage(&usage), Some(88));
     }
 
     #[test]
@@ -7565,6 +7772,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             chain_key: "chain-a".to_string(),
             endpoint_key: "ep-a".to_string(),
             full_input: vec![Value::String("x".to_string())],
+            static_prefix_summary: Some("pk_chain_a".to_string()),
+            static_prefix_same_as_prior: None,
         };
 
         record_stateful_chain_entry(&chain_store, &meta, "resp_001");
@@ -7574,6 +7783,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         assert_eq!(entry.response_id, "resp_001");
         assert_eq!(entry.endpoint_key, "ep-a");
         assert_eq!(entry.full_input.len(), 1);
+        assert_eq!(entry.static_prefix_summary.as_deref(), Some("pk_chain_a"));
     }
 
     #[test]

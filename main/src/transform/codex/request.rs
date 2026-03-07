@@ -231,6 +231,127 @@ fn extract_request_cwd(request_text_corpus: &str) -> Option<String> {
     None
 }
 
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn count_normalized_chars(text: &str) -> usize {
+    normalize_text_for_exact_match(text).chars().count()
+}
+
+fn format_fingerprint(hash: u64) -> String {
+    format!("{:016x}", hash)
+}
+
+pub(crate) fn normalize_text_for_exact_match(text: &str) -> String {
+    normalize_line_endings(text).trim().to_string()
+}
+
+fn fingerprint_normalized_text(normalized: &str) -> Option<String> {
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format_fingerprint(fnv1a64(normalized.as_bytes())))
+    }
+}
+
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_value).collect()),
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut normalized = Map::new();
+            for key in keys {
+                if let Some(child) = map.get(&key) {
+                    normalized.insert(key, canonicalize_json_value(child));
+                }
+            }
+            Value::Object(normalized)
+        }
+        _ => value.clone(),
+    }
+}
+
+pub(crate) fn fingerprint_json_value(value: &Value) -> String {
+    let normalized = canonicalize_json_value(value);
+    let bytes = serde_json::to_vec(&normalized).unwrap_or_default();
+    format_fingerprint(fnv1a64(&bytes))
+}
+
+#[derive(Debug, Clone)]
+struct StaticHeavyPayloadStats {
+    instructions_fingerprint: Option<String>,
+    instructions_chars: usize,
+    wrapped_system_fingerprint: Option<String>,
+    wrapped_system_chars: usize,
+    custom_prompt_fingerprint: Option<String>,
+    custom_prompt_chars: usize,
+    tools_fingerprint: Option<String>,
+    tools_count: usize,
+    tools_bytes: usize,
+    instructions_matches_system_exact: bool,
+}
+
+fn build_static_heavy_payload_stats(
+    raw_system_text: Option<&str>,
+    wrapped_system_text: Option<&str>,
+    custom_prompt_text: Option<&str>,
+    transformed_tools: &[Value],
+    transformed_tools_bytes: usize,
+) -> StaticHeavyPayloadStats {
+    let normalized_instructions = normalize_text_for_exact_match(CODEX_INSTRUCTIONS);
+    let normalized_system = raw_system_text.map(normalize_text_for_exact_match);
+    let normalized_wrapped_system = wrapped_system_text.map(normalize_text_for_exact_match);
+    let normalized_custom_prompt = custom_prompt_text.map(normalize_text_for_exact_match);
+    let tools_fingerprint = (!transformed_tools.is_empty())
+        .then(|| fingerprint_json_value(&Value::Array(transformed_tools.to_vec())));
+
+    StaticHeavyPayloadStats {
+        instructions_fingerprint: fingerprint_normalized_text(&normalized_instructions),
+        instructions_chars: normalized_instructions.chars().count(),
+        wrapped_system_fingerprint: normalized_wrapped_system
+            .as_deref()
+            .and_then(fingerprint_normalized_text),
+        wrapped_system_chars: wrapped_system_text.map(count_normalized_chars).unwrap_or(0),
+        custom_prompt_fingerprint: normalized_custom_prompt
+            .as_deref()
+            .and_then(fingerprint_normalized_text),
+        custom_prompt_chars: custom_prompt_text.map(count_normalized_chars).unwrap_or(0),
+        tools_fingerprint,
+        tools_count: transformed_tools.len(),
+        tools_bytes: transformed_tools_bytes,
+        instructions_matches_system_exact: normalized_system
+            .map(|system| system == normalized_instructions)
+            .unwrap_or(false),
+    }
+}
+
+fn format_optional_fingerprint(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
+pub(crate) fn push_proxy_injected_text_message(
+    final_input: &mut Vec<Value>,
+    seen_texts: &mut HashSet<String>,
+    text: &str,
+) -> bool {
+    let normalized = normalize_text_for_exact_match(text);
+    if normalized.is_empty() || !seen_texts.insert(normalized) {
+        return false;
+    }
+
+    final_input.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": text
+        }]
+    }));
+    true
+}
+
 fn has_skill_tool(tools: Option<&Vec<Value>>) -> bool {
     let Some(tools) = tools else {
         return false;
@@ -500,18 +621,23 @@ fn build_prompt_cache_key(
     applied_custom_injection_prompt: Option<&str>,
     applied_static_instructions: Option<&str>,
     system_text: Option<&str>,
+    tools_fingerprint: Option<&str>,
 ) -> String {
     let mut key_material = Vec::new();
     if let Some(instructions) = applied_static_instructions {
-        key_material.extend_from_slice(instructions.as_bytes());
+        key_material.extend_from_slice(normalize_text_for_exact_match(instructions).as_bytes());
     }
     key_material.push(PROMPT_CACHE_KEY_SEP);
     if let Some(custom_prompt) = applied_custom_injection_prompt {
-        key_material.extend_from_slice(custom_prompt.trim().as_bytes());
+        key_material.extend_from_slice(normalize_text_for_exact_match(custom_prompt).as_bytes());
     }
     key_material.push(PROMPT_CACHE_KEY_SEP);
     if let Some(system) = system_text {
-        key_material.extend_from_slice(system.trim().as_bytes());
+        key_material.extend_from_slice(normalize_text_for_exact_match(system).as_bytes());
+    }
+    key_material.push(PROMPT_CACHE_KEY_SEP);
+    if let Some(tools_fingerprint) = tools_fingerprint {
+        key_material.extend_from_slice(tools_fingerprint.as_bytes());
     }
     let key_hash = fnv1a64(&key_material);
     let model_segment = sanitize_cache_key_segment(codex_model, 48);
@@ -1106,9 +1232,13 @@ impl TransformRequest {
             augmentation.mode_label(), augmentation_reasons
         ));
         let mut system_text_for_cache_key = None::<String>;
+        let mut raw_system_text_for_stats = None::<String>;
+        let mut wrapped_system_payload_text = None::<String>;
+        let mut injected_text_dedupe = HashSet::new();
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let system_text = system.to_string();
+            raw_system_text_for_stats = Some(system_text.clone());
             system_text_for_cache_key = Some(system_text.clone());
             log(&format!(
                 "📋 [Transform] System prompt: {} chars",
@@ -1128,6 +1258,7 @@ impl TransformRequest {
                     system_text
                 )
             };
+            wrapped_system_payload_text = Some(system_payload_text.clone());
             final_input.push(json!({
                 "type": "message",
                 "role": "user",
@@ -1151,14 +1282,9 @@ impl TransformRequest {
                 extracted_skills.len()
             ));
             for skill in extracted_skills {
-                final_input.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": skill
-                    }]
-                }));
+                if !push_proxy_injected_text_message(&mut final_input, &mut injected_text_dedupe, &skill) {
+                    log("🎯 [Transform] Skip duplicate proxy-injected skill payload");
+                }
             }
         }
 
@@ -1169,14 +1295,13 @@ impl TransformRequest {
                 "🎯 [Transform] Injecting custom global prompt ({} chars)",
                 custom_injection_prompt.len()
             ));
-            final_input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": custom_injection_prompt
-                }]
-            }));
+            if !push_proxy_injected_text_message(
+                &mut final_input,
+                &mut injected_text_dedupe,
+                custom_injection_prompt,
+            ) {
+                log("🎯 [Transform] Skip duplicate custom global prompt");
+            }
         }
 
         // 追加对话历史
@@ -1209,6 +1334,16 @@ impl TransformRequest {
             log_tx,
             enable_tool_schema_compaction,
         );
+        let transformed_tools_bytes = serde_json::to_vec(&transformed_tools)
+            .map(|buf| buf.len())
+            .unwrap_or(0);
+        let static_heavy_payload_stats = build_static_heavy_payload_stats(
+            raw_system_text_for_stats.as_deref(),
+            wrapped_system_payload_text.as_deref(),
+            (!trimmed_custom_injection_prompt.is_empty()).then_some(trimmed_custom_injection_prompt),
+            &transformed_tools,
+            transformed_tools_bytes,
+        );
 
         log(&format!(
             "📋 [Transform] Final: {} input items, {} tools",
@@ -1231,6 +1366,7 @@ impl TransformRequest {
             custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
             static_instructions_applied.then_some(CODEX_INSTRUCTIONS),
             system_text_for_cache_key.as_deref(),
+            static_heavy_payload_stats.tools_fingerprint.as_deref(),
         );
         let thinking_disabled = anthropic_body.is_thinking_disabled();
         let reasoning_summary_mode = if thinking_disabled {
@@ -1252,6 +1388,19 @@ impl TransformRequest {
             "🧩 [Transform] custom_prompt_applied={} static_instructions_applied={}",
             custom_prompt_applied,
             static_instructions_applied
+        ));
+        log(&format!(
+            "🧾 [Transform] static_heavy instructions_fingerprint={} instructions_chars={} wrapped_system_fingerprint={} wrapped_system_chars={} custom_prompt_fingerprint={} custom_prompt_chars={} tools_fingerprint={} tools_count={} tools_bytes={} instructions_matches_system_exact={}",
+            format_optional_fingerprint(static_heavy_payload_stats.instructions_fingerprint.as_deref()),
+            static_heavy_payload_stats.instructions_chars,
+            format_optional_fingerprint(static_heavy_payload_stats.wrapped_system_fingerprint.as_deref()),
+            static_heavy_payload_stats.wrapped_system_chars,
+            format_optional_fingerprint(static_heavy_payload_stats.custom_prompt_fingerprint.as_deref()),
+            static_heavy_payload_stats.custom_prompt_chars,
+            format_optional_fingerprint(static_heavy_payload_stats.tools_fingerprint.as_deref()),
+            static_heavy_payload_stats.tools_count,
+            static_heavy_payload_stats.tools_bytes,
+            static_heavy_payload_stats.instructions_matches_system_exact,
         ));
 
         let mut reasoning = json!({ "effort": reasoning_effort.as_str() });
@@ -1822,7 +1971,9 @@ impl TransformRequest {
 mod tests {
     use super::{
         compact_tool_description, decide_request_augmentation, detect_requested_skill_name,
-        extract_request_cwd, RequestAugmentationMode, TransformRequest,
+        extract_request_cwd, fingerprint_json_value, normalize_text_for_exact_match,
+        push_proxy_injected_text_message, RequestAugmentationMode, TransformRequest,
+        CODEX_INSTRUCTIONS,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
     use serde_json::{json, Value};
@@ -2449,6 +2600,99 @@ mod tests {
             body.pointer("/reasoning/summary").is_none(),
             "thinking.disabled should still suppress visible reasoning summary"
         );
+    }
+
+    #[test]
+    fn tool_fingerprint_is_stable_across_json_key_order_changes() {
+        let tool_a = json!({
+            "name": "searchDocs",
+            "description": "Search docs",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["query"]
+            }
+        });
+        let tool_b = json!({
+            "description": "Search docs",
+            "input_schema": {
+                "required": ["query"],
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "query": {"type": "string"}
+                },
+                "type": "object"
+            },
+            "name": "searchDocs"
+        });
+
+        assert_eq!(fingerprint_json_value(&tool_a), fingerprint_json_value(&tool_b));
+    }
+
+    #[test]
+    fn prompt_cache_key_changes_when_tools_change() {
+        let request_a: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":[{"type":"text","text":"hello"}]}],
+            "system": "System prompt",
+            "tools": [{
+                "name": "toolA",
+                "description": "A",
+                "input_schema": {"type":"object","properties":{"query":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("request a");
+        let request_b: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":[{"type":"text","text":"hello"}]}],
+            "system": "System prompt",
+            "tools": [{
+                "name": "toolB",
+                "description": "B",
+                "input_schema": {"type":"object","properties":{"query":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("request b");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body_a, _) = TransformRequest::transform(&request_a, None, &mapping, "", "gpt-5.3-codex");
+        let (body_b, _) = TransformRequest::transform(&request_b, None, &mapping, "", "gpt-5.3-codex");
+
+        assert_ne!(body_a.get("prompt_cache_key"), body_b.get("prompt_cache_key"));
+    }
+
+    #[test]
+    fn proxy_injected_text_message_dedupes_exact_match_only() {
+        let mut input = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        assert!(push_proxy_injected_text_message(&mut input, &mut seen, "alpha\r\n\r\n"));
+        assert!(!push_proxy_injected_text_message(&mut input, &mut seen, "  alpha\n"));
+        assert!(push_proxy_injected_text_message(&mut input, &mut seen, "alpha beta"));
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(normalize_text_for_exact_match("\r\nalpha\r\n"), "alpha");
+    }
+
+    #[test]
+    fn instructions_are_not_omitted_even_when_system_text_matches_exactly() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":[{"type":"text","text":"hello"}]}],
+            "system": CODEX_INSTRUCTIONS,
+            "stream": true
+        }))
+        .expect("request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        assert_eq!(body.get("instructions").and_then(|v| v.as_str()), Some(CODEX_INSTRUCTIONS));
     }
 
     #[test]
