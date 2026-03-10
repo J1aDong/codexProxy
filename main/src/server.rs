@@ -447,6 +447,7 @@ struct StatefulChainRequestMeta {
     full_input: Vec<Value>,
     static_prefix_summary: Option<String>,
     static_prefix_same_as_prior: Option<bool>,
+    non_input_fingerprint: Option<String>,
 }
 
 #[derive(Clone)]
@@ -456,6 +457,8 @@ struct StatefulChainEntry {
     full_input: Vec<Value>,
     output_items: Vec<Value>,
     static_prefix_summary: Option<String>,
+    non_input_fingerprint: Option<String>,
+    turn_state: Option<String>,
     updated_at: Instant,
 }
 
@@ -540,6 +543,61 @@ fn extract_stateful_chain_output_items(snapshot: &Value) -> Vec<Value> {
         .and_then(|value| value.as_array())
         .map(|items| items.iter().map(strip_stateful_output_metadata).collect())
         .unwrap_or_default()
+}
+
+fn canonical_json_string(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut sorted: Vec<_> = map.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            let pairs: Vec<String> = sorted
+                .iter()
+                .map(|(k, v)| format!("\"{}\":{}", k, canonical_json_string(v)))
+                .collect();
+            format!("{{{}}}", pairs.join(","))
+        }
+        Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(canonical_json_string).collect();
+            format!("[{}]", items.join(","))
+        }
+        Value::String(s) => format!("\"{}\"", s),
+        _ => value.to_string(),
+    }
+}
+
+fn compute_non_input_fingerprint(body: &Value) -> Option<String> {
+    let obj = body.as_object()?;
+    let keys_to_check = [
+        "model",
+        "instructions",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "reasoning",
+        "store",
+        "stream",
+        "include",
+        "prompt_cache_key",
+    ];
+
+    let mut fingerprint_parts: Vec<(&str, String)> = Vec::new();
+    for key in keys_to_check {
+        if let Some(value) = obj.get(key) {
+            fingerprint_parts.push((key, canonical_json_string(value)));
+        }
+    }
+
+    if fingerprint_parts.is_empty() {
+        return None;
+    }
+
+    let combined = fingerprint_parts
+        .iter()
+        .map(|(k, v)| format!("{}:{}", k, v))
+        .collect::<Vec<_>>()
+        .join("|");
+
+    Some(format!("{:016x}", hash_to_u64(&[&combined])))
 }
 
 
@@ -1013,8 +1071,9 @@ fn prepare_stateful_chain_request(
     request_id: &str,
     log_tx: &broadcast::Sender<String>,
     logger: &Option<Arc<AppLogger>>,
-) -> Option<StatefulChainRequestMeta> {
+) -> Option<(StatefulChainRequestMeta, Option<String>)> {
     let static_prefix_summary = derive_static_prefix_summary_from_upstream_body(body);
+    let current_non_input_fingerprint = compute_non_input_fingerprint(body);
     let obj = body.as_object_mut()?;
     let full_input = obj.get("input").and_then(|v| v.as_array()).cloned()?;
     obj.insert("store".to_string(), json!(true));
@@ -1028,13 +1087,14 @@ fn prepare_stateful_chain_request(
                 request_id
             ),
         );
-        return Some(StatefulChainRequestMeta {
+        return Some((StatefulChainRequestMeta {
             chain_key: chain_key.to_string(),
             endpoint_key: endpoint_key.to_string(),
             full_input,
             static_prefix_summary,
             static_prefix_same_as_prior: None,
-        });
+            non_input_fingerprint: current_non_input_fingerprint,
+        }, None));
     }
 
     let existing_entry = match chain_store.lock() {
@@ -1058,47 +1118,10 @@ fn prepare_stateful_chain_request(
         ),
     );
 
+    let mut turn_state_to_inject: Option<String> = None;
+
     if let Some(entry) = existing_entry {
-        if entry.endpoint_key == endpoint_key {
-            let mut baseline = entry.full_input.clone();
-            if !entry.output_items.is_empty() {
-                baseline.extend(entry.output_items.clone());
-            }
-            let baseline_len = baseline.len();
-            let prefix_len = common_prefix_len(&baseline, &full_input);
-            if prefix_len == baseline_len && full_input.len() > prefix_len {
-                let incremental_input = full_input[prefix_len..].to_vec();
-                obj.insert("input".to_string(), Value::Array(incremental_input));
-                obj.insert(
-                    "previous_response_id".to_string(),
-                    json!(entry.response_id.clone()),
-                );
-                emit_stream_diag(
-                    log_tx,
-                    logger,
-                    format!(
-                        "[StatefulChain] #{} enabled=true previous_response_id_attached=true trimmed_prefix_items={} original_input_items={} incremental_input_items={}",
-                        request_id,
-                        prefix_len,
-                        full_input.len(),
-                        full_input.len() - prefix_len
-                    ),
-                );
-            } else {
-                emit_stream_diag(
-                    log_tx,
-                    logger,
-                    format!(
-                        "[StatefulChain] #{} previous_response_id_skipped reason=prefix_mismatch_or_no_delta matched_prefix_items={} stored_items={} stored_output_items={} current_items={}",
-                        request_id,
-                        prefix_len,
-                        entry.full_input.len(),
-                        entry.output_items.len(),
-                        full_input.len()
-                    ),
-                );
-            }
-        } else {
+        if entry.endpoint_key != endpoint_key {
             emit_stream_diag(
                 log_tx,
                 logger,
@@ -1107,6 +1130,66 @@ fn prepare_stateful_chain_request(
                     request_id
                 ),
             );
+        } else {
+            // 非 input 字段一致性校验
+            let non_input_matches = entry
+                .non_input_fingerprint
+                .as_ref()
+                .zip(current_non_input_fingerprint.as_ref())
+                .map(|(prev, curr)| prev == curr)
+                .unwrap_or(true); // 兼容旧数据，无指纹时允许通过
+
+            if !non_input_matches {
+                emit_stream_diag(
+                    log_tx,
+                    logger,
+                    format!(
+                        "[StatefulChain] #{} previous_response_id_skipped reason=non_input_fields_changed",
+                        request_id
+                    ),
+                );
+            } else {
+                let mut baseline = entry.full_input.clone();
+                if !entry.output_items.is_empty() {
+                    baseline.extend(entry.output_items.clone());
+                }
+                let baseline_len = baseline.len();
+                let prefix_len = common_prefix_len(&baseline, &full_input);
+                if prefix_len == baseline_len && full_input.len() > prefix_len {
+                    let incremental_input = full_input[prefix_len..].to_vec();
+                    obj.insert("input".to_string(), Value::Array(incremental_input));
+                    obj.insert(
+                        "previous_response_id".to_string(),
+                        json!(entry.response_id.clone()),
+                    );
+                    // 保存 turn-state 用于注入到请求头
+                    turn_state_to_inject = entry.turn_state.clone();
+                    emit_stream_diag(
+                        log_tx,
+                        logger,
+                        format!(
+                            "[StatefulChain] #{} enabled=true previous_response_id_attached=true trimmed_prefix_items={} original_input_items={} incremental_input_items={}",
+                            request_id,
+                            prefix_len,
+                            full_input.len(),
+                            full_input.len() - prefix_len
+                        ),
+                    );
+                } else {
+                    emit_stream_diag(
+                        log_tx,
+                        logger,
+                        format!(
+                            "[StatefulChain] #{} previous_response_id_skipped reason=prefix_mismatch_or_no_delta matched_prefix_items={} stored_items={} stored_output_items={} current_items={}",
+                            request_id,
+                            prefix_len,
+                            entry.full_input.len(),
+                            entry.output_items.len(),
+                            full_input.len()
+                        ),
+                    );
+                }
+            }
         }
     } else {
         emit_stream_diag(
@@ -1119,13 +1202,14 @@ fn prepare_stateful_chain_request(
         );
     }
 
-    Some(StatefulChainRequestMeta {
+    Some((StatefulChainRequestMeta {
         chain_key: chain_key.to_string(),
         endpoint_key: endpoint_key.to_string(),
         full_input,
         static_prefix_summary,
         static_prefix_same_as_prior,
-    })
+        non_input_fingerprint: current_non_input_fingerprint,
+    }, turn_state_to_inject))
 }
 
 fn record_stateful_chain_entry(
@@ -1133,6 +1217,7 @@ fn record_stateful_chain_entry(
     meta: &StatefulChainRequestMeta,
     response_id: &str,
     output_items: Vec<Value>,
+    turn_state: Option<String>,
 ) {
     let mut guard = match chain_store.lock() {
         Ok(guard) => guard,
@@ -1157,6 +1242,8 @@ fn record_stateful_chain_entry(
             full_input: meta.full_input.clone(),
             output_items,
             static_prefix_summary: meta.static_prefix_summary.clone(),
+            non_input_fingerprint: meta.non_input_fingerprint.clone(),
+            turn_state,
             updated_at: Instant::now(),
         },
     );
@@ -4873,6 +4960,7 @@ async fn handle_request(
                 &log_tx,
                 &logger,
             )
+            .map(|(meta, _turn_state)| meta) // 解构元组，只保留 meta
         } else {
             None
         };
@@ -5616,6 +5704,7 @@ async fn handle_request(
                         meta,
                         response_id,
                         extract_stateful_chain_output_items(&parsed),
+                        None, // turn_state will be extracted from response headers in streaming mode
                     );
                     emit_stream_diag(
                         &log_tx,
@@ -5914,6 +6003,7 @@ async fn handle_request(
                         .as_ref()
                         .map(extract_stateful_chain_output_items)
                         .unwrap_or_default(),
+                    None, // turn_state will be extracted from response headers in streaming mode
                 );
                 emit_stream_diag(
                     &log_tx,
@@ -6936,6 +7026,7 @@ async fn handle_request(
                         .as_ref()
                         .map(extract_stateful_chain_output_items)
                         .unwrap_or_default(),
+                    None, // turn_state extracted from response headers
                 );
                 emit_stream_diag(
                     &log_tx_clone,
@@ -7835,6 +7926,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     ],
                     output_items: Vec::new(),
                     static_prefix_summary: Some("pk_same".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
                     updated_at: Instant::now(),
                 },
             );
@@ -7852,7 +7945,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
 
         let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
         let logger = None;
-        let meta = prepare_stateful_chain_request(
+        let (meta, _turn_state) = prepare_stateful_chain_request(
             &mut body,
             &chain_store,
             &unsupported_store,
@@ -7903,6 +7996,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                         json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}),
                     ],
                     static_prefix_summary: Some("pk_same".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
                     updated_at: Instant::now(),
                 },
             );
@@ -7920,7 +8015,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
 
         let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
         let logger = None;
-        let _meta = prepare_stateful_chain_request(
+        let (_meta, _turn_state) = prepare_stateful_chain_request(
             &mut body,
             &chain_store,
             &unsupported_store,
@@ -7988,6 +8083,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     ],
                     output_items: Vec::new(),
                     static_prefix_summary: Some("pk_unsupported".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
                     updated_at: Instant::now(),
                 },
             );
@@ -8004,7 +8101,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
 
         let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
         let logger = None;
-        let _meta = prepare_stateful_chain_request(
+        let (_meta, _turn_state) = prepare_stateful_chain_request(
             &mut body,
             &chain_store,
             &unsupported_store,
@@ -8045,6 +8142,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     full_input: vec![json!("x")],
                     output_items: Vec::new(),
                     static_prefix_summary: Some("pk_old".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
                     updated_at: Instant::now(),
                 },
             );
@@ -8059,7 +8158,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
 
         let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
         let logger = None;
-        let meta = prepare_stateful_chain_request(
+        let (meta, _turn_state) = prepare_stateful_chain_request(
             &mut body,
             &chain_store,
             &unsupported_store,
@@ -8089,6 +8188,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     full_input: vec![json!("x")],
                     output_items: Vec::new(),
                     static_prefix_summary: Some("pk_same".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
                     updated_at: Instant::now(),
                 },
             );
@@ -8103,7 +8204,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
 
         let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
         let logger = None;
-        let meta = prepare_stateful_chain_request(
+        let (meta, _turn_state) = prepare_stateful_chain_request(
             &mut body,
             &chain_store,
             &unsupported_store,
@@ -8138,9 +8239,10 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             full_input: vec![Value::String("x".to_string())],
             static_prefix_summary: Some("pk_chain_a".to_string()),
             static_prefix_same_as_prior: None,
+            non_input_fingerprint: None,
         };
 
-        record_stateful_chain_entry(&chain_store, &meta, "resp_001", Vec::new());
+        record_stateful_chain_entry(&chain_store, &meta, "resp_001", Vec::new(), None);
 
         let guard = chain_store.lock().expect("lock");
         let entry = guard.get("chain-a").expect("entry");

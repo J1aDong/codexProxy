@@ -537,6 +537,41 @@ fn extract_available_skill_names_ordered(system_text: &str) -> Vec<String> {
     names
 }
 
+fn extract_skill_catalog_entries_ordered(system_text: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for line in system_text.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* ") )
+        else {
+            continue;
+        };
+        let candidate = rest.splitn(2, ':').next().unwrap_or_default();
+        if candidate.trim_start().starts_with('/') {
+            continue;
+        }
+        let Some(name) = normalize_skill_name_token(candidate) else {
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let desc = rest
+            .splitn(2, ':')
+            .nth(1)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        if let Some(desc) = desc {
+            entries.push(format!("- {}: {}", name, desc));
+        } else {
+            entries.push(format!("- {}", name));
+        }
+    }
+    entries
+}
+
 fn text_contains_skill_catalog_header(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("the following skills are available")
@@ -1085,19 +1120,20 @@ fn strip_leaked_tool_suffix_from_text(text: &str) -> Option<String> {
 }
 
 fn compact_skill_catalog_block(block: &str) -> Option<String> {
-    let names = extract_available_skill_names_ordered(block);
-    if names.is_empty() {
+    let entries = extract_skill_catalog_entries_ordered(block);
+    if entries.is_empty() {
         return None;
     }
     let mut compacted = String::new();
-    compacted.push_str("Skill catalog (names only):\n");
-    for name in names {
-        compacted.push_str("- ");
-        compacted.push_str(&name);
+    compacted.push_str("Skill catalog (condensed):
+");
+    for entry in entries {
+        compacted.push_str(&entry);
         compacted.push('\n');
     }
     Some(compacted.trim_end().to_string())
 }
+
 
 fn strip_system_reminder_blocks(text: &str) -> String {
     const START: &str = "<system-reminder>";
@@ -2239,6 +2275,7 @@ mod tests {
                 "content": "<system-reminder>
 The following skills are available for use with the Skill tool:
 - figma-implement-design: Translate Figma nodes
+TRIGGER when: user provides a Figma URL
 - pdf: Read PDF files
 </system-reminder>
 
@@ -2259,13 +2296,11 @@ hello"
         let joined = texts.join("
 ");
 
-        assert!(joined.contains("Skill catalog"));
-        assert!(joined.contains("- figma-implement-design"));
-        assert!(joined.contains("- pdf"));
-        assert!(!joined.contains("Translate Figma nodes"));
-        assert!(!joined.contains("Read PDF files"));
+        assert!(joined.contains("Skill catalog (condensed)"));
+        assert!(joined.contains("- figma-implement-design: Translate Figma nodes"));
+        assert!(joined.contains("- pdf: Read PDF files"));
+        assert!(!joined.contains("TRIGGER when"));
     }
-
 
     #[test]
     fn strip_dynamic_system_header_lines_removes_billing_header() {
@@ -3535,7 +3570,7 @@ hello");
             .flat_map(|blocks| blocks.iter())
             .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
             .filter(|text| {
-                text.contains("Skill catalog (names only)")
+                text.contains("Skill catalog (condensed)")
             })
             .count();
 
