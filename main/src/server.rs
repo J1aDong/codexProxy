@@ -17,7 +17,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
@@ -454,6 +454,7 @@ struct StatefulChainEntry {
     response_id: String,
     endpoint_key: String,
     full_input: Vec<Value>,
+    output_items: Vec<Value>,
     static_prefix_summary: Option<String>,
     updated_at: Instant,
 }
@@ -513,6 +514,34 @@ fn hash_to_u64(parts: &[&str]) -> u64 {
     }
     hasher.finish()
 }
+
+fn strip_stateful_output_metadata(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut cleaned = Map::new();
+            for (key, val) in map {
+                if matches!(key.as_str(), "id" | "status" | "created_at" | "completed_at") {
+                    continue;
+                }
+                cleaned.insert(key.clone(), strip_stateful_output_metadata(val));
+            }
+            Value::Object(cleaned)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(strip_stateful_output_metadata).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn extract_stateful_chain_output_items(snapshot: &Value) -> Vec<Value> {
+    snapshot
+        .get("output")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().map(strip_stateful_output_metadata).collect())
+        .unwrap_or_default()
+}
+
 
 fn build_stateful_endpoint_key(
     converter: &str,
@@ -1031,8 +1060,13 @@ fn prepare_stateful_chain_request(
 
     if let Some(entry) = existing_entry {
         if entry.endpoint_key == endpoint_key {
-            let prefix_len = common_prefix_len(&entry.full_input, &full_input);
-            if prefix_len == entry.full_input.len() && full_input.len() > prefix_len {
+            let mut baseline = entry.full_input.clone();
+            if !entry.output_items.is_empty() {
+                baseline.extend(entry.output_items.clone());
+            }
+            let baseline_len = baseline.len();
+            let prefix_len = common_prefix_len(&baseline, &full_input);
+            if prefix_len == baseline_len && full_input.len() > prefix_len {
                 let incremental_input = full_input[prefix_len..].to_vec();
                 obj.insert("input".to_string(), Value::Array(incremental_input));
                 obj.insert(
@@ -1055,10 +1089,11 @@ fn prepare_stateful_chain_request(
                     log_tx,
                     logger,
                     format!(
-                        "[StatefulChain] #{} previous_response_id_skipped reason=prefix_mismatch_or_no_delta matched_prefix_items={} stored_items={} current_items={}",
+                        "[StatefulChain] #{} previous_response_id_skipped reason=prefix_mismatch_or_no_delta matched_prefix_items={} stored_items={} stored_output_items={} current_items={}",
                         request_id,
                         prefix_len,
                         entry.full_input.len(),
+                        entry.output_items.len(),
                         full_input.len()
                     ),
                 );
@@ -1097,6 +1132,7 @@ fn record_stateful_chain_entry(
     chain_store: &StatefulChainStore,
     meta: &StatefulChainRequestMeta,
     response_id: &str,
+    output_items: Vec<Value>,
 ) {
     let mut guard = match chain_store.lock() {
         Ok(guard) => guard,
@@ -1119,6 +1155,7 @@ fn record_stateful_chain_entry(
             response_id: response_id.to_string(),
             endpoint_key: meta.endpoint_key.clone(),
             full_input: meta.full_input.clone(),
+            output_items,
             static_prefix_summary: meta.static_prefix_summary.clone(),
             updated_at: Instant::now(),
         },
@@ -5574,7 +5611,12 @@ async fn handle_request(
                     stateful_chain_meta_for_request.as_ref(),
                     parsed.get("id").and_then(|v| v.as_str()),
                 ) {
-                    record_stateful_chain_entry(&stateful_chain_store, meta, response_id);
+                    record_stateful_chain_entry(
+                        &stateful_chain_store,
+                        meta,
+                        response_id,
+                        extract_stateful_chain_output_items(&parsed),
+                    );
                     emit_stream_diag(
                         &log_tx,
                         &logger,
@@ -5864,7 +5906,15 @@ async fn handle_request(
                 stateful_chain_meta_for_request.as_ref(),
                 latest_upstream_response_id.as_deref(),
             ) {
-                record_stateful_chain_entry(&stateful_chain_store, meta, response_id);
+                record_stateful_chain_entry(
+                    &stateful_chain_store,
+                    meta,
+                    response_id,
+                    latest_codex_terminal_snapshot
+                        .as_ref()
+                        .map(extract_stateful_chain_output_items)
+                        .unwrap_or_default(),
+                );
                 emit_stream_diag(
                     &log_tx,
                     &logger,
@@ -6878,7 +6928,15 @@ async fn handle_request(
                 stateful_chain_meta_for_stream.as_ref(),
                 latest_upstream_response_id.as_deref(),
             ) {
-                record_stateful_chain_entry(&stateful_chain_store_for_stream, meta, response_id);
+                record_stateful_chain_entry(
+                    &stateful_chain_store_for_stream,
+                    meta,
+                    response_id,
+                    latest_codex_terminal_snapshot
+                        .as_ref()
+                        .map(extract_stateful_chain_output_items)
+                        .unwrap_or_default(),
+                );
                 emit_stream_diag(
                     &log_tx_clone,
                     &logger_for_stream,
@@ -7046,8 +7104,8 @@ mod tests {
         disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
         extract_cached_input_tokens_from_response_usage,
         extract_codex_terminal_response_snapshot, extract_stateful_chain_hint_from_request,
-        extract_tool_leak_retry_signal, extract_upstream_response_id,
-        resolve_stateful_chain_hint_info,
+        extract_stateful_chain_output_items, extract_tool_leak_retry_signal,
+        extract_upstream_response_id, resolve_stateful_chain_hint_info,
         get_cached_skill_catalog_reminder, get_parallel_tool_degrade_remaining_seconds,
         inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
         is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
@@ -7775,6 +7833,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                         json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
                         json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}),
                     ],
+                    output_items: Vec::new(),
                     static_prefix_summary: Some("pk_same".to_string()),
                     updated_at: Instant::now(),
                 },
@@ -7824,6 +7883,90 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         assert_eq!(meta.static_prefix_same_as_prior, None);
     }
 
+
+    #[test]
+    fn test_prepare_stateful_chain_request_uses_output_items_in_prefix() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: vec![
+                        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
+                    ],
+                    output_items: vec![
+                        json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}),
+                    ],
+                    static_prefix_summary: Some("pk_same".to_string()),
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+            ],
+            "store": false
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let _meta = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            "test-chain",
+            "ep_1",
+            "req_1",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        let input = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(input.len(), 1, "only new user turn should remain");
+        assert_eq!(
+            input[0].pointer("/content/0/text").and_then(|v| v.as_str()),
+            Some("next")
+        );
+    }
+
+    #[test]
+    fn test_extract_stateful_chain_output_items_strips_metadata() {
+        let snapshot = json!({
+            "output": [{
+                "id": "msg_1",
+                "status": "completed",
+                "created_at": 123,
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }]
+        });
+
+        let items = extract_stateful_chain_output_items(&snapshot);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].get("id").is_none());
+        assert!(items[0].get("status").is_none());
+        assert!(items[0].get("created_at").is_none());
+        assert_eq!(
+            items[0].pointer("/content/0/text").and_then(|v| v.as_str()),
+            Some("hi")
+        );
+    }
     #[test]
     fn test_prepare_stateful_chain_request_skips_previous_response_id_for_unsupported_endpoint() {
         let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
@@ -7843,6 +7986,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     full_input: vec![
                         json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
                     ],
+                    output_items: Vec::new(),
                     static_prefix_summary: Some("pk_unsupported".to_string()),
                     updated_at: Instant::now(),
                 },
@@ -7899,6 +8043,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     response_id: "resp_prev".to_string(),
                     endpoint_key: "ep_1".to_string(),
                     full_input: vec![json!("x")],
+                    output_items: Vec::new(),
                     static_prefix_summary: Some("pk_old".to_string()),
                     updated_at: Instant::now(),
                 },
@@ -7942,6 +8087,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     response_id: "resp_prev".to_string(),
                     endpoint_key: "ep_1".to_string(),
                     full_input: vec![json!("x")],
+                    output_items: Vec::new(),
                     static_prefix_summary: Some("pk_same".to_string()),
                     updated_at: Instant::now(),
                 },
@@ -7994,13 +8140,14 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             static_prefix_same_as_prior: None,
         };
 
-        record_stateful_chain_entry(&chain_store, &meta, "resp_001");
+        record_stateful_chain_entry(&chain_store, &meta, "resp_001", Vec::new());
 
         let guard = chain_store.lock().expect("lock");
         let entry = guard.get("chain-a").expect("entry");
         assert_eq!(entry.response_id, "resp_001");
         assert_eq!(entry.endpoint_key, "ep-a");
         assert_eq!(entry.full_input.len(), 1);
+        assert_eq!(entry.output_items.len(), 0);
         assert_eq!(entry.static_prefix_summary.as_deref(), Some("pk_chain_a"));
     }
 

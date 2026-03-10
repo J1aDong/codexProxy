@@ -1217,6 +1217,23 @@ fn strip_known_trailing_noise(text: &str) -> String {
     result
 }
 
+fn strip_dynamic_system_header_lines(text: &str) -> String {
+    let mut filtered = Vec::new();
+    let mut removed = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("x-anthropic-billing-header:") {
+            removed = true;
+            continue;
+        }
+        filtered.push(line);
+    }
+    if !removed {
+        return text.to_string();
+    }
+    filtered.join("\n")
+}
+
 fn sanitize_message_text_for_codex(text: &str) -> Option<String> {
     let without_reminder = strip_system_reminder_blocks(text);
     if without_reminder.trim().is_empty() {
@@ -1387,7 +1404,12 @@ impl TransformRequest {
         let mut system_matches_codex_instructions = false;
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
-            let system_text = system.to_string();
+            let mut system_text = system.to_string();
+            let sanitized_system_text = strip_dynamic_system_header_lines(&system_text);
+            if sanitized_system_text != system_text {
+                log("📋 [Transform] Stripped dynamic system header lines");
+                system_text = sanitized_system_text;
+            }
             raw_system_text_for_stats = Some(system_text.clone());
             system_text_for_cache_key = Some(system_text.clone());
             system_matches_codex_instructions = system_contains_codex_instructions(&system_text);
@@ -2126,8 +2148,8 @@ mod tests {
     use super::{
         compact_tool_description, decide_request_augmentation, detect_requested_skill_name,
         extract_request_cwd, fingerprint_json_value, normalize_text_for_exact_match,
-        push_proxy_injected_text_message, RequestAugmentationMode, TransformRequest,
-        CODEX_INSTRUCTIONS,
+        push_proxy_injected_text_message, strip_dynamic_system_header_lines,
+        RequestAugmentationMode, TransformRequest, CODEX_INSTRUCTIONS,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
     use serde_json::{json, Value};
@@ -2244,6 +2266,13 @@ hello"
         assert!(!joined.contains("Read PDF files"));
     }
 
+
+    #[test]
+    fn strip_dynamic_system_header_lines_removes_billing_header() {
+        let input = "x-anthropic-billing-header: cc_version=2.1.72.873; cc_entrypoint=cli; cch=abcd;\nYou are Claude Code.\nKeep this line.";
+        let output = strip_dynamic_system_header_lines(input);
+        assert_eq!(output, "You are Claude Code.\nKeep this line.");
+    }
     #[test]
     fn compact_tool_description_truncates_and_normalizes() {
         let description = "First line with    extra spaces.\nSecond line stays in first paragraph.\n\nSecond paragraph should be dropped.";
