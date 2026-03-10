@@ -590,6 +590,78 @@ fn extract_stateful_chain_hint(req: &Request<hyper::body::Incoming>) -> Option<S
     }
     None
 }
+fn extract_session_hint_from_user_id(user_id: &str) -> Option<String> {
+    let lower = user_id.to_ascii_lowercase();
+    if let Some(idx) = lower.find("session_") {
+        let tail = &user_id[idx + "session_".len()..];
+        let token = tail
+            .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
+            .next()
+            .unwrap_or("");
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn extract_stateful_chain_hint_from_request(request: &AnthropicRequest) -> Option<String> {
+    let metadata = request.metadata.as_ref()?;
+    let read_str = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    };
+    if let Some(value) = read_str("session_id") {
+        return Some(value);
+    }
+    if let Some(value) = read_str("conversation_id") {
+        return Some(value);
+    }
+    if let Some(user_id) = metadata.get("user_id").and_then(|value| value.as_str()) {
+        return extract_session_hint_from_user_id(user_id);
+    }
+    None
+}
+struct StatefulChainHintInfo {
+    value: Option<String>,
+    source: &'static str,
+}
+
+fn resolve_stateful_chain_hint_info(
+    header_hint: Option<String>,
+    request: &AnthropicRequest,
+) -> StatefulChainHintInfo {
+    let header_hint = header_hint.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    if let Some(value) = header_hint {
+        return StatefulChainHintInfo {
+            value: Some(value),
+            source: "header",
+        };
+    }
+    if let Some(value) = extract_stateful_chain_hint_from_request(request) {
+        return StatefulChainHintInfo {
+            value: Some(value),
+            source: "metadata",
+        };
+    }
+    StatefulChainHintInfo {
+        value: None,
+        source: "none",
+    }
+}
+
+
 
 fn build_message_prefix_signature(request: &AnthropicRequest) -> String {
     request
@@ -791,6 +863,29 @@ fn upsert_skill_catalog_reminder(
     );
 }
 
+fn request_mentions_skill_tool(request: &AnthropicRequest) -> bool {
+    if !collect_skill_catalog_reminder_blocks(request).is_empty() {
+        return true;
+    }
+
+    for message in &request.messages {
+        if let Some(text) = extract_message_text(message) {
+            let lower = text.to_ascii_lowercase();
+            if lower.contains("/skill") || lower.contains("$skill") {
+                return true;
+            }
+            if lower.contains("skills are available")
+                || lower.contains("available skills")
+                || lower.contains("skill tool")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn ensure_skill_catalog_context_for_codex(
     request: &mut AnthropicRequest,
     reminder_store: &SkillCatalogReminderStore,
@@ -799,6 +894,17 @@ fn ensure_skill_catalog_context_for_codex(
     log_tx: &broadcast::Sender<String>,
     logger: &Option<Arc<AppLogger>>,
 ) {
+    if !request_mentions_skill_tool(request) {
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[SkillCatalogCache] #{} skipped=true reason=no_skill_hint",
+                request_id
+            ),
+        );
+        return;
+    }
     let current_blocks = collect_skill_catalog_reminder_blocks(request);
     if !current_blocks.is_empty() {
         upsert_skill_catalog_reminder(reminder_store, cache_key, &current_blocks);
@@ -2160,6 +2266,31 @@ fn extract_cached_input_tokens_from_response_usage(usage: &Value) -> Option<u64>
     usage
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(|value| value.as_u64())
+}
+
+fn log_usage_tokens(
+    log_tx: &broadcast::Sender<String>,
+    request_id: &str,
+    usage: Option<&Value>,
+    source: &str,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let input_tokens = usage.get("input_tokens").and_then(|value| value.as_u64());
+    let output_tokens = usage.get("output_tokens").and_then(|value| value.as_u64());
+    if input_tokens.is_none() && output_tokens.is_none() {
+        return;
+    }
+    let cached_input_tokens = extract_cached_input_tokens_from_response_usage(usage);
+    let _ = log_tx.send(format!(
+        "[Tokens] #{} input_tokens={} output_tokens={} cached_input_tokens={} source={}",
+        request_id,
+        input_tokens.unwrap_or(0),
+        output_tokens.unwrap_or(0),
+        cached_input_tokens.unwrap_or(0),
+        source
+    ));
 }
 
 fn log_prompt_cache_observation(
@@ -3953,7 +4084,7 @@ async fn handle_request(
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
-    let stateful_chain_hint = extract_stateful_chain_hint(&req);
+    let stateful_chain_hint_header = extract_stateful_chain_hint(&req);
 
     // 确定最终使用的 API key
     let final_api_key = if let Some(key) = api_key.clone() {
@@ -4023,6 +4154,10 @@ async fn handle_request(
                     .unwrap());
             }
         };
+
+    let stateful_chain_hint_info =
+        resolve_stateful_chain_hint_info(stateful_chain_hint_header, &anthropic_body);
+    let stateful_chain_hint = stateful_chain_hint_info.value.clone();
 
     let skill_catalog_cache_key =
         derive_skill_catalog_cache_key(stateful_chain_hint.as_deref(), &anthropic_body);
@@ -4665,6 +4800,20 @@ async fn handle_request(
         let mut stateful_chain_meta_for_attempt = if enable_stateful_responses_chain
             && route_selection.converter.eq_ignore_ascii_case("codex")
         {
+            let hint_tail = stateful_chain_hint
+                .as_deref()
+                .map(|value| tail_chars(value, 18))
+                .unwrap_or_else(|| "-".to_string());
+            emit_stream_diag(
+                &log_tx,
+                &logger,
+                format!(
+                    "[StatefulChain] #{} hint_source={} hint={}",
+                    request_id,
+                    stateful_chain_hint_info.source,
+                    hint_tail
+                ),
+            );
             let endpoint_key = build_stateful_endpoint_key(
                 &route_selection.converter,
                 &resolved_target_url,
@@ -5404,6 +5553,12 @@ async fn handle_request(
             };
 
             let payload = build_anthropic_message_from_codex_json_response(&parsed, &model);
+            log_usage_tokens(
+                &log_tx,
+                &request_id,
+                parsed.get("usage"),
+                "codex_non_stream",
+            );
             log_prompt_cache_observation(
                 &log_tx,
                 &request_id,
@@ -6706,6 +6861,15 @@ async fn handle_request(
                 .and_then(|meta| meta.static_prefix_same_as_prior),
         );
 
+        log_usage_tokens(
+            &log_tx_clone,
+            &request_id_for_stream,
+            latest_codex_terminal_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("usage")),
+            "codex_stream",
+        );
+
         if stateful_chain_enabled_for_stream
             && decision.saw_response_completed
             && !decision.saw_response_failed
@@ -6881,8 +7045,9 @@ mod tests {
         backfill_non_stream_payload_from_codex_snapshot,
         disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
         extract_cached_input_tokens_from_response_usage,
-        extract_codex_terminal_response_snapshot, extract_tool_leak_retry_signal,
-        extract_upstream_response_id,
+        extract_codex_terminal_response_snapshot, extract_stateful_chain_hint_from_request,
+        extract_tool_leak_retry_signal, extract_upstream_response_id,
+        resolve_stateful_chain_hint_info,
         get_cached_skill_catalog_reminder, get_parallel_tool_degrade_remaining_seconds,
         inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
         is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
@@ -6978,7 +7143,7 @@ mod tests {
             "model": "claude-sonnet-4-6",
             "messages": [{
                 "role": "user",
-                "content": "你当前有些什么技能，只从当前上下文告诉我"
+                "content": "你当前有些什么技能，请用/skill 从当前上下文告诉我"
             }],
             "stream": true
         }))
@@ -7004,6 +7169,59 @@ mod tests {
         let refreshed = get_cached_skill_catalog_reminder(&reminder_store, &cache_key)
             .expect("catalog should be updated");
         assert!(refreshed.contains("- playwright: browser automation"));
+    }
+
+    #[test]
+    fn test_skill_catalog_cache_skips_when_no_skill_hint() {
+        let reminder_store: SkillCatalogReminderStore = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut request_with_catalog: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>"
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let cache_key = derive_skill_catalog_cache_key(None, &request_with_catalog);
+        ensure_skill_catalog_context_for_codex(
+            &mut request_with_catalog,
+            &reminder_store,
+            &cache_key,
+            "req_seed",
+            &broadcast::channel(8).0,
+            &None,
+        );
+
+        let mut request_without_skill_hint: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "你好"
+            }],
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        ensure_skill_catalog_context_for_codex(
+            &mut request_without_skill_hint,
+            &reminder_store,
+            &cache_key,
+            "req_skip",
+            &broadcast::channel(8).0,
+            &None,
+        );
+
+        let injected_text =
+            super::extract_message_text(&request_without_skill_hint.messages[0]).unwrap_or_default();
+        assert!(!injected_text.contains("The following skills are available"));
     }
 
     #[test]
@@ -7784,6 +8002,39 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         assert_eq!(entry.endpoint_key, "ep-a");
         assert_eq!(entry.full_input.len(), 1);
         assert_eq!(entry.static_prefix_summary.as_deref(), Some("pk_chain_a"));
+    }
+
+    #[test]
+    fn test_extract_stateful_chain_hint_from_metadata_user_id() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [],
+            "metadata": {"user_id": "user_abc_account__session_123e4567-e89b-12d3-a456-426614174000"},
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let hint = extract_stateful_chain_hint_from_request(&request);
+        assert_eq!(
+            hint.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            "metadata user_id should supply stable session hint"
+        );
+    }
+
+    #[test]
+    fn test_resolve_stateful_chain_hint_from_metadata() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [],
+            "metadata": {"user_id": "user_abc_account__session_123e4567-e89b-12d3-a456-426614174000"},
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let info = resolve_stateful_chain_hint_info(None, &request);
+        assert_eq!(info.value.as_deref(), Some("123e4567-e89b-12d3-a456-426614174000"));
+        assert_eq!(info.source, "metadata");
     }
 
     #[test]

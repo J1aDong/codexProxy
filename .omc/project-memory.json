@@ -1,0 +1,169 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1773120017012,
+  "projectRoot": "/Users/mr.j/myRoom/code/ai/MyProjects/codexProxy",
+  "techStack": {
+    "languages": [],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "test"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "backup": {
+      "path": "backup",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1773120016941,
+      "keyFiles": [
+        "codex-proxy-anthropic.js",
+        "run-proxy.sh"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 1,
+      "lastAccessed": 1773120016943,
+      "keyFiles": []
+    },
+    "fronted-tauri": {
+      "path": "fronted-tauri",
+      "purpose": null,
+      "fileCount": 10,
+      "lastAccessed": 1773120016943,
+      "keyFiles": [
+        "app-icon.svg",
+        "index.html",
+        "package-lock.json",
+        "package.json",
+        "postcss.config.js"
+      ]
+    },
+    "imgs": {
+      "path": "imgs",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1773120016945,
+      "keyFiles": [
+        "multi.png",
+        "single.png"
+      ]
+    },
+    "issue": {
+      "path": "issue",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1773120016945,
+      "keyFiles": [
+        "fix_commentary_phase_overflow_20260222_081856.txt"
+      ]
+    },
+    "main": {
+      "path": "main",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1773120016945,
+      "keyFiles": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "test_logging",
+        "test_logging.rs"
+      ]
+    },
+    "test": {
+      "path": "test",
+      "purpose": "Test files",
+      "fileCount": 2,
+      "lastAccessed": 1773120016948,
+      "keyFiles": [
+        "TESTING_PROXY.md",
+        "proxy_tests.py"
+      ]
+    },
+    "fronted-tauri/dist": {
+      "path": "fronted-tauri/dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 1,
+      "lastAccessed": 1773120016949,
+      "keyFiles": [
+        "index.html"
+      ]
+    },
+    "fronted-tauri/node_modules": {
+      "path": "fronted-tauri/node_modules",
+      "purpose": "Dependencies",
+      "fileCount": 1,
+      "lastAccessed": 1773120016970,
+      "keyFiles": []
+    },
+    "fronted-tauri/src": {
+      "path": "fronted-tauri/src",
+      "purpose": "Source code",
+      "fileCount": 4,
+      "lastAccessed": 1773120016971,
+      "keyFiles": [
+        "App.vue",
+        "main.ts",
+        "style.css"
+      ]
+    },
+    "main/scripts": {
+      "path": "main/scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 1,
+      "lastAccessed": 1773120017008,
+      "keyFiles": [
+        "generate_replay_fixture.py"
+      ]
+    },
+    "main/src": {
+      "path": "main/src",
+      "purpose": "Source code",
+      "fileCount": 5,
+      "lastAccessed": 1773120017012,
+      "keyFiles": [
+        "instructions.txt",
+        "lib.rs",
+        "logger.rs"
+      ]
+    },
+    "main/tests": {
+      "path": "main/tests",
+      "purpose": "Test files",
+      "fileCount": 2,
+      "lastAccessed": 1773120017012,
+      "keyFiles": [
+        "load_balancer_test.rs",
+        "test_logging.rs"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}

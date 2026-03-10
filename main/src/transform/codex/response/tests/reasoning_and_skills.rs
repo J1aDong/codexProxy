@@ -260,6 +260,7 @@ fn test_custom_injection_prompt() {
         model: Some("claude-3-opus".to_string()),
         messages,
         system: None,
+        metadata: None,
         stream: false,
         tools: None,
         tool_choice: None,

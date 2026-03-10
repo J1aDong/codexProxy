@@ -68,6 +68,16 @@ fn is_wrapped_agents_instructions(system_text: &str) -> bool {
         && lower.contains("</instructions>")
 }
 
+fn system_contains_codex_instructions(system_text: &str) -> bool {
+    let normalized = normalize_text_for_exact_match(system_text).to_ascii_lowercase();
+    if normalized.contains("you are a coding agent running in the codex cli") {
+        return true;
+    }
+    let normalized_instructions =
+        normalize_text_for_exact_match(CODEX_INSTRUCTIONS).to_ascii_lowercase();
+    normalized.contains(&normalized_instructions)
+}
+
 fn request_contains_environment_context(request_text_corpus: &str) -> bool {
     request_text_corpus
         .to_ascii_lowercase()
@@ -125,6 +135,14 @@ fn decide_request_augmentation(
         .unwrap_or(false)
     {
         reasons.push("system");
+        if request
+            .system
+            .as_ref()
+            .map(|system| system_contains_codex_instructions(&system.to_string()))
+            .unwrap_or(false)
+        {
+            reasons.push("system_codex");
+        }
     }
 
     if request
@@ -151,6 +169,15 @@ fn decide_request_augmentation(
         .unwrap_or(false)
     {
         reasons.push("wrapped_agents_system");
+    }
+
+    if reasons.contains(&"environment_context")
+        && !reasons.contains(&"tools")
+        && !reasons.contains(&"tool_state")
+        && !reasons.contains(&"system_codex")
+        && !reasons.contains(&"wrapped_agents_system")
+    {
+        reasons.retain(|reason| *reason != "environment_context");
     }
 
     let mode = if reasons.is_empty() {
@@ -197,6 +224,99 @@ fn collect_request_text_corpus(request: &AnthropicRequest) -> String {
     }
 
     parts.join("\n")
+}
+
+fn extract_session_hint_from_user_id(user_id: &str) -> Option<String> {
+    let lower = user_id.to_ascii_lowercase();
+    if let Some(idx) = lower.find("session_") {
+        let tail = &user_id[idx + "session_".len()..];
+        let token = tail
+            .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
+            .next()
+            .unwrap_or("");
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn extract_session_hint_from_metadata(request: &AnthropicRequest) -> Option<String> {
+    let metadata = request.metadata.as_ref()?;
+    let read_str = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    };
+    if let Some(value) = read_str("session_id") {
+        return Some(value);
+    }
+    if let Some(value) = read_str("conversation_id") {
+        return Some(value);
+    }
+    if let Some(user_id) = metadata.get("user_id").and_then(|value| value.as_str()) {
+        return extract_session_hint_from_user_id(user_id);
+    }
+    None
+}
+
+fn extract_request_session_hint(request: &AnthropicRequest) -> Option<String> {
+    if let Some(value) = extract_session_hint_from_metadata(request) {
+        return Some(value);
+    }
+    let mut candidates = Vec::new();
+    if let Some(system_text) = request.system.as_ref().map(|s| s.to_string()) {
+        candidates.push(system_text);
+    }
+    for message in &request.messages {
+        if let Some(content) = message.content.as_ref() {
+            match content {
+                MessageContent::Text(text) => candidates.push(text.clone()),
+                MessageContent::Blocks(blocks) => {
+                    for block in blocks {
+                        if let ContentBlock::Text { text } = block {
+                            candidates.push(text.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for text in candidates {
+        let lower = text.to_ascii_lowercase();
+        if let Some(idx) = lower.find("session_id") {
+            let tail = &text[idx..];
+            if let Some(start) = tail.find(':') {
+                let after = tail[start + 1..].trim();
+                let token = after
+                    .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
+                    .next()
+                    .unwrap_or("");
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+        if let Some(idx) = lower.find("conversation_id") {
+            let tail = &text[idx..];
+            if let Some(start) = tail.find(':') {
+                let after = tail[start + 1..].trim();
+                let token = after
+                    .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
+                    .next()
+                    .unwrap_or("");
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn extract_first_tag_content<'a>(text: &'a str, tag_start: &str, tag_end: &str) -> Option<&'a str> {
@@ -618,11 +738,20 @@ fn sanitize_cache_key_segment(input: &str, max_len: usize) -> String {
 fn build_prompt_cache_key(
     request_cwd: Option<&str>,
     codex_model: &str,
+    request_session_hint: Option<&str>,
     applied_custom_injection_prompt: Option<&str>,
     applied_static_instructions: Option<&str>,
     system_text: Option<&str>,
     tools_fingerprint: Option<&str>,
 ) -> String {
+    let hint = request_session_hint
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| sanitize_cache_key_segment(value, 72));
+    if let Some(hint) = hint {
+        let model_segment = sanitize_cache_key_segment(codex_model, 48);
+        return format!("codex-proxy:{}:session:{}", model_segment, hint);
+    }
     let mut key_material = Vec::new();
     if let Some(instructions) = applied_static_instructions {
         key_material.extend_from_slice(normalize_text_for_exact_match(instructions).as_bytes());
@@ -955,6 +1084,21 @@ fn strip_leaked_tool_suffix_from_text(text: &str) -> Option<String> {
     Some(text.to_string())
 }
 
+fn compact_skill_catalog_block(block: &str) -> Option<String> {
+    let names = extract_available_skill_names_ordered(block);
+    if names.is_empty() {
+        return None;
+    }
+    let mut compacted = String::new();
+    compacted.push_str("Skill catalog (names only):\n");
+    for name in names {
+        compacted.push_str("- ");
+        compacted.push_str(&name);
+        compacted.push('\n');
+    }
+    Some(compacted.trim_end().to_string())
+}
+
 fn strip_system_reminder_blocks(text: &str) -> String {
     const START: &str = "<system-reminder>";
     const END: &str = "</system-reminder>";
@@ -993,7 +1137,11 @@ fn strip_system_reminder_blocks(text: &str) -> String {
             .any(|marker| block_lower.contains(marker));
         if preserve_block {
             sanitized.push_str(START);
-            sanitized.push_str(block);
+            if let Some(compacted) = compact_skill_catalog_block(block) {
+                sanitized.push_str(&compacted);
+            } else {
+                sanitized.push_str(block);
+            }
             sanitized.push_str(END);
         };
         remaining = &after_start[end_rel + END.len()..];
@@ -1220,6 +1368,7 @@ impl TransformRequest {
 
         let request_text_corpus = collect_request_text_corpus(anthropic_body);
         let request_cwd = extract_request_cwd(&request_text_corpus);
+        let request_session_hint = extract_request_session_hint(anthropic_body);
         let augmentation = decide_request_augmentation(anthropic_body, &request_text_corpus);
         let apply_agent_augmentations = augmentation.is_agent();
         let augmentation_reasons = if augmentation.reasons.is_empty() {
@@ -1235,11 +1384,13 @@ impl TransformRequest {
         let mut raw_system_text_for_stats = None::<String>;
         let mut wrapped_system_payload_text = None::<String>;
         let mut injected_text_dedupe = HashSet::new();
+        let mut system_matches_codex_instructions = false;
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let system_text = system.to_string();
             raw_system_text_for_stats = Some(system_text.clone());
             system_text_for_cache_key = Some(system_text.clone());
+            system_matches_codex_instructions = system_contains_codex_instructions(&system_text);
             log(&format!(
                 "📋 [Transform] System prompt: {} chars",
                 system_text.len()
@@ -1359,10 +1510,13 @@ impl TransformRequest {
             parallel_tool_calls,
             transformed_tools.len()
         ));
-        let static_instructions_applied = apply_agent_augmentations;
+        let static_instructions_applied = apply_agent_augmentations
+            && !system_matches_codex_instructions
+            && !augmentation.reasons.contains(&"system");
         let prompt_cache_key = build_prompt_cache_key(
             request_cwd.as_deref(),
             final_codex_model,
+            request_session_hint.as_deref(),
             custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
             static_instructions_applied.then_some(CODEX_INSTRUCTIONS),
             system_text_for_cache_key.as_deref(),
@@ -2055,6 +2209,42 @@ mod tests {
     }
 
     #[test]
+    fn skill_catalog_system_reminder_is_compacted_for_codex() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role":"user",
+                "content": "<system-reminder>
+The following skills are available for use with the Skill tool:
+- figma-implement-design: Translate Figma nodes
+- pdf: Read PDF files
+</system-reminder>
+
+hello"
+            }],
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let texts = input_texts(&body);
+        let joined = texts.join("
+");
+
+        assert!(joined.contains("Skill catalog"));
+        assert!(joined.contains("- figma-implement-design"));
+        assert!(joined.contains("- pdf"));
+        assert!(!joined.contains("Translate Figma nodes"));
+        assert!(!joined.contains("Read PDF files"));
+    }
+
+    #[test]
     fn compact_tool_description_truncates_and_normalizes() {
         let description = "First line with    extra spaces.\nSecond line stays in first paragraph.\n\nSecond paragraph should be dropped.";
         let compacted = compact_tool_description(Some(description));
@@ -2309,6 +2499,95 @@ mod tests {
             body_a.get("prompt_cache_key").and_then(|v| v.as_str()),
             Some(session_a.as_str()),
             "prompt cache key should not use random session id"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_uses_session_hint_from_metadata_user_id() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role":"user","content":[{"type":"text","text":"hello"}]}],
+            "metadata": {"user_id": "user_abc_account__session_123e4567-e89b-12d3-a456-426614174000"},
+            "stream": true
+        }))
+        .expect("request with metadata session hint");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body_a, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt A",
+            "gpt-5.4",
+        );
+        let (body_b, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt B",
+            "gpt-5.4",
+        );
+
+        let key_a = body_a
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let key_b = body_b
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        assert_eq!(
+            key_a, key_b,
+            "metadata session hint should stabilize cache key"
+        );
+        assert_eq!(
+            key_a,
+            "codex-proxy:gpt_5_4:session:123e4567_e89b_12d3_a456_426614174000",
+            "cache key should use metadata session hint"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_uses_session_hint_when_present() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":[{"type":"text","text":"hello"}]}],
+            "system": "System prompt\nsession_id: abc-123",
+            "stream": true
+        }))
+        .expect("request with session hint");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body_a, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt A",
+            "gpt-5.3-codex",
+        );
+        let (body_b, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt B",
+            "gpt-5.3-codex",
+        );
+
+        let key_a = body_a
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let key_b = body_b
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        assert_eq!(key_a, key_b, "session hint should stabilize cache key");
+        assert_eq!(
+            key_a,
+            "codex-proxy:gpt_5_3_codex:session:abc_123",
+            "cache key should use sanitized session hint"
         );
     }
 
@@ -2637,7 +2916,7 @@ mod tests {
         let request_a: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
             "messages": [{"role":"user","content":[{"type":"text","text":"hello"}]}],
-            "system": "System prompt",
+            "system": "System prompt\nsession_id: abc123",
             "tools": [{
                 "name": "toolA",
                 "description": "A",
@@ -2649,7 +2928,7 @@ mod tests {
         let request_b: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
             "messages": [{"role":"user","content":[{"type":"text","text":"hello"}]}],
-            "system": "System prompt",
+            "system": "System prompt\nsession_id: abc123",
             "tools": [{
                 "name": "toolB",
                 "description": "B",
@@ -2663,7 +2942,7 @@ mod tests {
         let (body_a, _) = TransformRequest::transform(&request_a, None, &mapping, "", "gpt-5.3-codex");
         let (body_b, _) = TransformRequest::transform(&request_b, None, &mapping, "", "gpt-5.3-codex");
 
-        assert_ne!(body_a.get("prompt_cache_key"), body_b.get("prompt_cache_key"));
+        assert_eq!(body_a.get("prompt_cache_key"), body_b.get("prompt_cache_key"));
     }
 
     #[test]
@@ -2692,7 +2971,10 @@ mod tests {
 
         let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
 
-        assert_eq!(body.get("instructions").and_then(|v| v.as_str()), Some(CODEX_INSTRUCTIONS));
+        assert!(
+            body.get("instructions").is_none(),
+            "static instructions should be skipped when system already contains them"
+        );
     }
 
     #[test]
@@ -2854,13 +3136,9 @@ hello");
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
-        let instructions = body
-            .get("instructions")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
         assert!(
-            instructions.starts_with("You are a coding agent running in the Codex CLI"),
-            "agent-shaped requests should carry the official static instructions"
+            body.get("instructions").is_none(),
+            "system-only agent requests should rely on wrapped system instead of static instructions"
         );
         assert!(
             input_texts(&body).iter().any(|text| text == "global prompt"),
@@ -2885,13 +3163,9 @@ hello");
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
-        let instructions = body
-            .get("instructions")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
         assert!(
-            instructions.starts_with("You are a coding agent running in the Codex CLI"),
-            "static instructions should still be present alongside wrapped system content"
+            body.get("instructions").is_none(),
+            "system-only requests with codex rules should skip static instructions"
         );
     }
 
@@ -3232,7 +3506,7 @@ hello");
             .flat_map(|blocks| blocks.iter())
             .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
             .filter(|text| {
-                text.contains("The following skills are available for use with the Skill tool")
+                text.contains("Skill catalog (names only)")
             })
             .count();
 

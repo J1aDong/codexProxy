@@ -192,6 +192,7 @@ fn test_codex_input_strips_leaked_tool_suffix_from_message_text() {
             }])),
         }],
         system: None,
+        metadata: None,
         stream: true,
         tools: None,
         tool_choice: None,

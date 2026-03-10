@@ -10,6 +10,8 @@ pub struct AnthropicRequest {
     pub system: Option<SystemContent>,
     pub tools: Option<Vec<Value>>,
     #[serde(default)]
+    pub metadata: Option<Value>,
+    #[serde(default)]
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub thinking: Option<RequestThinkingConfig>,
