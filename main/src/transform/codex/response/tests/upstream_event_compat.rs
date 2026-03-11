@@ -778,7 +778,10 @@ fn output_index_routing_wins_over_conflicting_item_id_for_tool_arguments() {
 }
 
 #[test]
-fn terminal_invariant_violation_emits_controlled_error_and_stop() {
+fn terminal_invariant_violation_auto_clears_orphaned_tool_argument_updates() {
+    // When upstream sends inconsistent tool call data (e.g., tool argument updates
+    // without a corresponding function_call), we auto-clear them at terminal phase
+    // and emit a warning instead of failing the entire response.
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     transformer
         .pending_tool_argument_updates
@@ -800,9 +803,12 @@ fn terminal_invariant_violation_emits_controlled_error_and_stop() {
     );
 
     let joined = transformer.transform_sse_line(&completed).join("");
-    assert!(joined.contains("event: error"));
-    assert!(joined.contains("\"code\":\"terminal_invariant_violation\""));
+    // Should NOT emit error - instead auto-clear and continue normally
+    assert!(!joined.contains("event: error"));
+    // Should emit normal message_stop
     assert!(joined.contains("\"type\":\"message_stop\""));
+    // Pending updates should be cleared
+    assert!(transformer.pending_tool_argument_updates.is_empty());
 }
 
 #[test]

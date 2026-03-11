@@ -3907,6 +3907,17 @@ data: {}
         self.close_open_text_block(output);
         self.close_open_thinking_block(output);
 
+        // Auto-cleanup orphaned pending tool argument updates at terminal phase
+        // This can happen when upstream sends inconsistent tool call data
+        if !self.pending_tool_argument_updates.is_empty() {
+            let count = self.pending_tool_argument_updates.len();
+            self.logger.log_raw(&format!(
+                "[Warn] Clearing {} orphaned tool argument updates at terminal phase (upstream inconsistency)",
+                count
+            ));
+            self.pending_tool_argument_updates.clear();
+        }
+
         if let Some(reason) = self.terminal_invariant_violation_reason() {
             self.emit_terminal_invariant_violation_error(output, reason);
             return;

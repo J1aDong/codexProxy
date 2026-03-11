@@ -446,7 +446,7 @@ fn default_enable_stream_heartbeat() -> bool {
 }
 
 fn default_stream_heartbeat_interval_ms() -> u64 {
-    8_000
+    3_000
 }
 
 fn default_enable_stream_log_sampling() -> bool {
