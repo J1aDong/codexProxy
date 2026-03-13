@@ -4,10 +4,11 @@ use crate::load_balancer::{
 use crate::logger::AppLogger;
 use crate::models::{
     AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
-    GeminiReasoningEffortMapping, Message, MessageContent, ReasoningEffort, ReasoningEffortMapping,
+    GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping, ReasoningEffort,
+    ReasoningEffortMapping,
 };
 use crate::transform::{
-    AnthropicBackend, CodexBackend, GeminiBackend, TransformBackend, TransformContext,
+    AnthropicBackend, CodexBackend, GeminiBackend, OpenAIChatBackend, TransformBackend, TransformContext,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -43,6 +44,7 @@ pub struct ProxyServer {
     codex_model: String,
     codex_model_mapping: CodexModelMapping,
     anthropic_model_mapping: AnthropicModelMapping,
+    openai_model_mapping: OpenAIModelMapping,
     gemini_reasoning_effort: GeminiReasoningEffortMapping,
     max_concurrency: u32,
     ignore_probe_requests: bool,
@@ -222,6 +224,8 @@ fn build_backend_by_converter(converter: &str) -> Arc<dyn TransformBackend> {
         Arc::new(GeminiBackend)
     } else if converter.eq_ignore_ascii_case("anthropic") {
         Arc::new(AnthropicBackend)
+    } else if converter.eq_ignore_ascii_case("openai") {
+        Arc::new(OpenAIChatBackend)
     } else {
         Arc::new(CodexBackend)
     }
@@ -232,6 +236,8 @@ fn backend_label_by_converter(converter: &str) -> &'static str {
         "Gemini API"
     } else if converter.eq_ignore_ascii_case("anthropic") {
         "Anthropic API"
+    } else if converter.eq_ignore_ascii_case("openai") {
+        "OpenAI API"
     } else {
         "Codex API"
     }
@@ -243,6 +249,7 @@ fn resolve_model_for_converter(
     reasoning_mapping: &ReasoningEffortMapping,
     codex_model_mapping: &CodexModelMapping,
     anthropic_model_mapping: &AnthropicModelMapping,
+    openai_model_mapping: &OpenAIModelMapping,
     gemini_reasoning_effort: &GeminiReasoningEffortMapping,
 ) -> String {
     if converter.eq_ignore_ascii_case("anthropic") {
@@ -264,6 +271,21 @@ fn resolve_model_for_converter(
                     anthropic_model_mapping.sonnet.trim()
                 }
                 ReasoningEffort::Low => anthropic_model_mapping.haiku.trim(),
+            };
+            if !model.is_empty() {
+                return model.to_string();
+            }
+        }
+        return input_model.to_string();
+    }
+
+    if converter.eq_ignore_ascii_case("openai") {
+        if let Some(family) = detect_model_family(input_model) {
+            let model = match family {
+                "opus" => openai_model_mapping.opus.trim(),
+                "sonnet" => openai_model_mapping.sonnet.trim(),
+                "haiku" => openai_model_mapping.haiku.trim(),
+                _ => "",
             };
             if !model.is_empty() {
                 return model.to_string();
@@ -3402,6 +3424,20 @@ fn build_anthropic_count_tokens_endpoint(target_url: &str) -> String {
     format!("{}/messages/count_tokens", base)
 }
 
+fn build_openai_messages_endpoint(target_url: &str) -> String {
+    if target_url.contains("/chat/completions") || target_url.contains("openai.azure.com") {
+        return target_url.to_string();
+    }
+
+    let clean = strip_query(target_url.to_string());
+    let base = clean.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{}/chat/completions", base)
+    } else {
+        format!("{}/v1/chat/completions", base)
+    }
+}
+
 fn resolve_upstream_url(
     converter: &str,
     target_url: &str,
@@ -3419,6 +3455,13 @@ fn resolve_upstream_url(
         return match operation {
             UpstreamOperation::Messages => build_gemini_messages_endpoint(target_url, model),
             UpstreamOperation::CountTokens => build_gemini_count_tokens_endpoint(target_url, model),
+        };
+    }
+
+    if converter.eq_ignore_ascii_case("openai") {
+        return match operation {
+            UpstreamOperation::Messages => build_openai_messages_endpoint(target_url),
+            UpstreamOperation::CountTokens => build_openai_messages_endpoint(target_url),
         };
     }
 
@@ -3451,6 +3494,7 @@ fn resolve_route_selection(
         &ctx.reasoning_mapping,
         &ctx.codex_model_mapping,
         &ctx.anthropic_model_mapping,
+        &ctx.openai_model_mapping,
         &ctx.gemini_reasoning_effort,
     );
 
@@ -3471,6 +3515,7 @@ fn resolve_route_selection(
                     &ctx.reasoning_mapping,
                     &ctx.codex_model_mapping,
                     &ctx.anthropic_model_mapping,
+                    &ctx.openai_model_mapping,
                     &ctx.gemini_reasoning_effort,
                 );
             }
@@ -3607,6 +3652,7 @@ impl ProxyServer {
             codex_model: "gpt-5.3-codex".to_string(),
             codex_model_mapping: CodexModelMapping::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
             gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
             max_concurrency: 0,
             ignore_probe_requests: false,
@@ -3667,6 +3713,11 @@ impl ProxyServer {
 
     pub fn with_anthropic_model_mapping(mut self, mapping: AnthropicModelMapping) -> Self {
         self.anthropic_model_mapping = mapping;
+        self
+    }
+
+    pub fn with_openai_model_mapping(mut self, mapping: OpenAIModelMapping) -> Self {
+        self.openai_model_mapping = mapping;
         self
     }
 
@@ -3833,6 +3884,7 @@ impl ProxyServer {
                 reasoning_mapping: self.reasoning_mapping.clone(),
                 codex_model_mapping: self.codex_model_mapping.clone(),
                 anthropic_model_mapping: self.anthropic_model_mapping.clone(),
+                openai_model_mapping: self.openai_model_mapping.clone(),
                 custom_injection_prompt: self.custom_injection_prompt.clone(),
                 converter: self.converter.clone(),
                 codex_model: self.codex_model.clone(),
@@ -4427,7 +4479,9 @@ async fn handle_request(
             prefer_codex_v1_path_for_route,
         );
 
-        if route_selection.converter.eq_ignore_ascii_case("gemini") {
+        if route_selection.converter.eq_ignore_ascii_case("openai") {
+            source = "estimate_openai".to_string();
+        } else if route_selection.converter.eq_ignore_ascii_case("gemini") {
             let (messages, _) = crate::transform::MessageProcessor::transform_messages(
                 &anthropic_body.messages,
                 Some(&log_tx),
@@ -7524,6 +7578,17 @@ mod tests {
             url,
             "http://localhost:8317/v1beta/models/gemini-3-flash-preview:streamGenerateContent?alt=sse"
         );
+    }
+
+    #[test]
+    fn test_resolve_upstream_url_openai_messages_from_v1_base() {
+        let url = resolve_upstream_url(
+            "openai",
+            "https://api.openai.com/v1",
+            UpstreamOperation::Messages,
+            "gpt-4o",
+        );
+        assert_eq!(url, "https://api.openai.com/v1/chat/completions");
     }
 
     #[test]

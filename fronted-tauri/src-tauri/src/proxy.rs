@@ -5,8 +5,9 @@ use codex_proxy_core::load_balancer::{
     SlotEndpointRef as CoreSlotEndpointRef, SlotMapping as CoreSlotMapping,
 };
 use codex_proxy_core::{
-    AnthropicModelMapping, CodexModelMapping, GeminiReasoningEffortMapping, ProxyRuntimeHandle,
-    ProxyServer, ReasoningEffort, ReasoningEffortMapping, RuntimeConfigUpdate, TransformContext,
+    AnthropicModelMapping, CodexModelMapping, GeminiReasoningEffortMapping, OpenAIModelMapping,
+    ProxyRuntimeHandle, ProxyServer, ReasoningEffort, ReasoningEffortMapping,
+    RuntimeConfigUpdate, TransformContext,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,6 +33,13 @@ pub struct CodexModelMappingConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AnthropicModelMappingConfig {
+    pub opus: String,
+    pub sonnet: String,
+    pub haiku: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct OpenAIModelMappingConfig {
     pub opus: String,
     pub sonnet: String,
     pub haiku: String,
@@ -165,6 +173,9 @@ pub struct EndpointOption {
     #[serde(rename = "anthropicModelMapping", default)]
     pub anthropic_model_mapping: Option<AnthropicModelMappingConfig>,
 
+    #[serde(rename = "openaiModelMapping", default)]
+    pub openai_model_mapping: Option<OpenAIModelMappingConfig>,
+
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: Option<ReasoningEffortConfig>,
 
@@ -184,6 +195,7 @@ fn default_endpoint_options() -> Vec<EndpointOption> {
         codex_effort_capability_map: None,
         gemini_model_preset: None,
         anthropic_model_mapping: None,
+        openai_model_mapping: None,
         reasoning_effort: None,
         gemini_reasoning_effort: None,
     }]
@@ -213,6 +225,10 @@ fn default_anthropic_model_mapping() -> AnthropicModelMappingConfig {
     AnthropicModelMappingConfig::default()
 }
 
+fn default_openai_model_mapping() -> OpenAIModelMappingConfig {
+    OpenAIModelMappingConfig::default()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ProxyConfig {
     pub port: u16,
@@ -238,6 +254,12 @@ pub struct ProxyConfig {
         default = "default_anthropic_model_mapping"
     )]
     pub anthropic_model_mapping: AnthropicModelMappingConfig,
+
+    #[serde(
+        rename = "openaiModelMapping",
+        default = "default_openai_model_mapping"
+    )]
+    pub openai_model_mapping: OpenAIModelMappingConfig,
 
     #[serde(rename = "codexEffortCapabilityMap", default)]
     pub codex_effort_capability_map: Option<std::collections::HashMap<String, Vec<String>>>,
@@ -555,6 +577,7 @@ fn default_proxy_config() -> ProxyConfig {
         codex_model: default_codex_model(),
         codex_model_mapping: CodexModelMappingConfig::default(),
         anthropic_model_mapping: default_anthropic_model_mapping(),
+        openai_model_mapping: default_openai_model_mapping(),
         codex_effort_capability_map: None,
         gemini_model_preset: default_gemini_model_preset(),
         max_concurrency: 0,
@@ -795,6 +818,11 @@ fn build_runtime_update(
                 opus: config.anthropic_model_mapping.opus.clone(),
                 sonnet: config.anthropic_model_mapping.sonnet.clone(),
                 haiku: config.anthropic_model_mapping.haiku.clone(),
+            },
+            openai_model_mapping: OpenAIModelMapping {
+                opus: config.openai_model_mapping.opus.clone(),
+                sonnet: config.openai_model_mapping.sonnet.clone(),
+                haiku: config.openai_model_mapping.haiku.clone(),
             },
             custom_injection_prompt: custom_injection_prompt,
             converter: config.converter.clone(),
@@ -1062,6 +1090,11 @@ async fn start_proxy_with_manager(
             opus: config.anthropic_model_mapping.opus.clone(),
             sonnet: config.anthropic_model_mapping.sonnet.clone(),
             haiku: config.anthropic_model_mapping.haiku.clone(),
+        })
+        .with_openai_model_mapping(OpenAIModelMapping {
+            opus: config.openai_model_mapping.opus.clone(),
+            sonnet: config.openai_model_mapping.sonnet.clone(),
+            haiku: config.openai_model_mapping.haiku.clone(),
         })
         .with_gemini_reasoning_effort(config.gemini_reasoning_effort.to_gemini_mapping())
         .with_ignore_probe_requests(config.ignore_probe_requests)

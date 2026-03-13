@@ -166,3 +166,13 @@ pub struct AnthropicModelMapping {
     #[serde(default)]
     pub haiku: String,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct OpenAIModelMapping {
+    #[serde(default)]
+    pub opus: String,
+    #[serde(default)]
+    pub sonnet: String,
+    #[serde(default)]
+    pub haiku: String,
+}

@@ -107,7 +107,7 @@
               />
             </div>
 
-            <div v-if="form.converter !== 'anthropic'" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+            <div v-if="form.converter === 'codex' || form.converter === 'gemini'" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
               <h3
                 class="text-sm font-semibold mb-3"
                 :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
@@ -182,7 +182,7 @@
               </div>
             </div>
 
-            <div v-else class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+            <div v-else-if="form.converter === 'anthropic'" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
               <h3
                 class="text-sm font-semibold mb-3"
                 :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
@@ -206,6 +206,36 @@
               </div>
               <div class="text-apple-text-secondary text-xs mt-2">
                 {{ t('anthropicModelMappingTip') }}
+              </div>
+              <div class="text-apple-text-secondary text-xs mt-1">
+                {{ t('anthropicPassthroughTip') }}
+              </div>
+            </div>
+
+            <div v-else class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+              <h3
+                class="text-sm font-semibold mb-3"
+                :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+              >{{ t('openaiModelMappingTitle') }}</h3>
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-5">
+                <Input
+                  v-model="form.openaiModelMapping.opus"
+                  label="Opus"
+                  :placeholder="t('openaiModelPlaceholder')"
+                />
+                <Input
+                  v-model="form.openaiModelMapping.sonnet"
+                  label="Sonnet"
+                  :placeholder="t('openaiModelPlaceholder')"
+                />
+                <Input
+                  v-model="form.openaiModelMapping.haiku"
+                  label="Haiku"
+                  :placeholder="t('openaiModelPlaceholder')"
+                />
+              </div>
+              <div class="text-apple-text-secondary text-xs mt-2">
+                {{ t('openaiModelMappingTip') }}
               </div>
               <div class="text-apple-text-secondary text-xs mt-1">
                 {{ t('anthropicPassthroughTip') }}
@@ -487,6 +517,11 @@ interface EndpointOption {
     sonnet: string
     haiku: string
   }
+  openaiModelMapping?: {
+    opus: string
+    sonnet: string
+    haiku: string
+  }
   reasoningEffort?: {
     opus: string
     sonnet: string
@@ -504,7 +539,7 @@ interface EndpointOption {
 interface EndpointSelectOption {
   value: string
   label: string
-  converterTag: 'codex' | 'gemini' | 'anthropic'
+  converterTag: 'codex' | 'gemini' | 'anthropic' | 'openai'
 }
 
 interface FormData {
@@ -532,6 +567,11 @@ interface FormData {
     haiku: string
   }
   anthropicModelMapping: {
+    opus: string
+    sonnet: string
+    haiku: string
+  }
+  openaiModelMapping: {
     opus: string
     sonnet: string
     haiku: string
@@ -666,6 +706,7 @@ const converterOptions = computed(() => [
   { value: 'codex', label: t('converterCodex') },
   { value: 'gemini', label: t('converterGemini') },
   { value: 'anthropic', label: t('converterAnthropic') },
+  { value: 'openai', label: t('converterOpenai') },
 ])
 
 const proxyModeOptions = computed(() => [
@@ -677,6 +718,7 @@ const lbConverterOptions = computed(() => [
   { value: 'codex', label: t('converterCodex') },
   { value: 'gemini', label: t('converterGemini') },
   { value: 'anthropic', label: t('converterAnthropic') },
+  { value: 'openai', label: t('converterOpenai') },
 ])
 
 const formatLbProfileName = (name: string) => {
@@ -718,7 +760,7 @@ const expandedSlotCandidates = ref<Record<string, boolean>>({})
 const openAddMenuSlot = ref<ModelSlot | null>(null)
 
 const toLbConverter = (value: string): LbConverterType => {
-  if (value === 'gemini' || value === 'anthropic') return value
+  if (value === 'gemini' || value === 'anthropic' || value === 'openai') return value
   return 'codex'
 }
 
@@ -996,6 +1038,9 @@ const getDefaultModelForSlot = (slot: ModelSlot, converter: LbConverterType): st
       || codexModelOptions.value[0]?.value
       || 'gpt-5.3-codex'
   }
+  if (converter === 'openai') {
+    return (props.form.openaiModelMapping[slot] || '').trim()
+  }
   return ''
 }
 
@@ -1030,6 +1075,15 @@ const normalizeCandidateByConverter = (
     }
   }
 
+  if (converter === 'openai') {
+    const nextModel = (candidate.customModelName || '').trim()
+    return {
+      ...candidate,
+      customModelName: nextModel || undefined,
+      customReasoningEffort: undefined,
+    }
+  }
+
   if (converter === 'gemini') {
     const nextModel = candidate.customModelName || getDefaultModelForSlot(slot, 'gemini')
     return {
@@ -1048,8 +1102,9 @@ const normalizeCandidateByConverter = (
 const buildCandidateFromEndpointSnapshot = (
   slot: ModelSlot,
   endpoint: EndpointOption,
+  forcedConverter?: LbConverterType,
 ): LbSlotEndpointRef => {
-  const converter = toLbConverter(endpoint.converter || props.form.converter)
+  const converter = forcedConverter || toLbConverter(endpoint.converter || props.form.converter)
   const candidate: LbSlotEndpointRef = {
     endpointId: endpoint.id,
     converterOverride: converter,
@@ -1064,6 +1119,10 @@ const buildCandidateFromEndpointSnapshot = (
 
     candidate.customModelName = endpointModel || formModel || fallbackModel
     candidate.customReasoningEffort = endpointEffort || formEffort || undefined
+  } else if (converter === 'openai') {
+    const endpointModel = (endpoint.openaiModelMapping?.[slot] || '').trim()
+
+    candidate.customModelName = endpointModel || undefined
   } else if (converter === 'gemini') {
     const endpointModel = (endpoint.geminiReasoningEffort?.[slot] || '').trim()
     const endpointPresetModel = endpoint.geminiModelPreset?.find((item) => item.trim())?.trim() || ''
@@ -1145,12 +1204,19 @@ const handleUpdateSlotCandidateEndpoint = (slot: ModelSlot, idx: number, endpoin
 const handleUpdateSlotCandidateConverter = (slot: ModelSlot, idx: number, converter: string) => {
   updateSlotCandidate(slot, idx, (candidate) => {
     const converterOverride = toLbConverter(converter)
+    const endpoint = props.form.endpointOptions.find((item) => item.id === candidate.endpointId)
+
+    if (endpoint) {
+      return buildCandidateFromEndpointSnapshot(slot, endpoint, converterOverride)
+    }
 
     return normalizeCandidateByConverter(
       slot,
       {
         ...candidate,
         converterOverride,
+        customModelName: undefined,
+        customReasoningEffort: undefined,
       },
       converterOverride,
     )
@@ -1202,6 +1268,7 @@ const getCandidateReasoningEffortValue = (slot: ModelSlot, candidate: LbSlotEndp
 const getConverterLabel = (converter: LbConverterType) => {
   if (converter === 'gemini') return t('converterGemini')
   if (converter === 'anthropic') return t('converterAnthropic')
+  if (converter === 'openai') return t('converterOpenai')
   return t('converterCodex')
 }
 
@@ -1218,6 +1285,13 @@ const getSlotCandidateSummary = (slot: ModelSlot, candidate: LbSlotEndpointRef) 
 
   if (converter === 'gemini') {
     const model = getCandidateModelValue(slot, candidate)
+    return `${converterLabel} · ${model}`
+  }
+
+  if (converter === 'openai') {
+    const model = (candidate.customModelName || '').trim()
+      || getDefaultModelForSlot(slot, 'openai')
+      || t('openaiModelPlaceholder')
     return `${converterLabel} · ${model}`
   }
 

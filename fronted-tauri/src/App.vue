@@ -234,7 +234,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
 import { applyProxyConfig, loadConfig, restartProxy, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
-import type { AnthropicModelMapping, CodexEffortCapabilityMap, ConverterType, EndpointOption, GeminiModelPreset, ProxyConfigV2 } from './types/configTypes'
+import type { AnthropicModelMapping, CodexEffortCapabilityMap, ConverterType, EndpointOption, GeminiModelPreset, OpenAIModelMapping, ProxyConfigV2 } from './types/configTypes'
 import { DEFAULT_PROXY_CONFIG_V2 } from './types/configTypes'
 
 import Header from './components/features/Header.vue'
@@ -360,6 +360,11 @@ const DEFAULT_CONFIG = {
     sonnet: '',
     haiku: '',
   } as AnthropicModelMapping,
+  openaiModelMapping: {
+    opus: '',
+    sonnet: '',
+    haiku: '',
+  } as OpenAIModelMapping,
   codexEffortCapabilityMap: {
     'gpt-5.3-codex': ['low', 'medium', 'high', 'xhigh'],
     'gpt-5.4': ['low', 'medium', 'high', 'xhigh'],
@@ -420,6 +425,7 @@ const form = reactive({
   codexModel: DEFAULT_CONFIG.codexModel,
   codexModelMapping: { ...DEFAULT_CONFIG.codexModelMapping },
   anthropicModelMapping: { ...DEFAULT_CONFIG.anthropicModelMapping },
+  openaiModelMapping: { ...DEFAULT_CONFIG.openaiModelMapping },
   codexEffortCapabilityMap: JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap)),
   geminiModelPreset: [...DEFAULT_CONFIG.geminiModelPreset],
   geminiReasoningEffort: { ...DEFAULT_CONFIG.geminiReasoningEffort },
@@ -494,8 +500,24 @@ const normalizeAnthropicModelMapping = (input: unknown): AnthropicModelMapping =
   }
 }
 
+const normalizeOpenaiModelMapping = (input: unknown): OpenAIModelMapping => {
+  const fallback = { ...DEFAULT_CONFIG.openaiModelMapping }
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return fallback
+  }
+
+  const source = input as Record<string, unknown>
+  const normalizeItem = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
+
+  return {
+    opus: normalizeItem(source.opus),
+    sonnet: normalizeItem(source.sonnet),
+    haiku: normalizeItem(source.haiku),
+  }
+}
+
 const normalizeConverter = (value: unknown, fallback: ConverterType): ConverterType => {
-  if (value === 'codex' || value === 'gemini' || value === 'anthropic') {
+  if (value === 'codex' || value === 'gemini' || value === 'anthropic' || value === 'openai') {
     return value
   }
   return fallback
@@ -667,6 +689,9 @@ const handleConfigImported = async () => {
         anthropicModelMapping: item.anthropicModelMapping
           ? normalizeAnthropicModelMapping(item.anthropicModelMapping)
           : item.anthropicModelMapping,
+        openaiModelMapping: item.openaiModelMapping
+          ? normalizeOpenaiModelMapping(item.openaiModelMapping)
+          : item.openaiModelMapping,
       }))
       if (savedConfig.selectedEndpointId) {
         form.selectedEndpointId = savedConfig.selectedEndpointId
@@ -720,6 +745,9 @@ const handleConfigImported = async () => {
     form.anthropicModelMapping = savedConfig.anthropicModelMapping
       ? normalizeAnthropicModelMapping(savedConfig.anthropicModelMapping)
       : { ...DEFAULT_CONFIG.anthropicModelMapping }
+    form.openaiModelMapping = savedConfig.openaiModelMapping
+      ? normalizeOpenaiModelMapping(savedConfig.openaiModelMapping)
+      : { ...DEFAULT_CONFIG.openaiModelMapping }
     if (savedConfig.geminiReasoningEffort) {
       form.geminiReasoningEffort = {
         opus: savedConfig.geminiReasoningEffort.opus || DEFAULT_CONFIG.geminiReasoningEffort.opus,
@@ -765,6 +793,9 @@ const syncEndpointFromSelection = () => {
   form.anthropicModelMapping = endpoint.anthropicModelMapping
     ? normalizeAnthropicModelMapping(endpoint.anthropicModelMapping)
     : { ...DEFAULT_CONFIG.anthropicModelMapping }
+  form.openaiModelMapping = endpoint.openaiModelMapping
+    ? normalizeOpenaiModelMapping(endpoint.openaiModelMapping)
+    : { ...DEFAULT_CONFIG.openaiModelMapping }
   if (endpoint.codexEffortCapabilityMap) {
     form.codexEffortCapabilityMap = normalizeCapabilityMap(endpoint.codexEffortCapabilityMap)
   }
@@ -795,6 +826,7 @@ const updateSelectedEndpointConfig = () => {
       codexModel: form.codexModel,
       codexModelMapping: { ...form.codexModelMapping },
       anthropicModelMapping: { ...form.anthropicModelMapping },
+      openaiModelMapping: { ...form.openaiModelMapping },
       codexEffortCapabilityMap: JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
       geminiModelPreset: [...form.geminiModelPreset],
       reasoningEffort: { ...form.reasoningEffort },
@@ -812,6 +844,7 @@ watch(
     () => form.codexModel,
     () => form.codexModelMapping,
     () => form.anthropicModelMapping,
+    () => form.openaiModelMapping,
     () => form.codexEffortCapabilityMap,
     () => form.geminiModelPreset,
     () => form.reasoningEffort,
@@ -874,6 +907,7 @@ const handleEndpointSubmit = (endpointData: any) => {
       codexModel: endpointData.codexModel || form.codexModel,
       codexModelMapping: endpointData.codexModelMapping || { ...form.codexModelMapping },
       anthropicModelMapping: endpointData.anthropicModelMapping || { ...form.anthropicModelMapping },
+      openaiModelMapping: endpointData.openaiModelMapping || { ...form.openaiModelMapping },
       codexEffortCapabilityMap: endpointData.codexEffortCapabilityMap || JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
       geminiModelPreset: endpointData.geminiModelPreset || [...form.geminiModelPreset],
       reasoningEffort: endpointData.reasoningEffort || { ...form.reasoningEffort },
@@ -975,6 +1009,7 @@ const resetDefaults = () => {
   form.codexModel = DEFAULT_CONFIG.codexModel
   form.codexModelMapping = { ...DEFAULT_CONFIG.codexModelMapping }
   form.anthropicModelMapping = { ...DEFAULT_CONFIG.anthropicModelMapping }
+  form.openaiModelMapping = { ...DEFAULT_CONFIG.openaiModelMapping }
   form.codexEffortCapabilityMap = JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap))
   form.geminiModelPreset = [...DEFAULT_CONFIG.geminiModelPreset]
   form.reasoningEffort = { ...DEFAULT_CONFIG.reasoningEffort }
@@ -1005,6 +1040,7 @@ const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   codexModel: form.codexModel,
   codexModelMapping: form.codexModelMapping,
   anthropicModelMapping: form.anthropicModelMapping,
+  openaiModelMapping: form.openaiModelMapping,
   codexEffortCapabilityMap: form.codexEffortCapabilityMap,
   geminiModelPreset: form.geminiModelPreset,
   maxConcurrency: form.maxConcurrency,
@@ -1209,6 +1245,9 @@ onMounted(() => {
             anthropicModelMapping: item.anthropicModelMapping
               ? normalizeAnthropicModelMapping(item.anthropicModelMapping)
               : item.anthropicModelMapping,
+            openaiModelMapping: item.openaiModelMapping
+              ? normalizeOpenaiModelMapping(item.openaiModelMapping)
+              : item.openaiModelMapping,
           }))
           if (savedConfig.selectedEndpointId) {
             form.selectedEndpointId = savedConfig.selectedEndpointId
@@ -1255,6 +1294,9 @@ onMounted(() => {
         form.anthropicModelMapping = savedConfig.anthropicModelMapping
           ? normalizeAnthropicModelMapping(savedConfig.anthropicModelMapping)
           : { ...DEFAULT_CONFIG.anthropicModelMapping }
+        form.openaiModelMapping = savedConfig.openaiModelMapping
+          ? normalizeOpenaiModelMapping(savedConfig.openaiModelMapping)
+          : { ...DEFAULT_CONFIG.openaiModelMapping }
         if (savedConfig.codexEffortCapabilityMap) {
           form.codexEffortCapabilityMap = normalizeCapabilityMap(savedConfig.codexEffortCapabilityMap)
         }

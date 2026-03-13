@@ -5,7 +5,7 @@ import {
     type ProxyMode,
 } from './loadBalancerTypes'
 
-export type ConverterType = 'codex' | 'gemini' | 'anthropic'
+export type ConverterType = 'codex' | 'gemini' | 'anthropic' | 'openai'
 
 export interface EndpointOption {
     id: string
@@ -20,6 +20,7 @@ export interface EndpointOption {
     reasoningEffort?: ReasoningEffort
     geminiReasoningEffort?: ReasoningEffort
     anthropicModelMapping?: AnthropicModelMapping
+    openaiModelMapping?: OpenAIModelMapping
 }
 
 export interface ReasoningEffort {
@@ -40,6 +41,12 @@ export interface AnthropicModelMapping {
     haiku: string
 }
 
+export interface OpenAIModelMapping {
+    opus: string
+    sonnet: string
+    haiku: string
+}
+
 export type CodexEffortCapabilityMap = Record<string, string[]>
 export type GeminiModelPreset = string[]
 
@@ -53,6 +60,7 @@ export interface ProxyConfig {
     codexModel: string
     codexModelMapping: CodexModelMapping
     anthropicModelMapping: AnthropicModelMapping
+    openaiModelMapping: OpenAIModelMapping
     codexEffortCapabilityMap: CodexEffortCapabilityMap
     geminiModelPreset: GeminiModelPreset
     maxConcurrency: number

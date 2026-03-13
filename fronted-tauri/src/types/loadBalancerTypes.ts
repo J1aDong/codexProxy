@@ -1,4 +1,4 @@
-export type LbConverterType = 'codex' | 'gemini' | 'anthropic'
+export type LbConverterType = 'codex' | 'gemini' | 'anthropic' | 'openai'
 export type ProxyMode = 'single' | 'load_balancer'
 
 export interface LbSlotEndpointRef {
