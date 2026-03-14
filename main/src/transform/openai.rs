@@ -546,7 +546,7 @@ impl OpenAIChatResponseTransformer {
         match reason {
             Some("tool_calls") => "tool_use",
             Some("length") => "max_tokens",
-            Some("content_filter") => "stop_sequence",
+            Some("content_filter") | Some("refusal") => "refusal",
             Some("stop") => "end_turn",
             Some(_) => "end_turn",
             None => {
@@ -600,6 +600,9 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
         }
 
         let payload = line[6..].trim();
+        // OpenAI may send a final usage-only chunk before [DONE] when include_usage=true.
+        // We must delay Anthropic-style message_stop until the terminal marker arrives,
+        // otherwise the downstream side can miss final usage accounting.
         if payload == "[DONE]" {
             self.emit_message_stop(&mut output);
             return output;
@@ -633,12 +636,7 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
 
         let delta = match choice.get("delta") {
             Some(d) => d,
-            None => {
-                if self.finish_reason.is_some() {
-                    self.emit_message_stop(&mut output);
-                }
-                return output;
-            }
+            None => return output,
         };
 
         if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
@@ -737,10 +735,6 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
             }
         }
 
-        if self.finish_reason.is_some() {
-            self.emit_message_stop(&mut output);
-        }
-
         output
     }
 }
@@ -797,8 +791,10 @@ mod tests {
         // Final chunk with finish_reason
         let line3 = r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"stop","index":0}]}"#;
         let events3 = transformer.transform_line(line3);
+        assert!(events3.is_empty());
 
-        assert!(events3.iter().any(|e| e.contains("message_stop")));
+        let done_events = transformer.transform_line("data: [DONE]");
+        assert!(done_events.iter().any(|e| e.contains("message_stop")));
     }
 
     #[test]
@@ -822,8 +818,11 @@ mod tests {
         let line3 = r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Beijing\"}"}}]},"finish_reason":"tool_calls","index":0}]}"#;
         let events3 = transformer.transform_line(line3);
 
-        assert!(events3.iter().any(|e| e.contains("tool_use")));
-        assert!(events3.iter().any(|e| e.contains("message_stop")));
+        assert!(events3.iter().any(|e| e.contains("input_json_delta")));
+        assert!(!events3.iter().any(|e| e.contains("message_stop")));
+
+        let done_events = transformer.transform_line("data: [DONE]");
+        assert!(done_events.iter().any(|e| e.contains("message_stop")));
     }
 
     #[test]
@@ -845,7 +844,10 @@ mod tests {
         let line3 = r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}"#;
         let events3 = transformer.transform_line(line3);
 
-        assert!(events3.iter().any(|e| e.contains("message_stop")));
+        assert!(events3.is_empty());
+
+        let done_events = transformer.transform_line("data: [DONE]");
+        assert!(done_events.iter().any(|e| e.contains("message_stop")));
     }
 
     #[test]
@@ -930,7 +932,10 @@ mod tests {
         let events = transformer.transform_line(
             r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"stop","index":0}]}"#,
         );
-        let parsed_events = parse_non_empty_sse_events(&events);
+        assert!(events.is_empty());
+
+        let done_events = transformer.transform_line("data: [DONE]");
+        let parsed_events = parse_non_empty_sse_events(&done_events);
 
         let message_delta = parsed_events
             .iter()
@@ -945,6 +950,145 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("end_turn")
         );
+    }
+
+    #[test]
+    fn usage_chunk_before_done_updates_message_delta_usage() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"},"index":0}]}"#,
+        );
+        let finish_events = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":null}"#,
+        );
+        assert!(finish_events.is_empty(), "should wait for [DONE] before emitting message_stop");
+
+        let usage_events = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":34}}"#,
+        );
+        assert!(usage_events.is_empty(), "usage-only chunk should not emit message_stop before [DONE]");
+
+        let done_events = transformer.transform_line("data: [DONE]");
+        let parsed = parse_non_empty_sse_events(&done_events);
+        let message_delta = parsed
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("message_delta should be emitted on done");
+
+        assert_eq!(
+            message_delta
+                .1
+                .get("usage")
+                .and_then(|usage| usage.get("input_tokens"))
+                .and_then(|value| value.as_i64()),
+            Some(12)
+        );
+        assert_eq!(
+            message_delta
+                .1
+                .get("usage")
+                .and_then(|usage| usage.get("output_tokens"))
+                .and_then(|value| value.as_i64()),
+            Some(34)
+        );
+    }
+
+    #[test]
+    fn content_filter_maps_to_refusal_stop_reason() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"Blocked"},"index":0}]}"#,
+        );
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"content_filter","index":0}]}"#,
+        );
+        let done_events = transformer.transform_line("data: [DONE]");
+        let parsed = parse_non_empty_sse_events(&done_events);
+        let message_delta = parsed
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("message_delta should be emitted on done");
+
+        assert_eq!(
+            message_delta
+                .1
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(|value| value.as_str()),
+            Some("refusal")
+        );
+    }
+
+    #[test]
+    fn transform_request_preserves_original_system_prompt_without_codebuddy_wrapping() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
+            Message, MessageContent, OpenAIModelMapping, ReasoningEffortMapping, SystemContent,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("你好".to_string())),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: Some(vec![json!({
+                "name": "custom_tool",
+                "description": "custom tool",
+                "input_schema": {"type": "object", "properties": {}}
+            })]),
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
+        assert_eq!(
+            messages[0].get("content").and_then(Value::as_str),
+            Some("You are Claude Code.")
+        );
+        assert_eq!(
+            body.get("tools")
+                .and_then(|value| value.as_array())
+                .and_then(|tools| tools.first())
+                .and_then(|tool| tool.get("function"))
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str),
+            Some("custom_tool")
+        );
+        let serialized = body.to_string();
+        assert!(!serialized.contains("CodeBuddy Code"));
     }
 
     #[test]

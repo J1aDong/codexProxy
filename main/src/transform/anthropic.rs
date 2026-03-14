@@ -16,6 +16,10 @@ impl ResponseTransformer for AnthropicPassthroughResponseTransformer {
     fn transform_line(&mut self, line: &str) -> Vec<String> {
         let normalized = line.trim_end_matches('\r');
 
+        if normalized.starts_with(':') {
+            return vec![format!("{}\n\n", normalized)];
+        }
+
         if let Some(event_name) = normalized.strip_prefix("event: ") {
             self.pending_event = Some(event_name.to_string());
             return Vec::new();
@@ -33,11 +37,36 @@ impl ResponseTransformer for AnthropicPassthroughResponseTransformer {
             return vec![chunk];
         }
 
-        if normalized.starts_with(':') {
-            return vec![format!("{}\n\n", normalized)];
+        Vec::new()
+    }
+
+    fn transform_event(&mut self, event: &str) -> Vec<String> {
+        // Anthropic SSE events may legally contain multiple data: lines in one event frame.
+        // Passthrough must preserve the whole frame instead of re-emitting each data line as
+        // a separate event, otherwise downstream parsers observe broken SSE semantics.
+        let normalized = event.trim_end_matches(|ch| ch == '\n' || ch == '\r');
+        if normalized.trim().is_empty() {
+            return Vec::new();
         }
 
-        Vec::new()
+        let mut chunk = String::new();
+        for line in normalized.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.starts_with(':') {
+                return vec![format!("{}\n\n", line)];
+            }
+            if line.starts_with("event: ") || line.starts_with("data: ") || line.starts_with("id: ") {
+                chunk.push_str(line);
+                chunk.push('\n');
+            }
+        }
+
+        if chunk.is_empty() {
+            Vec::new()
+        } else {
+            chunk.push('\n');
+            vec![chunk]
+        }
     }
 }
 
@@ -112,5 +141,17 @@ mod tests {
         let chunks = transformer.transform_line("data: {\"ok\":true}");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], "data: {\"ok\":true}\n\n");
+    }
+
+    #[test]
+    fn test_passthrough_multiline_event_frame() {
+        let mut transformer = AnthropicPassthroughResponseTransformer::default();
+        let frame = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\ndata: {\"usage\":{\"output_tokens\":1}}\n\n";
+        let chunks = transformer.transform_event(frame);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0],
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\ndata: {\"usage\":{\"output_tokens\":1}}\n\n"
+        );
     }
 }
