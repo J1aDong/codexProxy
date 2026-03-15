@@ -278,7 +278,7 @@ impl TransformBackend for OpenAIChatBackend {
         &self,
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
-        _ctx: &TransformContext,
+        ctx: &TransformContext,
         _effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
@@ -315,8 +315,36 @@ impl TransformBackend for OpenAIChatBackend {
 
         // Add optional parameters
         if let Some(obj) = body.as_object_mut() {
+            // Apply max_tokens limiting based on slot configuration
             if let Some(max_tokens) = anthropic_body.max_tokens {
-                obj.insert("max_tokens".to_string(), json!(max_tokens));
+                // Get configured limit for this model's slot
+                let configured_limit = ctx.openai_max_tokens_mapping.get_limit(&requested);
+                
+                // Debug logging
+                if let Some(tx) = log_tx {
+                    let _ = tx.send(format!(
+                        "[TransformDebug] model: {}, max_tokens: {}, configured_limit: {:?}, mapping: {:?}",
+                        requested, max_tokens, configured_limit, ctx.openai_max_tokens_mapping
+                    ));
+                }
+                
+                let effective_max_tokens = if let Some(limit) = configured_limit {
+                    // Configured limit exists: apply min( request, limit )
+                    let effective = max_tokens.min(limit);
+                    if effective < max_tokens {
+                        if let Some(tx) = log_tx {
+                            let _ = tx.send(format!(
+                                "[Transform] max_tokens limited: {} → {} (configured limit: {})",
+                                max_tokens, effective, limit
+                            ));
+                        }
+                    }
+                    effective
+                } else {
+                    // No configured limit: pass-through
+                    max_tokens
+                };
+                obj.insert("max_tokens".to_string(), json!(effective_max_tokens));
             }
             if let Some(temperature) = anthropic_body.temperature {
                 obj.insert("temperature".to_string(), json!(temperature));

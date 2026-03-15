@@ -5,8 +5,8 @@ use codex_proxy_core::load_balancer::{
     SlotEndpointRef as CoreSlotEndpointRef, SlotMapping as CoreSlotMapping,
 };
 use codex_proxy_core::{
-    AnthropicModelMapping, CodexModelMapping, GeminiReasoningEffortMapping, OpenAIModelMapping,
-    ProxyRuntimeHandle, ProxyServer, ReasoningEffort, ReasoningEffortMapping,
+    AnthropicModelMapping, CodexModelMapping, GeminiReasoningEffortMapping, OpenAIMaxTokensMapping,
+    OpenAIModelMapping, ProxyRuntimeHandle, ProxyServer, ReasoningEffort, ReasoningEffortMapping,
     RuntimeConfigUpdate, TransformContext,
 };
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,29 @@ pub struct OpenAIModelMappingConfig {
     pub opus: String,
     pub sonnet: String,
     pub haiku: String,
+}
+
+/// Per-slot max_tokens configuration for OpenAI Chat API.
+/// None means pass-through (use the value from Anthropic request).
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAIMaxTokensMappingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sonnet: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub haiku: Option<u32>,
+}
+
+impl From<OpenAIMaxTokensMappingConfig> for OpenAIMaxTokensMapping {
+    fn from(config: OpenAIMaxTokensMappingConfig) -> Self {
+        OpenAIMaxTokensMapping {
+            opus: config.opus,
+            sonnet: config.sonnet,
+            haiku: config.haiku,
+        }
+    }
 }
 
 impl Default for CodexModelMappingConfig {
@@ -176,6 +199,9 @@ pub struct EndpointOption {
     #[serde(rename = "openaiModelMapping", default)]
     pub openai_model_mapping: Option<OpenAIModelMappingConfig>,
 
+    #[serde(rename = "openaiMaxTokensMapping", default)]
+    pub openai_max_tokens_mapping: Option<OpenAIMaxTokensMappingConfig>,
+
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: Option<ReasoningEffortConfig>,
 
@@ -196,6 +222,7 @@ fn default_endpoint_options() -> Vec<EndpointOption> {
         gemini_model_preset: None,
         anthropic_model_mapping: None,
         openai_model_mapping: None,
+        openai_max_tokens_mapping: None,
         reasoning_effort: None,
         gemini_reasoning_effort: None,
     }]
@@ -804,6 +831,13 @@ fn build_runtime_update(
         None
     };
 
+    // Get openai_max_tokens_mapping from selected endpoint
+    let selected = selected_endpoint(config);
+    let openai_max_tokens_mapping = selected
+        .and_then(|ep| ep.openai_max_tokens_mapping.clone())
+        .map(|m| m.into())
+        .unwrap_or_default();
+
     RuntimeConfigUpdate {
         target_url,
         api_key,
@@ -824,6 +858,7 @@ fn build_runtime_update(
                 sonnet: config.openai_model_mapping.sonnet.clone(),
                 haiku: config.openai_model_mapping.haiku.clone(),
             },
+            openai_max_tokens_mapping,
             custom_injection_prompt: custom_injection_prompt,
             converter: config.converter.clone(),
             codex_model: config.codex_model.clone(),

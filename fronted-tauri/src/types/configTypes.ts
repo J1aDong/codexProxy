@@ -21,6 +21,7 @@ export interface EndpointOption {
     geminiReasoningEffort?: ReasoningEffort
     anthropicModelMapping?: AnthropicModelMapping
     openaiModelMapping?: OpenAIModelMapping
+    openaiMaxTokensMapping?: OpenAIMaxTokensMapping
 }
 
 export interface ReasoningEffort {
@@ -47,6 +48,12 @@ export interface OpenAIModelMapping {
     haiku: string
 }
 
+export interface OpenAIMaxTokensMapping {
+    opus: number | null
+    sonnet: number | null
+    haiku: number | null
+}
+
 export type CodexEffortCapabilityMap = Record<string, string[]>
 export type GeminiModelPreset = string[]
 
@@ -61,6 +68,7 @@ export interface ProxyConfig {
     codexModelMapping: CodexModelMapping
     anthropicModelMapping: AnthropicModelMapping
     openaiModelMapping: OpenAIModelMapping
+    openaiMaxTokensMapping?: OpenAIMaxTokensMapping
     codexEffortCapabilityMap: CodexEffortCapabilityMap
     geminiModelPreset: GeminiModelPreset
     maxConcurrency: number

@@ -4,7 +4,7 @@ use crate::load_balancer::{
 use crate::logger::AppLogger;
 use crate::models::{
     AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
-    GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping, ReasoningEffort,
+    GeminiReasoningEffortMapping, Message, MessageContent, OpenAIMaxTokensMapping, OpenAIModelMapping, ReasoningEffort,
     ReasoningEffortMapping,
 };
 use crate::transform::{
@@ -45,6 +45,7 @@ pub struct ProxyServer {
     codex_model_mapping: CodexModelMapping,
     anthropic_model_mapping: AnthropicModelMapping,
     openai_model_mapping: OpenAIModelMapping,
+    openai_max_tokens_mapping: OpenAIMaxTokensMapping,
     gemini_reasoning_effort: GeminiReasoningEffortMapping,
     max_concurrency: u32,
     ignore_probe_requests: bool,
@@ -3653,6 +3654,7 @@ impl ProxyServer {
             codex_model_mapping: CodexModelMapping::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
             openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: OpenAIMaxTokensMapping::default(),
             gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
             max_concurrency: 0,
             ignore_probe_requests: false,
@@ -3718,6 +3720,11 @@ impl ProxyServer {
 
     pub fn with_openai_model_mapping(mut self, mapping: OpenAIModelMapping) -> Self {
         self.openai_model_mapping = mapping;
+        self
+    }
+
+    pub fn with_openai_max_tokens_mapping(mut self, mapping: OpenAIMaxTokensMapping) -> Self {
+        self.openai_max_tokens_mapping = mapping;
         self
     }
 
@@ -3885,6 +3892,7 @@ impl ProxyServer {
                 codex_model_mapping: self.codex_model_mapping.clone(),
                 anthropic_model_mapping: self.anthropic_model_mapping.clone(),
                 openai_model_mapping: self.openai_model_mapping.clone(),
+                openai_max_tokens_mapping: self.openai_max_tokens_mapping.clone(),
                 custom_injection_prompt: self.custom_injection_prompt.clone(),
                 converter: self.converter.clone(),
                 codex_model: self.codex_model.clone(),

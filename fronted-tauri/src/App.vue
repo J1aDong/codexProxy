@@ -365,6 +365,11 @@ const DEFAULT_CONFIG = {
     sonnet: '',
     haiku: '',
   } as OpenAIModelMapping,
+  openaiMaxTokensMapping: {
+    opus: null as number | null,
+    sonnet: null as number | null,
+    haiku: null as number | null,
+  },
   codexEffortCapabilityMap: {
     'gpt-5.3-codex': ['low', 'medium', 'high', 'xhigh'],
     'gpt-5.4': ['low', 'medium', 'high', 'xhigh'],
@@ -426,6 +431,7 @@ const form = reactive({
   codexModelMapping: { ...DEFAULT_CONFIG.codexModelMapping },
   anthropicModelMapping: { ...DEFAULT_CONFIG.anthropicModelMapping },
   openaiModelMapping: { ...DEFAULT_CONFIG.openaiModelMapping },
+  openaiMaxTokensMapping: { ...DEFAULT_CONFIG.openaiMaxTokensMapping },
   codexEffortCapabilityMap: JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap)),
   geminiModelPreset: [...DEFAULT_CONFIG.geminiModelPreset],
   geminiReasoningEffort: { ...DEFAULT_CONFIG.geminiReasoningEffort },
@@ -796,6 +802,9 @@ const syncEndpointFromSelection = () => {
   form.openaiModelMapping = endpoint.openaiModelMapping
     ? normalizeOpenaiModelMapping(endpoint.openaiModelMapping)
     : { ...DEFAULT_CONFIG.openaiModelMapping }
+  form.openaiMaxTokensMapping = endpoint.openaiMaxTokensMapping
+    ? { opus: endpoint.openaiMaxTokensMapping.opus ?? null, sonnet: endpoint.openaiMaxTokensMapping.sonnet ?? null, haiku: endpoint.openaiMaxTokensMapping.haiku ?? null }
+    : { opus: null as number | null, sonnet: null as number | null, haiku: null as number | null }
   if (endpoint.codexEffortCapabilityMap) {
     form.codexEffortCapabilityMap = normalizeCapabilityMap(endpoint.codexEffortCapabilityMap)
   }
@@ -827,6 +836,7 @@ const updateSelectedEndpointConfig = () => {
       codexModelMapping: { ...form.codexModelMapping },
       anthropicModelMapping: { ...form.anthropicModelMapping },
       openaiModelMapping: { ...form.openaiModelMapping },
+      openaiMaxTokensMapping: { ...form.openaiMaxTokensMapping },
       codexEffortCapabilityMap: JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
       geminiModelPreset: [...form.geminiModelPreset],
       reasoningEffort: { ...form.reasoningEffort },
@@ -845,6 +855,7 @@ watch(
     () => form.codexModelMapping,
     () => form.anthropicModelMapping,
     () => form.openaiModelMapping,
+    () => form.openaiMaxTokensMapping,
     () => form.codexEffortCapabilityMap,
     () => form.geminiModelPreset,
     () => form.reasoningEffort,
@@ -1041,6 +1052,7 @@ const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   codexModelMapping: form.codexModelMapping,
   anthropicModelMapping: form.anthropicModelMapping,
   openaiModelMapping: form.openaiModelMapping,
+  openaiMaxTokensMapping: form.openaiMaxTokensMapping,
   codexEffortCapabilityMap: form.codexEffortCapabilityMap,
   geminiModelPreset: form.geminiModelPreset,
   maxConcurrency: form.maxConcurrency,

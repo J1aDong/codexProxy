@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 
 use crate::models::{
     AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
-    OpenAIModelMapping, ReasoningEffortMapping,
+    OpenAIMaxTokensMapping, OpenAIModelMapping, ReasoningEffortMapping,
 };
 
 /// 转换上下文 —— 从 ProxyServer 配置派生，传入 transform 方法
@@ -19,6 +19,7 @@ pub struct TransformContext {
     pub codex_model_mapping: CodexModelMapping,
     pub anthropic_model_mapping: AnthropicModelMapping,
     pub openai_model_mapping: OpenAIModelMapping,
+    pub openai_max_tokens_mapping: OpenAIMaxTokensMapping,
     pub custom_injection_prompt: String,
     pub converter: String,
     pub codex_model: String,

@@ -240,6 +240,40 @@
               <div class="text-apple-text-secondary text-xs mt-1">
                 {{ t('anthropicPassthroughTip') }}
               </div>
+
+              <!-- Max Tokens 限制配置 -->
+              <div class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+                <h3
+                  class="text-sm font-semibold mb-3"
+                  :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
+                >{{ t('openaiMaxTokensTitle') }}</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-5">
+                  <Input
+                    :model-value="form.openaiMaxTokensMapping.opus ?? ''"
+                    label="Opus"
+                    type="number"
+                    :placeholder="t('openaiMaxTokensPlaceholder')"
+                    @update:model-value="(v: string | number) => form.openaiMaxTokensMapping.opus = v === '' || v === null ? null : Number(v)"
+                  />
+                  <Input
+                    :model-value="form.openaiMaxTokensMapping.sonnet ?? ''"
+                    label="Sonnet"
+                    type="number"
+                    :placeholder="t('openaiMaxTokensPlaceholder')"
+                    @update:model-value="(v: string | number) => form.openaiMaxTokensMapping.sonnet = v === '' || v === null ? null : Number(v)"
+                  />
+                  <Input
+                    :model-value="form.openaiMaxTokensMapping.haiku ?? ''"
+                    label="Haiku"
+                    type="number"
+                    :placeholder="t('openaiMaxTokensPlaceholder')"
+                    @update:model-value="(v: string | number) => form.openaiMaxTokensMapping.haiku = v === '' || v === null ? null : Number(v)"
+                  />
+                </div>
+                <div class="text-apple-text-secondary text-xs mt-2">
+                  {{ t('openaiMaxTokensTip') }}
+                </div>
+              </div>
             </div>
           </div>
 
@@ -522,6 +556,11 @@ interface EndpointOption {
     sonnet: string
     haiku: string
   }
+  openaiMaxTokensMapping?: {
+    opus: number | null
+    sonnet: number | null
+    haiku: number | null
+  }
   reasoningEffort?: {
     opus: string
     sonnet: string
@@ -575,6 +614,11 @@ interface FormData {
     opus: string
     sonnet: string
     haiku: string
+  }
+  openaiMaxTokensMapping: {
+    opus: number | null
+    sonnet: number | null
+    haiku: number | null
   }
   codexEffortCapabilityMap: Record<string, string[]>
   geminiModelPreset: string[]

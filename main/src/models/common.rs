@@ -176,3 +176,33 @@ pub struct OpenAIModelMapping {
     #[serde(default)]
     pub haiku: String,
 }
+
+/// Per-slot max_tokens configuration for OpenAI Chat API.
+/// None means pass-through (use the value from Anthropic request).
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct OpenAIMaxTokensMapping {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sonnet: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub haiku: Option<u32>,
+}
+
+impl OpenAIMaxTokensMapping {
+    /// Get max_tokens limit for the given model slot.
+    /// Returns None if no limit configured (pass-through).
+    pub fn get_limit(&self, model: &str) -> Option<u32> {
+        let model_lower = model.to_lowercase();
+        if model_lower.contains("opus") {
+            self.opus
+        } else if model_lower.contains("sonnet") {
+            self.sonnet
+        } else if model_lower.contains("haiku") {
+            self.haiku
+        } else {
+            // Default to sonnet slot for unknown models
+            self.sonnet
+        }
+    }
+}
