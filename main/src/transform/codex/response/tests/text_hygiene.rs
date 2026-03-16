@@ -83,6 +83,84 @@ fn test_plain_text_preserves_markdown_line_breaks() {
 }
 
 #[test]
+fn test_plain_text_without_proposed_plan_wrapper_is_unchanged() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "普通说明文字，不含任何 plan wrapper。"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+    assert!(
+        joined.contains("普通说明文字，不含任何 plan wrapper。"),
+        "ordinary visible text should remain unchanged when no proposed_plan wrapper is present"
+    );
+    assert!(
+        !joined.contains("proposed_plan"),
+        "ordinary text should not gain proposed_plan markers during hygiene"
+    );
+}
+
+#[test]
+fn test_proposed_plan_tags_are_stripped_from_visible_text() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "<proposed_plan>\n1. 先检查请求链路\n2. 等你确认后再执行修改\n</proposed_plan>"
+        })
+    );
+
+    let events = transformer.transform_sse_line(&line);
+    let joined = events.join("");
+    assert!(
+        !joined.contains("proposed_plan"),
+        "proposed_plan wrapper tags should stay hidden from visible text"
+    );
+    assert!(
+        joined.contains("先检查请求链路") && joined.contains("等你确认后再执行修改"),
+        "plan body should remain visible after stripping wrapper tags"
+    );
+}
+
+#[test]
+fn test_proposed_plan_tags_split_across_chunks_are_stripped() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "<proposed_plan>\n1. 先检查请求链路\n"
+        })
+    );
+    let second = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "2. 等你确认后再执行修改\n</proposed_plan>"
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&first);
+    events.extend(transformer.transform_sse_line(&second));
+    let joined = events.join("");
+
+    assert!(
+        !joined.contains("proposed_plan"),
+        "proposed_plan wrapper tags should be hidden even when split across chunks"
+    );
+    assert!(
+        joined.contains("先检查请求链路") && joined.contains("等你确认后再执行修改"),
+        "plan body should remain visible across chunk boundaries"
+    );
+}
+
+#[test]
 fn test_log_sample_overflow_text_is_safely_suppressed() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 

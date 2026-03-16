@@ -463,6 +463,8 @@ impl TransformResponse {
     const SUGGESTION_MODE_START_MARKER: &'static str = "[SUGGESTION MODE:";
     const SUGGESTION_MODE_END_MARKER: &'static str =
         "Reply with ONLY the suggestion, no quotes or explanation.";
+    const PROPOSED_PLAN_OPEN_TAG: &'static str = "<proposed_plan>";
+    const PROPOSED_PLAN_CLOSE_TAG: &'static str = "</proposed_plan>";
 
     fn find_potential_leaked_tool_marker_start(line: &str) -> Option<usize> {
         Self::LEAKED_TOOL_MARKERS
@@ -477,7 +479,12 @@ impl TransformResponse {
 
         let all_markers = Self::LEAKED_TOOL_MARKERS
             .iter()
-            .chain(Self::MARKDOWN_BASH_MARKERS.iter());
+            .chain(Self::MARKDOWN_BASH_MARKERS.iter())
+            .chain([
+                Self::PROPOSED_PLAN_OPEN_TAG,
+                Self::PROPOSED_PLAN_CLOSE_TAG,
+            ]
+            .iter());
 
         for marker in all_markers {
             let marker_bytes = marker.as_bytes();
@@ -495,6 +502,11 @@ impl TransformResponse {
         }
 
         max_len
+    }
+
+    fn strip_proposed_plan_wrappers(text: &str) -> String {
+        text.replace(Self::PROPOSED_PLAN_OPEN_TAG, "")
+            .replace(Self::PROPOSED_PLAN_CLOSE_TAG, "")
     }
 
     fn find_markdown_bash_start(line: &str) -> Option<(usize, usize)> {
@@ -3304,6 +3316,7 @@ data: {}
             merged.push_str(fragment);
             merged
         };
+        let combined = Self::strip_proposed_plan_wrappers(&combined);
 
         if let Some(message) = Self::build_task_lifecycle_progress_message(&combined) {
             self.logger
@@ -3659,6 +3672,7 @@ data: {}
         }
 
         let carryover = std::mem::take(&mut self.text_carryover);
+        let carryover = Self::strip_proposed_plan_wrappers(&carryover);
 
         if let Some((marker_start, marker_len)) = LeakDetector::find_markdown_bash_start(&carryover)
         {

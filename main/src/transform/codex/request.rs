@@ -84,10 +84,50 @@ fn request_contains_environment_context(request_text_corpus: &str) -> bool {
         .contains("<environment_context>")
 }
 
+fn request_metadata_plan_mode_enabled(request: &AnthropicRequest) -> bool {
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("plan_mode"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn request_targets_exit_plan_mode_tool(request: &AnthropicRequest) -> bool {
+    let Some(tool_choice) = request.tool_choice.as_ref().and_then(|value| value.as_object()) else {
+        return false;
+    };
+
+    tool_choice
+        .get("name")
+        .or_else(|| tool_choice.get("tool_name"))
+        .or_else(|| tool_choice.get("toolName"))
+        .and_then(|value| value.as_str())
+        .map(|name| name.eq_ignore_ascii_case("ExitPlanMode"))
+        .unwrap_or(false)
+}
+
+fn request_contains_plan_approval_signal(request: &AnthropicRequest, request_text_corpus: &str) -> bool {
+    if request_text_corpus
+        .to_ascii_lowercase()
+        .contains("plan_approval_response")
+    {
+        return true;
+    }
+
+    request
+        .tools
+        .as_ref()
+        .and_then(|tools| serde_json::to_string(tools).ok())
+        .map(|tools_json| tools_json.to_ascii_lowercase().contains("plan_approval_response"))
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestAugmentationMode {
     Agent,
     Passthrough,
+    Plan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +145,7 @@ impl RequestAugmentationDecision {
         match self.mode {
             RequestAugmentationMode::Agent => "agent",
             RequestAugmentationMode::Passthrough => "passthrough",
+            RequestAugmentationMode::Plan => "plan",
         }
     }
 }
@@ -127,6 +168,18 @@ fn decide_request_augmentation(
     request_text_corpus: &str,
 ) -> RequestAugmentationDecision {
     let mut reasons = Vec::new();
+
+    if request_metadata_plan_mode_enabled(request) {
+        reasons.push("plan_mode");
+    }
+    if request_targets_exit_plan_mode_tool(request) {
+        reasons.push("exit_plan_mode_tool");
+    }
+    if request_contains_plan_approval_signal(request, request_text_corpus) {
+        reasons.push("plan_approval_response");
+    }
+
+    let has_plan_signal = !reasons.is_empty();
 
     if request
         .system
@@ -180,7 +233,9 @@ fn decide_request_augmentation(
         reasons.retain(|reason| *reason != "environment_context");
     }
 
-    let mode = if reasons.is_empty() {
+    let mode = if has_plan_signal {
+        RequestAugmentationMode::Plan
+    } else if reasons.is_empty() {
         RequestAugmentationMode::Passthrough
     } else {
         RequestAugmentationMode::Agent
@@ -1424,6 +1479,7 @@ impl TransformRequest {
         let request_session_hint = extract_request_session_hint(anthropic_body);
         let augmentation = decide_request_augmentation(anthropic_body, &request_text_corpus);
         let apply_agent_augmentations = augmentation.is_agent();
+        let apply_plan_augmentations = matches!(augmentation.mode, RequestAugmentationMode::Plan);
         let augmentation_reasons = if augmentation.reasons.is_empty() {
             "none".to_string()
         } else {
@@ -1512,6 +1568,17 @@ impl TransformRequest {
                 log("🎯 [Transform] Skip duplicate custom global prompt");
             }
         }
+        if apply_plan_augmentations {
+            let plan_prompt = "Plan mode: propose a concise step-by-step plan first. Do not execute tools or make code changes until the user explicitly approves the plan.";
+            log("🗺️ [Transform] Injecting minimal plan-mode prompt");
+            if !push_proxy_injected_text_message(
+                &mut final_input,
+                &mut injected_text_dedupe,
+                plan_prompt,
+            ) {
+                log("🗺️ [Transform] Skip duplicate plan-mode prompt");
+            }
+        }
 
         // 追加对话历史
         final_input.extend(chat_messages);
@@ -1560,7 +1627,7 @@ impl TransformRequest {
             transformed_tools.len()
         ));
 
-        let tool_choice = Self::build_tool_choice(anthropic_body, &transformed_tools);
+        let tool_choice = Self::build_tool_choice(anthropic_body, &transformed_tools, &augmentation);
         let parallel_tool_calls = Self::resolve_parallel_tool_calls(anthropic_body);
         log(&format!(
             "🧰 [Transform] Resolved tool_choice={} parallel_tool_calls={} (tools={})",
@@ -1774,7 +1841,14 @@ impl TransformRequest {
     fn build_tool_choice(
         anthropic_body: &AnthropicRequest,
         transformed_tools: &[Value],
+        augmentation: &RequestAugmentationDecision,
     ) -> Option<Value> {
+        if matches!(augmentation.mode, RequestAugmentationMode::Plan)
+            && request_targets_exit_plan_mode_tool(anthropic_body)
+        {
+            return Some(json!("none"));
+        }
+
         if transformed_tools.is_empty() {
             return Some(json!("none"));
         }
@@ -2182,10 +2256,11 @@ impl TransformRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_tool_description, decide_request_augmentation, detect_requested_skill_name,
-        extract_request_cwd, fingerprint_json_value, normalize_text_for_exact_match,
-        push_proxy_injected_text_message, strip_dynamic_system_header_lines,
-        RequestAugmentationMode, TransformRequest, CODEX_INSTRUCTIONS,
+        compact_tool_description, decide_request_augmentation, collect_request_text_corpus,
+        detect_requested_skill_name, extract_request_cwd, fingerprint_json_value,
+        normalize_text_for_exact_match, push_proxy_injected_text_message,
+        strip_dynamic_system_header_lines, RequestAugmentationMode, TransformRequest,
+        CODEX_INSTRUCTIONS,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
     use serde_json::{json, Value};
@@ -3184,7 +3259,12 @@ hello"
             body.get("instructions").is_none(),
             "passthrough requests should not carry static codex instructions"
         );
-        assert_eq!(input_texts(&body), vec!["hello".to_string()]);
+        let texts = input_texts(&body);
+        assert_eq!(texts, vec!["hello".to_string()]);
+        assert!(
+            !texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
+            "passthrough requests must not receive plan-mode prompt injection"
+        );
     }
 
     #[test]
@@ -3204,9 +3284,85 @@ hello");
             body.get("instructions").is_none(),
             "system-only agent requests should rely on wrapped system instead of static instructions"
         );
+        let texts = input_texts(&body);
         assert!(
-            input_texts(&body).iter().any(|text| text == "global prompt"),
+            texts.iter().any(|text| text == "global prompt"),
             "agent-shaped requests should inject the custom global prompt"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
+            "ordinary agent requests must not receive plan-mode prompt injection"
+        );
+    }
+
+    #[test]
+    fn plan_mode_requests_use_plan_augmentation() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": "请先给我 plan，不要直接执行"
+            }],
+            "system": "<system-reminder>Skill catalog (condensed):\n- test-driven-development: Use when implementing any feature or bugfix, before writing implementation code\n</system-reminder>",
+            "metadata": {
+                "plan_mode": true
+            },
+            "tools": [{
+                "name": "Read",
+                "description": "Read files",
+                "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+            }],
+            "tool_choice": {
+                "type": "tool",
+                "name": "ExitPlanMode"
+            },
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let request_text_corpus = collect_request_text_corpus(&request);
+        let augmentation = decide_request_augmentation(&request, &request_text_corpus);
+
+        assert_eq!(augmentation.mode, RequestAugmentationMode::Plan);
+        assert!(
+            augmentation.reasons.contains(&"plan_mode"),
+            "plan requests should record the detected plan reason"
+        );
+
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+        let texts = input_texts(&body);
+
+        assert!(
+            texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
+            "plan requests should inject the minimal plan-mode prompt"
+        );
+        assert_eq!(
+            body.get("tool_choice").and_then(|value| value.as_str()),
+            Some("none"),
+            "ExitPlanMode should not be forwarded upstream as an executable named tool choice"
+        );
+    }
+
+    #[test]
+    fn plan_approval_signal_requests_use_plan_augmentation() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": "请处理这个 plan_approval_response，再等我确认"
+            }],
+            "system": "",
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let request_text_corpus = collect_request_text_corpus(&request);
+        let augmentation = decide_request_augmentation(&request, &request_text_corpus);
+
+        assert_eq!(augmentation.mode, RequestAugmentationMode::Plan);
+        assert!(
+            augmentation.reasons.contains(&"plan_approval_response"),
+            "plan approval signal should keep the request on the plan path"
         );
     }
 

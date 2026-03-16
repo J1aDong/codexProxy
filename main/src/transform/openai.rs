@@ -1085,6 +1085,7 @@ mod tests {
             codex_model_mapping: CodexModelMapping::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
             openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
             custom_injection_prompt: String::new(),
             converter: "openai".to_string(),
             codex_model: String::new(),
