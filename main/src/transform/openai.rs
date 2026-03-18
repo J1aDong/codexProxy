@@ -58,10 +58,8 @@ impl OpenAIChatBackend {
                 }))
             }
             "thinking" => {
-                // OpenAI doesn't have native thinking support
-                // Some providers (DeepSeek) use reasoning_content in response
-                // For input, we skip thinking blocks
-                None
+                let thinking = block.get("thinking").and_then(|t| t.as_str())?;
+                Some(json!({ "type": "text", "text": thinking }))
             }
             _ => None,
         }
@@ -288,6 +286,62 @@ impl OpenAIChatBackend {
 
         Some(json!({ "role": "system", "content": merged }))
     }
+    fn build_tool_choice(anthropic_body: &AnthropicRequest, tools: &[Value]) -> Option<Value> {
+        if tools.is_empty() {
+            return Some(json!("none"));
+        }
+
+        let tool_choice = anthropic_body.tool_choice.as_ref()?;
+        match tool_choice {
+            Value::String(choice) => match choice.trim().to_ascii_lowercase().as_str() {
+                "auto" => Some(json!("auto")),
+                "none" => Some(json!("none")),
+                "required" | "any" => Some(json!("required")),
+                _ => None,
+            },
+            Value::Object(object) => {
+                let choice_type = object
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim().to_ascii_lowercase());
+
+                match choice_type.as_deref() {
+                    Some("auto") => Some(json!("auto")),
+                    Some("none") => Some(json!("none")),
+                    Some("required") | Some("any") => Some(json!("required")),
+                    Some("tool") | Some("function") => object
+                        .get("name")
+                        .or_else(|| object.get("tool_name"))
+                        .or_else(|| object.get("toolName"))
+                        .and_then(|value| value.as_str())
+                        .and_then(|name| {
+                            tools.iter().find_map(|tool| {
+                                let function = tool.get("function")?;
+                                let tool_name = function.get("name")?.as_str()?;
+                                if tool_name == name {
+                                    Some(json!({ "type": "function", "name": name }))
+                                } else {
+                                    None
+                                }
+                            })
+                        }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_parallel_tool_calls(anthropic_body: &AnthropicRequest) -> bool {
+        anthropic_body
+            .tool_choice
+            .as_ref()
+            .and_then(|tool_choice| tool_choice.as_object())
+            .and_then(|tool_choice| tool_choice.get("disable_parallel_tool_use"))
+            .and_then(|value| value.as_bool())
+            .map(|disabled| !disabled)
+            .unwrap_or(true)
+    }
 }
 
 impl TransformBackend for OpenAIChatBackend {
@@ -296,7 +350,7 @@ impl TransformBackend for OpenAIChatBackend {
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
         ctx: &TransformContext,
-        _effective_stream: bool,
+        effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
         let session_id = Uuid::new_v4().to_string();
@@ -326,11 +380,14 @@ impl TransformBackend for OpenAIChatBackend {
         let mut body = json!({
             "model": model,
             "messages": messages,
-            "stream": true,
-            "stream_options": {
-                "include_usage": true
-            }
+            "stream": effective_stream
         });
+
+        if effective_stream {
+            body["stream_options"] = json!({
+                "include_usage": true
+            });
+        }
 
         // Add optional parameters
         if let Some(obj) = body.as_object_mut() {
@@ -371,11 +428,21 @@ impl TransformBackend for OpenAIChatBackend {
             if let Some(top_p) = anthropic_body.top_p {
                 obj.insert("top_p".to_string(), json!(top_p));
             }
+            if let Some(metadata) = anthropic_body.metadata.as_ref() {
+                obj.insert("metadata".to_string(), metadata.clone());
+            }
             if let Some(stop) = &anthropic_body.stop_sequences {
                 obj.insert("stop".to_string(), json!(stop));
             }
             if let Some(tools) = Self::convert_tools(anthropic_body.tools.as_ref()) {
                 obj.insert("tools".to_string(), json!(tools));
+                obj.insert(
+                    "parallel_tool_calls".to_string(),
+                    json!(Self::resolve_parallel_tool_calls(anthropic_body)),
+                );
+                if let Some(tool_choice) = Self::build_tool_choice(anthropic_body, &tools) {
+                    obj.insert("tool_choice".to_string(), tool_choice);
+                }
             }
         }
 
@@ -396,10 +463,20 @@ impl TransformBackend for OpenAIChatBackend {
         // Azure uses api-key header, others use Bearer token
         let is_azure = target_url.contains("openai.azure.com");
 
+        let accept_header = if body
+            .get("stream")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+
         let mut builder = client
             .post(endpoint)
             .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
+            .header("Accept", accept_header);
 
         if is_azure {
             builder = builder.header("api-key", api_key);
@@ -413,9 +490,12 @@ impl TransformBackend for OpenAIChatBackend {
     fn create_response_transformer(
         &self,
         model: &str,
-        _allow_visible_thinking: bool,
+        allow_visible_thinking: bool,
     ) -> Box<dyn ResponseTransformer> {
-        Box::new(OpenAIChatResponseTransformer::new(model))
+        Box::new(OpenAIChatResponseTransformer::new_with_visibility(
+            model,
+            allow_visible_thinking,
+        ))
     }
 }
 
@@ -433,6 +513,7 @@ struct ToolCallState {
 pub struct OpenAIChatResponseTransformer {
     message_id: String,
     model: String,
+    allow_visible_thinking: bool,
     content_index: usize,
     open_text_index: Option<usize>,
     open_text_block_kind: Option<TextBlockKind>,
@@ -441,14 +522,20 @@ pub struct OpenAIChatResponseTransformer {
     tool_calls: Vec<Option<ToolCallState>>,
     saw_tool_call: bool,
     finish_reason: Option<String>,
+    stop_sequence: Option<String>,
     usage: Option<Value>,
 }
 
 impl OpenAIChatResponseTransformer {
     pub fn new(model: &str) -> Self {
+        Self::new_with_visibility(model, true)
+    }
+
+    pub fn new_with_visibility(model: &str, allow_visible_thinking: bool) -> Self {
         Self {
             message_id: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
             model: model.to_string(),
+            allow_visible_thinking,
             content_index: 0,
             open_text_index: None,
             open_text_block_kind: None,
@@ -457,6 +544,7 @@ impl OpenAIChatResponseTransformer {
             tool_calls: Vec::new(),
             saw_tool_call: false,
             finish_reason: None,
+            stop_sequence: None,
             usage: None,
         }
     }
@@ -627,7 +715,10 @@ impl OpenAIChatResponseTransformer {
             "event: message_delta\ndata: {}\n\n",
             json!({
                 "type": "message_delta",
-                "delta": { "stop_reason": stop_reason },
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": self.stop_sequence
+                },
                 "usage": usage_obj
             })
         ));
@@ -659,8 +750,6 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
             return output;
         };
 
-        self.ensure_message_start(&mut output);
-
         if let Some(usage) = data.get("usage") {
             self.usage = Some(json!({
                 "input_tokens": usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
@@ -677,45 +766,73 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
             None => return output,
         };
 
-        if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-            self.finish_reason = Some(reason.to_string());
-        }
-
         let delta = match choice.get("delta") {
             Some(d) => d,
             None => return output,
         };
 
-        if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-            if !reasoning.is_empty() {
-                self.open_thinking_block_if_needed(&mut output);
-                output.push(format!(
-                    "event: content_block_delta\ndata: {}\n\n",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": self.open_text_index,
-                        "delta": { "type": "thinking_delta", "thinking": reasoning }
-                    })
-                ));
+        self.ensure_message_start(&mut output);
+
+        if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+            self.finish_reason = Some(reason.to_string());
+        }
+        if let Some(stop_sequence) = choice.get("stop_sequence").and_then(|v| v.as_str()) {
+            self.stop_sequence = Some(stop_sequence.to_string());
+        }
+
+        if self.allow_visible_thinking {
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                if !reasoning.is_empty() {
+                    self.open_thinking_block_if_needed(&mut output);
+                    output.push(format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": self.open_text_index,
+                            "delta": { "type": "thinking_delta", "thinking": reasoning }
+                        })
+                    ));
+                }
             }
         }
 
-        if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
-            if !content.is_empty() {
-                self.open_text_block_if_needed(&mut output);
-                output.push(format!(
-                    "event: content_block_delta\ndata: {}\n\n",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": self.open_text_index,
-                        "delta": { "type": "text_delta", "text": content }
-                    })
-                ));
-            }
+        let text_delta = delta
+            .get("content")
+            .and_then(|v| v.as_str())
+            .filter(|content| !content.is_empty())
+            .or_else(|| {
+                delta.get("refusal")
+                    .and_then(|v| v.as_str())
+                    .filter(|refusal| !refusal.is_empty())
+            });
+
+        if let Some(content) = text_delta {
+            self.open_text_block_if_needed(&mut output);
+            output.push(format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_delta",
+                    "index": self.open_text_index,
+                    "delta": { "type": "text_delta", "text": content }
+                })
+            ));
         }
 
-        if let Some(tool_calls_delta) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-            for tool_call_delta in tool_calls_delta {
+        let normalized_tool_calls: Vec<Value> = if let Some(tool_calls_delta) =
+            delta.get("tool_calls").and_then(|v| v.as_array())
+        {
+            tool_calls_delta.clone()
+        } else if let Some(function_call_delta) = delta.get("function_call") {
+            vec![json!({
+                "index": 0,
+                "function": function_call_delta
+            })]
+        } else {
+            Vec::new()
+        };
+
+        if !normalized_tool_calls.is_empty() {
+            for tool_call_delta in &normalized_tool_calls {
                 let index = tool_call_delta
                     .get("index")
                     .and_then(|v| v.as_u64())
@@ -1069,6 +1186,263 @@ mod tests {
     }
 
     #[test]
+    fn chunk_without_choices_does_not_emit_message_start() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let events = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#,
+        );
+
+        assert!(events.is_empty(), "chunk without choices should not emit downstream events");
+    }
+
+    #[test]
+    fn reasoning_content_is_hidden_when_visible_thinking_is_disabled() {
+        let backend = OpenAIChatBackend;
+        let mut transformer = backend.create_response_transformer("gpt-4o", false);
+
+        let events = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"reasoning_content":"internal reasoning"},"index":0}]}"#,
+        );
+
+        let parsed_events = parse_non_empty_sse_events(&events);
+        assert!(
+            parsed_events.iter().all(|(_, payload)| {
+                payload
+                    .get("content_block")
+                    .and_then(|block| block.get("type"))
+                    .and_then(|value| value.as_str())
+                    != Some("thinking")
+            }),
+            "thinking blocks should stay hidden when visible thinking is disabled"
+        );
+        assert!(
+            parsed_events.iter().all(|(_, payload)| {
+                payload
+                    .get("delta")
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(|value| value.as_str())
+                    != Some("thinking_delta")
+            }),
+            "thinking deltas should stay hidden when visible thinking is disabled"
+        );
+    }
+
+    #[test]
+    fn deprecated_function_call_delta_is_mapped_to_tool_use_stream() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let events1 = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"function_call":{"name":"get_weather","arguments":"{\"city\":"}},"index":0}]}"#,
+        );
+        assert!(
+            events1.iter().any(|event| event.contains("tool_use")),
+            "deprecated function_call name delta should open a tool_use block"
+        );
+
+        let events2 = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"function_call":{"arguments":"\"Beijing\"}"}},"finish_reason":"function_call","index":0}]}"#,
+        );
+        assert!(
+            events2.iter().any(|event| event.contains("input_json_delta")),
+            "deprecated function_call arguments delta should map to input_json_delta"
+        );
+    }
+
+    #[test]
+    fn refusal_delta_is_emitted_as_text_content() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let events = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"refusal":"I can’t help with that."},"index":0}]}"#,
+        );
+        let parsed_events = parse_non_empty_sse_events(&events);
+
+        assert!(
+            parsed_events.iter().any(|(name, payload)| {
+                name == "content_block_delta"
+                    && payload
+                        .get("delta")
+                        .and_then(|delta| delta.get("type"))
+                        .and_then(|value| value.as_str())
+                        == Some("text_delta")
+                    && payload
+                        .get("delta")
+                        .and_then(|delta| delta.get("text"))
+                        .and_then(|value| value.as_str())
+                        == Some("I can’t help with that.")
+            }),
+            "refusal delta should be surfaced instead of being silently ignored"
+        );
+    }
+
+    #[test]
+    fn stop_sequence_is_preserved_in_message_delta() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"done soon"},"index":0}]}"#,
+        );
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"stop","stop_sequence":"</END>","index":0}]}"#,
+        );
+        let done_events = transformer.transform_line("data: [DONE]");
+        let parsed_events = parse_non_empty_sse_events(&done_events);
+
+        let message_delta = parsed_events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("message_delta should be emitted on DONE");
+        assert_eq!(
+            message_delta
+                .1
+                .get("delta")
+                .and_then(|delta| delta.get("stop_sequence"))
+                .and_then(|value| value.as_str()),
+            Some("</END>")
+        );
+    }
+
+    #[test]
+    fn transform_request_preserves_metadata_and_omits_unsupported_top_k() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+            }],
+            system: None,
+            tools: None,
+            metadata: Some(json!({"trace_id": "req-123", "tenant": "demo"})),
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(64),
+            temperature: None,
+            top_p: None,
+            top_k: Some(17),
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+
+        assert_eq!(
+            body.get("metadata"),
+            Some(&json!({"trace_id": "req-123", "tenant": "demo"}))
+        );
+        assert!(
+            body.get("top_k").is_none(),
+            "unsupported top_k should be omitted rather than sent upstream"
+        );
+    }
+
+    #[test]
+    fn transform_request_respects_stream_and_maps_tool_choice_controls() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Run tool".to_string())),
+            }],
+            system: None,
+            tools: Some(vec![json!({
+                "name": "Bash",
+                "description": "Run bash commands",
+                "input_schema": {"type": "object", "properties": {}}
+            })]),
+            metadata: None,
+            tool_choice: Some(json!({
+                "type": "tool",
+                "name": "Bash",
+                "disable_parallel_tool_use": true
+            })),
+            thinking: None,
+            stream: false,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, false, None);
+
+        assert_eq!(body.get("stream").and_then(Value::as_bool), Some(false));
+        assert!(
+            body.get("stream_options").is_none(),
+            "non-stream requests should not force stream_options"
+        );
+        assert_eq!(body.get("tool_choice"), Some(&json!({"type": "function", "name": "Bash"})));
+        assert_eq!(
+            body.get("parallel_tool_calls").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn build_messages_downgrades_thinking_input_blocks_to_text() {
+        let messages = OpenAIChatBackend::build_messages(&[json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "thinking",
+                "thinking": "chain of thought"
+            }]
+        })]);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("assistant"));
+        assert_eq!(
+            messages[0].get("content").and_then(Value::as_str),
+            Some("chain of thought")
+        );
+    }
+
+    #[test]
     fn transform_request_preserves_original_system_prompt_without_codebuddy_wrapping() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
@@ -1257,6 +1631,34 @@ mod tests {
             Some("Always inspect repo instructions first.")
         );
         assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
+    }
+
+    #[test]
+    fn build_upstream_request_uses_json_accept_for_non_stream_requests() {
+        let backend = OpenAIChatBackend;
+        let client = reqwest::Client::new();
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        });
+
+        let request = backend
+            .build_upstream_request(
+                &client,
+                "https://api.openai.com/v1",
+                "test-key",
+                &body,
+                "session-1",
+                "2023-06-01",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request.headers().get("Accept").and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
     }
 
     #[test]

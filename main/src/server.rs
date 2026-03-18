@@ -2080,7 +2080,12 @@ fn finalize_tool_input_block(
         return;
     };
 
-    let parsed_input = serde_json::from_str::<Value>(&partial_json).unwrap_or_else(|_| json!({}));
+    let parsed_input = serde_json::from_str::<Value>(&partial_json).unwrap_or_else(|_| {
+        json!({
+            "_parse_error": "invalid_json",
+            "_raw_input": partial_json
+        })
+    });
     if let Some(block) = blocks.get_mut(&index) {
         if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
             if let Some(obj) = block.as_object_mut() {
@@ -7925,6 +7930,193 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
         assert_eq!(
             leaked_tool_text_retry_skip_reason(&state, true, true, signal),
             Some("high_risk_leak_requires_confirmation")
+        );
+    }
+
+    #[test]
+    fn test_finalize_tool_input_block_marks_invalid_json_instead_of_empty_object() {
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(
+            0,
+            json!({
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "get_weather",
+                "input": {}
+            }),
+        );
+        let mut tool_input_buffers = std::collections::HashMap::new();
+        tool_input_buffers.insert(0, "{".to_string());
+
+        super::finalize_tool_input_block(0, &mut blocks, &mut tool_input_buffers);
+
+        let input = blocks
+            .get(&0)
+            .and_then(|block| block.get("input"))
+            .cloned()
+            .expect("tool_use block should retain input field");
+
+        assert_eq!(
+            input.get("_parse_error").and_then(|value| value.as_str()),
+            Some("invalid_json"),
+            "invalid tool input should be explicitly marked instead of silently becoming an empty object"
+        );
+        assert_eq!(
+            input.get("_raw_input").and_then(|value| value.as_str()),
+            Some("{"),
+            "invalid tool input should preserve the raw partial payload for debugging"
+        );
+    }
+
+    #[test]
+    fn test_non_stream_aggregation_preserves_multi_tool_order_and_usage() {
+        let mut message_state = Some(json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "gpt-4o",
+            "stop_reason": null,
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        }));
+        let mut blocks = std::collections::BTreeMap::new();
+        let mut tool_input_buffers = std::collections::HashMap::new();
+        let mut stop_reason_state = None;
+        let mut usage_input_tokens = 0_u64;
+        let mut usage_output_tokens = 0_u64;
+
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"get_weather","input":{}}}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+        );
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+        );
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_2","name":"get_time","input":{}}}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+        );
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+        );
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"Beijing\"}"}}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+        );
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+        );
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+        );
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":11,"output_tokens":7}}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+        );
+
+        let mut message = message_state.expect("message state should exist");
+        let content: Vec<Value> = blocks.into_values().collect();
+        let stop_reason = stop_reason_state.unwrap_or_else(|| "end_turn".to_string());
+        if let Some(message_obj) = message.as_object_mut() {
+            message_obj.insert("content".to_string(), Value::Array(content));
+            message_obj.insert("stop_reason".to_string(), json!(stop_reason));
+            message_obj.insert(
+                "usage".to_string(),
+                json!({
+                    "input_tokens": usage_input_tokens,
+                    "output_tokens": usage_output_tokens,
+                }),
+            );
+        }
+
+        let content = message
+            .get("content")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("content should exist");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0].get("name").and_then(Value::as_str), Some("get_weather"));
+        assert_eq!(content[1].get("name").and_then(Value::as_str), Some("get_time"));
+        assert_eq!(
+            content[0].get("input"),
+            Some(&json!({"city": "Beijing"}))
+        );
+        assert_eq!(content[1].get("input"), Some(&json!({})));
+        assert_eq!(
+            message.get("usage"),
+            Some(&json!({"input_tokens": 11, "output_tokens": 7}))
+        );
+        assert_eq!(
+            message.get("stop_reason").and_then(Value::as_str),
+            Some("tool_use")
         );
     }
 

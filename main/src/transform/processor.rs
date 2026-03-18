@@ -626,15 +626,20 @@ impl MessageProcessor {
                                     "output": result_output
                                 }));
                             }
-                            ContentBlock::Document { .. } => {
+                            ContentBlock::Document { name, .. } => {
+                                let document_marker = name
+                                    .as_deref()
+                                    .map(|name| format!("[document omitted: {}]", name))
+                                    .unwrap_or_else(|| "[document omitted]".to_string());
                                 current_msg_content.push(json!({
                                     "type": text_type,
-                                    "text": "[document omitted]"
+                                    "text": document_marker
                                 }));
                             }
                             ContentBlock::OtherValue(v) => {
                                 let text = serde_json::to_string(v)
-                                    .unwrap_or_else(|_| "[unknown content]".to_string());
+                                    .map(|json| format!("[unsupported content]{}", json))
+                                    .unwrap_or_else(|_| "[unsupported content]".to_string());
                                 current_msg_content.push(json!({
                                     "type": text_type,
                                     "text": text
@@ -1231,6 +1236,37 @@ mod tests {
             .expect("payload should fit with truncation");
         assert!(payload.contains("[skill content truncated]"));
         assert!(payload.chars().count() <= 1200);
+    }
+
+    #[test]
+    fn test_transform_messages_explicitly_marks_document_and_unknown_blocks() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Blocks(vec![
+                ContentBlock::Document {
+                    source: Some(json!({"type": "text", "media_type": "application/pdf"})),
+                    name: Some("spec.pdf".to_string()),
+                },
+                ContentBlock::OtherValue(json!({"type": "search_result", "query": "foo"})),
+            ])),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let content = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .expect("message content should be present");
+
+        assert_eq!(
+            content[0].get("text").and_then(Value::as_str),
+            Some("[document omitted: spec.pdf]")
+        );
+        assert_eq!(
+            content[1].get("text").and_then(Value::as_str),
+            Some("[unsupported content]{\"query\":\"foo\",\"type\":\"search_result\"}")
+        );
     }
 
     #[test]
