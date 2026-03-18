@@ -242,11 +242,11 @@ impl OpenAIChatBackend {
         }
     }
 
-    /// Build system message from Anthropic system field
-    fn build_system_message(system: Option<&crate::models::SystemContent>) -> Option<Value> {
+    fn flatten_system_text(system: Option<&crate::models::SystemContent>) -> Option<String> {
         match system {
-            Some(crate::models::SystemContent::Text(s)) if !s.is_empty() => {
-                Some(json!({ "role": "system", "content": s }))
+            Some(crate::models::SystemContent::Text(s)) => {
+                let trimmed = s.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
             }
             Some(crate::models::SystemContent::Blocks(blocks)) if !blocks.is_empty() => {
                 let text = blocks
@@ -262,14 +262,31 @@ impl OpenAIChatBackend {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                if !text.is_empty() {
-                    Some(json!({ "role": "system", "content": text }))
-                } else {
-                    None
-                }
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
             }
             _ => None,
         }
+    }
+
+    /// Build system message from Anthropic system field and custom injection prompt
+    fn build_system_message(
+        system: Option<&crate::models::SystemContent>,
+        custom_injection_prompt: &str,
+    ) -> Option<Value> {
+        let system_text = Self::flatten_system_text(system);
+        let custom_text = custom_injection_prompt
+            .trim()
+            .to_string();
+
+        let merged = match (system_text, custom_text.is_empty()) {
+            (Some(system_text), true) => Some(system_text),
+            (Some(system_text), false) => Some(format!("{}\n\n{}", system_text, custom_text)),
+            (None, false) => Some(custom_text),
+            (None, true) => None,
+        }?;
+
+        Some(json!({ "role": "system", "content": merged }))
     }
 }
 
@@ -296,7 +313,9 @@ impl TransformBackend for OpenAIChatBackend {
         let mut messages = Vec::new();
 
         // Add system message first if present
-        if let Some(system_msg) = Self::build_system_message(anthropic_body.system.as_ref()) {
+        if let Some(system_msg) =
+            Self::build_system_message(anthropic_body.system.as_ref(), &ctx.custom_injection_prompt)
+        {
             messages.push(system_msg);
         }
 
@@ -1118,6 +1137,126 @@ mod tests {
         );
         let serialized = body.to_string();
         assert!(!serialized.contains("CodeBuddy Code"));
+    }
+
+    #[test]
+    fn transform_request_appends_custom_injection_prompt_to_system_message() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
+            Message, MessageContent, OpenAIModelMapping, ReasoningEffortMapping, SystemContent,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("你好".to_string())),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: "Always inspect repo instructions first.".to_string(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+
+        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
+        let content = messages[0]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(content.contains("You are Claude Code."));
+        assert!(content.contains("Always inspect repo instructions first."));
+        assert!(
+            messages
+                .iter()
+                .skip(1)
+                .all(|msg| msg.get("content").and_then(Value::as_str) != Some("Always inspect repo instructions first.")),
+            "custom prompt should remain in system content instead of user messages"
+        );
+    }
+
+    #[test]
+    fn transform_request_creates_system_message_from_custom_injection_prompt_when_missing() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
+            Message, MessageContent, OpenAIModelMapping, ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("你好".to_string())),
+            }],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: "Always inspect repo instructions first.".to_string(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+
+        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
+        assert_eq!(
+            messages[0].get("content").and_then(Value::as_str),
+            Some("Always inspect repo instructions first.")
+        );
+        assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
     }
 
     #[test]

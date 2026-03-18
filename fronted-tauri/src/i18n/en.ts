@@ -130,7 +130,7 @@ export default {
     // Settings
     settingsTitle: 'Settings',
     customInjection: 'Custom Prompt Injection',
-    customInjectionTip: 'Inject this prompt into User Message globally for all chats. Leave empty to disable.',
+    customInjectionTip: 'Attach this prompt as system/context instructions for all chats. Leave empty to disable.',
     customInjectionPlaceholder: 'E.g. CRITICAL: You MUST use JSON tools...',
     useDefaultPrompt: 'Use Default Prompt',
 

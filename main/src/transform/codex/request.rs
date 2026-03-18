@@ -68,6 +68,92 @@ fn is_wrapped_agents_instructions(system_text: &str) -> bool {
         && lower.contains("</instructions>")
 }
 
+fn normalized_contains(haystack: &str, needle: &str) -> bool {
+    let normalized_needle = normalize_text_for_exact_match(needle);
+    if normalized_needle.is_empty() {
+        return false;
+    }
+
+    normalize_text_for_exact_match(haystack).contains(&normalized_needle)
+}
+
+fn append_instruction_text(base: &str, extra: &str) -> String {
+    let trimmed_base = base.trim();
+    let trimmed_extra = extra.trim();
+
+    if trimmed_base.is_empty() {
+        return trimmed_extra.to_string();
+    }
+    if trimmed_extra.is_empty() {
+        return trimmed_base.to_string();
+    }
+    if normalized_contains(trimmed_base, trimmed_extra) {
+        return trimmed_base.to_string();
+    }
+
+    format!("{}\n\n{}", trimmed_base, trimmed_extra)
+}
+
+fn wrap_agents_instructions(instructions_text: &str, request_cwd: Option<&str>) -> String {
+    if let Some(cwd) = request_cwd {
+        format!(
+            "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+            cwd, instructions_text
+        )
+    } else {
+        format!(
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+            instructions_text
+        )
+    }
+}
+
+fn inject_into_agents_wrapper(wrapper_text: &str, extra_text: &str) -> String {
+    let trimmed_extra = extra_text.trim();
+    if trimmed_extra.is_empty() || normalized_contains(wrapper_text, trimmed_extra) {
+        return wrapper_text.to_string();
+    }
+
+    let lower = wrapper_text.to_ascii_lowercase();
+    if let Some(idx) = lower.rfind("</instructions>") {
+        let prefix = &wrapper_text[..idx];
+        let suffix = &wrapper_text[idx..];
+        let trimmed_prefix = prefix.trim_end();
+        return format!("{}\n\n{}\n{}", trimmed_prefix, trimmed_extra, suffix);
+    }
+
+    append_instruction_text(wrapper_text, trimmed_extra)
+}
+
+fn build_agents_wrapper_payload(
+    system_text: Option<&str>,
+    request_cwd: Option<&str>,
+    custom_prompt: Option<&str>,
+) -> Option<String> {
+    let trimmed_system = system_text.map(str::trim).filter(|text| !text.is_empty());
+    let trimmed_custom = custom_prompt.map(str::trim).filter(|text| !text.is_empty());
+
+    match (trimmed_system, trimmed_custom) {
+        (None, None) => None,
+        (Some(system_text), None) => {
+            if is_wrapped_agents_instructions(system_text) {
+                Some(system_text.to_string())
+            } else {
+                Some(wrap_agents_instructions(system_text, request_cwd))
+            }
+        }
+        (Some(system_text), Some(custom_prompt)) => {
+            if is_wrapped_agents_instructions(system_text) {
+                Some(inject_into_agents_wrapper(system_text, custom_prompt))
+            } else {
+                let merged = append_instruction_text(system_text, custom_prompt);
+                Some(wrap_agents_instructions(&merged, request_cwd))
+            }
+        }
+        (None, Some(custom_prompt)) => Some(wrap_agents_instructions(custom_prompt, request_cwd)),
+    }
+}
+
 fn system_contains_codex_instructions(system_text: &str) -> bool {
     let normalized = normalize_text_for_exact_match(system_text).to_ascii_lowercase();
     if normalized.contains("you are a coding agent running in the codex cli") {
@@ -1494,6 +1580,9 @@ impl TransformRequest {
         let mut wrapped_system_payload_text = None::<String>;
         let mut injected_text_dedupe = HashSet::new();
         let mut system_matches_codex_instructions = false;
+        let trimmed_custom_injection_prompt = custom_injection_prompt.trim();
+        let custom_prompt_applied =
+            apply_agent_augmentations && !trimmed_custom_injection_prompt.is_empty();
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let mut system_text = system.to_string();
@@ -1510,19 +1599,12 @@ impl TransformRequest {
                 system_text.len()
             ));
 
-            let system_payload_text = if is_wrapped_agents_instructions(&system_text) {
-                system_text
-            } else if let Some(cwd) = request_cwd.as_deref() {
-                format!(
-                    "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-                    cwd, system_text
-                )
-            } else {
-                format!(
-                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-                    system_text
-                )
-            };
+            let system_payload_text = build_agents_wrapper_payload(
+                Some(&system_text),
+                request_cwd.as_deref(),
+                custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
+            )
+            .unwrap_or(system_text);
             wrapped_system_payload_text = Some(system_payload_text.clone());
             final_input.push(json!({
                 "type": "message",
@@ -1538,6 +1620,26 @@ impl TransformRequest {
             } else {
                 log("📋 [Transform] Skip runtime <environment_context> injection (no trusted request cwd)");
             }
+        } else if custom_prompt_applied {
+            log(&format!(
+                "🎯 [Transform] Wrapping custom global prompt as AGENTS instructions ({} chars)",
+                custom_injection_prompt.len()
+            ));
+            if let Some(system_payload_text) = build_agents_wrapper_payload(
+                None,
+                request_cwd.as_deref(),
+                Some(trimmed_custom_injection_prompt),
+            ) {
+                wrapped_system_payload_text = Some(system_payload_text.clone());
+                final_input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": system_payload_text
+                    }]
+                }));
+            }
         }
 
         // 注入提取的 Skills
@@ -1550,22 +1652,6 @@ impl TransformRequest {
                 if !push_proxy_injected_text_message(&mut final_input, &mut injected_text_dedupe, &skill) {
                     log("🎯 [Transform] Skip duplicate proxy-injected skill payload");
                 }
-            }
-        }
-
-        let trimmed_custom_injection_prompt = custom_injection_prompt.trim();
-        let custom_prompt_applied = apply_agent_augmentations && !trimmed_custom_injection_prompt.is_empty();
-        if custom_prompt_applied {
-            log(&format!(
-                "🎯 [Transform] Injecting custom global prompt ({} chars)",
-                custom_injection_prompt.len()
-            ));
-            if !push_proxy_injected_text_message(
-                &mut final_input,
-                &mut injected_text_dedupe,
-                custom_injection_prompt,
-            ) {
-                log("🎯 [Transform] Skip duplicate custom global prompt");
             }
         }
         if apply_plan_augmentations {
@@ -2303,6 +2389,17 @@ mod tests {
             .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
             .map(|text| text.to_string())
             .collect()
+    }
+
+    fn first_input_text(body: &Value) -> String {
+        body.get("input")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("content").and_then(|v| v.as_array()))
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("text").and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_string()
     }
 
     #[test]
@@ -3286,12 +3383,77 @@ hello");
         );
         let texts = input_texts(&body);
         assert!(
-            texts.iter().any(|text| text == "global prompt"),
-            "agent-shaped requests should inject the custom global prompt"
+            !texts.iter().any(|text| text == "global prompt"),
+            "agent-shaped requests should not inject the custom global prompt as a standalone user message"
+        );
+        let first_text = first_input_text(&body);
+        assert!(
+            first_text.contains("System prompt"),
+            "wrapped system text should preserve the original system prompt"
+        );
+        assert!(
+            first_text.contains("global prompt"),
+            "wrapped system text should also carry the custom global prompt"
         );
         assert!(
             !texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
             "ordinary agent requests must not receive plan-mode prompt injection"
+        );
+    }
+
+    #[test]
+    fn agent_requests_without_system_wrap_custom_prompt_without_touching_default_instructions() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "skill",
+                    "input": { "command": "test-skill" }
+                }]
+            }, {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": "<command-name>test-skill</command-name>\nBase Path: /tmp\nContent"
+                }]
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(
+            &request,
+            None,
+            &mapping,
+            "global prompt",
+            "gpt-5.3-codex",
+        );
+
+        assert_eq!(
+            body.get("instructions").and_then(|v| v.as_str()),
+            Some(CODEX_INSTRUCTIONS),
+            "codex default instructions should still be emitted unchanged for agent requests without system text"
+        );
+
+        let texts = input_texts(&body);
+        assert!(
+            !texts.iter().any(|text| text == "global prompt"),
+            "custom prompt should not appear as a standalone user message"
+        );
+
+        let first_text = first_input_text(&body);
+        assert!(
+            first_text.starts_with("# AGENTS.md instructions"),
+            "custom prompt should be wrapped as AGENTS-style instructions"
+        );
+        assert!(
+            first_text.contains("global prompt"),
+            "wrapped AGENTS instructions should contain the custom prompt"
         );
     }
 
@@ -3488,9 +3650,13 @@ hello");
             marker_count, 1,
             "existing AGENTS wrapper should not be nested"
         );
-        assert_eq!(
-            first_system_text, already_wrapped,
-            "wrapped system text should be preserved as-is"
+        assert!(
+            first_system_text.contains("hello"),
+            "wrapped system text should preserve the original instructions"
+        );
+        assert!(
+            first_system_text.contains("global prompt"),
+            "wrapped system text should absorb the custom prompt inside the existing wrapper"
         );
     }
 

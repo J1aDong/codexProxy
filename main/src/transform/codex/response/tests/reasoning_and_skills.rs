@@ -278,16 +278,33 @@ fn test_custom_injection_prompt() {
     let (body, _) = TransformRequest::transform(&request, None, &mapping, prompt, "gpt-5.3-codex");
 
     let input_arr = body.get("input").unwrap().as_array().unwrap();
+    let texts: Vec<_> = input_arr
+        .iter()
+        .filter_map(|msg| msg.get("content").and_then(|v| v.as_array()))
+        .flat_map(|blocks| blocks.iter())
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect();
 
-    // Find the injected prompt
-    // It should be after the skill injection.
-    // Input structure: [Template, Skill, Prompt, ...History]
-    // Since history starts with assistant, and we inject user messages.
+    assert!(
+        !texts.iter().any(|text| *text == prompt),
+        "custom prompt should no longer be injected as a standalone user message"
+    );
 
-    // Let's look for the prompt text
-    let prompt_msg = input_arr.iter().find(|msg| {
-        msg["role"] == "user" && msg["content"][0]["text"].as_str().unwrap_or("") == prompt
-    });
+    let first_text = input_arr
+        .first()
+        .and_then(|msg| msg.get("content"))
+        .and_then(|v| v.as_array())
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| block.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
 
-    assert!(prompt_msg.is_some(), "Should inject custom prompt");
+    assert!(
+        first_text.starts_with("# AGENTS.md instructions"),
+        "custom prompt should be wrapped as AGENTS-style instructions"
+    );
+    assert!(
+        first_text.contains(prompt),
+        "wrapped instructions should include the custom prompt"
+    );
 }

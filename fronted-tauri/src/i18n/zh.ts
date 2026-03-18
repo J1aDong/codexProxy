@@ -130,7 +130,7 @@ export default {
     // Settings
     settingsTitle: '设置',
     customInjection: '附加指令注入',
-    customInjectionTip: '每次对话时，将此提示词注入到上下文中去规范 AI 的行为。留空则不注入。',
+    customInjectionTip: '每次对话时，将此提示词作为系统/上下文指令附加到请求中以规范 AI 的行为。留空则不注入。',
     customInjectionPlaceholder: '例如：CRITICAL: You MUST use JSON tools...',
     useDefaultPrompt: '使用默认提示词',
 
