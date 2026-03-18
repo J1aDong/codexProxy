@@ -55,11 +55,12 @@
 - **备选方案**：继续视 `reasoning_content` 为普通增强信息，默认透出。
 - **不选原因**：这与 Anthropic 请求级 thinking 语义不一致。
 
-### 5.1 Phase 1 对 thinking 完整性的收口边界
-- **决策**：Phase 1 仅保证 `thinking_delta` 与 `stop_sequence` 的下游行为；`signature_delta` 暂不在 OpenAI Chat Completions 路径中实现。
+### 5.1 Phase 1 对 thinking 完整性的边界澄清
+- **决策**：Phase 1 仅保证 `thinking_delta` 与 `stop_sequence` 的下游行为；`signature_delta` 暂不在通用 OpenAI Chat Completions 路径中实现。
 - **原因**：当前仓库内没有稳定、已验证的 OpenAI chat chunk 字段可无歧义映射为 Anthropic `signature_delta`，贸然定义项目内私有字段会扩大协议歧义。
 - **备选方案**：约定一个项目内字段（如 `signature` / `reasoning_signature`）并桥接成 `signature_delta`。
 - **不选原因**：这会引入非标准兼容约定，不适合作为当前 Phase 1 的默认行为。
+- **How to apply**：通用 `openai.rs` backend 不引入私有 signature 字段猜测；如需支持，必须以下游/上游对明确、稳定、可验证的 provider-specific 字段为前提。
 
 ### 6. 用同一份 change 记录两阶段计划，但实现时严格分阶段推进
 - **决策**：保留现有 change 名称与目录，在同一套 artifacts 中同时记录 P0/P1 与 P2；其中 P0/P1 为当前实现范围，P2 为后续阶段。

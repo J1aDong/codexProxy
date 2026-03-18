@@ -18,8 +18,10 @@
 - [x] 2.2 补充对 deprecated `function_call` 流式增量的兼容处理，并保持与 `tool_calls` 的行为一致性
 - [x] 2.3 补充对 `refusal` 相关 delta / finish 语义的显式下游映射
 - [x] 2.4 让 `allow_visible_thinking` 在 OpenAI backend response transformer 中真正生效
-- [ ] 2.5 为 thinking 输出补齐必要的完整性/附加信息处理策略，并明确 `stop_sequence` 的下游行为
-  - Phase 1 决策：已完成 `stop_sequence`；`signature_delta` 暂不在 OpenAI Chat Completions 路径实现
+- [x] 2.5 澄清通用 OpenAI Chat 路径下的 thinking 完整性边界，并明确 `stop_sequence` 的下游行为
+  - Phase 1：已支持 `thinking_delta` 与 `stop_sequence`
+  - Phase 1：不默认支持 `signature_delta`
+  - 后续仅在存在稳定 provider-specific 字段约定时，再单独实现 signature 桥接
 
 ## 3. 工具参数收口与聚合路径修正（P0 / P1）
 
