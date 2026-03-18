@@ -193,6 +193,37 @@ fn request_targets_exit_plan_mode_tool(request: &AnthropicRequest) -> bool {
         .unwrap_or(false)
 }
 
+fn request_contains_recent_plan_mode_reminder(request: &AnthropicRequest) -> bool {
+    const PLAN_MODE_REMINDER: &str = "plan mode is active.";
+
+    request
+        .messages
+        .iter()
+        .rev()
+        .filter_map(|message| {
+            if !message.role.eq_ignore_ascii_case("user") {
+                return None;
+            }
+
+            let content = message.content.as_ref()?;
+            let text = match content {
+                MessageContent::Text(text) => text.clone(),
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+
+            (!text.trim().is_empty()).then_some(text)
+        })
+        .take(1)
+        .any(|text| text.to_ascii_lowercase().contains(PLAN_MODE_REMINDER))
+}
+
 fn request_contains_plan_approval_signal(
     _request: &AnthropicRequest,
     request_text_corpus: &str,
@@ -261,6 +292,9 @@ fn decide_request_augmentation(
     }
     if request_contains_plan_approval_signal(request, request_text_corpus) {
         reasons.push("plan_approval_response");
+    }
+    if request_contains_recent_plan_mode_reminder(request) {
+        reasons.push("recent_plan_mode_reminder");
     }
 
     let has_plan_signal = !reasons.is_empty();
@@ -1654,7 +1688,7 @@ impl TransformRequest {
             }
         }
         if apply_plan_augmentations {
-            let plan_prompt = "Plan mode: propose a concise step-by-step plan first. Do not execute tools or make code changes until the user explicitly approves the plan.";
+            let plan_prompt = "Plan mode: propose a concise step-by-step plan first. Do not execute tools or make code changes until the user approves the plan via ExitPlanMode. After writing the plan, call ExitPlanMode to request approval. Do not ask the user to type approval in normal text, and do not use AskUserQuestion for plan approval.";
             log("🗺️ [Transform] Injecting minimal plan-mode prompt");
             if !push_proxy_injected_text_message(
                 &mut final_input,
@@ -3500,6 +3534,10 @@ hello");
             "plan requests should inject the minimal plan-mode prompt"
         );
         assert!(
+            texts.iter().any(|text| text.contains("call ExitPlanMode to request approval")),
+            "plan requests should instruct the model to use ExitPlanMode for approval"
+        );
+        assert!(
             first_text.contains("global prompt"),
             "plan-mode requests should also carry the custom prompt in system context"
         );
@@ -3540,6 +3578,10 @@ hello");
         assert!(
             texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
             "plan approval signal should still inject the minimal plan prompt"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("Do not ask the user to type approval in normal text")),
+            "plan approval signal should discourage plain-text approval asks"
         );
         assert!(
             first_text.starts_with("# AGENTS.md instructions"),
@@ -3606,6 +3648,72 @@ hello");
         assert!(
             first_text.contains("global prompt"),
             "ordinary agent requests should still carry the custom prompt"
+        );
+    }
+
+    #[test]
+    fn recent_plan_mode_reminder_keeps_request_on_plan_path() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        "<system-reminder>\nPlan mode is active. The user indicated that they do not want you to execute yet.\n</system-reminder>",
+                        "测试plan"
+                    ]
+                }
+            ],
+            "system": "You are Claude Code.",
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let request_text_corpus = collect_request_text_corpus(&request);
+        let augmentation = decide_request_augmentation(&request, &request_text_corpus);
+
+        assert_eq!(augmentation.mode, RequestAugmentationMode::Plan);
+        assert!(
+            augmentation.reasons.contains(&"recent_plan_mode_reminder"),
+            "latest user message carrying the official plan reminder should keep the request on the plan path"
+        );
+    }
+
+    #[test]
+    fn previous_user_plan_mode_reminder_does_not_keep_next_request_in_plan_mode() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        "<system-reminder>\nPlan mode is active. The user indicated that they do not want you to execute yet.\n</system-reminder>",
+                        "你好啊"
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "content": "先给你一个计划。"
+                },
+                {
+                    "role": "user",
+                    "content": "现在正常聊一句"
+                }
+            ],
+            "system": "You are Claude Code.",
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let request_text_corpus = collect_request_text_corpus(&request);
+        let augmentation = decide_request_augmentation(&request, &request_text_corpus);
+
+        assert_eq!(
+            augmentation.mode,
+            RequestAugmentationMode::Agent,
+            "a prior user turn carrying the plan reminder should not force the next plain request into plan mode"
+        );
+        assert!(
+            !augmentation.reasons.contains(&"recent_plan_mode_reminder"),
+            "only the latest user message should count as a current plan-mode reminder"
         );
     }
 
