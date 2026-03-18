@@ -193,7 +193,10 @@ fn request_targets_exit_plan_mode_tool(request: &AnthropicRequest) -> bool {
         .unwrap_or(false)
 }
 
-fn request_contains_plan_approval_signal(request: &AnthropicRequest, request_text_corpus: &str) -> bool {
+fn request_contains_plan_approval_signal(
+    _request: &AnthropicRequest,
+    request_text_corpus: &str,
+) -> bool {
     if request_text_corpus
         .to_ascii_lowercase()
         .contains("plan_approval_response")
@@ -201,12 +204,7 @@ fn request_contains_plan_approval_signal(request: &AnthropicRequest, request_tex
         return true;
     }
 
-    request
-        .tools
-        .as_ref()
-        .and_then(|tools| serde_json::to_string(tools).ok())
-        .map(|tools_json| tools_json.to_ascii_lowercase().contains("plan_approval_response"))
-        .unwrap_or(false)
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1582,7 +1580,8 @@ impl TransformRequest {
         let mut system_matches_codex_instructions = false;
         let trimmed_custom_injection_prompt = custom_injection_prompt.trim();
         let custom_prompt_applied =
-            apply_agent_augmentations && !trimmed_custom_injection_prompt.is_empty();
+            (apply_agent_augmentations || apply_plan_augmentations)
+                && !trimmed_custom_injection_prompt.is_empty();
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let mut system_text = system.to_string();
@@ -3494,10 +3493,15 @@ hello");
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
         let texts = input_texts(&body);
+        let first_text = first_input_text(&body);
 
         assert!(
             texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
             "plan requests should inject the minimal plan-mode prompt"
+        );
+        assert!(
+            first_text.contains("global prompt"),
+            "plan-mode requests should also carry the custom prompt in system context"
         );
         assert_eq!(
             body.get("tool_choice").and_then(|value| value.as_str()),
@@ -3525,6 +3529,83 @@ hello");
         assert!(
             augmentation.reasons.contains(&"plan_approval_response"),
             "plan approval signal should keep the request on the plan path"
+        );
+
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+        let texts = input_texts(&body);
+        let first_text = first_input_text(&body);
+
+        assert!(
+            texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
+            "plan approval signal should still inject the minimal plan prompt"
+        );
+        assert!(
+            first_text.starts_with("# AGENTS.md instructions"),
+            "plan approval requests without system text should still wrap the custom prompt as instructions"
+        );
+        assert!(
+            first_text.contains("global prompt"),
+            "plan approval requests should not drop the custom prompt"
+        );
+    }
+
+    #[test]
+    fn tool_schema_mentions_plan_approval_response_do_not_force_plan_mode() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": "你好啊啊啊啊啊啊"
+            }],
+            "system": "You are Claude Code.",
+            "tools": [{
+                "name": "SendMessage",
+                "description": "When a teammate is in plan mode, send a plan_approval_response after approval.",
+                "input_schema": {
+                    "type":"object",
+                    "properties":{
+                        "message":{
+                            "type":"object",
+                            "properties":{
+                                "type":{"const":"plan_approval_response"},
+                                "request_id":{"type":"string"},
+                                "approve":{"type":"boolean"}
+                            }
+                        }
+                    }
+                }
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let request_text_corpus = collect_request_text_corpus(&request);
+        let augmentation = decide_request_augmentation(&request, &request_text_corpus);
+
+        assert_eq!(
+            augmentation.mode,
+            RequestAugmentationMode::Agent,
+            "tool schema text alone should not force plan mode"
+        );
+        assert!(
+            !augmentation.reasons.contains(&"plan_approval_response"),
+            "tool schema mentions should not be treated as plan approval signals"
+        );
+
+        let mapping = ReasoningEffortMapping::default();
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+        let texts = input_texts(&body);
+        let first_text = first_input_text(&body);
+
+        assert!(
+            !texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
+            "non-plan requests should not inject the plan prompt"
+        );
+        assert!(
+            first_text.contains("global prompt"),
+            "ordinary agent requests should still carry the custom prompt"
         );
     }
 

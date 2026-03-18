@@ -13,6 +13,91 @@ const SKILL_TRUNCATION_MARKER: &str = "\n[skill content truncated]";
 pub struct MessageProcessor;
 
 impl MessageProcessor {
+    fn extract_teammate_message_bodies(text: &str) -> Vec<String> {
+        let mut bodies = Vec::new();
+        let mut rest = text;
+        let close_tag = "</teammate-message>";
+
+        while let Some(start) = rest.find("<teammate-message") {
+            let after_open = &rest[start..];
+            let Some(open_end_rel) = after_open.find('>') else {
+                break;
+            };
+            let body_start = start + open_end_rel + 1;
+            let Some(close_rel) = rest[body_start..].find(close_tag) else {
+                break;
+            };
+            let body_end = body_start + close_rel;
+            bodies.push(rest[body_start..body_end].trim().to_string());
+            rest = &rest[body_end + close_tag.len()..];
+        }
+
+        bodies
+    }
+
+    fn rewrite_teammate_protocol_text(text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        if !trimmed.contains("<teammate-message") {
+            return None;
+        }
+
+        if trimmed.contains("summary=\"Acknowledge shutdown and exit\"")
+            && trimmed.contains("shutdown_request")
+        {
+            return Some(
+                "Teammate sent a plain-text shutdown acknowledgment. This is not a valid shutdown_response, so the teammate may still be active. TeamDelete will keep failing until the teammate sends a structured shutdown_response to `team-lead`."
+                    .to_string(),
+            );
+        }
+
+        for body in Self::extract_teammate_message_bodies(trimmed) {
+            let Ok(payload) = serde_json::from_str::<Value>(&body) else {
+                continue;
+            };
+            let Some(kind) = payload.get("type").and_then(|value| value.as_str()) else {
+                continue;
+            };
+
+            if kind == "shutdown_request" {
+                let request_id = payload
+                    .get("requestId")
+                    .or_else(|| payload.get("request_id"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let from = payload
+                    .get("from")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("team-lead");
+                let reason = payload
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+
+                return Some(format!(
+                    "Structured teammate protocol message from `{from}`: shutdown_request (request_id `{request_id}`). Reason: {reason}\n\nDo NOT reply with plain text. Use SendMessage to send a structured `shutdown_response` to `team-lead` with this exact request_id. If approving shutdown, send `approve: true` and then exit."
+                ));
+            }
+
+            if kind == "plan_approval_request" {
+                let request_id = payload
+                    .get("requestId")
+                    .or_else(|| payload.get("request_id"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let from = payload
+                    .get("from")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("team-lead");
+
+                return Some(format!(
+                    "Structured teammate protocol message from `{from}`: plan_approval_request (request_id `{request_id}`).\n\nDo NOT reply with plain text. Use SendMessage to send a structured `plan_approval_response` to `{from}` with this exact request_id."
+                ));
+            }
+        }
+
+        None
+    }
+
     fn extract_tool_result_plain_text(content: &Value) -> Option<String> {
         match content {
             Value::String(text) => Some(text.clone()),
@@ -238,6 +323,11 @@ impl MessageProcessor {
 
             match content {
                 MessageContent::Text(text) => {
+                    let text = if msg.role == "user" {
+                        Self::rewrite_teammate_protocol_text(text).unwrap_or_else(|| text.clone())
+                    } else {
+                        text.clone()
+                    };
                     log(&format!(
                         "📝 [Message #{}] role={}, type=Text, len={}",
                         msg_idx,
@@ -287,6 +377,12 @@ impl MessageProcessor {
                     for (block_idx, block) in blocks.iter().enumerate() {
                         match block {
                             ContentBlock::Text { text } => {
+                                let text = if msg.role == "user" {
+                                    Self::rewrite_teammate_protocol_text(text)
+                                        .unwrap_or_else(|| text.clone())
+                                } else {
+                                    text.clone()
+                                };
                                 current_msg_content.push(json!({
                                     "type": text_type,
                                     "text": text
@@ -1221,5 +1317,57 @@ mod tests {
         assert!(rewritten.contains("TaskOutput cannot query team agent IDs"));
         assert!(rewritten.contains("agent_vehicle@debug-swarm"));
         assert!(!rewritten.contains("<tool_use_error>"));
+    }
+
+    #[test]
+    fn test_transform_messages_rewrites_teammate_shutdown_request_into_protocol_hint() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(
+                "<teammate-message teammate_id=\"team-lead\">\n{\"type\":\"shutdown_request\",\"requestId\":\"shutdown-1773827469809@external-researcher\",\"from\":\"team-lead\",\"reason\":\"User requested the team be disbanded. Stop work and exit the team now.\",\"timestamp\":\"2026-03-18T09:51:09.809Z\"}\n</teammate-message>".to_string(),
+            )),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("Structured teammate protocol message"));
+        assert!(rewritten.contains("shutdown_request"));
+        assert!(rewritten.contains("Do NOT reply with plain text"));
+        assert!(rewritten.contains("shutdown_response"));
+        assert!(rewritten.contains("shutdown-1773827469809@external-researcher"));
+    }
+
+    #[test]
+    fn test_transform_messages_rewrites_plain_shutdown_acknowledgement_warning() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(
+                "<teammate-message teammate_id=\"external-researcher\" color=\"green\" summary=\"Acknowledge shutdown and exit\">\n收到 shutdown_request。已停止工作并退出队伍，不再执行任何任务。\n</teammate-message>\n\n<teammate-message teammate_id=\"external-researcher\" color=\"green\">\n{\"type\":\"idle_notification\",\"from\":\"external-researcher\",\"timestamp\":\"2026-03-18T09:51:21.994Z\",\"idleReason\":\"available\"}\n</teammate-message>".to_string(),
+            )),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("plain-text shutdown acknowledgment"));
+        assert!(rewritten.contains("not a valid shutdown_response"));
+        assert!(rewritten.contains("TeamDelete will keep failing"));
     }
 }
