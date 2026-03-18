@@ -13,6 +13,103 @@ const SKILL_TRUNCATION_MARKER: &str = "\n[skill content truncated]";
 pub struct MessageProcessor;
 
 impl MessageProcessor {
+    fn extract_tool_result_plain_text(content: &Value) -> Option<String> {
+        match content {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(items) => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Value::String(text) => Some(text.clone()),
+                        Value::Object(obj) => obj
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .map(|text| text.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+
+                (!parts.is_empty()).then(|| parts.join("\n"))
+            }
+            Value::Object(obj) => obj
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(|text| text.to_string()),
+            _ => None,
+        }
+    }
+
+    fn rewrite_agent_tool_result(content: &Value) -> Option<Value> {
+        let text = Self::extract_tool_result_plain_text(content)?;
+        let trimmed = text.trim();
+        if !trimmed.starts_with("Spawned successfully.") {
+            return None;
+        }
+        if !trimmed.contains("agent_id:") || !trimmed.contains("team_name:") {
+            return None;
+        }
+
+        let read_field = |label: &str| -> Option<String> {
+            trimmed
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(label))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        };
+
+        let agent_id = read_field("agent_id:").unwrap_or_default();
+        let teammate_name = read_field("name:").unwrap_or_default();
+        let team_name = read_field("team_name:").unwrap_or_default();
+
+        if agent_id.is_empty() || team_name.is_empty() {
+            return None;
+        }
+
+        let rewritten = format!(
+            "Spawned successfully.\nagent_id: {agent_id}\nname: {teammate_name}\nteam_name: {team_name}\nThe agent is now running and will receive instructions via mailbox.\n\nImportant: this is a team mailbox agent id, not a TaskOutput task_id. Do not call TaskOutput with this agent_id. Wait for teammate-message or idle_notification updates instead."
+        );
+        Some(Value::String(rewritten))
+    }
+
+    fn rewrite_task_output_tool_result(content: &Value) -> Option<Value> {
+        let text = Self::extract_tool_result_plain_text(content)?;
+        let trimmed = text.trim();
+        let missing_prefix = "No task found with ID:";
+
+        let missing_id = trimmed
+            .strip_prefix("<tool_use_error>")
+            .and_then(|inner| inner.strip_suffix("</tool_use_error>"))
+            .map(str::trim)
+            .or(Some(trimmed))
+            .and_then(|inner| inner.strip_prefix(missing_prefix))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        if !missing_id.contains('@') {
+            return None;
+        }
+
+        let rewritten = format!(
+            "TaskOutput cannot query team agent IDs like `{missing_id}`. This is a mailbox-style agent id rather than a TaskOutput task_id. Wait for teammate-message or idle_notification updates instead of polling TaskOutput with this id."
+        );
+        Some(Value::String(rewritten))
+    }
+
+    fn rewrite_tool_result_output(tool_name: Option<&str>, content: &Value) -> Option<Value> {
+        let tool_name = tool_name?;
+
+        if tool_name.eq_ignore_ascii_case("Agent") {
+            return Self::rewrite_agent_tool_result(content);
+        }
+
+        if tool_name.eq_ignore_ascii_case("TaskOutput") {
+            return Self::rewrite_task_output_tool_result(content);
+        }
+
+        None
+    }
+
     fn normalize_skill_tool_input_for_history(input: &mut Value) {
         let Some(obj) = input.as_object_mut() else {
             return;
@@ -74,6 +171,8 @@ impl MessageProcessor {
         let mut extracted_skill_chars = 0usize;
         let mut skill_tool_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        let mut tool_name_by_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         // 获取全局日志记录器
         let logger = AppLogger::get();
@@ -100,6 +199,9 @@ impl MessageProcessor {
             if let Some(MessageContent::Blocks(blocks)) = &msg.content {
                 for block in blocks {
                     if let ContentBlock::ToolUse { id, name, .. } = block {
+                        if let Some(tool_id) = id {
+                            tool_name_by_id.insert(tool_id.clone(), name.clone());
+                        }
                         if name.to_lowercase() == "skill" {
                             if let Some(tool_id) = id {
                                 skill_tool_ids.insert(tool_id.clone());
@@ -401,6 +503,21 @@ impl MessageProcessor {
                                     override_result_text
                                 {
                                     Value::String(override_text)
+                                } else if let Some(rewritten) = tool_use_id
+                                    .as_deref()
+                                    .and_then(|tid| tool_name_by_id.get(tid).map(|name| name.as_str()))
+                                    .and_then(|tool_name| {
+                                        tool_content
+                                            .as_ref()
+                                            .and_then(|content| {
+                                                Self::rewrite_tool_result_output(
+                                                    Some(tool_name),
+                                                    content,
+                                                )
+                                            })
+                                    })
+                                {
+                                    rewritten
                                 } else if let Some(cv) = tool_content {
                                     Self::transform_tool_result_output(cv, &log, msg_idx, block_idx)
                                 } else {
@@ -1001,6 +1118,8 @@ impl MessageProcessor {
 #[cfg(test)]
 mod tests {
     use super::MessageProcessor;
+    use crate::models::{ContentBlock, Message, MessageContent};
+    use serde_json::{json, Value};
 
     #[test]
     fn test_build_skill_key_changes_with_content() {
@@ -1016,5 +1135,91 @@ mod tests {
             .expect("payload should fit with truncation");
         assert!(payload.contains("[skill content truncated]"));
         assert!(payload.chars().count() <= 1200);
+    }
+
+    #[test]
+    fn test_transform_messages_rewrites_team_agent_spawn_result() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_agent_1".to_string()),
+                    name: "Agent".to_string(),
+                    input: json!({
+                        "name": "agent_vehicle",
+                        "team_name": "debug-swarm",
+                        "run_in_background": true
+                    }),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_agent_1".to_string()),
+                    id: None,
+                    content: Some(Value::Array(vec![json!({
+                        "type": "text",
+                        "text": "Spawned successfully.\nagent_id: agent_vehicle@debug-swarm\nname: agent_vehicle\nteam_name: debug-swarm\nThe agent is now running and will receive instructions via mailbox."
+                    })])),
+                }])),
+            },
+        ];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .and_then(|item| item.get("output"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("team mailbox agent id"));
+        assert!(rewritten.contains("Do not call TaskOutput with this agent_id"));
+        assert!(rewritten.contains("agent_vehicle@debug-swarm"));
+    }
+
+    #[test]
+    fn test_transform_messages_rewrites_task_output_missing_team_agent_error() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_task_output_1".to_string()),
+                    name: "TaskOutput".to_string(),
+                    input: json!({
+                        "task_id": "agent_vehicle@debug-swarm",
+                        "block": true,
+                        "timeout": 600000
+                    }),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_task_output_1".to_string()),
+                    id: None,
+                    content: Some(Value::String(
+                        "<tool_use_error>No task found with ID: agent_vehicle@debug-swarm</tool_use_error>"
+                            .to_string(),
+                    )),
+                }])),
+            },
+        ];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .and_then(|item| item.get("output"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("TaskOutput cannot query team agent IDs"));
+        assert!(rewritten.contains("agent_vehicle@debug-swarm"));
+        assert!(!rewritten.contains("<tool_use_error>"));
     }
 }
