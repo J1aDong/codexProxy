@@ -161,6 +161,137 @@ fn test_proposed_plan_tags_split_across_chunks_are_preserved() {
 }
 
 #[test]
+fn test_proposed_plan_detection_is_recorded_in_diagnostics() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let plan_body = "# Clock Plan\n\n## Summary\n- inspect request path\n- patch converter";
+    let first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "<proposed_plan>\n# Clock Plan\n\n## Summary\n- inspect request path\n"
+        })
+    );
+    let second = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "- patch converter\n</proposed_plan>"
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": { "status": "completed" }
+        })
+    );
+
+    let _ = transformer.transform_sse_line(&first);
+    let _ = transformer.transform_sse_line(&second);
+    let _ = transformer.transform_sse_line(&completed);
+
+    let summary =
+        <TransformResponse as crate::transform::ResponseTransformer>::take_diagnostics_summary(
+            &mut transformer,
+        )
+        .expect("diagnostics summary should exist after proposed plan extraction");
+
+    assert_eq!(
+        summary
+            .pointer("/counters/detected_proposed_plan_blocks")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "complete proposed_plan blocks should be counted for future bridge instrumentation"
+    );
+    assert_eq!(
+        summary
+            .pointer("/counters/extracted_proposed_plan_body_chars")
+            .and_then(|v| v.as_u64()),
+        Some(plan_body.chars().count() as u64),
+        "diagnostics should record extracted proposed_plan body size"
+    );
+}
+
+#[test]
+fn test_proposed_plan_bridge_writes_plan_file_and_emits_exit_plan_mode() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let plan_path = std::env::temp_dir().join(format!(
+        "codex_proxy_plan_bridge_{}.md",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    <TransformResponse as crate::transform::ResponseTransformer>::configure_request_context(
+        &mut transformer,
+        &crate::transform::ResponseTransformRequestContext {
+            codex_plan_file_path: Some(plan_path.to_string_lossy().to_string()),
+        },
+    );
+
+    let plan_body = "# Clock Plan\n\n## Summary\n- inspect request path\n- patch converter";
+    let first = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "<proposed_plan>\n# Clock Plan\n\n## Summary\n- inspect request path\n"
+        })
+    );
+    let second = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "- patch converter\n</proposed_plan>"
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": { "status": "completed" }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&first);
+    events.extend(transformer.transform_sse_line(&second));
+    events.extend(transformer.transform_sse_line(&completed));
+    let joined = events.join("");
+
+    assert!(
+        joined.contains("\"type\":\"tool_use\"") && joined.contains("\"name\":\"ExitPlanMode\""),
+        "plan bridge should emit a synthetic ExitPlanMode tool_use"
+    );
+    assert!(
+        joined.contains("\"stop_reason\":\"tool_use\""),
+        "terminal stop_reason should switch to tool_use when ExitPlanMode is bridged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plan_path).expect("plan file should be written"),
+        plan_body,
+        "plan bridge should persist extracted proposed_plan body to Claude's plan file path"
+    );
+
+    let summary =
+        <TransformResponse as crate::transform::ResponseTransformer>::take_diagnostics_summary(
+            &mut transformer,
+        )
+        .expect("diagnostics summary should exist after plan bridge");
+    assert_eq!(
+        summary
+            .pointer("/counters/plan_bridge_write_successes")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "diagnostics should record successful plan-file writes"
+    );
+    assert_eq!(
+        summary
+            .pointer("/counters/plan_bridge_exit_plan_mode_emitted")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "diagnostics should record synthetic ExitPlanMode emission"
+    );
+
+    let _ = std::fs::remove_file(plan_path);
+}
+
+#[test]
 fn test_log_sample_overflow_text_is_safely_suppressed() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 

@@ -12,6 +12,11 @@ use crate::models::{
     OpenAIMaxTokensMapping, OpenAIModelMapping, ReasoningEffortMapping,
 };
 
+#[derive(Clone, Debug, Default)]
+pub struct ResponseTransformRequestContext {
+    pub codex_plan_file_path: Option<String>,
+}
+
 /// 转换上下文 —— 从 ProxyServer 配置派生，传入 transform 方法
 #[derive(Clone)]
 pub struct TransformContext {
@@ -69,6 +74,9 @@ pub trait TransformBackend: Send + Sync {
 pub trait ResponseTransformer: Send {
     /// 将上游的一行 SSE 转换为 Anthropic 格式的多行输出
     fn transform_line(&mut self, line: &str) -> Vec<String>;
+
+    /// 注入当前请求相关的附加上下文（默认忽略）
+    fn configure_request_context(&mut self, _ctx: &ResponseTransformRequestContext) {}
 
     /// 导出转换器诊断摘要（可选）
     fn take_diagnostics_summary(&mut self) -> Option<Value> {

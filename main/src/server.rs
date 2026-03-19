@@ -4,11 +4,12 @@ use crate::load_balancer::{
 use crate::logger::AppLogger;
 use crate::models::{
     AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
-    GeminiReasoningEffortMapping, Message, MessageContent, OpenAIMaxTokensMapping, OpenAIModelMapping, ReasoningEffort,
-    ReasoningEffortMapping,
+    GeminiReasoningEffortMapping, Message, MessageContent, OpenAIMaxTokensMapping,
+    OpenAIModelMapping, ReasoningEffort, ReasoningEffortMapping,
 };
 use crate::transform::{
-    AnthropicBackend, CodexBackend, GeminiBackend, OpenAIChatBackend, TransformBackend, TransformContext,
+    AnthropicBackend, CodexBackend, GeminiBackend, OpenAIChatBackend,
+    ResponseTransformRequestContext, TransformBackend, TransformContext,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -546,7 +547,10 @@ fn strip_stateful_output_metadata(value: &Value) -> Value {
         Value::Object(map) => {
             let mut cleaned = Map::new();
             for (key, val) in map {
-                if matches!(key.as_str(), "id" | "status" | "created_at" | "completed_at") {
+                if matches!(
+                    key.as_str(),
+                    "id" | "status" | "created_at" | "completed_at"
+                ) {
                     continue;
                 }
                 cleaned.insert(key.clone(), strip_stateful_output_metadata(val));
@@ -622,7 +626,6 @@ fn compute_non_input_fingerprint(body: &Value) -> Option<String> {
 
     Some(format!("{:016x}", hash_to_u64(&[&combined])))
 }
-
 
 fn build_stateful_endpoint_key(
     converter: &str,
@@ -770,8 +773,6 @@ fn resolve_stateful_chain_hint_info(
         source: "none",
     }
 }
-
-
 
 fn build_message_prefix_signature(request: &AnthropicRequest) -> String {
     request
@@ -1110,14 +1111,17 @@ fn prepare_stateful_chain_request(
                 request_id
             ),
         );
-        return Some((StatefulChainRequestMeta {
-            chain_key: chain_key.to_string(),
-            endpoint_key: endpoint_key.to_string(),
-            full_input,
-            static_prefix_summary,
-            static_prefix_same_as_prior: None,
-            non_input_fingerprint: current_non_input_fingerprint,
-        }, None));
+        return Some((
+            StatefulChainRequestMeta {
+                chain_key: chain_key.to_string(),
+                endpoint_key: endpoint_key.to_string(),
+                full_input,
+                static_prefix_summary,
+                static_prefix_same_as_prior: None,
+                non_input_fingerprint: current_non_input_fingerprint,
+            },
+            None,
+        ));
     }
 
     let existing_entry = match chain_store.lock() {
@@ -1225,14 +1229,17 @@ fn prepare_stateful_chain_request(
         );
     }
 
-    Some((StatefulChainRequestMeta {
-        chain_key: chain_key.to_string(),
-        endpoint_key: endpoint_key.to_string(),
-        full_input,
-        static_prefix_summary,
-        static_prefix_same_as_prior,
-        non_input_fingerprint: current_non_input_fingerprint,
-    }, turn_state_to_inject))
+    Some((
+        StatefulChainRequestMeta {
+            chain_key: chain_key.to_string(),
+            endpoint_key: endpoint_key.to_string(),
+            full_input,
+            static_prefix_summary,
+            static_prefix_same_as_prior,
+            non_input_fingerprint: current_non_input_fingerprint,
+        },
+        turn_state_to_inject,
+    ))
 }
 
 fn record_stateful_chain_entry(
@@ -2280,7 +2287,10 @@ fn extract_assistant_preview_from_content(content: &Value) -> Option<String> {
         .filter_map(|block| {
             let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
             match block_type {
-                "text" => block.get("text").and_then(|v| v.as_str()).map(|text| text.to_string()),
+                "text" => block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|text| text.to_string()),
                 "tool_use" => block
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -2314,7 +2324,10 @@ fn log_non_stream_assistant_preview(
     ));
 }
 
-fn build_anthropic_message_from_codex_json_response(response: &Value, fallback_model: &str) -> Value {
+fn build_anthropic_message_from_codex_json_response(
+    response: &Value,
+    fallback_model: &str,
+) -> Value {
     let mut content = Vec::new();
     let mut first_message_id: Option<String> = None;
 
@@ -2346,7 +2359,10 @@ fn build_anthropic_message_from_codex_json_response(response: &Value, fallback_m
                     }
                 }
                 "function_call" => {
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     let tool_use_id = item
                         .get("call_id")
                         .or_else(|| item.get("id"))
@@ -2371,9 +2387,10 @@ fn build_anthropic_message_from_codex_json_response(response: &Value, fallback_m
         }
     }
 
-    let stop_reason = if content.iter().any(|block| {
-        block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
-    }) {
+    let stop_reason = if content
+        .iter()
+        .any(|block| block.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+    {
         "tool_use"
     } else {
         "end_turn"
@@ -2870,6 +2887,45 @@ fn extract_message_text(message: &Message) -> Option<String> {
         }
         None => None,
     }
+}
+
+fn extract_plan_file_path_from_text(text: &str) -> Option<String> {
+    const PLAN_PREFIX: &str = "You should create your plan at ";
+    const PLAN_SUFFIX: &str = " using the Write tool";
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(start_idx) = trimmed.find(PLAN_PREFIX) else {
+            continue;
+        };
+        let after_prefix = &trimmed[start_idx + PLAN_PREFIX.len()..];
+        let candidate = after_prefix
+            .split(PLAN_SUFFIX)
+            .next()
+            .map(str::trim)
+            .filter(|value| value.starts_with('/') && value.ends_with(".md"))?;
+        return Some(candidate.to_string());
+    }
+
+    None
+}
+
+fn extract_codex_plan_file_path_from_request(request: &AnthropicRequest) -> Option<String> {
+    if let Some(system_text) = request.system.as_ref().map(|system| system.to_string()) {
+        if let Some(path) = extract_plan_file_path_from_text(&system_text) {
+            return Some(path);
+        }
+    }
+
+    for message in &request.messages {
+        if let Some(text) = extract_message_text(message) {
+            if let Some(path) = extract_plan_file_path_from_text(&text) {
+                return Some(path);
+            }
+        }
+    }
+
+    None
 }
 
 fn detect_probe_request(request: &AnthropicRequest) -> Option<&'static str> {
@@ -4413,6 +4469,9 @@ async fn handle_request(
         .as_ref()
         .map(|system| system.to_string().chars().count())
         .unwrap_or(0);
+    let response_transform_request_ctx = ResponseTransformRequestContext {
+        codex_plan_file_path: extract_codex_plan_file_path_from_request(&anthropic_body),
+    };
     let logger = AppLogger::get();
 
     if is_count_tokens {
@@ -5000,9 +5059,7 @@ async fn handle_request(
                 &logger,
                 format!(
                     "[StatefulChain] #{} hint_source={} hint={}",
-                    request_id,
-                    stateful_chain_hint_info.source,
-                    hint_tail
+                    request_id, stateful_chain_hint_info.source, hint_tail
                 ),
             );
             let endpoint_key = build_stateful_endpoint_key(
@@ -5754,7 +5811,9 @@ async fn handle_request(
             log_prompt_cache_observation(
                 &log_tx,
                 &request_id,
-                parsed.get("usage").and_then(extract_cached_input_tokens_from_response_usage),
+                parsed
+                    .get("usage")
+                    .and_then(extract_cached_input_tokens_from_response_usage),
                 stateful_chain_meta_for_request
                     .as_ref()
                     .and_then(|meta| meta.static_prefix_same_as_prior),
@@ -5802,6 +5861,7 @@ async fn handle_request(
         let mut frame_parser = SseFrameParser::default();
         let mut transformer =
             request_backend.create_response_transformer(&model, allow_visible_thinking_for_request);
+        transformer.configure_request_context(&response_transform_request_ctx);
         let mut metrics = StreamMetrics::new(request_started_at);
 
         let mut message_state: Option<Value> = None;
@@ -5826,7 +5886,9 @@ async fn handle_request(
                                     latest_upstream_response_id = Some(response_id);
                                 }
                                 if request_converter.eq_ignore_ascii_case("codex") {
-                                    if let Some(snapshot) = extract_codex_terminal_response_snapshot(&frame) {
+                                    if let Some(snapshot) =
+                                        extract_codex_terminal_response_snapshot(&frame)
+                                    {
                                         latest_codex_terminal_snapshot = Some(snapshot);
                                     }
                                 }
@@ -6125,11 +6187,13 @@ async fn handle_request(
     let stateful_chain_store_for_stream = stateful_chain_store.clone();
     let parallel_tool_degrade_until_for_stream = parallel_tool_degrade_until.clone();
     let parallel_tool_degrade_key_for_stream = parallel_tool_degrade_key_for_stream.clone();
+    let response_transform_request_ctx_for_stream = response_transform_request_ctx.clone();
     tokio::spawn(async move {
         let _permit_guard = permit_for_stream;
         let mut stream = response.bytes_stream();
         let mut transformer = request_backend_for_stream
             .create_response_transformer(&model_for_stream, allow_visible_thinking_for_request);
+        transformer.configure_request_context(&response_transform_request_ctx_for_stream);
         let mut active_upstream_body_for_stream = upstream_body_for_stream.clone();
         let mut active_session_id_for_stream = session_id_for_stream;
         let mut line_buffer = String::new();
@@ -6185,7 +6249,9 @@ async fn handle_request(
                                         latest_upstream_response_id = Some(response_id);
                                     }
                                     if is_codex_stream_for_task {
-                                        if let Some(snapshot) = extract_codex_terminal_response_snapshot(&frame) {
+                                        if let Some(snapshot) =
+                                            extract_codex_terminal_response_snapshot(&frame)
+                                        {
                                             latest_codex_terminal_snapshot = Some(snapshot);
                                         }
                                     }
@@ -6461,7 +6527,8 @@ async fn handle_request(
                         latest_upstream_response_id = Some(response_id);
                     }
                     if is_codex_stream_for_task {
-                        if let Some(snapshot) = extract_codex_terminal_response_snapshot(&remaining) {
+                        if let Some(snapshot) = extract_codex_terminal_response_snapshot(&remaining)
+                        {
                             latest_codex_terminal_snapshot = Some(snapshot);
                         }
                     }
@@ -6652,6 +6719,8 @@ async fn handle_request(
                         &model_for_stream,
                         allow_visible_thinking_for_request,
                     );
+                    transformer
+                        .configure_request_context(&response_transform_request_ctx_for_stream);
                     line_buffer.clear();
                     frame_parser = SseFrameParser::default();
                     decision.on_retry_success_reset();
@@ -6754,6 +6823,8 @@ async fn handle_request(
                         &model_for_stream,
                         allow_visible_thinking_for_request,
                     );
+                    transformer
+                        .configure_request_context(&response_transform_request_ctx_for_stream);
                     line_buffer.clear();
                     frame_parser = SseFrameParser::default();
                     decision.on_retry_success_reset();
@@ -7254,31 +7325,30 @@ fn full_body(s: String) -> BoxBody<Bytes, Infallible> {
 mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
-        body_uses_priority_service_tier, build_anthropic_message_from_codex_json_response,
-        build_parallel_tool_degrade_key, chunk_contains_sibling_tool_call_error,
-        classify_connection_error, collect_skill_catalog_reminder_blocks,
-        derive_skill_catalog_cache_key, derive_stateful_chain_key, derive_stream_close_cause,
-        backfill_non_stream_payload_from_codex_snapshot,
+        backfill_non_stream_payload_from_codex_snapshot, body_uses_priority_service_tier,
+        build_anthropic_message_from_codex_json_response, build_parallel_tool_degrade_key,
+        chunk_contains_sibling_tool_call_error, classify_connection_error,
+        collect_skill_catalog_reminder_blocks, derive_skill_catalog_cache_key,
+        derive_stateful_chain_key, derive_stream_close_cause,
         disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
-        extract_cached_input_tokens_from_response_usage,
+        extract_cached_input_tokens_from_response_usage, extract_codex_plan_file_path_from_request,
         extract_codex_terminal_response_snapshot, extract_stateful_chain_hint_from_request,
         extract_stateful_chain_output_items, extract_tool_leak_retry_signal,
-        extract_upstream_response_id, resolve_stateful_chain_hint_info,
-        get_cached_skill_catalog_reminder, get_parallel_tool_degrade_remaining_seconds,
-        inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
-        is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
+        extract_upstream_response_id, get_cached_skill_catalog_reminder,
+        get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
+        is_business_stream_output, is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
         is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
         mark_codex_fast_endpoint_unsupported, mark_parallel_tool_degrade,
         observe_upstream_chunk_events, prepare_stateful_chain_request, record_stateful_chain_entry,
         remove_priority_service_tier_from_upstream_body, resolve_effective_stream,
-        resolve_upstream_url, resolve_upstream_url_with_codex_path_preference,
-        should_drop_post_message_stop_output, should_retry_codex_fast_without_service_tier,
-        should_retry_codex_v1_path_with_legacy, should_suppress_premature_message_stop,
-        sibling_tool_error_retry_skip_reason, upsert_skill_catalog_reminder,
-        CodexFastUnsupportedEndpointStore, ConnErrorClass, SkillCatalogReminderStore,
-        SseFrameParser, StatefulChainEntry, StatefulChainRequestMeta, StatefulChainStore,
-        StatefulChainUnsupportedEndpointStore, StreamEventCounters, StreamRuntimeOptions,
-        UpstreamOperation,
+        resolve_stateful_chain_hint_info, resolve_upstream_url,
+        resolve_upstream_url_with_codex_path_preference, should_drop_post_message_stop_output,
+        should_retry_codex_fast_without_service_tier, should_retry_codex_v1_path_with_legacy,
+        should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
+        upsert_skill_catalog_reminder, CodexFastUnsupportedEndpointStore, ConnErrorClass,
+        SkillCatalogReminderStore, SseFrameParser, StatefulChainEntry, StatefulChainRequestMeta,
+        StatefulChainStore, StatefulChainUnsupportedEndpointStore, StreamEventCounters,
+        StreamRuntimeOptions, UpstreamOperation,
     };
     use crate::models::AnthropicRequest;
     use serde_json::{json, Value};
@@ -7323,6 +7393,26 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].contains("The following skills are available"));
         assert!(blocks[0].contains("- pdf: Read PDF files"));
+    }
+
+    #[test]
+    fn test_extract_codex_plan_file_path_from_request() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "<system-reminder>\nPlan mode is active.\n\n## Plan File Info:\nNo plan file exists yet. You should create your plan at /Users/mr.j/.claude/plans/encapsulated-tickling-nebula.md using the Write tool.\n</system-reminder>\n\n请给我方案"
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let path = extract_codex_plan_file_path_from_request(&request);
+        assert_eq!(
+            path.as_deref(),
+            Some("/Users/mr.j/.claude/plans/encapsulated-tickling-nebula.md"),
+            "server should recover Claude plan file path from the original plan-mode reminder"
+        );
     }
 
     #[test]
@@ -7435,8 +7525,8 @@ mod tests {
             &None,
         );
 
-        let injected_text =
-            super::extract_message_text(&request_without_skill_hint.messages[0]).unwrap_or_default();
+        let injected_text = super::extract_message_text(&request_without_skill_hint.messages[0])
+            .unwrap_or_default();
         assert!(!injected_text.contains("The following skills are available"));
     }
 
@@ -7640,7 +7730,9 @@ mod tests {
         let snapshot = extract_codex_terminal_response_snapshot(frame).expect("snapshot");
         assert_eq!(snapshot.get("id").and_then(Value::as_str), Some("resp_1"));
         assert_eq!(
-            snapshot.pointer("/output/0/content/0/text").and_then(Value::as_str),
+            snapshot
+                .pointer("/output/0/content/0/text")
+                .and_then(Value::as_str),
             Some("问候交流")
         );
     }
@@ -7668,7 +7760,8 @@ mod tests {
             }]
         });
 
-        let filled = backfill_non_stream_payload_from_codex_snapshot(payload, Some(&snapshot), "gpt-5.4");
+        let filled =
+            backfill_non_stream_payload_from_codex_snapshot(payload, Some(&snapshot), "gpt-5.4");
         assert_eq!(
             filled.pointer("/content/0/text").and_then(Value::as_str),
             Some("问候交流")
@@ -8103,12 +8196,15 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input
             .cloned()
             .expect("content should exist");
         assert_eq!(content.len(), 2);
-        assert_eq!(content[0].get("name").and_then(Value::as_str), Some("get_weather"));
-        assert_eq!(content[1].get("name").and_then(Value::as_str), Some("get_time"));
         assert_eq!(
-            content[0].get("input"),
-            Some(&json!({"city": "Beijing"}))
+            content[0].get("name").and_then(Value::as_str),
+            Some("get_weather")
         );
+        assert_eq!(
+            content[1].get("name").and_then(Value::as_str),
+            Some("get_time")
+        );
+        assert_eq!(content[0].get("input"), Some(&json!({"city": "Beijing"})));
         assert_eq!(content[1].get("input"), Some(&json!({})));
         assert_eq!(
             message.get("usage"),
@@ -8240,7 +8336,6 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         assert_eq!(meta.full_input.len(), 3);
         assert_eq!(meta.static_prefix_same_as_prior, None);
     }
-
 
     #[test]
     fn test_prepare_stateful_chain_request_uses_output_items_in_prefix() {
@@ -8393,7 +8488,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
     }
 
     #[test]
-    fn test_prepare_stateful_chain_request_marks_static_prefix_changed_when_prompt_cache_key_differs() {
+    fn test_prepare_stateful_chain_request_marks_static_prefix_changed_when_prompt_cache_key_differs(
+    ) {
         let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
         let unsupported_store: StatefulChainUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
@@ -8439,7 +8535,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
     }
 
     #[test]
-    fn test_prepare_stateful_chain_request_marks_static_prefix_same_when_prompt_cache_key_matches() {
+    fn test_prepare_stateful_chain_request_marks_static_prefix_same_when_prompt_cache_key_matches()
+    {
         let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
         let unsupported_store: StatefulChainUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
@@ -8492,7 +8589,10 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             "output_tokens": 5
         });
 
-        assert_eq!(extract_cached_input_tokens_from_response_usage(&usage), Some(88));
+        assert_eq!(
+            extract_cached_input_tokens_from_response_usage(&usage),
+            Some(88)
+        );
     }
 
     #[test]
@@ -8547,7 +8647,10 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         .expect("valid request");
 
         let info = resolve_stateful_chain_hint_info(None, &request);
-        assert_eq!(info.value.as_deref(), Some("123e4567-e89b-12d3-a456-426614174000"));
+        assert_eq!(
+            info.value.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
         assert_eq!(info.source, "metadata");
     }
 

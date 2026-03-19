@@ -1,5 +1,5 @@
 use crate::logger::AppLogger;
-use crate::transform::ResponseTransformer;
+use crate::transform::{ResponseTransformRequestContext, ResponseTransformer};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -45,6 +45,11 @@ struct ActiveWebSearchCall {
 struct TransformDiagnostics {
     deferred_unscoped_text_chunks: u64,
     deferred_unscoped_text_flushes: u64,
+    detected_proposed_plan_blocks: u64,
+    extracted_proposed_plan_body_chars: u64,
+    plan_bridge_write_successes: u64,
+    plan_bridge_write_failures: u64,
+    plan_bridge_exit_plan_mode_emitted: u64,
     dropped_leaked_marker_fragments: u64,
     dropped_raw_tool_json_fragments: u64,
     assessed_raw_tool_json_fragments: u64,
@@ -76,6 +81,11 @@ impl TransformDiagnostics {
     fn has_activity(&self) -> bool {
         self.deferred_unscoped_text_chunks > 0
             || self.deferred_unscoped_text_flushes > 0
+            || self.detected_proposed_plan_blocks > 0
+            || self.extracted_proposed_plan_body_chars > 0
+            || self.plan_bridge_write_successes > 0
+            || self.plan_bridge_write_failures > 0
+            || self.plan_bridge_exit_plan_mode_emitted > 0
             || self.dropped_leaked_marker_fragments > 0
             || self.dropped_raw_tool_json_fragments > 0
             || self.assessed_raw_tool_json_fragments > 0
@@ -426,6 +436,11 @@ pub struct TransformResponse {
     pending_tool_text: String,
     deferred_unscoped_text: String,
     pending_tool_argument_updates: Vec<PendingToolArgumentUpdate>,
+    capturing_proposed_plan: bool,
+    proposed_plan_body_buffer: String,
+    latest_proposed_plan_body: Option<String>,
+    codex_plan_file_path: Option<String>,
+    plan_bridge_emitted: bool,
 
     // Cross-chunk leak suppression state
     suppressing_cross_chunk_leak: bool,
@@ -502,6 +517,127 @@ impl TransformResponse {
 
     fn strip_proposed_plan_wrappers(text: &str) -> String {
         text.to_string()
+    }
+
+    fn record_extracted_proposed_plan_body(&mut self) {
+        let body = self.proposed_plan_body_buffer.trim();
+        if body.is_empty() {
+            return;
+        }
+
+        self.diagnostics.detected_proposed_plan_blocks += 1;
+        self.diagnostics.extracted_proposed_plan_body_chars += body.chars().count() as u64;
+        self.latest_proposed_plan_body = Some(body.to_string());
+        self.logger.log_raw(&format!(
+            "[PlanBridge] Extracted proposed_plan body chars={}\n{}",
+            body.chars().count(),
+            body
+        ));
+    }
+
+    fn write_codex_plan_bridge_file(&mut self) -> bool {
+        let Some(plan_file_path) = self.codex_plan_file_path.as_deref() else {
+            return false;
+        };
+        let Some(plan_body) = self.latest_proposed_plan_body.as_deref() else {
+            return false;
+        };
+
+        let path = std::path::Path::new(plan_file_path);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                self.diagnostics.plan_bridge_write_failures += 1;
+                self.logger.log_raw(&format!(
+                    "[PlanBridge] Failed to create parent dir for {}: {}",
+                    plan_file_path, error
+                ));
+                return false;
+            }
+        }
+
+        match std::fs::write(path, plan_body) {
+            Ok(_) => {
+                self.diagnostics.plan_bridge_write_successes += 1;
+                self.logger.log_raw(&format!(
+                    "[PlanBridge] Wrote plan file to {}",
+                    plan_file_path
+                ));
+                true
+            }
+            Err(error) => {
+                self.diagnostics.plan_bridge_write_failures += 1;
+                self.logger.log_raw(&format!(
+                    "[PlanBridge] Failed to write plan file {}: {}",
+                    plan_file_path, error
+                ));
+                false
+            }
+        }
+    }
+
+    fn maybe_emit_plan_mode_bridge(&mut self, output: &mut Vec<String>) {
+        if self.plan_bridge_emitted || self.saw_tool_call {
+            return;
+        }
+        if self.latest_proposed_plan_body.is_none() || self.codex_plan_file_path.is_none() {
+            return;
+        }
+        if !self.write_codex_plan_bridge_file() {
+            return;
+        }
+
+        let synthetic_tool = BufferedToolCall {
+            order_key: u64::MAX,
+            arrival_seq: u64::MAX,
+            output_index: None,
+            item_id: None,
+            call_id: format!("plan_bridge_exit_{}", chrono::Utc::now().timestamp_millis()),
+            name: "ExitPlanMode".to_string(),
+            arguments_buffer: "{}".to_string(),
+            consecutive_whitespace_run: 0,
+            done_flag: true,
+            start_emitted: false,
+            content_block_index: None,
+            emitted_arguments_len: 0,
+            last_progress_message: None,
+        };
+
+        self.diagnostics.plan_bridge_exit_plan_mode_emitted += 1;
+        self.plan_bridge_emitted = true;
+        self.saw_tool_call = true;
+        self.logger
+            .log_raw("[PlanBridge] Emitting synthetic ExitPlanMode tool_use");
+        self.emit_serialized_tool_call(output, &synthetic_tool);
+    }
+
+    fn observe_proposed_plan_fragment(&mut self, fragment: &str) {
+        if fragment.is_empty() {
+            return;
+        }
+
+        let mut remaining = fragment.to_string();
+        loop {
+            if self.capturing_proposed_plan {
+                if let Some(end) = remaining.find(Self::PROPOSED_PLAN_CLOSE_TAG) {
+                    self.proposed_plan_body_buffer.push_str(&remaining[..end]);
+                    self.record_extracted_proposed_plan_body();
+                    self.proposed_plan_body_buffer.clear();
+                    self.capturing_proposed_plan = false;
+                    remaining = remaining[end + Self::PROPOSED_PLAN_CLOSE_TAG.len()..].to_string();
+                    continue;
+                }
+
+                self.proposed_plan_body_buffer.push_str(&remaining);
+                break;
+            }
+
+            let Some(start) = remaining.find(Self::PROPOSED_PLAN_OPEN_TAG) else {
+                break;
+            };
+            remaining = remaining[start + Self::PROPOSED_PLAN_OPEN_TAG.len()..].to_string();
+            self.capturing_proposed_plan = true;
+            self.proposed_plan_body_buffer.clear();
+        }
     }
 
     fn find_markdown_bash_start(line: &str) -> Option<(usize, usize)> {
@@ -1442,6 +1578,11 @@ impl TransformResponse {
             pending_tool_text: String::new(),
             deferred_unscoped_text: String::new(),
             pending_tool_argument_updates: Vec::new(),
+            capturing_proposed_plan: false,
+            proposed_plan_body_buffer: String::new(),
+            latest_proposed_plan_body: None,
+            codex_plan_file_path: None,
+            plan_bridge_emitted: false,
             suppressing_cross_chunk_leak: false,
             suppressing_suggestion_mode_prompt: false,
             in_markdown_bash: false,
@@ -3458,6 +3599,7 @@ data: {}
             return;
         }
         let fragment = normalized_fragment.as_str();
+        self.observe_proposed_plan_fragment(fragment);
 
         // Commentary phase: redirect text to thinking blocks
         // Either explicit via phase field, or fallback when reasoning was seen
@@ -3799,6 +3941,11 @@ data: {}
             "counters": {
                 "deferred_unscoped_text_chunks": self.diagnostics.deferred_unscoped_text_chunks,
                 "deferred_unscoped_text_flushes": self.diagnostics.deferred_unscoped_text_flushes,
+                "detected_proposed_plan_blocks": self.diagnostics.detected_proposed_plan_blocks,
+                "extracted_proposed_plan_body_chars": self.diagnostics.extracted_proposed_plan_body_chars,
+                "plan_bridge_write_successes": self.diagnostics.plan_bridge_write_successes,
+                "plan_bridge_write_failures": self.diagnostics.plan_bridge_write_failures,
+                "plan_bridge_exit_plan_mode_emitted": self.diagnostics.plan_bridge_exit_plan_mode_emitted,
                 "dropped_leaked_marker_fragments": self.diagnostics.dropped_leaked_marker_fragments,
                 "dropped_raw_tool_json_fragments": self.diagnostics.dropped_raw_tool_json_fragments,
                 "assessed_raw_tool_json_fragments": self.diagnostics.assessed_raw_tool_json_fragments,
@@ -3936,6 +4083,7 @@ data: {}
             return;
         }
 
+        self.maybe_emit_plan_mode_bridge(output);
         let stop_reason = self.determine_stop_reason(data, force_incomplete);
 
         let usage = data
@@ -4566,6 +4714,10 @@ data: {}
 impl ResponseTransformer for TransformResponse {
     fn transform_line(&mut self, line: &str) -> Vec<String> {
         self.transform_sse_line(line)
+    }
+
+    fn configure_request_context(&mut self, ctx: &ResponseTransformRequestContext) {
+        self.codex_plan_file_path = ctx.codex_plan_file_path.clone();
     }
 
     fn take_diagnostics_summary(&mut self) -> Option<Value> {

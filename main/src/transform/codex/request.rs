@@ -17,6 +17,7 @@ const PROMPT_CACHE_KEY_SEP: u8 = 0x1f;
 const MAX_TRUSTED_REQUEST_CWD_CHARS: usize = 512;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 240;
 const MAX_TOOL_SCHEMA_DESCRIPTION_CHARS: usize = 120;
+const PLAN_MODE_TOOL_BLACKLIST: &[&str] = &["EnterPlanMode", "ExitPlanMode"];
 const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
 const ENV_REASONING_SUMMARY_MODE: &str = "CODEX_PROXY_REASONING_SUMMARY";
 const ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT: &str =
@@ -210,6 +211,22 @@ fn request_targets_exit_plan_mode_tool(request: &AnthropicRequest) -> bool {
         .or_else(|| tool_choice.get("toolName"))
         .and_then(|value| value.as_str())
         .map(|name| name.eq_ignore_ascii_case("ExitPlanMode"))
+        .unwrap_or(false)
+}
+
+fn request_targets_blacklisted_plan_mode_tool(request: &AnthropicRequest) -> bool {
+    request
+        .tool_choice
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .and_then(|tool_choice| {
+            tool_choice
+                .get("name")
+                .or_else(|| tool_choice.get("tool_name"))
+                .or_else(|| tool_choice.get("toolName"))
+                .and_then(|value| value.as_str())
+        })
+        .map(is_plan_mode_tool_blacklisted)
         .unwrap_or(false)
 }
 
@@ -1333,13 +1350,79 @@ fn compact_skill_catalog_block(block: &str) -> Option<String> {
     Some(compacted.trim_end().to_string())
 }
 
+fn is_plan_mode_tool_blacklisted(name: &str) -> bool {
+    PLAN_MODE_TOOL_BLACKLIST
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+}
+
+fn is_claude_plan_mode_orchestration_block(block: &str) -> bool {
+    let lower = block.to_ascii_lowercase();
+    lower.contains("plan mode is active")
+        || lower.contains("## plan file info")
+        || lower.contains("## plan workflow")
+        || lower.contains("call exitplanmode")
+        || lower.contains("launch plan agent")
+        || lower.contains("launch up to 3 explore agents")
+        || lower.contains("askuserquestion")
+        || lower.contains("write tool")
+        || lower.contains(".claude/plans/")
+        || lower.contains("the only file you are allowed to edit")
+}
+
+fn strip_plan_mode_orchestration_system_reminders(text: &str) -> String {
+    const START: &str = "<system-reminder>";
+    const END: &str = "</system-reminder>";
+
+    let mut remaining = text;
+    let mut sanitized = String::with_capacity(text.len());
+
+    loop {
+        let Some(start_idx) = remaining.find(START) else {
+            sanitized.push_str(remaining);
+            break;
+        };
+
+        sanitized.push_str(&remaining[..start_idx]);
+        let after_start = &remaining[start_idx + START.len()..];
+        let Some(end_rel) = after_start.find(END) else {
+            sanitized.push_str(&remaining[start_idx..]);
+            break;
+        };
+
+        let block = &after_start[..end_rel];
+        if is_claude_plan_mode_orchestration_block(block) {
+            remaining = &after_start[end_rel + END.len()..];
+            continue;
+        }
+
+        sanitized.push_str(START);
+        if let Some(compacted) = compact_skill_catalog_block(block) {
+            sanitized.push_str(&compacted);
+        } else {
+            sanitized.push_str(block);
+        }
+        sanitized.push_str(END);
+        remaining = &after_start[end_rel + END.len()..];
+    }
+
+    sanitized
+}
+
+fn sanitize_plan_mode_system_text_for_codex(text: &str) -> String {
+    strip_plan_mode_orchestration_system_reminders(text)
+        .trim()
+        .to_string()
+}
+
 fn strip_system_reminder_blocks(text: &str) -> String {
     const START: &str = "<system-reminder>";
     const END: &str = "</system-reminder>";
-    const SKILL_MARKERS: [&str; 9] = [
+    const SKILL_MARKERS: [&str; 10] = [
         "available skills",
         "the following skills are available",
         "skills are available for use with the skill tool",
+        "skill catalog (condensed)",
         "### available skills",
         "how to use skills",
         "a skill is a set of local instructions",
@@ -1654,6 +1737,14 @@ impl TransformRequest {
                 log("📋 [Transform] Stripped dynamic system header lines");
                 system_text = sanitized_system_text;
             }
+            if apply_plan_augmentations {
+                let sanitized_plan_system_text =
+                    sanitize_plan_mode_system_text_for_codex(&system_text);
+                if sanitized_plan_system_text != system_text {
+                    log("📋 [Transform] Stripped Claude-native plan orchestration from system prompt");
+                    system_text = sanitized_plan_system_text;
+                }
+            }
             raw_system_text_for_stats = Some(system_text.clone());
             system_text_for_cache_key = Some(system_text.clone());
             system_matches_codex_instructions = system_contains_codex_instructions(&system_text);
@@ -1751,6 +1842,7 @@ impl TransformRequest {
             anthropic_body.tools.as_ref(),
             log_tx,
             enable_tool_schema_compaction,
+            apply_plan_augmentations,
         );
         let transformed_tools_bytes = serde_json::to_vec(&transformed_tools)
             .map(|buf| buf.len())
@@ -1988,9 +2080,9 @@ impl TransformRequest {
         augmentation: &RequestAugmentationDecision,
     ) -> Option<Value> {
         if matches!(augmentation.mode, RequestAugmentationMode::Plan)
-            && request_targets_exit_plan_mode_tool(anthropic_body)
+            && request_targets_blacklisted_plan_mode_tool(anthropic_body)
         {
-            return Some(json!("none"));
+            return None;
         }
 
         if transformed_tools.is_empty() {
@@ -2200,6 +2292,7 @@ impl TransformRequest {
         tools: Option<&Vec<Value>>,
         log_tx: Option<&broadcast::Sender<String>>,
         enable_tool_schema_compaction: bool,
+        apply_plan_mode_blacklist: bool,
     ) -> Vec<Value> {
         // 获取全局日志记录器
         let logger = AppLogger::get();
@@ -2233,6 +2326,18 @@ impl TransformRequest {
         let mut native_web_search_added = false;
 
         for tool in tools {
+            if apply_plan_mode_blacklist {
+                if let Some(name) = Self::tool_name(tool) {
+                    if is_plan_mode_tool_blacklisted(name) {
+                        log(&format!(
+                            "🔧 [Tools] {} skipped by plan-mode blacklist",
+                            name
+                        ));
+                        continue;
+                    }
+                }
+            }
+
             if Self::is_anthropic_web_search_tool(tool) {
                 if native_web_search_added {
                     log("🔧 [Tools] WebSearch duplicate skipped after native mapping");
@@ -2460,6 +2565,16 @@ mod tests {
             .to_string()
     }
 
+    fn tool_names(body: &Value) -> Vec<String> {
+        body.get("tools")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool.get("name").and_then(|v| v.as_str()))
+            .map(|name| name.to_string())
+            .collect()
+    }
+
     #[test]
     fn transform_does_not_inject_skill_catalog_hint_for_skill_list_queries() {
         let request: AnthropicRequest = serde_json::from_value(json!({
@@ -2574,7 +2689,7 @@ hello"
             "description": long_description,
             "input_schema": {"type":"object","properties":{"command":{"type":"string"}}}
         })];
-        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true, false);
         assert_eq!(transformed.len(), 1, "one tool should remain");
         let description = transformed[0]
             .get("description")
@@ -2609,7 +2724,7 @@ hello"
             }
         })];
 
-        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true, false);
         let parameters = transformed[0]
             .get("parameters")
             .cloned()
@@ -2663,7 +2778,7 @@ hello"
             }
         })];
 
-        let transformed = TransformRequest::transform_tools(Some(&tools), None, false);
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, false, false);
         let parameters = transformed[0]
             .get("parameters")
             .cloned()
@@ -2695,7 +2810,7 @@ hello"
             }
         })];
 
-        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true, false);
         assert_eq!(
             transformed.len(),
             1,
@@ -2734,7 +2849,7 @@ hello"
             }
         })];
 
-        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true, false);
         assert_eq!(
             transformed[0]
                 .get("strict")
@@ -2755,7 +2870,7 @@ hello"
             }
         })];
 
-        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true, false);
         assert!(
             transformed[0].get("strict").is_none(),
             "strict should be omitted when upstream tool does not specify it"
@@ -2768,7 +2883,7 @@ hello"
             "type": "apply_patch"
         })];
 
-        let transformed = TransformRequest::transform_tools(Some(&tools), None, true);
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true, false);
         assert_eq!(
             transformed, tools,
             "native responses tools should pass through unchanged"
@@ -3595,9 +3710,144 @@ hello",
             "plan-mode prompt should be merged into the wrapped system context, not sent as a standalone user message"
         );
         assert_eq!(
-            body.get("tool_choice").and_then(|value| value.as_str()),
-            Some("none"),
-            "ExitPlanMode should not be forwarded upstream as an executable named tool choice"
+            body.get("tool_choice"),
+            None,
+            "blacklisted Claude orchestration tool choices should fall back to upstream default behavior"
+        );
+    }
+
+    #[test]
+    fn plan_mode_system_prompt_strips_claude_plan_orchestration() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": "在下载文件夹中写一个时钟的html页面，告诉我你的方案"
+            }],
+            "system": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- test-driven-development: Use when implementing any feature or bugfix, before writing implementation code\n</system-reminder>\n\n<system-reminder>\nPlan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits.\n\n## Plan File Info:\nNo plan file exists yet. You should create your plan at /Users/mr.j/.claude/plans/warm-cooking-token.md using the Write tool.\n\n## Plan Workflow\nLaunch Plan agent(s) to design the implementation.\nAt the very end of your turn, call ExitPlanMode.\n</system-reminder>",
+            "metadata": {
+                "plan_mode": true
+            },
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+        let first_text = first_input_text(&body);
+
+        assert!(
+            first_text.contains("Skill catalog (condensed)"),
+            "skill catalog reminder should still be preserved after plan-mode cleaning"
+        );
+        assert!(
+            !first_text.contains("Plan File Info")
+                && !first_text.contains("warm-cooking-token.md")
+                && !first_text.contains("Launch Plan agent(s)"),
+            "claude-native plan orchestration text should be stripped before forwarding to codex"
+        );
+        assert!(
+            first_text.contains("Emit exactly one <proposed_plan> block in the turn."),
+            "codex-native plan instructions should still be injected"
+        );
+    }
+
+    #[test]
+    fn plan_mode_tool_blacklist_filters_only_orchestration_tools() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": "请先给我 plan"
+            }],
+            "metadata": {
+                "plan_mode": true
+            },
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read files",
+                    "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+                },
+                {
+                    "name": "EnterPlanMode",
+                    "description": "Enter plan mode",
+                    "input_schema": {"type":"object","properties":{}}
+                },
+                {
+                    "name": "ExitPlanMode",
+                    "description": "Exit plan mode",
+                    "input_schema": {"type":"object","properties":{}}
+                },
+                {
+                    "name": "AskUserQuestion",
+                    "description": "Ask user question",
+                    "input_schema": {"type":"object","properties":{"questions":{"type":"array"}}}
+                }
+            ],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let tool_names = tool_names(&body);
+
+        assert!(
+            tool_names.contains(&"Read".to_string())
+                && tool_names.contains(&"AskUserQuestion".to_string()),
+            "ordinary non-blacklisted tools should still be forwarded in plan mode"
+        );
+        assert!(
+            !tool_names.contains(&"EnterPlanMode".to_string())
+                && !tool_names.contains(&"ExitPlanMode".to_string()),
+            "claude-native orchestration tools should be removed by the plan-mode blacklist"
+        );
+    }
+
+    #[test]
+    fn plan_mode_blacklisted_tool_choice_does_not_force_none() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": "请先给我 plan"
+            }],
+            "metadata": {
+                "plan_mode": true
+            },
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read files",
+                    "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+                },
+                {
+                    "name": "ExitPlanMode",
+                    "description": "Exit plan mode",
+                    "input_schema": {"type":"object","properties":{}}
+                }
+            ],
+            "tool_choice": {
+                "type": "tool",
+                "name": "ExitPlanMode"
+            },
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        assert_eq!(
+            body.get("tool_choice"),
+            None,
+            "blacklisted plan-mode tool choices should not lock codex upstream into tool_choice none"
+        );
+        assert!(
+            tool_names(&body).contains(&"Read".to_string()),
+            "safe tools should still remain available after tool-choice fallback"
         );
     }
 
