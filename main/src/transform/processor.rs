@@ -601,16 +601,16 @@ impl MessageProcessor {
                                     Value::String(override_text)
                                 } else if let Some(rewritten) = tool_use_id
                                     .as_deref()
-                                    .and_then(|tid| tool_name_by_id.get(tid).map(|name| name.as_str()))
+                                    .and_then(|tid| {
+                                        tool_name_by_id.get(tid).map(|name| name.as_str())
+                                    })
                                     .and_then(|tool_name| {
-                                        tool_content
-                                            .as_ref()
-                                            .and_then(|content| {
-                                                Self::rewrite_tool_result_output(
-                                                    Some(tool_name),
-                                                    content,
-                                                )
-                                            })
+                                        tool_content.as_ref().and_then(|content| {
+                                            Self::rewrite_tool_result_output(
+                                                Some(tool_name),
+                                                content,
+                                            )
+                                        })
                                     })
                                 {
                                     rewritten

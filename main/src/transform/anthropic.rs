@@ -55,7 +55,8 @@ impl ResponseTransformer for AnthropicPassthroughResponseTransformer {
             if line.starts_with(':') {
                 return vec![format!("{}\n\n", line)];
             }
-            if line.starts_with("event: ") || line.starts_with("data: ") || line.starts_with("id: ") {
+            if line.starts_with("event: ") || line.starts_with("data: ") || line.starts_with("id: ")
+            {
                 chunk.push_str(line);
                 chunk.push('\n');
             }

@@ -176,10 +176,7 @@ impl OpenAIChatBackend {
                     }
                 }
                 "function_call_output" => {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|i| i.as_str())
-                        .unwrap_or("");
+                    let call_id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
                     let output = item.get("output").cloned().unwrap_or(Value::Null);
                     let content_str = if let Some(text) = output.as_str() {
                         text.to_string()
@@ -273,9 +270,7 @@ impl OpenAIChatBackend {
         custom_injection_prompt: &str,
     ) -> Option<Value> {
         let system_text = Self::flatten_system_text(system);
-        let custom_text = custom_injection_prompt
-            .trim()
-            .to_string();
+        let custom_text = custom_injection_prompt.trim().to_string();
 
         let merged = match (system_text, custom_text.is_empty()) {
             (Some(system_text), true) => Some(system_text),
@@ -361,7 +356,8 @@ impl TransformBackend for OpenAIChatBackend {
         let model = Self::normalize_model(&requested);
 
         // Transform messages using MessageProcessor
-        let (codex_messages, _) = MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
+        let (codex_messages, _) =
+            MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
 
         // Build OpenAI messages array
         let mut messages = Vec::new();
@@ -395,7 +391,7 @@ impl TransformBackend for OpenAIChatBackend {
             if let Some(max_tokens) = anthropic_body.max_tokens {
                 // Get configured limit for this model's slot
                 let configured_limit = ctx.openai_max_tokens_mapping.get_limit(&requested);
-                
+
                 // Debug logging
                 if let Some(tx) = log_tx {
                     let _ = tx.send(format!(
@@ -403,7 +399,7 @@ impl TransformBackend for OpenAIChatBackend {
                         requested, max_tokens, configured_limit, ctx.openai_max_tokens_mapping
                     ));
                 }
-                
+
                 let effective_max_tokens = if let Some(limit) = configured_limit {
                     // Configured limit exists: apply min( request, limit )
                     let effective = max_tokens.min(limit);
@@ -705,7 +701,8 @@ impl OpenAIChatResponseTransformer {
             self.close_tool_block(i, out);
         }
 
-        let stop_reason = Self::map_finish_reason(self.finish_reason.as_deref(), self.saw_tool_call);
+        let stop_reason =
+            Self::map_finish_reason(self.finish_reason.as_deref(), self.saw_tool_call);
         let usage_obj = self.usage.clone().unwrap_or(json!({
             "input_tokens": 0,
             "output_tokens": 0
@@ -801,7 +798,8 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
             .and_then(|v| v.as_str())
             .filter(|content| !content.is_empty())
             .or_else(|| {
-                delta.get("refusal")
+                delta
+                    .get("refusal")
                     .and_then(|v| v.as_str())
                     .filter(|refusal| !refusal.is_empty())
             });
@@ -818,18 +816,17 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
             ));
         }
 
-        let normalized_tool_calls: Vec<Value> = if let Some(tool_calls_delta) =
-            delta.get("tool_calls").and_then(|v| v.as_array())
-        {
-            tool_calls_delta.clone()
-        } else if let Some(function_call_delta) = delta.get("function_call") {
-            vec![json!({
-                "index": 0,
-                "function": function_call_delta
-            })]
-        } else {
-            Vec::new()
-        };
+        let normalized_tool_calls: Vec<Value> =
+            if let Some(tool_calls_delta) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                tool_calls_delta.clone()
+            } else if let Some(function_call_delta) = delta.get("function_call") {
+                vec![json!({
+                    "index": 0,
+                    "function": function_call_delta
+                })]
+            } else {
+                Vec::new()
+            };
 
         if !normalized_tool_calls.is_empty() {
             for tool_call_delta in &normalized_tool_calls {
@@ -939,7 +936,8 @@ mod tests {
         let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
 
         // First chunk with content
-        let line1 = r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"},"index":0}]}"#;
+        let line1 =
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"},"index":0}]}"#;
         let events1 = transformer.transform_line(line1);
 
         assert!(events1.iter().any(|e| e.contains("message_start")));
@@ -947,7 +945,8 @@ mod tests {
         assert!(events1.iter().any(|e| e.contains("text_delta")));
 
         // Second chunk
-        let line2 = r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":" world"},"index":0}]}"#;
+        let line2 =
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":" world"},"index":0}]}"#;
         let events2 = transformer.transform_line(line2);
 
         assert!(events2.iter().any(|e| e.contains("text_delta")));
@@ -1017,8 +1016,9 @@ mod tests {
     #[test]
     fn closes_text_block_before_opening_tool_block() {
         let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
-        let _ = transformer
-            .transform_line(r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"},"index":0}]}"#);
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"},"index":0}]}"#,
+        );
 
         let events = transformer.transform_line(
             r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"index":0}]}"#,
@@ -1044,7 +1044,10 @@ mod tests {
             })
             .expect("tool_use block should start");
 
-        assert!(text_stop < tool_start, "text block must stop before tool block starts");
+        assert!(
+            text_stop < tool_start,
+            "text block must stop before tool block starts"
+        );
     }
 
     #[test]
@@ -1126,12 +1129,18 @@ mod tests {
         let finish_events = transformer.transform_line(
             r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":null}"#,
         );
-        assert!(finish_events.is_empty(), "should wait for [DONE] before emitting message_stop");
+        assert!(
+            finish_events.is_empty(),
+            "should wait for [DONE] before emitting message_stop"
+        );
 
         let usage_events = transformer.transform_line(
             r#"data: {"id":"chatcmpl-123","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":34}}"#,
         );
-        assert!(usage_events.is_empty(), "usage-only chunk should not emit message_stop before [DONE]");
+        assert!(
+            usage_events.is_empty(),
+            "usage-only chunk should not emit message_stop before [DONE]"
+        );
 
         let done_events = transformer.transform_line("data: [DONE]");
         let parsed = parse_non_empty_sse_events(&done_events);
@@ -1193,7 +1202,10 @@ mod tests {
             r#"data: {"id":"chatcmpl-123","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#,
         );
 
-        assert!(events.is_empty(), "chunk without choices should not emit downstream events");
+        assert!(
+            events.is_empty(),
+            "chunk without choices should not emit downstream events"
+        );
     }
 
     #[test]
@@ -1244,7 +1256,9 @@ mod tests {
             r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"function_call":{"arguments":"\"Beijing\"}"}},"finish_reason":"function_call","index":0}]}"#,
         );
         assert!(
-            events2.iter().any(|event| event.contains("input_json_delta")),
+            events2
+                .iter()
+                .any(|event| event.contains("input_json_delta")),
             "deprecated function_call arguments delta should map to input_json_delta"
         );
     }
@@ -1416,7 +1430,10 @@ mod tests {
             body.get("stream_options").is_none(),
             "non-stream requests should not force stream_options"
         );
-        assert_eq!(body.get("tool_choice"), Some(&json!({"type": "function", "name": "Bash"})));
+        assert_eq!(
+            body.get("tool_choice"),
+            Some(&json!({"type": "function", "name": "Bash"}))
+        );
         assert_eq!(
             body.get("parallel_tool_calls").and_then(Value::as_bool),
             Some(false)
@@ -1435,7 +1452,10 @@ mod tests {
         })]);
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("assistant"));
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
         assert_eq!(
             messages[0].get("content").and_then(Value::as_str),
             Some("chain of thought")
@@ -1445,8 +1465,9 @@ mod tests {
     #[test]
     fn transform_request_preserves_original_system_prompt_without_codebuddy_wrapping() {
         use crate::models::{
-            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
-            Message, MessageContent, OpenAIModelMapping, ReasoningEffortMapping, SystemContent,
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping, SystemContent,
         };
         use crate::transform::TransformContext;
 
@@ -1495,7 +1516,10 @@ mod tests {
             .expect("messages should be present");
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
         assert_eq!(
             messages[0].get("content").and_then(Value::as_str),
             Some("You are Claude Code.")
@@ -1516,8 +1540,9 @@ mod tests {
     #[test]
     fn transform_request_appends_custom_injection_prompt_to_system_message() {
         use crate::models::{
-            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
-            Message, MessageContent, OpenAIModelMapping, ReasoningEffortMapping, SystemContent,
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping, SystemContent,
         };
         use crate::transform::TransformContext;
 
@@ -1561,7 +1586,10 @@ mod tests {
             .and_then(|value| value.as_array())
             .expect("messages should be present");
 
-        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
         let content = messages[0]
             .get("content")
             .and_then(Value::as_str)
@@ -1572,7 +1600,8 @@ mod tests {
             messages
                 .iter()
                 .skip(1)
-                .all(|msg| msg.get("content").and_then(Value::as_str) != Some("Always inspect repo instructions first.")),
+                .all(|msg| msg.get("content").and_then(Value::as_str)
+                    != Some("Always inspect repo instructions first.")),
             "custom prompt should remain in system content instead of user messages"
         );
     }
@@ -1580,8 +1609,9 @@ mod tests {
     #[test]
     fn transform_request_creates_system_message_from_custom_injection_prompt_when_missing() {
         use crate::models::{
-            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
-            Message, MessageContent, OpenAIModelMapping, ReasoningEffortMapping,
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
         };
         use crate::transform::TransformContext;
 
@@ -1625,12 +1655,18 @@ mod tests {
             .and_then(|value| value.as_array())
             .expect("messages should be present");
 
-        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
         assert_eq!(
             messages[0].get("content").and_then(Value::as_str),
             Some("Always inspect repo instructions first.")
         );
-        assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
+        assert_eq!(
+            messages[1].get("role").and_then(Value::as_str),
+            Some("user")
+        );
     }
 
     #[test]
@@ -1659,7 +1695,10 @@ mod tests {
             .expect("request should build");
 
         assert_eq!(
-            request.headers().get("Accept").and_then(|value| value.to_str().ok()),
+            request
+                .headers()
+                .get("Accept")
+                .and_then(|value| value.to_str().ok()),
             Some("application/json")
         );
     }
@@ -1689,8 +1728,14 @@ mod tests {
         ]);
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("assistant"));
-        assert_eq!(messages[0].get("content").and_then(Value::as_str), Some("Hello"));
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
+        assert_eq!(
+            messages[0].get("content").and_then(Value::as_str),
+            Some("Hello")
+        );
         assert_eq!(
             messages[0]
                 .get("tool_calls")
