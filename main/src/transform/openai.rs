@@ -1636,7 +1636,10 @@ mod tests {
     #[test]
     fn build_upstream_request_uses_json_accept_for_non_stream_requests() {
         let backend = OpenAIChatBackend;
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client should build without system proxy lookup");
         let body = json!({
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "hello"}],
