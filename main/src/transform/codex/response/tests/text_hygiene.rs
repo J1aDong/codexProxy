@@ -106,7 +106,7 @@ fn test_plain_text_without_proposed_plan_wrapper_is_unchanged() {
 }
 
 #[test]
-fn test_proposed_plan_tags_are_stripped_from_visible_text() {
+fn test_proposed_plan_tags_are_preserved_in_visible_text() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let line = format!(
         "data: {}",
@@ -119,8 +119,8 @@ fn test_proposed_plan_tags_are_stripped_from_visible_text() {
     let events = transformer.transform_sse_line(&line);
     let joined = events.join("");
     assert!(
-        !joined.contains("proposed_plan"),
-        "proposed_plan wrapper tags should stay hidden from visible text"
+        joined.contains("<proposed_plan>") && joined.contains("</proposed_plan>"),
+        "proposed_plan wrapper tags should remain visible so Claude clients can render plan previews"
     );
     assert!(
         joined.contains("先检查请求链路") && joined.contains("等你确认后再执行修改"),
@@ -129,7 +129,7 @@ fn test_proposed_plan_tags_are_stripped_from_visible_text() {
 }
 
 #[test]
-fn test_proposed_plan_tags_split_across_chunks_are_stripped() {
+fn test_proposed_plan_tags_split_across_chunks_are_preserved() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     let first = format!(
         "data: {}",
@@ -151,8 +151,8 @@ fn test_proposed_plan_tags_split_across_chunks_are_stripped() {
     let joined = events.join("");
 
     assert!(
-        !joined.contains("proposed_plan"),
-        "proposed_plan wrapper tags should be hidden even when split across chunks"
+        joined.contains("<proposed_plan>") && joined.contains("</proposed_plan>"),
+        "proposed_plan wrapper tags should remain visible even when split across chunks"
     );
     assert!(
         joined.contains("先检查请求链路") && joined.contains("等你确认后再执行修改"),

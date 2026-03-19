@@ -10,6 +10,7 @@ use crate::models::{
 use crate::transform::MessageProcessor;
 
 const CODEX_INSTRUCTIONS: &str = include_str!("../../instructions.txt");
+const ANTHROPIC_COMPAT_PLAN_MODE_PROMPT: &str = include_str!("plan_mode_prompt.txt");
 const EMPTY_TOOL_OUTPUT_PLACEHOLDER: &str = "(No output)";
 const PROMPT_CACHE_KEY_MAX_CWD_LEN: usize = 64;
 const PROMPT_CACHE_KEY_SEP: u8 = 0x1f;
@@ -32,7 +33,6 @@ const NATIVE_RESPONSES_TOOL_TYPES: &[&str] = &[
     "shell",
     "custom",
 ];
-
 fn bool_env_enabled(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -154,6 +154,22 @@ fn build_agents_wrapper_payload(
     }
 }
 
+fn merge_instruction_context(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    let mut merged = None::<String>;
+    for text in [first, second].into_iter().flatten() {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        merged = Some(match merged {
+            Some(existing) => append_instruction_text(&existing, trimmed),
+            None => trimmed.to_string(),
+        });
+    }
+    merged
+}
+
 fn system_contains_codex_instructions(system_text: &str) -> bool {
     let normalized = normalize_text_for_exact_match(system_text).to_ascii_lowercase();
     if normalized.contains("you are a coding agent running in the codex cli") {
@@ -180,7 +196,11 @@ fn request_metadata_plan_mode_enabled(request: &AnthropicRequest) -> bool {
 }
 
 fn request_targets_exit_plan_mode_tool(request: &AnthropicRequest) -> bool {
-    let Some(tool_choice) = request.tool_choice.as_ref().and_then(|value| value.as_object()) else {
+    let Some(tool_choice) = request
+        .tool_choice
+        .as_ref()
+        .and_then(|value| value.as_object())
+    else {
         return false;
     };
 
@@ -325,7 +345,11 @@ fn decide_request_augmentation(
         reasons.push("tools");
     }
 
-    if request.messages.iter().any(message_contains_agentic_tool_state) {
+    if request
+        .messages
+        .iter()
+        .any(message_contains_agentic_tool_state)
+    {
         reasons.push("tool_state");
     }
 
@@ -717,7 +741,7 @@ fn extract_skill_catalog_entries_ordered(system_text: &str) -> Vec<String> {
         let trimmed = line.trim_start();
         let Some(rest) = trimmed
             .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* ") )
+            .or_else(|| trimmed.strip_prefix("* "))
         else {
             continue;
         };
@@ -1298,15 +1322,16 @@ fn compact_skill_catalog_block(block: &str) -> Option<String> {
         return None;
     }
     let mut compacted = String::new();
-    compacted.push_str("Skill catalog (condensed):
-");
+    compacted.push_str(
+        "Skill catalog (condensed):
+",
+    );
     for entry in entries {
         compacted.push_str(&entry);
         compacted.push('\n');
     }
     Some(compacted.trim_end().to_string())
 }
-
 
 fn strip_system_reminder_blocks(text: &str) -> String {
     const START: &str = "<system-reminder>";
@@ -1605,7 +1630,8 @@ impl TransformRequest {
         };
         log(&format!(
             "🧩 [Transform] request_augmentation_mode={} augmentation_reasons=[{}]",
-            augmentation.mode_label(), augmentation_reasons
+            augmentation.mode_label(),
+            augmentation_reasons
         ));
         let mut system_text_for_cache_key = None::<String>;
         let mut raw_system_text_for_stats = None::<String>;
@@ -1613,9 +1639,13 @@ impl TransformRequest {
         let mut injected_text_dedupe = HashSet::new();
         let mut system_matches_codex_instructions = false;
         let trimmed_custom_injection_prompt = custom_injection_prompt.trim();
-        let custom_prompt_applied =
-            (apply_agent_augmentations || apply_plan_augmentations)
-                && !trimmed_custom_injection_prompt.is_empty();
+        let custom_prompt_applied = (apply_agent_augmentations || apply_plan_augmentations)
+            && !trimmed_custom_injection_prompt.is_empty();
+        let plan_prompt_applied = apply_plan_augmentations;
+        let merged_instruction_context = merge_instruction_context(
+            custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
+            plan_prompt_applied.then_some(ANTHROPIC_COMPAT_PLAN_MODE_PROMPT),
+        );
         // 注入 system prompt
         if let Some(system) = &anthropic_body.system {
             let mut system_text = system.to_string();
@@ -1635,7 +1665,7 @@ impl TransformRequest {
             let system_payload_text = build_agents_wrapper_payload(
                 Some(&system_text),
                 request_cwd.as_deref(),
-                custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
+                merged_instruction_context.as_deref(),
             )
             .unwrap_or(system_text);
             wrapped_system_payload_text = Some(system_payload_text.clone());
@@ -1653,15 +1683,16 @@ impl TransformRequest {
             } else {
                 log("📋 [Transform] Skip runtime <environment_context> injection (no trusted request cwd)");
             }
-        } else if custom_prompt_applied {
+        } else if let Some(instruction_context) = merged_instruction_context.as_deref() {
+            let context_chars = count_normalized_chars(instruction_context);
             log(&format!(
-                "🎯 [Transform] Wrapping custom global prompt as AGENTS instructions ({} chars)",
-                custom_injection_prompt.len()
+                "🎯 [Transform] Wrapping injected instruction context as AGENTS instructions ({} chars)",
+                context_chars
             ));
             if let Some(system_payload_text) = build_agents_wrapper_payload(
                 None,
                 request_cwd.as_deref(),
-                Some(trimmed_custom_injection_prompt),
+                Some(instruction_context),
             ) {
                 wrapped_system_payload_text = Some(system_payload_text.clone());
                 final_input.push(json!({
@@ -1682,23 +1713,15 @@ impl TransformRequest {
                 extracted_skills.len()
             ));
             for skill in extracted_skills {
-                if !push_proxy_injected_text_message(&mut final_input, &mut injected_text_dedupe, &skill) {
+                if !push_proxy_injected_text_message(
+                    &mut final_input,
+                    &mut injected_text_dedupe,
+                    &skill,
+                ) {
                     log("🎯 [Transform] Skip duplicate proxy-injected skill payload");
                 }
             }
         }
-        if apply_plan_augmentations {
-            let plan_prompt = "Plan mode: propose a concise step-by-step plan first. Do not execute tools or make code changes until the user approves the plan via ExitPlanMode. After writing the plan, call ExitPlanMode to request approval. Do not ask the user to type approval in normal text, and do not use AskUserQuestion for plan approval.";
-            log("🗺️ [Transform] Injecting minimal plan-mode prompt");
-            if !push_proxy_injected_text_message(
-                &mut final_input,
-                &mut injected_text_dedupe,
-                plan_prompt,
-            ) {
-                log("🗺️ [Transform] Skip duplicate plan-mode prompt");
-            }
-        }
-
         // 追加对话历史
         final_input.extend(chat_messages);
         if apply_agent_augmentations && enable_skill_routing_hint {
@@ -1735,7 +1758,7 @@ impl TransformRequest {
         let static_heavy_payload_stats = build_static_heavy_payload_stats(
             raw_system_text_for_stats.as_deref(),
             wrapped_system_payload_text.as_deref(),
-            (!trimmed_custom_injection_prompt.is_empty()).then_some(trimmed_custom_injection_prompt),
+            merged_instruction_context.as_deref(),
             &transformed_tools,
             transformed_tools_bytes,
         );
@@ -1746,7 +1769,8 @@ impl TransformRequest {
             transformed_tools.len()
         ));
 
-        let tool_choice = Self::build_tool_choice(anthropic_body, &transformed_tools, &augmentation);
+        let tool_choice =
+            Self::build_tool_choice(anthropic_body, &transformed_tools, &augmentation);
         let parallel_tool_calls = Self::resolve_parallel_tool_calls(anthropic_body);
         log(&format!(
             "🧰 [Transform] Resolved tool_choice={} parallel_tool_calls={} (tools={})",
@@ -1761,7 +1785,7 @@ impl TransformRequest {
             request_cwd.as_deref(),
             final_codex_model,
             request_session_hint.as_deref(),
-            custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
+            merged_instruction_context.as_deref(),
             static_instructions_applied.then_some(CODEX_INSTRUCTIONS),
             system_text_for_cache_key.as_deref(),
             static_heavy_payload_stats.tools_fingerprint.as_deref(),
@@ -1783,8 +1807,9 @@ impl TransformRequest {
             include_reasoning_encrypted_content
         ));
         log(&format!(
-            "🧩 [Transform] custom_prompt_applied={} static_instructions_applied={}",
+            "🧩 [Transform] custom_prompt_applied={} plan_prompt_applied={} static_instructions_applied={}",
             custom_prompt_applied,
+            plan_prompt_applied,
             static_instructions_applied
         ));
         log(&format!(
@@ -2375,11 +2400,11 @@ impl TransformRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_tool_description, decide_request_augmentation, collect_request_text_corpus,
+        collect_request_text_corpus, compact_tool_description, decide_request_augmentation,
         detect_requested_skill_name, extract_request_cwd, fingerprint_json_value,
         normalize_text_for_exact_match, push_proxy_injected_text_message,
         strip_dynamic_system_header_lines, RequestAugmentationMode, TransformRequest,
-        CODEX_INSTRUCTIONS,
+        ANTHROPIC_COMPAT_PLAN_MODE_PROMPT, CODEX_INSTRUCTIONS,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
     use serde_json::{json, Value};
@@ -2498,8 +2523,10 @@ hello"
 
         let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
         let texts = input_texts(&body);
-        let joined = texts.join("
-");
+        let joined = texts.join(
+            "
+",
+        );
 
         assert!(joined.contains("Skill catalog (condensed)"));
         assert!(joined.contains("- figma-implement-design: Translate Figma nodes"));
@@ -2782,20 +2809,10 @@ hello"
         .expect("request with metadata session hint");
         let mapping = ReasoningEffortMapping::default();
 
-        let (body_a, _) = TransformRequest::transform(
-            &request,
-            None,
-            &mapping,
-            "global prompt A",
-            "gpt-5.4",
-        );
-        let (body_b, _) = TransformRequest::transform(
-            &request,
-            None,
-            &mapping,
-            "global prompt B",
-            "gpt-5.4",
-        );
+        let (body_a, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt A", "gpt-5.4");
+        let (body_b, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt B", "gpt-5.4");
 
         let key_a = body_a
             .get("prompt_cache_key")
@@ -2811,8 +2828,7 @@ hello"
             "metadata session hint should stabilize cache key"
         );
         assert_eq!(
-            key_a,
-            "codex-proxy:gpt_5_4:session:123e4567_e89b_12d3_a456_426614174000",
+            key_a, "codex-proxy:gpt_5_4:session:123e4567_e89b_12d3_a456_426614174000",
             "cache key should use metadata session hint"
         );
     }
@@ -2854,8 +2870,7 @@ hello"
 
         assert_eq!(key_a, key_b, "session hint should stabilize cache key");
         assert_eq!(
-            key_a,
-            "codex-proxy:gpt_5_3_codex:session:abc_123",
+            key_a, "codex-proxy:gpt_5_3_codex:session:abc_123",
             "cache key should use sanitized session hint"
         );
     }
@@ -3116,7 +3131,6 @@ hello"
         );
     }
 
-
     #[test]
     fn tool_requests_remain_agent_shaped_when_thinking_disabled() {
         let request: AnthropicRequest = serde_json::from_value(json!({
@@ -3177,7 +3191,10 @@ hello"
             "name": "searchDocs"
         });
 
-        assert_eq!(fingerprint_json_value(&tool_a), fingerprint_json_value(&tool_b));
+        assert_eq!(
+            fingerprint_json_value(&tool_a),
+            fingerprint_json_value(&tool_b)
+        );
     }
 
     #[test]
@@ -3208,10 +3225,15 @@ hello"
         .expect("request b");
         let mapping = ReasoningEffortMapping::default();
 
-        let (body_a, _) = TransformRequest::transform(&request_a, None, &mapping, "", "gpt-5.3-codex");
-        let (body_b, _) = TransformRequest::transform(&request_b, None, &mapping, "", "gpt-5.3-codex");
+        let (body_a, _) =
+            TransformRequest::transform(&request_a, None, &mapping, "", "gpt-5.3-codex");
+        let (body_b, _) =
+            TransformRequest::transform(&request_b, None, &mapping, "", "gpt-5.3-codex");
 
-        assert_eq!(body_a.get("prompt_cache_key"), body_b.get("prompt_cache_key"));
+        assert_eq!(
+            body_a.get("prompt_cache_key"),
+            body_b.get("prompt_cache_key")
+        );
     }
 
     #[test]
@@ -3219,9 +3241,21 @@ hello"
         let mut input = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        assert!(push_proxy_injected_text_message(&mut input, &mut seen, "alpha\r\n\r\n"));
-        assert!(!push_proxy_injected_text_message(&mut input, &mut seen, "  alpha\n"));
-        assert!(push_proxy_injected_text_message(&mut input, &mut seen, "alpha beta"));
+        assert!(push_proxy_injected_text_message(
+            &mut input,
+            &mut seen,
+            "alpha\r\n\r\n"
+        ));
+        assert!(!push_proxy_injected_text_message(
+            &mut input,
+            &mut seen,
+            "  alpha\n"
+        ));
+        assert!(push_proxy_injected_text_message(
+            &mut input,
+            &mut seen,
+            "alpha beta"
+        ));
 
         assert_eq!(input.len(), 2);
         assert_eq!(normalize_text_for_exact_match("\r\nalpha\r\n"), "alpha");
@@ -3301,7 +3335,11 @@ hello"
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
         assert!(body.get("instructions").is_none());
         let texts = input_texts(&body);
-        assert_eq!(texts.len(), 1, "meta request should keep a single original user text item");
+        assert_eq!(
+            texts.len(),
+            1,
+            "meta request should keep a single original user text item"
+        );
         assert!(
             texts[0].contains("用户消息：你好啊"),
             "original request text should pass through untouched"
@@ -3344,13 +3382,11 @@ hello"
         );
     }
 
-
     #[test]
     fn codex_request_upstream_transport_remains_streaming_for_non_stream_clients() {
         let request = sample_passthrough_request();
         let mapping = ReasoningEffortMapping::default();
-        let (body, _) =
-            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
 
         assert_eq!(
             body.get("stream").and_then(|v| v.as_bool()),
@@ -3363,8 +3399,7 @@ hello"
     fn codex_request_upstream_transport_stays_streaming_for_stream_clients() {
         let request = sample_request();
         let mapping = ReasoningEffortMapping::default();
-        let (body, _) =
-            TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
 
         assert_eq!(
             body.get("stream").and_then(|v| v.as_bool()),
@@ -3380,7 +3415,10 @@ hello"
         let augmentation = decide_request_augmentation(&request, "hello");
 
         assert_eq!(augmentation.mode, RequestAugmentationMode::Passthrough);
-        assert!(augmentation.reasons.is_empty(), "plain text request should not have agent reasons");
+        assert!(
+            augmentation.reasons.is_empty(),
+            "plain text request should not have agent reasons"
+        );
 
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
@@ -3392,7 +3430,9 @@ hello"
         let texts = input_texts(&body);
         assert_eq!(texts, vec!["hello".to_string()]);
         assert!(
-            !texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
+            !texts
+                .iter()
+                .any(|text| text.contains("After emitting the <proposed_plan> block")),
             "passthrough requests must not receive plan-mode prompt injection"
         );
     }
@@ -3401,8 +3441,11 @@ hello"
     fn system_requests_include_agent_prefixes() {
         let request = sample_request();
         let mapping = ReasoningEffortMapping::default();
-        let augmentation = decide_request_augmentation(&request, "System prompt
-hello");
+        let augmentation = decide_request_augmentation(
+            &request,
+            "System prompt
+hello",
+        );
 
         assert_eq!(augmentation.mode, RequestAugmentationMode::Agent);
         assert!(augmentation.reasons.contains(&"system"));
@@ -3429,7 +3472,9 @@ hello");
             "wrapped system text should also carry the custom global prompt"
         );
         assert!(
-            !texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
+            !texts
+                .iter()
+                .any(|text| text.contains("After emitting the <proposed_plan> block")),
             "ordinary agent requests must not receive plan-mode prompt injection"
         );
     }
@@ -3459,13 +3504,8 @@ hello");
         .expect("valid anthropic request");
         let mapping = ReasoningEffortMapping::default();
 
-        let (body, _) = TransformRequest::transform(
-            &request,
-            None,
-            &mapping,
-            "global prompt",
-            "gpt-5.3-codex",
-        );
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
         assert_eq!(
             body.get("instructions").and_then(|v| v.as_str()),
@@ -3530,16 +3570,29 @@ hello");
         let first_text = first_input_text(&body);
 
         assert!(
-            texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
-            "plan requests should inject the minimal plan-mode prompt"
+            first_text.contains("Emit exactly one <proposed_plan> block in the turn."),
+            "plan requests should inject the anthropic-compatible plan-mode prompt"
         );
         assert!(
-            texts.iter().any(|text| text.contains("call ExitPlanMode to request approval")),
-            "plan requests should instruct the model to use ExitPlanMode for approval"
+            first_text.contains("<proposed_plan>") && first_text.contains("</proposed_plan>"),
+            "plan requests should explicitly instruct the model to emit a proposed_plan block"
+        );
+        assert!(
+            first_text.contains(
+                "After the <proposed_plan> block, call ExitPlanMode to request approval."
+            ),
+            "plan requests should instruct the model to use ExitPlanMode after emitting the plan"
         );
         assert!(
             first_text.contains("global prompt"),
             "plan-mode requests should also carry the custom prompt in system context"
+        );
+        assert_eq!(
+            texts.iter()
+                .filter(|text| text.trim() == ANTHROPIC_COMPAT_PLAN_MODE_PROMPT.trim())
+                .count(),
+            0,
+            "plan-mode prompt should be merged into the wrapped system context, not sent as a standalone user message"
         );
         assert_eq!(
             body.get("tool_choice").and_then(|value| value.as_str()),
@@ -3576,11 +3629,15 @@ hello");
         let first_text = first_input_text(&body);
 
         assert!(
-            texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
-            "plan approval signal should still inject the minimal plan prompt"
+            first_text.contains("Emit exactly one <proposed_plan> block in the turn."),
+            "plan approval signal should still inject the anthropic-compatible plan prompt"
         );
         assert!(
-            texts.iter().any(|text| text.contains("Do not ask the user to type approval in normal text")),
+            first_text.contains("<proposed_plan>") && first_text.contains("</proposed_plan>"),
+            "plan approval signal should preserve the proposed_plan requirement"
+        );
+        assert!(
+            first_text.contains("Do not ask the user to type approval in normal text."),
             "plan approval signal should discourage plain-text approval asks"
         );
         assert!(
@@ -3590,6 +3647,13 @@ hello");
         assert!(
             first_text.contains("global prompt"),
             "plan approval requests should not drop the custom prompt"
+        );
+        assert_eq!(
+            texts.iter()
+                .filter(|text| text.trim() == ANTHROPIC_COMPAT_PLAN_MODE_PROMPT.trim())
+                .count(),
+            0,
+            "plan-mode prompt should stay inside wrapped instructions even when no original system text exists"
         );
     }
 
@@ -3642,7 +3706,9 @@ hello");
         let first_text = first_input_text(&body);
 
         assert!(
-            !texts.iter().any(|text| text.contains("Plan mode: propose a concise step-by-step plan first")),
+            !texts
+                .iter()
+                .any(|text| text.contains("After emitting the <proposed_plan> block")),
             "non-plan requests should not inject the plan prompt"
         );
         assert!(
@@ -4080,9 +4146,7 @@ hello");
             .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
             .flat_map(|blocks| blocks.iter())
             .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-            .filter(|text| {
-                text.contains("Skill catalog (condensed)")
-            })
+            .filter(|text| text.contains("Skill catalog (condensed)"))
             .count();
 
         assert_eq!(

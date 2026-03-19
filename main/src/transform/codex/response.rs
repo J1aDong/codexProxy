@@ -480,11 +480,7 @@ impl TransformResponse {
         let all_markers = Self::LEAKED_TOOL_MARKERS
             .iter()
             .chain(Self::MARKDOWN_BASH_MARKERS.iter())
-            .chain([
-                Self::PROPOSED_PLAN_OPEN_TAG,
-                Self::PROPOSED_PLAN_CLOSE_TAG,
-            ]
-            .iter());
+            .chain([Self::PROPOSED_PLAN_OPEN_TAG, Self::PROPOSED_PLAN_CLOSE_TAG].iter());
 
         for marker in all_markers {
             let marker_bytes = marker.as_bytes();
@@ -505,8 +501,7 @@ impl TransformResponse {
     }
 
     fn strip_proposed_plan_wrappers(text: &str) -> String {
-        text.replace(Self::PROPOSED_PLAN_OPEN_TAG, "")
-            .replace(Self::PROPOSED_PLAN_CLOSE_TAG, "")
+        text.to_string()
     }
 
     fn find_markdown_bash_start(line: &str) -> Option<(usize, usize)> {
@@ -2885,9 +2880,7 @@ data: {}
     ) -> Option<String> {
         output_index
             .and_then(|idx| self.web_search_call_by_output_index.get(&idx).cloned())
-            .or_else(|| {
-                item_id.and_then(|id| self.web_search_call_by_item_id.get(id).cloned())
-            })
+            .or_else(|| item_id.and_then(|id| self.web_search_call_by_item_id.get(id).cloned()))
     }
 
     fn clear_active_web_search_call(&mut self, server_tool_use_id: &str) {
@@ -3006,12 +2999,14 @@ data: {}
         output_index: Option<u64>,
         item_id: Option<&str>,
     ) {
-        let server_tool_use_id = self.register_active_web_search_call(output, output_index, item_id);
+        let server_tool_use_id =
+            self.register_active_web_search_call(output, output_index, item_id);
 
-        let (content_block_index, already_closed) = match self.active_web_search_calls.get(&server_tool_use_id) {
-            Some(call) => (call.content_block_index, call.input_closed),
-            None => return,
-        };
+        let (content_block_index, already_closed) =
+            match self.active_web_search_calls.get(&server_tool_use_id) {
+                Some(call) => (call.content_block_index, call.input_closed),
+                None => return,
+            };
 
         if !already_closed {
             let query = action
@@ -3073,7 +3068,11 @@ data: {}
     fn close_open_web_search_calls(&mut self, output: &mut Vec<String>) {
         let active_ids: Vec<String> = self.active_web_search_calls.keys().cloned().collect();
         for server_tool_use_id in active_ids {
-            let Some(call) = self.active_web_search_calls.get(&server_tool_use_id).cloned() else {
+            let Some(call) = self
+                .active_web_search_calls
+                .get(&server_tool_use_id)
+                .cloned()
+            else {
                 continue;
             };
             if !call.input_closed {
@@ -4121,7 +4120,7 @@ data: {}
                     return output;
                 }
 
-                                // Only close thinking block if text will NOT be redirected to thinking
+                // Only close thinking block if text will NOT be redirected to thinking
                 // (avoids unnecessary open/close cycles during commentary)
                 let redirect_to_thinking = self.in_commentary_phase
                     || (self.had_reasoning_in_response && !self.saw_message_item_added);
@@ -4152,7 +4151,7 @@ data: {}
                             return output;
                         }
 
-                                                let redirect_to_thinking = self.in_commentary_phase
+                        let redirect_to_thinking = self.in_commentary_phase
                             || (self.had_reasoning_in_response && !self.saw_message_item_added);
                         if !redirect_to_thinking {
                             self.close_open_thinking_block(&mut output);
