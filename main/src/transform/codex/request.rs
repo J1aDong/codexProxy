@@ -907,6 +907,36 @@ fn latest_user_text(request: &AnthropicRequest) -> Option<String> {
     None
 }
 
+fn latest_user_text_block(request: &AnthropicRequest) -> Option<String> {
+    for message in request.messages.iter().rev() {
+        if !message.role.eq_ignore_ascii_case("user") {
+            continue;
+        }
+        let Some(content) = message.content.as_ref() else {
+            continue;
+        };
+        match content {
+            MessageContent::Text(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks.iter().rev() {
+                    if let ContentBlock::Text { text } = block {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn detect_requested_skill_name(request: &AnthropicRequest) -> Option<String> {
     if !has_skill_tool(request.tools.as_ref()) {
         return None;
@@ -930,6 +960,57 @@ fn detect_requested_skill_name(request: &AnthropicRequest) -> Option<String> {
         }
     }
     None
+}
+
+fn request_explicitly_mentions_worktree(request: &AnthropicRequest) -> bool {
+    latest_user_text_block(request)
+        .map(|text| {
+            let lower = text.to_ascii_lowercase();
+            lower.contains("worktree")
+                || lower.contains("git worktree")
+                || lower.contains("进入 worktree")
+                || lower.contains("在 worktree")
+                || lower.contains("隔离 worktree")
+        })
+        .unwrap_or(false)
+}
+
+fn strip_agent_worktree_isolation(tool: &mut Value) {
+    let Some(obj) = tool.as_object_mut() else {
+        return;
+    };
+    if obj.get("name").and_then(|value| value.as_str()) != Some("Agent") {
+        return;
+    }
+    let Some(parameters) = obj.get_mut("parameters").and_then(|value| value.as_object_mut()) else {
+        return;
+    };
+    if let Some(properties) = parameters
+        .get_mut("properties")
+        .and_then(|value| value.as_object_mut())
+    {
+        properties.remove("isolation");
+    }
+    if let Some(required) = parameters.get_mut("required").and_then(|value| value.as_array_mut()) {
+        required.retain(|value| value.as_str() != Some("isolation"));
+    }
+    if let Some(description) = obj.get_mut("description") {
+        if let Some(text) = description.as_str() {
+            let clarification = " Ordinary Agent calls do not require worktree isolation; use worktree only when the user explicitly asks for isolated repo work.";
+            if !text.contains("do not require worktree isolation") {
+                *description = Value::String(format!("{}{}", text.trim_end(), clarification));
+            }
+        }
+    }
+}
+
+fn adjust_agent_tool_semantics_for_request(request: &AnthropicRequest, tools: &mut [Value]) {
+    if request_explicitly_mentions_worktree(request) {
+        return;
+    }
+    for tool in tools {
+        strip_agent_worktree_isolation(tool);
+    }
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1809,12 +1890,13 @@ impl TransformRequest {
         reconcile_function_call_pairs(&mut final_input);
 
         // 转换工具
-        let transformed_tools = Self::transform_tools(
+        let mut transformed_tools = Self::transform_tools(
             anthropic_body.tools.as_ref(),
             log_tx,
             enable_tool_schema_compaction,
             apply_plan_augmentations,
         );
+        adjust_agent_tool_semantics_for_request(anthropic_body, &mut transformed_tools);
         let transformed_tools_bytes = serde_json::to_vec(&transformed_tools)
             .map(|buf| buf.len())
             .unwrap_or(0);
@@ -2846,6 +2928,196 @@ hello"
             transformed, tools,
             "native responses tools should pass through unchanged"
         );
+    }
+
+    #[test]
+    fn transform_tools_strips_agent_worktree_isolation_for_ordinary_subagent_requests() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"用两个subagent搜索下 上海北京的天气"}],
+            "tools": [{
+                "name": "Agent",
+                "description": "Launch a new agent to handle complex tasks autonomously.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "isolation": {"type": "string", "enum": ["worktree"]},
+                        "prompt": {"type": "string"}
+                    },
+                    "required": ["description", "prompt"]
+                }
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let agent_tool = body
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .and_then(|tools| tools.iter().find(|tool| tool.get("name").and_then(Value::as_str) == Some("Agent")))
+            .cloned()
+            .expect("agent tool should exist");
+        let parameters = agent_tool
+            .get("parameters")
+            .and_then(Value::as_object)
+            .expect("agent parameters");
+
+        assert!(
+            parameters
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| !properties.contains_key("isolation"))
+                .unwrap_or(false),
+            "ordinary subagent requests should not expose worktree isolation in Agent schema"
+        );
+    }
+
+    #[test]
+    fn transform_tools_ignores_system_reminder_worktree_mentions_for_ordinary_subagent_requests() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>Use when starting feature work that needs isolation from current workspace or before executing implementation plans - creates isolated git worktrees with smart directory selection and safety verification</system-reminder>"
+                    },
+                    {
+                        "type": "text",
+                        "text": "用两个subagent搜索下 上海北京的天气"
+                    }
+                ]
+            }],
+            "tools": [{
+                "name": "Agent",
+                "description": "Launch a new agent to handle complex tasks autonomously.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "isolation": {"type": "string", "enum": ["worktree"]},
+                        "prompt": {"type": "string"}
+                    },
+                    "required": ["description", "prompt"]
+                }
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let agent_tool = body
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .and_then(|tools| tools.iter().find(|tool| tool.get("name").and_then(Value::as_str) == Some("Agent")))
+            .cloned()
+            .expect("agent tool should exist");
+        let parameters = agent_tool
+            .get("parameters")
+            .and_then(Value::as_object)
+            .expect("agent parameters");
+
+        assert!(
+            parameters
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| !properties.contains_key("isolation"))
+                .unwrap_or(false),
+            "system-reminder worktree mentions should not keep Agent isolation visible for ordinary subagent requests"
+        );
+    }
+
+    #[test]
+    fn transform_tools_keeps_agent_worktree_isolation_when_user_explicitly_mentions_worktree() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"请在 worktree 里开一个 subagent 处理这个任务"}],
+            "tools": [{
+                "name": "Agent",
+                "description": "Launch a new agent to handle complex tasks autonomously.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "isolation": {"type": "string", "enum": ["worktree"]},
+                        "prompt": {"type": "string"}
+                    },
+                    "required": ["description", "prompt"]
+                }
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let agent_tool = body
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .and_then(|tools| tools.iter().find(|tool| tool.get("name").and_then(Value::as_str) == Some("Agent")))
+            .cloned()
+            .expect("agent tool should exist");
+        let parameters = agent_tool
+            .get("parameters")
+            .and_then(Value::as_object)
+            .expect("agent parameters");
+
+        assert!(
+            parameters
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| properties.contains_key("isolation"))
+                .unwrap_or(false),
+            "explicit worktree requests should keep Agent isolation option visible"
+        );
+    }
+
+    #[test]
+    fn plan_mode_filters_worktree_tools_without_removing_agent_tool() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "请先给我 plan"}],
+            "metadata": {"plan_mode": true},
+            "tools": [
+                {
+                    "name": "Agent",
+                    "description": "Launch a new agent to handle complex tasks autonomously.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string"},
+                            "prompt": {"type": "string"}
+                        },
+                        "required": ["description", "prompt"]
+                    }
+                },
+                {
+                    "name": "EnterWorktree",
+                    "description": "Enter worktree",
+                    "input_schema": {"type":"object","properties":{}}
+                },
+                {
+                    "name": "ExitWorktree",
+                    "description": "Exit worktree",
+                    "input_schema": {"type":"object","properties":{"action":{"type":"string"}}}
+                }
+            ],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let tool_names = tool_names(&body);
+
+        assert!(tool_names.contains(&"Agent".to_string()));
+        assert!(!tool_names.contains(&"EnterWorktree".to_string()));
+        assert!(!tool_names.contains(&"ExitWorktree".to_string()));
     }
 
     #[test]

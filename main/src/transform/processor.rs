@@ -127,6 +127,11 @@ impl MessageProcessor {
     fn rewrite_agent_tool_result(content: &Value) -> Option<Value> {
         let text = Self::extract_tool_result_plain_text(content)?;
         let trimmed = text.trim();
+        if trimmed.starts_with("Cannot create agent worktree:") {
+            return Some(Value::String(
+                "Agent launch failed because the request asked for worktree isolation in a context where worktree creation is unavailable. Ordinary subagent requests do not require worktree; only use worktree when the user explicitly asks for isolated repo work.".to_string(),
+            ));
+        }
         if !trimmed.starts_with("Spawned successfully.") {
             return None;
         }
@@ -1414,6 +1419,46 @@ mod tests {
         assert!(rewritten.contains("TaskOutput cannot query team agent IDs"));
         assert!(rewritten.contains("agent_vehicle@debug-swarm"));
         assert!(!rewritten.contains("<tool_use_error>"));
+    }
+
+    #[test]
+    fn test_transform_messages_rewrites_agent_worktree_failure_into_precise_guidance() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_agent_1".to_string()),
+                    name: "Agent".to_string(),
+                    input: json!({
+                        "name": "weather-shanghai",
+                        "run_in_background": true
+                    }),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_agent_1".to_string()),
+                    id: None,
+                    content: Some(Value::String(
+                        "Cannot create agent worktree: not in a git repository and no WorktreeCreate hooks are configured.".to_string(),
+                    )),
+                }])),
+            },
+        ];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .and_then(|item| item.get("output"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("Ordinary subagent requests do not require worktree"));
+        assert!(rewritten.contains("explicitly asks for isolated repo work"));
     }
 
     #[test]
