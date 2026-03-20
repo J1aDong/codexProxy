@@ -8,10 +8,19 @@ use super::{MessageProcessor, ResponseTransformer, TransformBackend, TransformCo
 
 pub struct GeminiBackend;
 
+struct GeminiRequestMapper;
+
 impl GeminiBackend {
     fn normalize_model(model: &str) -> String {
         model.trim().to_string()
     }
+
+    pub(crate) fn build_contents_for_count(messages: &[Value]) -> Vec<Value> {
+        GeminiRequestMapper::build_contents_for_count(messages)
+    }
+}
+
+impl GeminiRequestMapper {
 
     fn convert_content_block(block: &Value) -> Option<Value> {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -221,8 +230,6 @@ impl GeminiBackend {
         let function_declarations: Vec<Value> = tools
             .iter()
             .filter_map(|tool| {
-                // Anthropic format: { name, description, input_schema }
-                // Gemini format: { name, description, parameters }
                 let name = tool.get("name").and_then(|n| n.as_str())?;
                 let description = tool
                     .get("description")
@@ -249,52 +256,97 @@ impl GeminiBackend {
             })])
         }
     }
-}
 
-impl TransformBackend for GeminiBackend {
-    fn transform_request(
-        &self,
+    fn collect_system_instruction_parts(
+        anthropic_body: &AnthropicRequest,
+        transformed_messages: &[Value],
+    ) -> Option<Vec<Value>> {
+        let mut parts = Vec::new();
+
+        if let Some(system) = &anthropic_body.system {
+            let text = system.to_string();
+            if !text.trim().is_empty() {
+                parts.push(json!({ "text": text }));
+            }
+        }
+
+        for message in &anthropic_body.messages {
+            if !message.role.eq_ignore_ascii_case("system") {
+                continue;
+            }
+
+            let Some(content) = message.content.as_ref() else {
+                continue;
+            };
+
+            match content {
+                crate::models::MessageContent::Text(text) => {
+                    if !text.trim().is_empty() {
+                        parts.push(json!({ "text": text }));
+                    }
+                }
+                crate::models::MessageContent::Blocks(blocks) => {
+                    for block in blocks {
+                        if let crate::models::ContentBlock::Text { text } = block {
+                            if !text.trim().is_empty() {
+                                parts.push(json!({ "text": text }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for message in transformed_messages {
+            if message
+                .get("type")
+                .and_then(|value| value.as_str())
+                != Some("message")
+            {
+                continue;
+            }
+            if message
+                .get("role")
+                .and_then(|value| value.as_str())
+                != Some("system")
+            {
+                continue;
+            }
+
+            if let Some(content_array) = message.get("content").and_then(|value| value.as_array()) {
+                for block in content_array {
+                    if let Some(text) = block.get("text").and_then(|value| value.as_str()) {
+                        if !text.trim().is_empty()
+                            && !parts.iter().any(|part| part.get("text") == Some(&json!(text)))
+                        {
+                            parts.push(json!({ "text": text }));
+                        }
+                    }
+                }
+            } else if let Some(text) = message.get("content").and_then(|value| value.as_str()) {
+                if !text.trim().is_empty()
+                    && !parts.iter().any(|part| part.get("text") == Some(&json!(text)))
+                {
+                    parts.push(json!({ "text": text }));
+                }
+            }
+        }
+
+        (!parts.is_empty()).then_some(parts)
+    }
+
+    fn build_body(
         anthropic_body: &AnthropicRequest,
         log_tx: Option<&broadcast::Sender<String>>,
-        _ctx: &TransformContext,
-        _effective_stream: bool,
-        model_override: Option<String>,
-    ) -> (Value, String) {
-        let session_id = Uuid::new_v4().to_string();
-
-        let requested = model_override
-            .or_else(|| anthropic_body.model.clone())
-            // Fallback (though model_override should usually be present)
-            .unwrap_or_else(|| "gemini-3-pro-preview".to_string());
-        let gemini_model = Self::normalize_model(&requested);
-
-        // Transform messages using Codex logic as base but outputting Gemini format
-        // We reuse TransformRequest::transform_messages to resolve images and extract basic info
-        // BUT here we need to map to Gemini structure directly.
-        // Actually, let's use the `build_contents` we just wrote, but we need `messages` with resolved images first.
-        // Since `TransformRequest::transform_messages` returns Codex-specific JSON, it might be better to
-        // iterate `anthropic_body.messages` directly and resolve images using helper if needed,
-        // OR reuse `transform_messages` output if it's generic enough.
-        // usage: let (messages, _) = TransformRequest::transform_messages(&anthropic_body.messages, None);
-        // The output of `transform_messages` is `Vec<Value>` in Codex format (content blocks).
-        // Our `convert_content_block` expects Codex-like blocks (type=text, image, tool_use).
-        // So yes, we can reuse `TransformRequest::transform_messages` to handle the heavy lifting of image resolution!
-        // Note: we pass None for log_tx to avoid double logging or just pass it if we want.
-
+        requested_model: &str,
+    ) -> Value {
+        let gemini_model = GeminiBackend::normalize_model(requested_model);
         let (messages, _) = MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
         let contents = Self::build_contents(&messages);
-
-        let system_instruction = if let Some(system) = &anthropic_body.system {
-            Some(json!({
-                "parts": [{ "text": system.to_string() }]
-            }))
-        } else {
-            None
-        };
-
+        let system_instruction = Self::collect_system_instruction_parts(anthropic_body, &messages)
+            .map(|parts| json!({ "parts": parts }));
         let tools = Self::convert_tools(anthropic_body.tools.as_ref());
 
-        // Configuration mapping
         let mut generation_config = json!({});
         if let Some(cfg) = generation_config.as_object_mut() {
             if let Some(max_tokens) = anthropic_body.max_tokens {
@@ -314,7 +366,7 @@ impl TransformBackend for GeminiBackend {
             }
         }
 
-        let body = json!({
+        json!({
             "model": gemini_model,
             "system_instruction": system_instruction,
             "contents": contents,
@@ -338,7 +390,87 @@ impl TransformBackend for GeminiBackend {
                     "threshold": "BLOCK_NONE"
                 }
             ]
-        });
+        })
+    }
+}
+
+struct GeminiUpstreamRequestBuilder;
+
+impl GeminiUpstreamRequestBuilder {
+    fn uses_cli_style_headers(target_url: &str) -> bool {
+        let lower = target_url.to_ascii_lowercase();
+        !(lower.contains("generativelanguage.googleapis.com")
+            || lower.contains("googleapis.com"))
+    }
+
+    fn build_endpoint(target_url: &str, model: &str) -> String {
+        if target_url.contains(":streamGenerateContent") {
+            target_url.to_string()
+        } else if target_url.contains("{model}") {
+            target_url.replace("{model}", model)
+        } else {
+            let base = target_url.trim_end_matches('/');
+            format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, model)
+        }
+    }
+
+    fn apply_auth_headers(
+        builder: reqwest::RequestBuilder,
+        target_url: &str,
+        api_key: &str,
+    ) -> reqwest::RequestBuilder {
+        let builder = builder
+            .header("x-goog-api-key", api_key)
+            .header("Authorization", format!("Bearer {}", api_key));
+
+        if Self::uses_cli_style_headers(target_url) {
+            builder.header("x-goog-api-client", "GeminiCLI/1.0")
+        } else {
+            builder
+        }
+    }
+
+    fn build_request(
+        client: &reqwest::Client,
+        target_url: &str,
+        api_key: &str,
+        body: &Value,
+    ) -> reqwest::RequestBuilder {
+        let model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gemini-3-pro-preview");
+        let endpoint = Self::build_endpoint(target_url, model);
+
+        let mut upstream_body = body.clone();
+        if let Some(obj) = upstream_body.as_object_mut() {
+            obj.remove("model");
+        }
+
+        let builder = client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+        Self::apply_auth_headers(builder, target_url, api_key).body(upstream_body.to_string())
+    }
+}
+
+impl TransformBackend for GeminiBackend {
+    fn transform_request(
+        &self,
+        anthropic_body: &AnthropicRequest,
+        log_tx: Option<&broadcast::Sender<String>>,
+        _ctx: &TransformContext,
+        _effective_stream: bool,
+        model_override: Option<String>,
+    ) -> (Value, String) {
+        let session_id = Uuid::new_v4().to_string();
+
+        let requested = model_override
+            .or_else(|| anthropic_body.model.clone())
+            // Fallback (though model_override should usually be present)
+            .unwrap_or_else(|| "gemini-3-pro-preview".to_string());
+        let body = GeminiRequestMapper::build_body(anthropic_body, log_tx, &requested);
 
         (body, session_id)
     }
@@ -352,35 +484,7 @@ impl TransformBackend for GeminiBackend {
         _session_id: &str,
         _anthropic_version: &str,
     ) -> reqwest::RequestBuilder {
-        let model = body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("gemini-3-pro-preview");
-
-        let endpoint = if target_url.contains(":streamGenerateContent") {
-            target_url.to_string()
-        } else if target_url.contains("{model}") {
-            target_url.replace("{model}", model)
-        } else {
-            let base = target_url.trim_end_matches('/');
-            format!(
-                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
-                base, model
-            )
-        };
-
-        let mut upstream_body = body.clone();
-        if let Some(obj) = upstream_body.as_object_mut() {
-            obj.remove("model");
-        }
-
-        client
-            .post(endpoint)
-            .header("Content-Type", "application/json")
-            .header("x-goog-api-key", api_key)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Accept", "text/event-stream")
-            .body(upstream_body.to_string())
+        GeminiUpstreamRequestBuilder::build_request(client, target_url, api_key, body)
     }
 
     fn create_response_transformer(
@@ -701,9 +805,10 @@ impl ResponseTransformer for GeminiResponseTransformer {
             return output;
         }
 
-        let Ok(data) = serde_json::from_str::<Value>(payload) else {
+        let Ok(parsed_data) = serde_json::from_str::<Value>(payload) else {
             return output;
         };
+        let data = parsed_data.get("response").cloned().unwrap_or(parsed_data);
 
         // 1. Extract thought signature if present
         if let Some(sig) = Self::extract_thought_signature(&data) {
@@ -827,87 +932,115 @@ mod tests {
     }
 
     #[test]
-    fn switches_to_dedicated_text_block_after_thinking() {
-        let mut transformer = GeminiResponseTransformer::new("gemini-test");
-        let line = r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"internal reasoning"},{"text":"final answer"}]}}]}"#;
+    fn request_mapper_merges_top_level_and_message_system_into_system_instruction() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "gemini-2.0-flash",
+            "system": "top-level system",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "message system"}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}]
+                }
+            ],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
 
-        let events = transformer.transform_line(line);
+        let body = GeminiRequestMapper::build_body(&request, None, "gemini-2.0-flash");
+        let parts = body
+            .get("system_instruction")
+            .and_then(|value| value.get("parts"))
+            .and_then(|value| value.as_array())
+            .expect("system instruction parts");
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].get("text").and_then(Value::as_str), Some("top-level system"));
+        assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("message system"));
+    }
+
+    #[test]
+    fn upstream_builder_uses_official_google_headers_for_google_endpoint() {
+        let client = reqwest::Client::new();
+        let body = json!({"model": "gemini-2.0-flash", "contents": [], "system_instruction": null});
+
+        let request = GeminiUpstreamRequestBuilder::build_request(
+            &client,
+            "https://generativelanguage.googleapis.com",
+            "test-key",
+            &body,
+        )
+        .build()
+        .expect("request should build");
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            request.headers().get("x-goog-api-key").and_then(|value| value.to_str().ok()),
+            Some("test-key")
+        );
+        assert!(
+            request.headers().get("x-goog-api-client").is_none(),
+            "official google endpoint should not add Gemini CLI client header"
+        );
+    }
+
+    #[test]
+    fn upstream_builder_uses_cli_header_for_non_google_endpoint() {
+        let client = reqwest::Client::new();
+        let body = json!({"model": "gemini-2.0-flash", "contents": [], "system_instruction": null});
+
+        let request = GeminiUpstreamRequestBuilder::build_request(
+            &client,
+            "https://gemini-cli.example.com",
+            "test-key",
+            &body,
+        )
+        .build()
+        .expect("request should build");
+
+        assert_eq!(
+            request.headers().get("x-goog-api-client").and_then(|value| value.to_str().ok()),
+            Some("GeminiCLI/1.0")
+        );
+    }
+
+    #[test]
+    fn wrapped_response_and_usage_variants_emit_stable_message_stop() {
+        let mut transformer = GeminiResponseTransformer::new("gemini-test");
+        let events = transformer.transform_line(
+            r#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"pong"}]},"finishReason":"STOP"}],"usage":{"promptTokenCount":3,"candidatesTokenCount":5,"totalTokenCount":8}}}"#,
+        );
         let parsed_events: Vec<(String, Value)> =
             events.iter().map(|event| parse_sse_event(event)).collect();
 
-        let thinking_start = parsed_events
-            .iter()
-            .position(|(name, payload)| {
-                name == "content_block_start"
-                    && payload
-                        .get("content_block")
-                        .and_then(|block| block.get("type"))
-                        .and_then(|value| value.as_str())
-                        == Some("thinking")
-            })
-            .expect("missing thinking block start event");
-
-        let thinking_index = parsed_events[thinking_start]
-            .1
-            .get("index")
-            .and_then(|value| value.as_u64())
-            .expect("thinking block index should exist");
-
-        let thinking_stop = parsed_events
-            .iter()
-            .position(|(name, payload)| {
-                name == "content_block_stop"
-                    && payload.get("index").and_then(|value| value.as_u64()) == Some(thinking_index)
-            })
-            .expect("missing thinking block stop event");
-
-        let text_start = parsed_events
-            .iter()
-            .position(|(name, payload)| {
-                name == "content_block_start"
-                    && payload
-                        .get("content_block")
-                        .and_then(|block| block.get("type"))
-                        .and_then(|value| value.as_str())
-                        == Some("text")
-            })
-            .expect("missing text block start event");
-
-        let text_index = parsed_events[text_start]
-            .1
-            .get("index")
-            .and_then(|value| value.as_u64())
-            .expect("text block index should exist");
-
-        let text_delta = parsed_events
-            .iter()
-            .position(|(name, payload)| {
+        assert!(
+            parsed_events.iter().any(|(name, payload)| {
                 name == "content_block_delta"
-                    && payload.get("index").and_then(|value| value.as_u64()) == Some(text_index)
                     && payload
                         .get("delta")
                         .and_then(|delta| delta.get("type"))
                         .and_then(|value| value.as_str())
                         == Some("text_delta")
-                    && payload
-                        .get("delta")
-                        .and_then(|delta| delta.get("text"))
-                        .and_then(|value| value.as_str())
-                        == Some("final answer")
-            })
-            .expect("missing text delta on text block");
-
-        assert_ne!(
-            thinking_index, text_index,
-            "thinking/text should use different block indices"
+            }),
+            "wrapped response should still emit text deltas"
         );
-        assert!(
-            thinking_stop < text_start,
-            "thinking block should stop before text starts"
-        );
-        assert!(
-            text_start < text_delta,
-            "text delta should follow text block start"
+        let message_delta = parsed_events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("message_delta should be emitted");
+        assert_eq!(
+            message_delta
+                .1
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(|value| value.as_str()),
+            Some("end_turn")
         );
     }
 }

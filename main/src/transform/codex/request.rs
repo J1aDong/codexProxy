@@ -9,7 +9,6 @@ use crate::models::{
 };
 use crate::transform::MessageProcessor;
 
-const CODEX_INSTRUCTIONS: &str = include_str!("../../instructions.txt");
 const ANTHROPIC_COMPAT_PLAN_MODE_PROMPT: &str = include_str!("plan_mode_prompt.txt");
 const EMPTY_TOOL_OUTPUT_PLACEHOLDER: &str = "(No output)";
 const PROMPT_CACHE_KEY_MAX_CWD_LEN: usize = 64;
@@ -176,16 +175,6 @@ fn merge_instruction_context(first: Option<&str>, second: Option<&str>) -> Optio
     merged
 }
 
-fn system_contains_codex_instructions(system_text: &str) -> bool {
-    let normalized = normalize_text_for_exact_match(system_text).to_ascii_lowercase();
-    if normalized.contains("you are a coding agent running in the codex cli") {
-        return true;
-    }
-    let normalized_instructions =
-        normalize_text_for_exact_match(CODEX_INSTRUCTIONS).to_ascii_lowercase();
-    normalized.contains(&normalized_instructions)
-}
-
 fn request_contains_environment_context(request_text_corpus: &str) -> bool {
     request_text_corpus
         .to_ascii_lowercase()
@@ -348,14 +337,6 @@ fn decide_request_augmentation(
         .unwrap_or(false)
     {
         reasons.push("system");
-        if request
-            .system
-            .as_ref()
-            .map(|system| system_contains_codex_instructions(&system.to_string()))
-            .unwrap_or(false)
-        {
-            reasons.push("system_codex");
-        }
     }
 
     if request
@@ -620,8 +601,6 @@ pub(crate) fn fingerprint_json_value(value: &Value) -> String {
 
 #[derive(Debug, Clone)]
 struct StaticHeavyPayloadStats {
-    instructions_fingerprint: Option<String>,
-    instructions_chars: usize,
     wrapped_system_fingerprint: Option<String>,
     wrapped_system_chars: usize,
     custom_prompt_fingerprint: Option<String>,
@@ -629,26 +608,20 @@ struct StaticHeavyPayloadStats {
     tools_fingerprint: Option<String>,
     tools_count: usize,
     tools_bytes: usize,
-    instructions_matches_system_exact: bool,
 }
 
 fn build_static_heavy_payload_stats(
-    raw_system_text: Option<&str>,
     wrapped_system_text: Option<&str>,
     custom_prompt_text: Option<&str>,
     transformed_tools: &[Value],
     transformed_tools_bytes: usize,
 ) -> StaticHeavyPayloadStats {
-    let normalized_instructions = normalize_text_for_exact_match(CODEX_INSTRUCTIONS);
-    let normalized_system = raw_system_text.map(normalize_text_for_exact_match);
     let normalized_wrapped_system = wrapped_system_text.map(normalize_text_for_exact_match);
     let normalized_custom_prompt = custom_prompt_text.map(normalize_text_for_exact_match);
     let tools_fingerprint = (!transformed_tools.is_empty())
         .then(|| fingerprint_json_value(&Value::Array(transformed_tools.to_vec())));
 
     StaticHeavyPayloadStats {
-        instructions_fingerprint: fingerprint_normalized_text(&normalized_instructions),
-        instructions_chars: normalized_instructions.chars().count(),
         wrapped_system_fingerprint: normalized_wrapped_system
             .as_deref()
             .and_then(fingerprint_normalized_text),
@@ -660,9 +633,6 @@ fn build_static_heavy_payload_stats(
         tools_fingerprint,
         tools_count: transformed_tools.len(),
         tools_bytes: transformed_tools_bytes,
-        instructions_matches_system_exact: normalized_system
-            .map(|system| system == normalized_instructions)
-            .unwrap_or(false),
     }
 }
 
@@ -1722,10 +1692,8 @@ impl TransformRequest {
             augmentation_reasons
         ));
         let mut system_text_for_cache_key = None::<String>;
-        let mut raw_system_text_for_stats = None::<String>;
         let mut wrapped_system_payload_text = None::<String>;
         let mut injected_text_dedupe = HashSet::new();
-        let mut system_matches_codex_instructions = false;
         let trimmed_custom_injection_prompt = custom_injection_prompt.trim();
         let custom_prompt_applied = (apply_agent_augmentations || apply_plan_augmentations)
             && !trimmed_custom_injection_prompt.is_empty();
@@ -1750,9 +1718,7 @@ impl TransformRequest {
                     system_text = sanitized_plan_system_text;
                 }
             }
-            raw_system_text_for_stats = Some(system_text.clone());
             system_text_for_cache_key = Some(system_text.clone());
-            system_matches_codex_instructions = system_contains_codex_instructions(&system_text);
             log(&format!(
                 "📋 [Transform] System prompt: {} chars",
                 system_text.len()
@@ -1853,7 +1819,6 @@ impl TransformRequest {
             .map(|buf| buf.len())
             .unwrap_or(0);
         let static_heavy_payload_stats = build_static_heavy_payload_stats(
-            raw_system_text_for_stats.as_deref(),
             wrapped_system_payload_text.as_deref(),
             merged_instruction_context.as_deref(),
             &transformed_tools,
@@ -1875,15 +1840,12 @@ impl TransformRequest {
             parallel_tool_calls,
             transformed_tools.len()
         ));
-        let static_instructions_applied = apply_agent_augmentations
-            && !system_matches_codex_instructions
-            && !augmentation.reasons.contains(&"system");
         let prompt_cache_key = build_prompt_cache_key(
             request_cwd.as_deref(),
             final_codex_model,
             request_session_hint.as_deref(),
             merged_instruction_context.as_deref(),
-            static_instructions_applied.then_some(CODEX_INSTRUCTIONS),
+            None,
             system_text_for_cache_key.as_deref(),
             static_heavy_payload_stats.tools_fingerprint.as_deref(),
         );
@@ -1904,15 +1866,12 @@ impl TransformRequest {
             include_reasoning_encrypted_content
         ));
         log(&format!(
-            "🧩 [Transform] custom_prompt_applied={} plan_prompt_applied={} static_instructions_applied={}",
+            "🧩 [Transform] custom_prompt_applied={} plan_prompt_applied={}",
             custom_prompt_applied,
-            plan_prompt_applied,
-            static_instructions_applied
+            plan_prompt_applied
         ));
         log(&format!(
-            "🧾 [Transform] static_heavy instructions_fingerprint={} instructions_chars={} wrapped_system_fingerprint={} wrapped_system_chars={} custom_prompt_fingerprint={} custom_prompt_chars={} tools_fingerprint={} tools_count={} tools_bytes={} instructions_matches_system_exact={}",
-            format_optional_fingerprint(static_heavy_payload_stats.instructions_fingerprint.as_deref()),
-            static_heavy_payload_stats.instructions_chars,
+            "🧾 [Transform] static_heavy wrapped_system_fingerprint={} wrapped_system_chars={} custom_prompt_fingerprint={} custom_prompt_chars={} tools_fingerprint={} tools_count={} tools_bytes={}",
             format_optional_fingerprint(static_heavy_payload_stats.wrapped_system_fingerprint.as_deref()),
             static_heavy_payload_stats.wrapped_system_chars,
             format_optional_fingerprint(static_heavy_payload_stats.custom_prompt_fingerprint.as_deref()),
@@ -1920,7 +1879,6 @@ impl TransformRequest {
             format_optional_fingerprint(static_heavy_payload_stats.tools_fingerprint.as_deref()),
             static_heavy_payload_stats.tools_count,
             static_heavy_payload_stats.tools_bytes,
-            static_heavy_payload_stats.instructions_matches_system_exact,
         ));
 
         let mut reasoning = json!({ "effort": reasoning_effort.as_str() });
@@ -1948,11 +1906,6 @@ impl TransformRequest {
         if enable_codex_fast_mode {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("service_tier".to_string(), json!("priority"));
-            }
-        }
-        if static_instructions_applied {
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("instructions".to_string(), json!(CODEX_INSTRUCTIONS));
             }
         }
         if include_reasoning_encrypted_content {
@@ -2514,7 +2467,7 @@ mod tests {
         detect_requested_skill_name, extract_request_cwd, fingerprint_json_value,
         normalize_text_for_exact_match, push_proxy_injected_text_message,
         strip_dynamic_system_header_lines, RequestAugmentationMode, TransformRequest,
-        ANTHROPIC_COMPAT_PLAN_MODE_PROMPT, CODEX_INSTRUCTIONS,
+        ANTHROPIC_COMPAT_PLAN_MODE_PROMPT,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
     use serde_json::{json, Value};
@@ -3275,8 +3228,17 @@ hello"
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
         assert!(
-            body.get("instructions").is_some(),
-            "tool-capable requests should still receive agent instructions"
+            body.get("instructions").is_none(),
+            "tool-capable requests should prefer wrapped prompt context over hidden static instructions"
+        );
+        let first_text = first_input_text(&body);
+        assert!(
+            first_text.starts_with("# AGENTS.md instructions"),
+            "tool-capable requests should stay agent-shaped via wrapped instructions"
+        );
+        assert!(
+            first_text.contains("global prompt"),
+            "custom prompt should stay in wrapped instruction context"
         );
         assert!(
             body.pointer("/reasoning/summary").is_none(),
@@ -3379,25 +3341,6 @@ hello"
 
         assert_eq!(input.len(), 2);
         assert_eq!(normalize_text_for_exact_match("\r\nalpha\r\n"), "alpha");
-    }
-
-    #[test]
-    fn instructions_are_not_omitted_even_when_system_text_matches_exactly() {
-        let request: AnthropicRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4-5",
-            "messages": [{"role":"user","content":[{"type":"text","text":"hello"}]}],
-            "system": CODEX_INSTRUCTIONS,
-            "stream": true
-        }))
-        .expect("request");
-        let mapping = ReasoningEffortMapping::default();
-
-        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
-
-        assert!(
-            body.get("instructions").is_none(),
-            "static instructions should be skipped when system already contains them"
-        );
     }
 
     #[test]
@@ -3629,8 +3572,8 @@ hello",
 
         assert_eq!(
             body.get("instructions").and_then(|v| v.as_str()),
-            Some(CODEX_INSTRUCTIONS),
-            "codex default instructions should still be emitted unchanged for agent requests without system text"
+            None,
+            "agent requests without system should keep custom prompt in wrapped user input instead of hidden static instructions"
         );
 
         let texts = input_texts(&body);
