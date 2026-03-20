@@ -1,6 +1,6 @@
 [package]
 name = "codex-proxy-desktop"
-version = "0.2.3"
+version = "0.2.4"
 description = "Desktop configuration UI for Codex Proxy"
 authors = ["J1aDong"]
 edition = "2021"
