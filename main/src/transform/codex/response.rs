@@ -535,6 +535,31 @@ impl TransformResponse {
         ));
     }
 
+    fn should_suppress_visible_proposed_plan_text(&self) -> bool {
+        self.codex_plan_file_path.is_some()
+    }
+
+    fn build_suppressed_proposed_plan_fallback(&self) -> Option<String> {
+        if let Some(body) = self.latest_proposed_plan_body.as_deref() {
+            return Some(format!(
+                "{}\n{}\n{}",
+                Self::PROPOSED_PLAN_OPEN_TAG,
+                body,
+                Self::PROPOSED_PLAN_CLOSE_TAG
+            ));
+        }
+
+        if self.capturing_proposed_plan && !self.proposed_plan_body_buffer.trim().is_empty() {
+            return Some(format!(
+                "{}\n{}",
+                Self::PROPOSED_PLAN_OPEN_TAG,
+                self.proposed_plan_body_buffer.trim()
+            ));
+        }
+
+        None
+    }
+
     fn write_codex_plan_bridge_file(&mut self) -> bool {
         let Some(plan_file_path) = self.codex_plan_file_path.as_deref() else {
             return false;
@@ -575,15 +600,15 @@ impl TransformResponse {
         }
     }
 
-    fn maybe_emit_plan_mode_bridge(&mut self, output: &mut Vec<String>) {
+    fn maybe_emit_plan_mode_bridge(&mut self, output: &mut Vec<String>) -> bool {
         if self.plan_bridge_emitted || self.saw_tool_call {
-            return;
+            return false;
         }
         if self.latest_proposed_plan_body.is_none() || self.codex_plan_file_path.is_none() {
-            return;
+            return false;
         }
         if !self.write_codex_plan_bridge_file() {
-            return;
+            return false;
         }
 
         let synthetic_tool = BufferedToolCall {
@@ -608,14 +633,44 @@ impl TransformResponse {
         self.logger
             .log_raw("[PlanBridge] Emitting synthetic ExitPlanMode tool_use");
         self.emit_serialized_tool_call(output, &synthetic_tool);
+        true
     }
 
-    fn observe_proposed_plan_fragment(&mut self, fragment: &str) {
+    fn observe_proposed_plan_fragment(&mut self, fragment: &str) -> String {
         if fragment.is_empty() {
-            return;
+            return String::new();
+        }
+
+        if !self.should_suppress_visible_proposed_plan_text() {
+            let mut remaining = fragment.to_string();
+            loop {
+                if self.capturing_proposed_plan {
+                    if let Some(end) = remaining.find(Self::PROPOSED_PLAN_CLOSE_TAG) {
+                        self.proposed_plan_body_buffer.push_str(&remaining[..end]);
+                        self.record_extracted_proposed_plan_body();
+                        self.proposed_plan_body_buffer.clear();
+                        self.capturing_proposed_plan = false;
+                        remaining =
+                            remaining[end + Self::PROPOSED_PLAN_CLOSE_TAG.len()..].to_string();
+                        continue;
+                    }
+
+                    self.proposed_plan_body_buffer.push_str(&remaining);
+                    break;
+                }
+
+                let Some(start) = remaining.find(Self::PROPOSED_PLAN_OPEN_TAG) else {
+                    break;
+                };
+                remaining = remaining[start + Self::PROPOSED_PLAN_OPEN_TAG.len()..].to_string();
+                self.capturing_proposed_plan = true;
+                self.proposed_plan_body_buffer.clear();
+            }
+            return fragment.to_string();
         }
 
         let mut remaining = fragment.to_string();
+        let mut visible = String::new();
         loop {
             if self.capturing_proposed_plan {
                 if let Some(end) = remaining.find(Self::PROPOSED_PLAN_CLOSE_TAG) {
@@ -632,12 +687,16 @@ impl TransformResponse {
             }
 
             let Some(start) = remaining.find(Self::PROPOSED_PLAN_OPEN_TAG) else {
+                visible.push_str(&remaining);
                 break;
             };
+            visible.push_str(&remaining[..start]);
             remaining = remaining[start + Self::PROPOSED_PLAN_OPEN_TAG.len()..].to_string();
             self.capturing_proposed_plan = true;
             self.proposed_plan_body_buffer.clear();
         }
+
+        visible
     }
 
     fn find_markdown_bash_start(line: &str) -> Option<(usize, usize)> {
@@ -3598,8 +3657,11 @@ data: {}
         if normalized_fragment.is_empty() {
             return;
         }
-        let fragment = normalized_fragment.as_str();
-        self.observe_proposed_plan_fragment(fragment);
+        let observed_fragment = self.observe_proposed_plan_fragment(&normalized_fragment);
+        if observed_fragment.is_empty() {
+            return;
+        }
+        let fragment = observed_fragment.as_str();
 
         // Commentary phase: redirect text to thinking blocks
         // Either explicit via phase field, or fallback when reasoning was seen
@@ -4083,7 +4145,19 @@ data: {}
             return;
         }
 
-        self.maybe_emit_plan_mode_bridge(output);
+        let should_fallback_proposed_plan = self.codex_plan_file_path.is_some()
+            && !self.plan_bridge_emitted
+            && !self.saw_tool_call
+            && (self.latest_proposed_plan_body.is_some()
+                || (self.capturing_proposed_plan
+                    && !self.proposed_plan_body_buffer.trim().is_empty()));
+        if should_fallback_proposed_plan && !self.maybe_emit_plan_mode_bridge(output) {
+            if let Some(fallback_text) = self.build_suppressed_proposed_plan_fallback() {
+                self.logger
+                    .log_raw("[PlanBridge] Falling back to visible proposed_plan text");
+                self.emit_visible_text_fragment(output, fallback_text.as_str());
+            }
+        }
         let stop_reason = self.determine_stop_reason(data, force_incomplete);
 
         let usage = data

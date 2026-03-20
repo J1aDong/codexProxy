@@ -259,6 +259,10 @@ fn test_proposed_plan_bridge_writes_plan_file_and_emits_exit_plan_mode() {
         "plan bridge should emit a synthetic ExitPlanMode tool_use"
     );
     assert!(
+        !joined.contains("<proposed_plan>") && !joined.contains("Clock Plan"),
+        "raw proposed_plan text should be suppressed once the bridge succeeds"
+    );
+    assert!(
         joined.contains("\"stop_reason\":\"tool_use\""),
         "terminal stop_reason should switch to tool_use when ExitPlanMode is bridged"
     );
