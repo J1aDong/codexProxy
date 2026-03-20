@@ -195,6 +195,21 @@ impl MessageProcessor {
         None
     }
 
+    fn is_synthetic_plan_bridge_call_id(call_id: &str) -> bool {
+        call_id.trim().starts_with("plan_bridge_exit_")
+    }
+
+    fn extract_synthetic_plan_bridge_user_note(content: Option<&Value>) -> Option<String> {
+        let text = Self::extract_tool_result_plain_text(content?)?;
+        let trimmed = text.trim();
+        let marker = "To tell you how to proceed, the user said:";
+        let note = trimmed
+            .split_once(marker)
+            .map(|(_, tail)| tail.trim())
+            .filter(|value| !value.is_empty())?;
+        Some(note.to_string())
+    }
+
     fn normalize_skill_tool_input_for_history(input: &mut Value) {
         let Some(obj) = input.as_object_mut() else {
             return;
@@ -509,6 +524,15 @@ impl MessageProcessor {
                                 input: tool_input,
                                 signature,
                             } => {
+                                if id.as_deref().map(Self::is_synthetic_plan_bridge_call_id)
+                                    == Some(true)
+                                {
+                                    log(&format!(
+                                        "📝 [Message #{} Block #{}] Skip synthetic plan bridge tool call in history",
+                                        msg_idx, block_idx
+                                    ));
+                                    continue;
+                                }
                                 if !current_msg_content.is_empty() {
                                     input.push(json!({
                                         "type": "message",
@@ -538,6 +562,43 @@ impl MessageProcessor {
                                 content: tool_content,
                                 ..
                             } => {
+                                if tool_use_id
+                                    .as_deref()
+                                    .map(Self::is_synthetic_plan_bridge_call_id)
+                                    == Some(true)
+                                {
+                                    if let Some(user_note) =
+                                        Self::extract_synthetic_plan_bridge_user_note(
+                                            tool_content.as_ref(),
+                                        )
+                                    {
+                                        if !current_msg_content.is_empty() {
+                                            input.push(json!({
+                                                "type": "message",
+                                                "role": msg.role,
+                                                "content": current_msg_content
+                                            }));
+                                            current_msg_content = Vec::new();
+                                        }
+                                        input.push(json!({
+                                            "type": "message",
+                                            "role": "user",
+                                            "content": [{
+                                                "type": "input_text",
+                                                "text": user_note
+                                            }]
+                                        }));
+                                        log(&format!(
+                                            "📝 [Message #{} Block #{}] Promote synthetic plan bridge rejection note back into user history",
+                                            msg_idx, block_idx
+                                        ));
+                                    }
+                                    log(&format!(
+                                        "📝 [Message #{} Block #{}] Skip synthetic plan bridge tool result in history",
+                                        msg_idx, block_idx
+                                    ));
+                                    continue;
+                                }
                                 let is_skill = if let Some(tid) = tool_use_id {
                                     skill_tool_ids.contains(tid)
                                 } else {
@@ -1405,5 +1466,83 @@ mod tests {
         assert!(rewritten.contains("plain-text shutdown acknowledgment"));
         assert!(rewritten.contains("not a valid shutdown_response"));
         assert!(rewritten.contains("TeamDelete will keep failing"));
+    }
+
+    #[test]
+    fn test_transform_messages_skips_synthetic_plan_bridge_history() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("plan_bridge_exit_1773967643650".to_string()),
+                    name: "ExitPlanMode".to_string(),
+                    input: json!({}),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("plan_bridge_exit_1773967643650".to_string()),
+                    id: None,
+                    content: Some(Value::String(
+                        "The user doesn't want to proceed with this tool use. 线上就是 /app/ 子路径"
+                            .to_string(),
+                    )),
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "继续分析 /app/ 子路径问题".to_string(),
+                )),
+            },
+        ];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let serialized = serde_json::to_string(&input).expect("input should serialize");
+
+        assert!(
+            !serialized.contains("plan_bridge_exit_1773967643650")
+                && !serialized.contains("ExitPlanMode"),
+            "synthetic plan bridge control history should not be replayed upstream"
+        );
+        assert!(
+            serialized.contains("继续分析 /app/ 子路径问题"),
+            "ordinary follow-up user text should remain in upstream history"
+        );
+    }
+
+    #[test]
+    fn test_transform_messages_preserves_user_note_from_synthetic_plan_bridge_rejection() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: Some("plan_bridge_exit_1773967643650".to_string()),
+                id: None,
+                content: Some(Value::String(
+                    "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said:\n改成模拟表盘".to_string(),
+                )),
+            }])),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let content = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .expect("message content should be preserved");
+
+        assert_eq!(
+            content[0].get("type").and_then(Value::as_str),
+            Some("input_text"),
+            "rejection note should be promoted to a normal user text message"
+        );
+        assert_eq!(
+            content[0].get("text").and_then(Value::as_str),
+            Some("改成模拟表盘"),
+            "user note attached to a synthetic ExitPlanMode rejection should remain visible upstream"
+        );
     }
 }

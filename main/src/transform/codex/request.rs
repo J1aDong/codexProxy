@@ -17,7 +17,12 @@ const PROMPT_CACHE_KEY_SEP: u8 = 0x1f;
 const MAX_TRUSTED_REQUEST_CWD_CHARS: usize = 512;
 const MAX_TOOL_DESCRIPTION_CHARS: usize = 240;
 const MAX_TOOL_SCHEMA_DESCRIPTION_CHARS: usize = 120;
-const PLAN_MODE_TOOL_BLACKLIST: &[&str] = &["EnterPlanMode", "ExitPlanMode"];
+const PLAN_MODE_TOOL_BLACKLIST: &[&str] = &[
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+];
 const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
 const ENV_REASONING_SUMMARY_MODE: &str = "CODEX_PROXY_REASONING_SUMMARY";
 const ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT: &str =
@@ -3781,6 +3786,16 @@ hello",
                     "input_schema": {"type":"object","properties":{}}
                 },
                 {
+                    "name": "EnterWorktree",
+                    "description": "Enter worktree",
+                    "input_schema": {"type":"object","properties":{}}
+                },
+                {
+                    "name": "ExitWorktree",
+                    "description": "Exit worktree",
+                    "input_schema": {"type":"object","properties":{"action":{"type":"string"}}}
+                },
+                {
                     "name": "AskUserQuestion",
                     "description": "Ask user question",
                     "input_schema": {"type":"object","properties":{"questions":{"type":"array"}}}
@@ -3801,8 +3816,45 @@ hello",
         );
         assert!(
             !tool_names.contains(&"EnterPlanMode".to_string())
-                && !tool_names.contains(&"ExitPlanMode".to_string()),
+                && !tool_names.contains(&"ExitPlanMode".to_string())
+                && !tool_names.contains(&"EnterWorktree".to_string())
+                && !tool_names.contains(&"ExitWorktree".to_string()),
             "claude-native orchestration tools should be removed by the plan-mode blacklist"
+        );
+    }
+
+    #[test]
+    fn non_plan_requests_keep_worktree_tools_available() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": "退出当前 worktree"
+            }],
+            "tools": [
+                {
+                    "name": "ExitWorktree",
+                    "description": "Exit worktree",
+                    "input_schema": {"type":"object","properties":{"action":{"type":"string"}}}
+                },
+                {
+                    "name": "Read",
+                    "description": "Read files",
+                    "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+                }
+            ],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let tool_names = tool_names(&body);
+
+        assert!(
+            tool_names.contains(&"ExitWorktree".to_string())
+                && tool_names.contains(&"Read".to_string()),
+            "worktree tools should remain available outside plan-mode requests"
         );
     }
 
