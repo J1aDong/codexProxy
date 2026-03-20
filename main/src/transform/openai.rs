@@ -246,14 +246,14 @@ impl OpenAIChatBackend {
             Some(crate::models::SystemContent::Blocks(blocks)) if !blocks.is_empty() => {
                 let text = blocks
                     .iter()
-                    .filter_map(|block| {
-                        if let crate::models::SystemBlock::Text { text } = block {
-                            Some(text.clone())
-                        } else if let crate::models::SystemBlock::PlainString(s) = block {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
+                    .filter_map(|block| match block {
+                        crate::models::SystemBlock::Text { text } => Some(text.clone()),
+                        crate::models::SystemBlock::PlainString(s) => Some(s.clone()),
+                        crate::models::SystemBlock::Other(value) => value
+                            .get("text")
+                            .and_then(|text| text.as_str())
+                            .map(|text| text.to_string())
+                            .or_else(|| serde_json::to_string(value).ok()),
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -314,7 +314,10 @@ impl OpenAIChatBackend {
                                 let function = tool.get("function")?;
                                 let tool_name = function.get("name")?.as_str()?;
                                 if tool_name == name {
-                                    Some(json!({ "type": "function", "name": name }))
+                                    Some(json!({
+                                        "type": "function",
+                                        "function": { "name": name }
+                                    }))
                                 } else {
                                     None
                                 }
@@ -339,6 +342,156 @@ impl OpenAIChatBackend {
     }
 }
 
+struct OpenAIRequestMapper;
+
+impl OpenAIRequestMapper {
+    fn build_body(
+        anthropic_body: &AnthropicRequest,
+        log_tx: Option<&broadcast::Sender<String>>,
+        ctx: &TransformContext,
+        effective_stream: bool,
+        requested_model: &str,
+    ) -> Value {
+        let model = OpenAIChatBackend::normalize_model(requested_model);
+        let (transformed_messages, _) =
+            MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
+
+        let mut messages = Vec::new();
+        if let Some(system_msg) = OpenAIChatBackend::build_system_message(
+            anthropic_body.system.as_ref(),
+            &ctx.custom_injection_prompt,
+        ) {
+            messages.push(system_msg);
+        }
+        messages.extend(OpenAIChatBackend::build_messages(&transformed_messages));
+
+        let mut body = json!({
+            "model": model,
+            "messages": messages,
+            "stream": effective_stream
+        });
+
+        if effective_stream {
+            body["stream_options"] = json!({
+                "include_usage": true
+            });
+        }
+
+        if let Some(obj) = body.as_object_mut() {
+            Self::apply_optional_parameters(obj, anthropic_body, log_tx, ctx, requested_model);
+        }
+
+        body
+    }
+
+    fn apply_optional_parameters(
+        obj: &mut serde_json::Map<String, Value>,
+        anthropic_body: &AnthropicRequest,
+        log_tx: Option<&broadcast::Sender<String>>,
+        ctx: &TransformContext,
+        requested_model: &str,
+    ) {
+        if let Some(max_tokens) = anthropic_body.max_tokens {
+            let configured_limit = ctx.openai_max_tokens_mapping.get_limit(requested_model);
+
+            if let Some(tx) = log_tx {
+                let _ = tx.send(format!(
+                    "[TransformDebug] model: {}, max_tokens: {}, configured_limit: {:?}, mapping: {:?}",
+                    requested_model, max_tokens, configured_limit, ctx.openai_max_tokens_mapping
+                ));
+            }
+
+            let effective_max_tokens = if let Some(limit) = configured_limit {
+                let effective = max_tokens.min(limit);
+                if effective < max_tokens {
+                    if let Some(tx) = log_tx {
+                        let _ = tx.send(format!(
+                            "[Transform] max_tokens limited: {} → {} (configured limit: {})",
+                            max_tokens, effective, limit
+                        ));
+                    }
+                }
+                effective
+            } else {
+                max_tokens
+            };
+            obj.insert("max_tokens".to_string(), json!(effective_max_tokens));
+        }
+        if let Some(temperature) = anthropic_body.temperature {
+            obj.insert("temperature".to_string(), json!(temperature));
+        }
+        if let Some(top_p) = anthropic_body.top_p {
+            obj.insert("top_p".to_string(), json!(top_p));
+        }
+        if let Some(metadata) = anthropic_body.metadata.as_ref() {
+            obj.insert("metadata".to_string(), metadata.clone());
+        }
+        if let Some(stop) = &anthropic_body.stop_sequences {
+            obj.insert("stop".to_string(), json!(stop));
+        }
+        if let Some(tools) = OpenAIChatBackend::convert_tools(anthropic_body.tools.as_ref()) {
+            obj.insert("tools".to_string(), json!(tools));
+            obj.insert(
+                "parallel_tool_calls".to_string(),
+                json!(OpenAIChatBackend::resolve_parallel_tool_calls(
+                    anthropic_body
+                )),
+            );
+            if let Some(tool_choice) = OpenAIChatBackend::build_tool_choice(anthropic_body, &tools)
+            {
+                obj.insert("tool_choice".to_string(), tool_choice);
+            }
+        }
+    }
+}
+
+struct OpenAIUpstreamRequestBuilder;
+
+impl OpenAIUpstreamRequestBuilder {
+    fn is_azure(target_url: &str) -> bool {
+        target_url.contains("openai.azure.com")
+    }
+
+    fn accept_header(body: &Value) -> &'static str {
+        if body
+            .get("stream")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            "text/event-stream"
+        } else {
+            "application/json"
+        }
+    }
+
+    fn apply_auth(
+        builder: reqwest::RequestBuilder,
+        target_url: &str,
+        api_key: &str,
+    ) -> reqwest::RequestBuilder {
+        if Self::is_azure(target_url) {
+            builder.header("api-key", api_key)
+        } else {
+            builder.header("Authorization", format!("Bearer {}", api_key))
+        }
+    }
+
+    fn build_request(
+        client: &reqwest::Client,
+        target_url: &str,
+        api_key: &str,
+        body: &Value,
+    ) -> reqwest::RequestBuilder {
+        let endpoint = OpenAIChatBackend::build_messages_endpoint(target_url);
+        let builder = client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .header("Accept", Self::accept_header(body));
+
+        Self::apply_auth(builder, target_url, api_key).body(body.to_string())
+    }
+}
+
 impl TransformBackend for OpenAIChatBackend {
     fn transform_request(
         &self,
@@ -353,94 +506,13 @@ impl TransformBackend for OpenAIChatBackend {
         let requested = model_override
             .or_else(|| anthropic_body.model.clone())
             .unwrap_or_else(|| "gpt-4o".to_string());
-        let model = Self::normalize_model(&requested);
-
-        // Transform messages using MessageProcessor
-        let (codex_messages, _) =
-            MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
-
-        // Build OpenAI messages array
-        let mut messages = Vec::new();
-
-        // Add system message first if present
-        if let Some(system_msg) =
-            Self::build_system_message(anthropic_body.system.as_ref(), &ctx.custom_injection_prompt)
-        {
-            messages.push(system_msg);
-        }
-
-        // Add converted messages
-        messages.extend(Self::build_messages(&codex_messages));
-
-        // Build request body
-        let mut body = json!({
-            "model": model,
-            "messages": messages,
-            "stream": effective_stream
-        });
-
-        if effective_stream {
-            body["stream_options"] = json!({
-                "include_usage": true
-            });
-        }
-
-        // Add optional parameters
-        if let Some(obj) = body.as_object_mut() {
-            // Apply max_tokens limiting based on slot configuration
-            if let Some(max_tokens) = anthropic_body.max_tokens {
-                // Get configured limit for this model's slot
-                let configured_limit = ctx.openai_max_tokens_mapping.get_limit(&requested);
-
-                // Debug logging
-                if let Some(tx) = log_tx {
-                    let _ = tx.send(format!(
-                        "[TransformDebug] model: {}, max_tokens: {}, configured_limit: {:?}, mapping: {:?}",
-                        requested, max_tokens, configured_limit, ctx.openai_max_tokens_mapping
-                    ));
-                }
-
-                let effective_max_tokens = if let Some(limit) = configured_limit {
-                    // Configured limit exists: apply min( request, limit )
-                    let effective = max_tokens.min(limit);
-                    if effective < max_tokens {
-                        if let Some(tx) = log_tx {
-                            let _ = tx.send(format!(
-                                "[Transform] max_tokens limited: {} → {} (configured limit: {})",
-                                max_tokens, effective, limit
-                            ));
-                        }
-                    }
-                    effective
-                } else {
-                    // No configured limit: pass-through
-                    max_tokens
-                };
-                obj.insert("max_tokens".to_string(), json!(effective_max_tokens));
-            }
-            if let Some(temperature) = anthropic_body.temperature {
-                obj.insert("temperature".to_string(), json!(temperature));
-            }
-            if let Some(top_p) = anthropic_body.top_p {
-                obj.insert("top_p".to_string(), json!(top_p));
-            }
-            if let Some(metadata) = anthropic_body.metadata.as_ref() {
-                obj.insert("metadata".to_string(), metadata.clone());
-            }
-            if let Some(stop) = &anthropic_body.stop_sequences {
-                obj.insert("stop".to_string(), json!(stop));
-            }
-            if let Some(tools) = Self::convert_tools(anthropic_body.tools.as_ref()) {
-                obj.insert("tools".to_string(), json!(tools));
-                obj.insert(
-                    "parallel_tool_calls".to_string(),
-                    json!(Self::resolve_parallel_tool_calls(anthropic_body)),
-                );
-                if let Some(tool_choice) = Self::build_tool_choice(anthropic_body, &tools) {
-                    obj.insert("tool_choice".to_string(), tool_choice);
-                }
-            }
-        }
+        let body = OpenAIRequestMapper::build_body(
+            anthropic_body,
+            log_tx,
+            ctx,
+            effective_stream,
+            &requested,
+        );
 
         (body, session_id)
     }
@@ -454,33 +526,7 @@ impl TransformBackend for OpenAIChatBackend {
         _session_id: &str,
         _anthropic_version: &str,
     ) -> reqwest::RequestBuilder {
-        let endpoint = Self::build_messages_endpoint(target_url);
-
-        // Azure uses api-key header, others use Bearer token
-        let is_azure = target_url.contains("openai.azure.com");
-
-        let accept_header = if body
-            .get("stream")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-        {
-            "text/event-stream"
-        } else {
-            "application/json"
-        };
-
-        let mut builder = client
-            .post(endpoint)
-            .header("Content-Type", "application/json")
-            .header("Accept", accept_header);
-
-        if is_azure {
-            builder = builder.header("api-key", api_key);
-        } else {
-            builder = builder.header("Authorization", format!("Bearer {}", api_key));
-        }
-
-        builder.body(body.to_string())
+        OpenAIUpstreamRequestBuilder::build_request(client, target_url, api_key, body)
     }
 
     fn create_response_transformer(
@@ -724,6 +770,164 @@ impl OpenAIChatResponseTransformer {
             json!({ "type": "message_stop" })
         ));
     }
+
+    fn capture_usage(&mut self, data: &Value) {
+        if let Some(usage) = data.get("usage") {
+            self.usage = Some(json!({
+                "input_tokens": usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                "output_tokens": usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0)
+            }));
+        }
+    }
+
+    fn first_choice<'a>(&self, data: &'a Value) -> Option<&'a Value> {
+        data.get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first())
+    }
+
+    fn capture_choice_metadata(&mut self, choice: &Value) {
+        if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+            self.finish_reason = Some(reason.to_string());
+        }
+        if let Some(stop_sequence) = choice.get("stop_sequence").and_then(|v| v.as_str()) {
+            self.stop_sequence = Some(stop_sequence.to_string());
+        }
+    }
+
+    fn emit_reasoning_delta_if_any(&mut self, delta: &Value, out: &mut Vec<String>) {
+        if !self.allow_visible_thinking {
+            return;
+        }
+
+        if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+            if !reasoning.is_empty() {
+                self.open_thinking_block_if_needed(out);
+                out.push(format!(
+                    "event: content_block_delta\ndata: {}\n\n",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": self.open_text_index,
+                        "delta": { "type": "thinking_delta", "thinking": reasoning }
+                    })
+                ));
+            }
+        }
+    }
+
+    fn text_delta_from(&self, delta: &Value) -> Option<String> {
+        delta
+            .get("content")
+            .and_then(|v| v.as_str())
+            .filter(|content| !content.is_empty())
+            .map(|content| content.to_string())
+            .or_else(|| {
+                delta
+                    .get("refusal")
+                    .and_then(|v| v.as_str())
+                    .filter(|refusal| !refusal.is_empty())
+                    .map(|refusal| refusal.to_string())
+            })
+    }
+
+    fn emit_text_delta_if_any(&mut self, delta: &Value, out: &mut Vec<String>) {
+        if let Some(content) = self.text_delta_from(delta) {
+            self.open_text_block_if_needed(out);
+            out.push(format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_delta",
+                    "index": self.open_text_index,
+                    "delta": { "type": "text_delta", "text": content }
+                })
+            ));
+        }
+    }
+
+    fn normalized_tool_calls_from(&self, delta: &Value) -> Vec<Value> {
+        if let Some(tool_calls_delta) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            tool_calls_delta.clone()
+        } else if let Some(function_call_delta) = delta.get("function_call") {
+            vec![json!({
+                "index": 0,
+                "function": function_call_delta
+            })]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn apply_tool_call_delta(&mut self, tool_call_delta: &Value, out: &mut Vec<String>) {
+        let index = tool_call_delta
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        while self.tool_calls.len() <= index {
+            self.tool_calls.push(None);
+        }
+
+        let current_state = self.tool_calls[index].clone();
+        let mut new_state = current_state.unwrap_or_else(|| ToolCallState {
+            id: format!("call_{}", index),
+            name: "unknown".to_string(),
+            arguments: String::new(),
+            block_index: None,
+            has_started: false,
+        });
+
+        if let Some(id) = tool_call_delta.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                new_state.id = id.to_string();
+            }
+        }
+        if let Some(name) = tool_call_delta
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            if !name.is_empty() {
+                new_state.name = name.to_string();
+            }
+        }
+        if let Some(args) = tool_call_delta
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|a| a.as_str())
+        {
+            new_state.arguments.push_str(args);
+        }
+
+        self.tool_calls[index] = Some(new_state);
+        self.open_tool_block_if_needed(index, out);
+
+        if let Some(args_delta) = tool_call_delta
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|a| a.as_str())
+        {
+            if !args_delta.is_empty() {
+                if let Some(Some(state)) = self.tool_calls.get(index) {
+                    if let Some(block_idx) = state.block_index {
+                        out.push(format!(
+                            "event: content_block_delta\ndata: {}\n\n",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": block_idx,
+                                "delta": { "type": "input_json_delta", "partial_json": args_delta }
+                            })
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn emit_tool_call_deltas(&mut self, delta: &Value, out: &mut Vec<String>) {
+        for tool_call_delta in self.normalized_tool_calls_from(delta) {
+            self.apply_tool_call_delta(&tool_call_delta, out);
+        }
+    }
 }
 
 impl ResponseTransformer for OpenAIChatResponseTransformer {
@@ -747,18 +951,9 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
             return output;
         };
 
-        if let Some(usage) = data.get("usage") {
-            self.usage = Some(json!({
-                "input_tokens": usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                "output_tokens": usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0)
-            }));
-        }
+        self.capture_usage(&data);
 
-        let choice = match data
-            .get("choices")
-            .and_then(|v| v.as_array())
-            .and_then(|v| v.first())
-        {
+        let choice = match self.first_choice(&data) {
             Some(c) => c,
             None => return output,
         };
@@ -769,132 +964,10 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
         };
 
         self.ensure_message_start(&mut output);
-
-        if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-            self.finish_reason = Some(reason.to_string());
-        }
-        if let Some(stop_sequence) = choice.get("stop_sequence").and_then(|v| v.as_str()) {
-            self.stop_sequence = Some(stop_sequence.to_string());
-        }
-
-        if self.allow_visible_thinking {
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                if !reasoning.is_empty() {
-                    self.open_thinking_block_if_needed(&mut output);
-                    output.push(format!(
-                        "event: content_block_delta\ndata: {}\n\n",
-                        json!({
-                            "type": "content_block_delta",
-                            "index": self.open_text_index,
-                            "delta": { "type": "thinking_delta", "thinking": reasoning }
-                        })
-                    ));
-                }
-            }
-        }
-
-        let text_delta = delta
-            .get("content")
-            .and_then(|v| v.as_str())
-            .filter(|content| !content.is_empty())
-            .or_else(|| {
-                delta
-                    .get("refusal")
-                    .and_then(|v| v.as_str())
-                    .filter(|refusal| !refusal.is_empty())
-            });
-
-        if let Some(content) = text_delta {
-            self.open_text_block_if_needed(&mut output);
-            output.push(format!(
-                "event: content_block_delta\ndata: {}\n\n",
-                json!({
-                    "type": "content_block_delta",
-                    "index": self.open_text_index,
-                    "delta": { "type": "text_delta", "text": content }
-                })
-            ));
-        }
-
-        let normalized_tool_calls: Vec<Value> =
-            if let Some(tool_calls_delta) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                tool_calls_delta.clone()
-            } else if let Some(function_call_delta) = delta.get("function_call") {
-                vec![json!({
-                    "index": 0,
-                    "function": function_call_delta
-                })]
-            } else {
-                Vec::new()
-            };
-
-        if !normalized_tool_calls.is_empty() {
-            for tool_call_delta in &normalized_tool_calls {
-                let index = tool_call_delta
-                    .get("index")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-
-                while self.tool_calls.len() <= index {
-                    self.tool_calls.push(None);
-                }
-
-                let current_state = self.tool_calls[index].clone();
-                let mut new_state = current_state.unwrap_or_else(|| ToolCallState {
-                    id: format!("call_{}", index),
-                    name: "unknown".to_string(),
-                    arguments: String::new(),
-                    block_index: None,
-                    has_started: false,
-                });
-
-                if let Some(id) = tool_call_delta.get("id").and_then(|v| v.as_str()) {
-                    if !id.is_empty() {
-                        new_state.id = id.to_string();
-                    }
-                }
-                if let Some(name) = tool_call_delta
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                {
-                    if !name.is_empty() {
-                        new_state.name = name.to_string();
-                    }
-                }
-                if let Some(args) = tool_call_delta
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                {
-                    new_state.arguments.push_str(args);
-                }
-
-                self.tool_calls[index] = Some(new_state);
-                self.open_tool_block_if_needed(index, &mut output);
-
-                if let Some(args_delta) = tool_call_delta
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                {
-                    if !args_delta.is_empty() {
-                        if let Some(Some(state)) = self.tool_calls.get(index) {
-                            if let Some(block_idx) = state.block_index {
-                                output.push(format!(
-                                    "event: content_block_delta\ndata: {}\n\n",
-                                    json!({
-                                        "type": "content_block_delta",
-                                        "index": block_idx,
-                                        "delta": { "type": "input_json_delta", "partial_json": args_delta }
-                                    })
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        self.capture_choice_metadata(choice);
+        self.emit_reasoning_delta_if_any(delta, &mut output);
+        self.emit_text_delta_if_any(delta, &mut output);
+        self.emit_tool_call_deltas(delta, &mut output);
 
         output
     }
@@ -1373,6 +1446,87 @@ mod tests {
     }
 
     #[test]
+    fn transform_request_maps_required_and_none_tool_choice_variants() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let tools = Some(vec![json!({
+            "name": "Bash",
+            "description": "Run bash commands",
+            "input_schema": {"type": "object", "properties": {}}
+        })]);
+        let base_request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Run tool".to_string())),
+            }],
+            system: None,
+            tools: tools.clone(),
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            top_k: None,
+            stop_sequences: Some(vec!["</END>".to_string()]),
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let mut required_request = base_request;
+        required_request.tool_choice = Some(json!({"type": "any"}));
+        let (required_body, _) =
+            backend.transform_request(&required_request, None, &ctx, true, None);
+        assert_eq!(required_body.get("tool_choice"), Some(&json!("required")));
+        assert_eq!(
+            required_body.get("stream_options"),
+            Some(&json!({"include_usage": true}))
+        );
+        assert!(
+            required_body
+                .get("temperature")
+                .and_then(Value::as_f64)
+                .map(|value| (value - 0.2).abs() < 1e-6)
+                .unwrap_or(false),
+            "temperature should be preserved within float tolerance"
+        );
+        assert!(
+            required_body
+                .get("top_p")
+                .and_then(Value::as_f64)
+                .map(|value| (value - 0.9).abs() < 1e-6)
+                .unwrap_or(false),
+            "top_p should be preserved within float tolerance"
+        );
+        assert_eq!(required_body.get("stop"), Some(&json!(["</END>"])));
+
+        let mut none_request = required_request;
+        none_request.tool_choice = Some(json!("none"));
+        let (none_body, _) = backend.transform_request(&none_request, None, &ctx, true, None);
+        assert_eq!(none_body.get("tool_choice"), Some(&json!("none")));
+    }
+
+    #[test]
     fn transform_request_respects_stream_and_maps_tool_choice_controls() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
@@ -1432,7 +1586,7 @@ mod tests {
         );
         assert_eq!(
             body.get("tool_choice"),
-            Some(&json!({"type": "function", "name": "Bash"}))
+            Some(&json!({"type": "function", "function": {"name": "Bash"}}))
         );
         assert_eq!(
             body.get("parallel_tool_calls").and_then(Value::as_bool),
@@ -1607,6 +1761,68 @@ mod tests {
     }
 
     #[test]
+    fn transform_request_preserves_text_from_other_system_blocks() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping, SystemBlock, SystemContent,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("你好".to_string())),
+            }],
+            system: Some(SystemContent::Blocks(vec![
+                SystemBlock::Text {
+                    text: "Primary system text.".to_string(),
+                },
+                SystemBlock::Other(json!({"text": "Secondary system text."})),
+            ])),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+        let system_content = messages[0]
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("system message should be string content");
+
+        assert!(system_content.contains("Primary system text."));
+        assert!(system_content.contains("Secondary system text."));
+    }
+
+    #[test]
     fn transform_request_creates_system_message_from_custom_injection_prompt_when_missing() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
@@ -1700,6 +1916,98 @@ mod tests {
                 .get("Accept")
                 .and_then(|value| value.to_str().ok()),
             Some("application/json")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_uses_api_key_for_azure_and_preserves_endpoint() {
+        let backend = OpenAIChatBackend;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client should build without system proxy lookup");
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        });
+        let azure_url = "https://demo.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview";
+
+        let request = backend
+            .build_upstream_request(
+                &client,
+                azure_url,
+                "azure-key",
+                &body,
+                "session-1",
+                "2023-06-01",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(request.url().as_str(), azure_url);
+        assert_eq!(
+            request
+                .headers()
+                .get("api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("azure-key")
+        );
+        assert!(
+            request.headers().get("Authorization").is_none(),
+            "azure requests should not send bearer authorization"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Accept")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_appends_chat_completions_for_custom_base_url() {
+        let backend = OpenAIChatBackend;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client should build without system proxy lookup");
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        });
+
+        let request = backend
+            .build_upstream_request(
+                &client,
+                "https://openrouter.ai/api",
+                "test-key",
+                &body,
+                "session-1",
+                "2023-06-01",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-key")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Accept")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
         );
     }
 
