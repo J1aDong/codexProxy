@@ -1639,6 +1639,37 @@ fn sanitize_function_call_output_for_codex(output: &str) -> Option<String> {
     }
 }
 
+fn normalize_function_call_output_value_for_codex(output: &Value) -> Value {
+    if let Some(text) = output.as_str() {
+        return sanitize_function_call_output_for_codex(text)
+            .map(Value::String)
+            .unwrap_or_else(|| Value::String(String::new()));
+    }
+
+    if let Some(items) = output.as_array() {
+        return Value::Array(items.clone());
+    }
+
+    if output.is_object() {
+        let compact = serde_json::to_string(output).unwrap_or_else(|_| "{}".to_string());
+        let sanitized = sanitize_function_call_output_for_codex(&compact)
+            .unwrap_or_else(|| EMPTY_TOOL_OUTPUT_PLACEHOLDER.to_string());
+        return Value::Array(vec![json!({
+            "type": "input_text",
+            "text": sanitized
+        })]);
+    }
+
+    let fallback = output
+        .as_bool()
+        .map(|v| v.to_string())
+        .or_else(|| output.as_i64().map(|v| v.to_string()))
+        .or_else(|| output.as_u64().map(|v| v.to_string()))
+        .or_else(|| output.as_f64().map(|v| v.to_string()))
+        .unwrap_or_else(|| EMPTY_TOOL_OUTPUT_PLACEHOLDER.to_string());
+    Value::String(fallback)
+}
+
 fn reconcile_function_call_pairs(input: &mut Vec<Value>) {
     let mut open_calls: HashSet<String> = HashSet::new();
     let mut call_order: Vec<String> = Vec::new();
@@ -2292,17 +2323,10 @@ impl TransformRequest {
                 }
             }
 
-            if item_type.as_deref() == Some("function_call_output")
-                && obj.get("output").and_then(|v| v.as_str()).is_some()
-            {
-                let output = obj
-                    .get("output")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if let Some(sanitized_output) = sanitize_function_call_output_for_codex(output) {
-                    obj.insert("output".to_string(), json!(sanitized_output));
-                } else {
-                    obj.insert("output".to_string(), json!(""));
+            if item_type.as_deref() == Some("function_call_output") {
+                if let Some(output) = obj.get_mut("output") {
+                    let normalized = normalize_function_call_output_value_for_codex(output);
+                    *output = normalized;
                 }
             }
         }

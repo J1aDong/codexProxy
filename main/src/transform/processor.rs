@@ -132,10 +132,14 @@ impl MessageProcessor {
                 "Agent launch failed because the request asked for worktree isolation in a context where worktree creation is unavailable. Ordinary subagent requests do not require worktree; only use worktree when the user explicitly asks for isolated repo work.".to_string(),
             ));
         }
-        if !trimmed.starts_with("Spawned successfully.") {
-            return None;
-        }
-        if !trimmed.contains("agent_id:") || !trimmed.contains("team_name:") {
+
+        let is_team_agent = trimmed.starts_with("Spawned successfully.")
+            && trimmed.contains("agent_id:")
+            && trimmed.contains("team_name:");
+        let is_async_agent = trimmed.starts_with("Async agent launched successfully.")
+            && trimmed.contains("agentId:");
+
+        if !is_team_agent && !is_async_agent {
             return None;
         }
 
@@ -148,18 +152,51 @@ impl MessageProcessor {
                 .map(|value| value.to_string())
         };
 
-        let agent_id = read_field("agent_id:").unwrap_or_default();
-        let teammate_name = read_field("name:").unwrap_or_default();
-        let team_name = read_field("team_name:").unwrap_or_default();
+        let extract_leading_token = |value: Option<String>| -> Option<String> {
+            value.and_then(|raw| {
+                raw.split_whitespace()
+                    .next()
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(|token| token.to_string())
+            })
+        };
 
-        if agent_id.is_empty() || team_name.is_empty() {
+        if is_team_agent {
+            let agent_id = read_field("agent_id:").unwrap_or_default();
+            let teammate_name = read_field("name:").unwrap_or_default();
+            let team_name = read_field("team_name:").unwrap_or_default();
+
+            if agent_id.is_empty() || team_name.is_empty() {
+                return None;
+            }
+
+            return Some(json!({
+                "kind": "background_agent",
+                "agent_id": agent_id,
+                "name": teammate_name,
+                "team_name": team_name,
+                "status": "running",
+                "poll_with_task_output": false,
+                "progress_hint": "Use SendMessage with the agent_id to continue this agent. Do not call TaskOutput with this agent_id; wait for teammate-message or idle_notification updates instead."
+            }));
+        }
+
+        let agent_id = extract_leading_token(read_field("agentId:")).unwrap_or_default();
+        let output_file = read_field("output_file:").unwrap_or_default();
+
+        if agent_id.is_empty() {
             return None;
         }
 
-        let rewritten = format!(
-            "Spawned successfully.\nagent_id: {agent_id}\nname: {teammate_name}\nteam_name: {team_name}\nThe agent is now running and will receive instructions via mailbox.\n\nImportant: this is a team mailbox agent id, not a TaskOutput task_id. Do not call TaskOutput with this agent_id. Wait for teammate-message or idle_notification updates instead."
-        );
-        Some(Value::String(rewritten))
+        Some(json!({
+            "kind": "background_agent",
+            "agent_id": agent_id,
+            "output_file": output_file,
+            "status": "running",
+            "poll_with_task_output": false,
+            "progress_hint": "Use SendMessage with the agent_id to continue this agent, or Read/Bash tail the output_file to inspect progress. Do not call TaskOutput with this agent_id."
+        }))
     }
 
     fn rewrite_task_output_tool_result(content: &Value) -> Option<Value> {
@@ -1369,13 +1406,81 @@ mod tests {
             .iter()
             .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
             .and_then(|item| item.get("output"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+            .cloned()
+            .unwrap_or(Value::Null);
 
-        assert!(rewritten.contains("team mailbox agent id"));
-        assert!(rewritten.contains("Do not call TaskOutput with this agent_id"));
-        assert!(rewritten.contains("agent_vehicle@debug-swarm"));
+        let output = rewritten.as_object().expect("structured agent launch metadata");
+        assert_eq!(output.get("kind").and_then(Value::as_str), Some("background_agent"));
+        assert_eq!(
+            output.get("agent_id").and_then(Value::as_str),
+            Some("agent_vehicle@debug-swarm")
+        );
+        assert_eq!(output.get("team_name").and_then(Value::as_str), Some("debug-swarm"));
+        assert_eq!(output.get("name").and_then(Value::as_str), Some("agent_vehicle"));
+        assert_eq!(
+            output.get("poll_with_task_output").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_transform_messages_rewrites_async_agent_launch_result_into_structured_metadata() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_agent_1".to_string()),
+                    name: "Agent".to_string(),
+                    input: json!({
+                        "name": "weather-beijing",
+                        "run_in_background": true
+                    }),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_agent_1".to_string()),
+                    id: None,
+                    content: Some(Value::Array(vec![json!({
+                        "type": "text",
+                        "text": "Async agent launched successfully.\nagentId: a6b95ea1c5bd2a390 (internal ID - do not mention to user. Use SendMessage with to: 'a6b95ea1c5bd2a390' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using. Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.\noutput_file: /private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output\nIf asked, you can check progress before completion by using Read or Bash tail on the output file."
+                    })])),
+                }])),
+            },
+        ];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .and_then(|item| item.get("output"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        let output = rewritten.as_object().expect("structured async agent launch metadata");
+        assert_eq!(output.get("kind").and_then(Value::as_str), Some("background_agent"));
+        assert_eq!(
+            output.get("agent_id").and_then(Value::as_str),
+            Some("a6b95ea1c5bd2a390")
+        );
+        assert_eq!(
+            output.get("output_file").and_then(Value::as_str),
+            Some("/private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output")
+        );
+        assert_eq!(output.get("status").and_then(Value::as_str), Some("running"));
+        assert_eq!(
+            output.get("poll_with_task_output").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            output
+                .get("progress_hint")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "Use SendMessage with the agent_id to continue this agent, or Read/Bash tail the output_file to inspect progress. Do not call TaskOutput with this agent_id."
+        );
     }
 
     #[test]

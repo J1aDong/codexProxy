@@ -676,6 +676,77 @@ fn test_codex_request_preserves_structured_tool_result_output() {
 }
 
 #[test]
+fn test_codex_request_normalizes_structured_background_agent_output_object() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_agent_bg".to_string()),
+                    name: "Agent".to_string(),
+                    input: json!({"description": "查北京天气", "run_in_background": true}),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_agent_bg".to_string()),
+                    id: None,
+                    content: Some(json!([
+                        {
+                            "type": "text",
+                            "text": "Async agent launched successfully.\nagentId: a6b95ea1c5bd2a390 (internal ID - do not mention to user. Use SendMessage with to: 'a6b95ea1c5bd2a390' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using. Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.\noutput_file: /private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output\nIf asked, you can check progress before completion by using Read or Bash tail on the output file."
+                        }
+                    ])),
+                }])),
+            },
+        ],
+        system: None,
+        metadata: None,
+        stream: true,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+    let tool_output = input
+        .iter()
+        .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+        .expect("function_call_output should exist");
+
+    let output = tool_output
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("background agent metadata should be normalized into output array");
+    assert_eq!(output.len(), 1);
+    assert_eq!(
+        output[0].get("type").and_then(|v| v.as_str()),
+        Some("input_text")
+    );
+    let text = output[0]
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(text.contains(r#""kind":"background_agent""#));
+    assert!(text.contains(r#""agent_id":"a6b95ea1c5bd2a390""#));
+    assert!(text.contains(r#""poll_with_task_output":false"#));
+}
+
+#[test]
 fn test_codex_request_maps_document_tool_result_to_input_file() {
     let request = AnthropicRequest {
         model: Some("claude-sonnet-4-5-20250929".to_string()),
