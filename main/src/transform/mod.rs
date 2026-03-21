@@ -15,6 +15,9 @@ use crate::models::{
 #[derive(Clone, Debug, Default)]
 pub struct ResponseTransformRequestContext {
     pub codex_plan_file_path: Option<String>,
+    pub contains_background_agent_completion: bool,
+    pub historical_background_agent_launch_count: usize,
+    pub terminal_background_agent_completion_count: usize,
 }
 
 /// 转换上下文 —— 从 ProxyServer 配置派生，传入 transform 方法

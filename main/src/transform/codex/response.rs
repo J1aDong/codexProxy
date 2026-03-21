@@ -440,6 +440,7 @@ pub struct TransformResponse {
     proposed_plan_body_buffer: String,
     latest_proposed_plan_body: Option<String>,
     codex_plan_file_path: Option<String>,
+    contains_background_agent_completion: bool,
     plan_bridge_emitted: bool,
 
     // Cross-chunk leak suppression state
@@ -462,6 +463,9 @@ pub struct TransformResponse {
     web_search_call_by_item_id: HashMap<String, String>,
     response_created_announced: bool,
     response_in_progress_announced: bool,
+    launched_background_agent_count: usize,
+    terminal_background_agent_completion_count: usize,
+    suppress_visible_final_answer_text: bool,
     high_risk_leak_question_emitted: bool,
     last_terminal_event: Option<String>,
     diagnostics: TransformDiagnostics,
@@ -1641,6 +1645,7 @@ impl TransformResponse {
             proposed_plan_body_buffer: String::new(),
             latest_proposed_plan_body: None,
             codex_plan_file_path: None,
+            contains_background_agent_completion: false,
             plan_bridge_emitted: false,
             suppressing_cross_chunk_leak: false,
             suppressing_suggestion_mode_prompt: false,
@@ -1655,6 +1660,9 @@ impl TransformResponse {
             web_search_call_by_item_id: HashMap::new(),
             response_created_announced: false,
             response_in_progress_announced: false,
+            launched_background_agent_count: 0,
+            terminal_background_agent_completion_count: 0,
+            suppress_visible_final_answer_text: false,
             high_risk_leak_question_emitted: false,
             last_terminal_event: None,
             diagnostics: TransformDiagnostics::default(),
@@ -2585,6 +2593,18 @@ impl TransformResponse {
         tool.arguments_buffer.clone()
     }
 
+    fn tool_launches_background_agent(tool_name: &str, arguments: &str) -> bool {
+        if !tool_name.eq_ignore_ascii_case("Agent") {
+            return false;
+        }
+
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|parsed| parsed.as_object().cloned())
+            .and_then(|input| input.get("run_in_background").and_then(|value| value.as_bool()))
+            .unwrap_or(false)
+    }
+
     fn build_background_task_progress_message(tool_name: &str, arguments: &str) -> Option<String> {
         let parsed = serde_json::from_str::<Value>(arguments).ok()?;
         let input = parsed.as_object()?;
@@ -2924,6 +2944,15 @@ data: {}
             "event: content_block_stop\ndata: {}\n\n",
             json!({ "type": "content_block_stop", "index": idx })
         ));
+
+        if Self::tool_launches_background_agent(tool.name.as_str(), arguments.as_str()) {
+            self.launched_background_agent_count += 1;
+            if self.launched_background_agent_count >= 2
+                && !self.contains_background_agent_completion
+            {
+                self.suppress_visible_final_answer_text = true;
+            }
+        }
 
         if Self::build_background_task_progress_message(tool.name.as_str(), arguments.as_str())
             .as_deref()
@@ -3671,6 +3700,16 @@ data: {}
         {
             self.open_thinking_block_if_needed(output);
             self.emit_thinking_delta(output, fragment);
+            return;
+        }
+
+        if self.suppress_visible_final_answer_text
+            && !self.in_commentary_phase
+            && !(self.had_reasoning_in_response && !self.saw_message_item_added)
+        {
+            self.logger.log_raw(
+                "[Info] Suppressing visible final-answer text for multi-background-agent launch turn",
+            );
             return;
         }
 
@@ -4792,6 +4831,15 @@ impl ResponseTransformer for TransformResponse {
 
     fn configure_request_context(&mut self, ctx: &ResponseTransformRequestContext) {
         self.codex_plan_file_path = ctx.codex_plan_file_path.clone();
+        self.contains_background_agent_completion = ctx.contains_background_agent_completion;
+        self.launched_background_agent_count = self
+            .launched_background_agent_count
+            .max(ctx.historical_background_agent_launch_count);
+        self.terminal_background_agent_completion_count =
+            ctx.terminal_background_agent_completion_count;
+        self.suppress_visible_final_answer_text = self.launched_background_agent_count >= 2
+            && self.terminal_background_agent_completion_count
+                < self.launched_background_agent_count;
     }
 
     fn take_diagnostics_summary(&mut self) -> Option<Value> {

@@ -69,6 +69,125 @@ impl MessageProcessor {
             || normalized.starts_with("I'llfirst")
     }
 
+    fn classify_background_agent_completion_from_transcript(
+        output_file: Option<&str>,
+        fallback_result: &str,
+    ) -> &'static str {
+        let Some(path) = output_file.map(str::trim).filter(|value| !value.is_empty()) else {
+            return if fallback_result.is_empty() {
+                "missing"
+            } else if Self::looks_like_placeholder_agent_result(fallback_result) {
+                "incomplete_placeholder"
+            } else {
+                "usable"
+            };
+        };
+
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return if fallback_result.is_empty() {
+                "missing"
+            } else if Self::looks_like_placeholder_agent_result(fallback_result) {
+                "incomplete_placeholder"
+            } else {
+                "usable"
+            };
+        };
+
+        let mut saw_execution = false;
+        let mut saw_terminal_answer = false;
+
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let payload = trimmed
+                .split_once('→')
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or(trimmed);
+            let Ok(entry) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+
+            let top_level_execution = entry
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(|value| matches!(value, "function_call" | "function_call_output" | "tool_use" | "tool_result" | "server_tool_use" | "server_tool_result"))
+                .unwrap_or(false);
+            let nested_execution = entry
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items.iter().any(|item| {
+                        item.get("type")
+                            .and_then(|value| value.as_str())
+                            .map(|value| {
+                                matches!(
+                                    value,
+                                    "function_call"
+                                        | "function_call_output"
+                                        | "tool_use"
+                                        | "tool_result"
+                                        | "server_tool_use"
+                                        | "server_tool_result"
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if top_level_execution || nested_execution {
+                saw_execution = true;
+            }
+
+            let is_terminal_answer = entry
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(|value| value == "assistant")
+                .unwrap_or(false)
+                && entry
+                    .get("message")
+                    .and_then(|message| message.get("stop_reason"))
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.eq_ignore_ascii_case("end_turn"))
+                    .unwrap_or(false)
+                && entry
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items.iter().any(|item| {
+                            item.get("type").and_then(|value| value.as_str()) == Some("text")
+                                && item
+                                    .get("text")
+                                    .and_then(|value| value.as_str())
+                                    .map(|text| !text.trim().is_empty())
+                                    .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+            if is_terminal_answer {
+                saw_terminal_answer = true;
+            }
+        }
+
+        if saw_execution && saw_terminal_answer {
+            return "usable";
+        }
+        if !saw_execution && saw_terminal_answer {
+            return "planning_only";
+        }
+        if saw_execution {
+            return "incomplete";
+        }
+        if fallback_result.is_empty() {
+            "missing"
+        } else {
+            "planning_only"
+        }
+    }
+
     fn build_background_agent_completion_payload(
         source: &str,
         agent_id: Option<&str>,
@@ -80,13 +199,10 @@ impl MessageProcessor {
         status: Option<&str>,
     ) -> String {
         let result_text = result.unwrap_or("").trim();
-        let result_status = if result_text.is_empty() {
-            "missing"
-        } else if Self::looks_like_placeholder_agent_result(result_text) {
-            "incomplete_placeholder"
-        } else {
-            "usable"
-        };
+        let result_status = Self::classify_background_agent_completion_from_transcript(
+            output_file,
+            result_text,
+        );
 
         let mut payload = json!({
             "kind": "background_agent_completion",
@@ -136,6 +252,15 @@ impl MessageProcessor {
         let output_file = Self::extract_xml_tag_body(trimmed, "output-file")
             .map(|value| value.to_string())
             .or_else(|| Self::extract_background_transcript_path(trimmed));
+
+        let looks_like_agent_completion = summary
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.starts_with("Agent \"") && value.ends_with(" completed"))
+            .unwrap_or(false);
+        if !looks_like_agent_completion {
+            return None;
+        }
 
         Some(Self::build_background_agent_completion_payload(
             "task_notification",
@@ -1863,6 +1988,119 @@ mod tests {
         assert!(rewritten.contains("- 3月21日：多云，16/5°C"));
         assert!(rewritten.contains("/tmp/weather-beijing.output"));
         assert!(!rewritten.contains("<teammate-message"));
+    }
+
+    #[test]
+    fn test_transform_messages_marks_task_notification_as_planning_only_from_transcript_structure() {
+        let transcript_path = std::env::temp_dir().join(format!(
+            "codex_proxy_bg_planning_only_{}.jsonl",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(
+            &transcript_path,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"查北京未来7天的天气变化\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"thinking\":\"请求已发送，正在等待上游开始输出…\\n模型正在处理中…\\n\",\"type\":\"thinking\",\"signature\":\"\"}],\"role\":\"assistant\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"text\":\"先说明一下我会怎么做：我将联网查询北京未来 7 天的最新天气预报。\",\"type\":\"text\"}],\"role\":\"assistant\"}}\n"
+            ),
+        )
+        .expect("transcript should be written");
+
+        let raw = format!(
+            "<task-notification>\n<task-id>a2c8dc9dd9190d6ed</task-id>\n<tool-use-id>call_GgkbzQzSSJttuWaYWXFpfJpx</tool-use-id>\n<output-file>{}</output-file>\n<status>completed</status>\n<summary>Agent \"Beijing weather\" completed</summary>\n<result>先说明一下我会怎么做：我将联网查询北京未来 7 天的最新天气预报。</result>\n</task-notification>\nFull transcript available at: {}\n",
+            transcript_path.display(),
+            transcript_path.display()
+        );
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(raw)),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("background_agent_completion"));
+        assert!(rewritten.contains(r#""result_status":"planning_only""#));
+        assert!(rewritten.contains("Beijing weather"));
+
+        let _ = std::fs::remove_file(&transcript_path);
+    }
+
+    #[test]
+    fn test_transform_messages_uses_transcript_structure_to_mark_task_notification_usable() {
+        let transcript_path = std::env::temp_dir().join(format!(
+            "codex_proxy_bg_usable_{}.jsonl",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(
+            &transcript_path,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"查浙江嘉兴未来7天的天气变化\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"caller\":{\"type\":\"direct\"},\"id\":\"srvtoolu_1774084400473_1\",\"input\":{\"query\":\"weather: China, Zhejiang, Jiaxing\"},\"name\":\"web_search\",\"type\":\"server_tool_use\"}],\"role\":\"assistant\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"text\":\"以下为浙江嘉兴未来 7 天天气预报：3月21日 17/10°C。\",\"type\":\"text\"}],\"role\":\"assistant\",\"stop_reason\":\"end_turn\"}}\n"
+            ),
+        )
+        .expect("transcript should be written");
+
+        let raw = format!(
+            "<task-notification>\n<task-id>a2a3a8606396c56af</task-id>\n<tool-use-id>call_7YJ2OtiBneUjTkAofdnwGsby</tool-use-id>\n<output-file>{}</output-file>\n<status>completed</status>\n<summary>Agent \"Jiaxing weather\" completed</summary>\n<result>我先查一个可验证的实时天气来源，再整理结果。</result>\n</task-notification>\nFull transcript available at: {}\n",
+            transcript_path.display(),
+            transcript_path.display()
+        );
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(raw)),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("background_agent_completion"));
+        assert!(rewritten.contains(r#""result_status":"usable""#));
+        assert!(rewritten.contains("Jiaxing weather"));
+        assert!(!rewritten.contains(r#""result_status":"incomplete_placeholder""#));
+
+        let _ = std::fs::remove_file(&transcript_path);
+    }
+
+    #[test]
+    fn test_transform_messages_does_not_rewrite_background_command_task_notification_as_agent_completion() {
+        let raw = "<task-notification>\n<task-id>bxiggtdu6</task-id>\n<tool-use-id>call_VTH8KAQi15QvcdrDBcTgjVWW</tool-use-id>\n<output-file>/tmp/bxiggtdu6.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run the full Codex response test suite after adding multi-background launch text suppression\" completed (exit code 0)</summary>\n</task-notification>\nFull transcript available at: /tmp/bxiggtdu6.output\n";
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(raw.to_string())),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(!rewritten.contains("background_agent_completion"));
+        assert!(rewritten.contains("Background command \"Run the full Codex response test suite"));
+        assert!(rewritten.contains("Full transcript available at: /tmp/bxiggtdu6.output"));
     }
 
     #[test]

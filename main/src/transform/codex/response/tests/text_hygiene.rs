@@ -223,6 +223,9 @@ fn test_proposed_plan_bridge_writes_plan_file_and_emits_exit_plan_mode() {
         &mut transformer,
         &crate::transform::ResponseTransformRequestContext {
             codex_plan_file_path: Some(plan_path.to_string_lossy().to_string()),
+            contains_background_agent_completion: false,
+            historical_background_agent_launch_count: 0,
+            terminal_background_agent_completion_count: 0,
         },
     );
 

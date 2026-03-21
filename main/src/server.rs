@@ -2889,6 +2889,58 @@ fn extract_message_text(message: &Message) -> Option<String> {
     }
 }
 
+fn request_contains_background_agent_completion(request: &AnthropicRequest) -> bool {
+    request.messages.iter().any(|message| {
+        extract_message_text(message)
+            .map(|text| text.contains("\"kind\":\"background_agent_completion\""))
+            .unwrap_or(false)
+    })
+}
+
+fn count_historical_background_agent_launches(request: &AnthropicRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role.eq_ignore_ascii_case("assistant"))
+        .filter_map(|message| match &message.content {
+            Some(MessageContent::Blocks(blocks)) => Some(blocks),
+            _ => None,
+        })
+        .flat_map(|blocks| blocks.iter())
+        .filter(|block| match block {
+            ContentBlock::ToolUse { name, input, .. } => {
+                name.eq_ignore_ascii_case("Agent")
+                    && input
+                        .get("run_in_background")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+            }
+            _ => false,
+        })
+        .count()
+}
+
+fn count_terminal_background_agent_completions(request: &AnthropicRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .filter_map(extract_message_text)
+        .map(|text| {
+            let rewritten_count = text.matches("\"kind\":\"background_agent_completion\"").count();
+            if rewritten_count > 0 {
+                return rewritten_count;
+            }
+
+            text.matches("<task-notification>")
+                .filter(|_| text.contains("<status>completed</status>"))
+                .count()
+                .min(
+                    text.matches("<summary>Agent \"").count(),
+                )
+        })
+        .sum()
+}
+
 fn extract_plan_file_path_from_text(text: &str) -> Option<String> {
     const PLAN_PREFIX: &str = "You should create your plan at ";
     const PLAN_SUFFIX: &str = " using the Write tool";
@@ -4471,6 +4523,15 @@ async fn handle_request(
         .unwrap_or(0);
     let response_transform_request_ctx = ResponseTransformRequestContext {
         codex_plan_file_path: extract_codex_plan_file_path_from_request(&anthropic_body),
+        contains_background_agent_completion: request_contains_background_agent_completion(
+            &anthropic_body,
+        ),
+        historical_background_agent_launch_count: count_historical_background_agent_launches(
+            &anthropic_body,
+        ),
+        terminal_background_agent_completion_count: count_terminal_background_agent_completions(
+            &anthropic_body,
+        ),
     };
     let logger = AppLogger::get();
 
@@ -7601,6 +7662,34 @@ mod tests {
         let injected_text = super::extract_message_text(&request_without_skill_hint.messages[0])
             .unwrap_or_default();
         assert!(!injected_text.contains("The following skills are available"));
+    }
+
+    #[test]
+    fn test_count_terminal_background_agent_completions_recognizes_raw_task_notifications() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n<summary>Agent \"Check Beijing weather\" completed</summary>\n<result>北京天气结果</result>\n</task-notification>"
+                    },
+                    {
+                        "type": "text",
+                        "text": "<task-notification>\n<task-id>a2</task-id>\n<status>completed</status>\n<summary>Agent \"Check Guangdong weather\" completed</summary>\n<result>广东天气结果</result>\n</task-notification>"
+                    },
+                    {
+                        "type": "text",
+                        "text": "<task-notification>\n<task-id>a3</task-id>\n<status>completed</status>\n<summary>Background command \"Run tests\" completed (exit code 0)</summary>\n</task-notification>"
+                    }
+                ]
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        assert_eq!(super::count_terminal_background_agent_completions(&request), 2);
     }
 
     #[test]
