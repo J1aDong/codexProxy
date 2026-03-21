@@ -747,6 +747,122 @@ fn test_codex_request_normalizes_structured_background_agent_output_object() {
 }
 
 #[test]
+fn test_codex_request_preserves_background_agent_completion_handoff_in_user_history() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_agent_bg".to_string()),
+                    name: "Agent".to_string(),
+                    input: json!({"description": "查嘉兴天气", "run_in_background": true}),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<task-notification>\n<task-id>aaf56deaf0a6f8f5b</task-id>\n<tool-use-id>call_agent_bg</tool-use-id>\n<output-file>/tmp/aaf56deaf0a6f8f5b.output</output-file>\n<status>completed</status>\n<summary>Agent \"Check Jiaxing weather\" completed</summary>\n<result>嘉兴未来 7 天天气大致如下：\n\n- 第1天：晴到薄雾，17/10°C\n- 第2天：晴间多云，21/12°C</result>\n</task-notification>\nFull transcript available at: /tmp/aaf56deaf0a6f8f5b.output\n"
+                        .to_string(),
+                )),
+            },
+        ],
+        system: None,
+        metadata: None,
+        stream: true,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+    let texts: Vec<_> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+        .flat_map(|blocks| blocks.iter())
+        .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("input_text"))
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect();
+    let joined = texts.join("\n");
+
+    assert!(joined.contains("background_agent_completion"));
+    assert!(joined.contains(r#""result_status":"usable""#));
+    assert!(joined.contains("Check Jiaxing weather"));
+    assert!(joined.contains("/tmp/aaf56deaf0a6f8f5b.output"));
+}
+
+#[test]
+fn test_codex_request_marks_placeholder_background_agent_completion_as_incomplete() {
+    let request = AnthropicRequest {
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        messages: vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_agent_bg".to_string()),
+                    name: "Agent".to_string(),
+                    input: json!({"description": "查北京天气", "run_in_background": true}),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<task-notification>\n<task-id>a0110ff52929529f5</task-id>\n<tool-use-id>call_agent_bg</tool-use-id>\n<output-file>/tmp/a0110ff52929529f5.output</output-file>\n<status>completed</status>\n<summary>Agent \"Check Beijing weather\" completed</summary>\n<result>我先查一个可验证的实时天气来源，获取北京未来 7 天逐日预报，再整理成简洁中文的按天概况和趋势总结。</result>\n</task-notification>\nFull transcript available at: /tmp/a0110ff52929529f5.output\n"
+                        .to_string(),
+                )),
+            },
+        ],
+        system: None,
+        metadata: None,
+        stream: true,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    };
+
+    let mapping = ReasoningEffortMapping::default();
+    let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+    let input = body
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("input should be an array");
+    let texts: Vec<_> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+        .flat_map(|blocks| blocks.iter())
+        .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("input_text"))
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect();
+    let joined = texts.join("\n");
+
+    assert!(joined.contains("background_agent_completion"));
+    assert!(joined.contains(r#""result_status":"incomplete_placeholder""#));
+    assert!(joined.contains("Check Beijing weather"));
+    assert!(joined.contains("should not be treated as a usable final result"));
+}
+
+#[test]
 fn test_codex_request_maps_document_tool_result_to_input_file() {
     let request = AnthropicRequest {
         model: Some("claude-sonnet-4-5-20250929".to_string()),

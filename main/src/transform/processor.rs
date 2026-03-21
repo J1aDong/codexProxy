@@ -35,8 +35,164 @@ impl MessageProcessor {
         bodies
     }
 
+    fn extract_xml_tag_body<'a>(fragment: &'a str, tag: &str) -> Option<&'a str> {
+        let start_marker = format!("<{tag}>");
+        let end_marker = format!("</{tag}>");
+        let start = fragment.find(start_marker.as_str())? + start_marker.len();
+        let end = fragment[start..].find(end_marker.as_str())? + start;
+        Some(fragment[start..end].trim())
+    }
+
+    fn extract_background_transcript_path(text: &str) -> Option<String> {
+        text.lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("Full transcript available at:")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+            })
+    }
+
+    fn looks_like_placeholder_agent_result(result: &str) -> bool {
+        let trimmed = result.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let normalized = trimmed.replace(char::is_whitespace, "");
+        normalized.starts_with("我先")
+            || normalized.starts_with("先去")
+            || normalized.starts_with("先查")
+            || normalized.starts_with("让我先")
+            || normalized.starts_with("Letmefirst")
+            || normalized.starts_with("I'llfirst")
+    }
+
+    fn build_background_agent_completion_payload(
+        source: &str,
+        agent_id: Option<&str>,
+        task_id: Option<&str>,
+        tool_use_id: Option<&str>,
+        summary: Option<&str>,
+        result: Option<&str>,
+        output_file: Option<&str>,
+        status: Option<&str>,
+    ) -> String {
+        let result_text = result.unwrap_or("").trim();
+        let result_status = if result_text.is_empty() {
+            "missing"
+        } else if Self::looks_like_placeholder_agent_result(result_text) {
+            "incomplete_placeholder"
+        } else {
+            "usable"
+        };
+
+        let mut payload = json!({
+            "kind": "background_agent_completion",
+            "source": source,
+            "result_status": result_status,
+        });
+
+        if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+            payload["agent_id"] = json!(agent_id);
+        }
+        if let Some(task_id) = task_id.map(str::trim).filter(|value| !value.is_empty()) {
+            payload["task_id"] = json!(task_id);
+        }
+        if let Some(tool_use_id) = tool_use_id.map(str::trim).filter(|value| !value.is_empty()) {
+            payload["tool_use_id"] = json!(tool_use_id);
+        }
+        if let Some(summary) = summary.map(str::trim).filter(|value| !value.is_empty()) {
+            payload["summary"] = json!(summary);
+        }
+        if let Some(status) = status.map(str::trim).filter(|value| !value.is_empty()) {
+            payload["status"] = json!(status);
+        }
+        if !result_text.is_empty() {
+            payload["result"] = json!(result_text);
+        }
+        if let Some(output_file) = output_file.map(str::trim).filter(|value| !value.is_empty()) {
+            payload["output_file"] = json!(output_file);
+        }
+        if result_status != "usable" {
+            payload["warning"] = json!("This completion should not be treated as a usable final result.");
+        }
+
+        payload.to_string()
+    }
+
+    fn rewrite_task_notification_text(text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        if !trimmed.starts_with("<task-notification>") {
+            return None;
+        }
+
+        let task_id = Self::extract_xml_tag_body(trimmed, "task-id");
+        let tool_use_id = Self::extract_xml_tag_body(trimmed, "tool-use-id");
+        let summary = Self::extract_xml_tag_body(trimmed, "summary");
+        let result = Self::extract_xml_tag_body(trimmed, "result");
+        let status = Self::extract_xml_tag_body(trimmed, "status");
+        let output_file = Self::extract_xml_tag_body(trimmed, "output-file")
+            .map(|value| value.to_string())
+            .or_else(|| Self::extract_background_transcript_path(trimmed));
+
+        Some(Self::build_background_agent_completion_payload(
+            "task_notification",
+            None,
+            task_id,
+            tool_use_id,
+            summary,
+            result,
+            output_file.as_deref(),
+            status,
+        ))
+    }
+
+    fn rewrite_teammate_idle_notification_payload(payload: &Value) -> Option<String> {
+        let kind = payload.get("type").and_then(|value| value.as_str())?;
+        if !kind.eq_ignore_ascii_case("idle_notification") {
+            return None;
+        }
+
+        let status = payload.get("status").and_then(|value| value.as_str());
+        let result = payload.get("result").and_then(|value| value.as_str());
+        let output_file = payload.get("output_file").and_then(|value| value.as_str());
+        let summary = payload.get("summary").and_then(|value| value.as_str());
+        let from = payload
+            .get("from")
+            .or_else(|| payload.get("agent_id"))
+            .and_then(|value| value.as_str());
+
+        let has_handoff_content = status
+            .map(|value| value.eq_ignore_ascii_case("completed"))
+            .unwrap_or(false)
+            || result.map(|value| !value.trim().is_empty()).unwrap_or(false)
+            || output_file
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+
+        if !has_handoff_content {
+            return None;
+        }
+
+        Some(Self::build_background_agent_completion_payload(
+            "idle_notification",
+            from,
+            None,
+            None,
+            summary,
+            result,
+            output_file,
+            status,
+        ))
+    }
+
     fn rewrite_teammate_protocol_text(text: &str) -> Option<String> {
         let trimmed = text.trim();
+        if let Some(rewritten) = Self::rewrite_task_notification_text(trimmed) {
+            return Some(rewritten);
+        }
         if !trimmed.contains("<teammate-message") {
             return None;
         }
@@ -57,6 +213,10 @@ impl MessageProcessor {
             let Some(kind) = payload.get("type").and_then(|value| value.as_str()) else {
                 continue;
             };
+
+            if let Some(rewritten) = Self::rewrite_teammate_idle_notification_payload(&payload) {
+                return Some(rewritten);
+            }
 
             if kind == "shutdown_request" {
                 let request_id = payload
@@ -1616,6 +1776,93 @@ mod tests {
         assert!(rewritten.contains("plain-text shutdown acknowledgment"));
         assert!(rewritten.contains("not a valid shutdown_response"));
         assert!(rewritten.contains("TeamDelete will keep failing"));
+    }
+
+    #[test]
+    fn test_transform_messages_rewrites_task_notification_completion_into_structured_handoff() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(
+                "<task-notification>\n<task-id>aaf56deaf0a6f8f5b</task-id>\n<tool-use-id>call_Pe2KJ3sGtCPm0EL4srTHNw0d</tool-use-id>\n<output-file>/tmp/aaf56deaf0a6f8f5b.output</output-file>\n<status>completed</status>\n<summary>Agent \"Check Jiaxing weather\" completed</summary>\n<result>嘉兴未来 7 天天气大致如下：\n\n- 第1天：晴到薄雾，17/10°C\n- 第2天：晴间多云，21/12°C\n\n整体趋势：先回暖，再降温，后半段在 16–18°C 附近波动。</result>\n</task-notification>\nFull transcript available at: /tmp/aaf56deaf0a6f8f5b.output\n".to_string(),
+            )),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("background_agent_completion"));
+        assert!(rewritten.contains(r#""result_status":"usable""#));
+        assert!(rewritten.contains("Check Jiaxing weather"));
+        assert!(rewritten.contains("嘉兴未来 7 天天气大致如下"));
+        assert!(rewritten.contains("/tmp/aaf56deaf0a6f8f5b.output"));
+        assert!(!rewritten.contains("<task-notification>"));
+        assert!(!rewritten.contains("Full transcript available at:"));
+    }
+
+    #[test]
+    fn test_transform_messages_marks_placeholder_task_notification_result_as_incomplete_handoff() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(
+                "<task-notification>\n<task-id>a0110ff52929529f5</task-id>\n<tool-use-id>call_SoqVpukFkthB6HVTVXr6Qdzn</tool-use-id>\n<output-file>/tmp/a0110ff52929529f5.output</output-file>\n<status>completed</status>\n<summary>Agent \"Check Beijing weather\" completed</summary>\n<result>我先查一个可验证的实时天气来源，获取北京未来 7 天逐日预报，再整理成简洁中文的按天概况和趋势总结。</result>\n</task-notification>\nFull transcript available at: /tmp/a0110ff52929529f5.output\n".to_string(),
+            )),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("background_agent_completion"));
+        assert!(rewritten.contains(r#""result_status":"incomplete_placeholder""#));
+        assert!(rewritten.contains("Check Beijing weather"));
+        assert!(rewritten.contains("我先查一个可验证的实时天气来源"));
+        assert!(rewritten.contains("/tmp/a0110ff52929529f5.output"));
+        assert!(rewritten.contains("should not be treated as a usable final result"));
+        assert!(!rewritten.contains("<task-notification>"));
+    }
+
+    #[test]
+    fn test_transform_messages_rewrites_teammate_idle_notification_result_into_structured_handoff() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(
+                "<teammate-message teammate_id=\"weather-beijing\" color=\"green\">\n{\"type\":\"idle_notification\",\"from\":\"weather-beijing\",\"timestamp\":\"2026-03-18T09:51:21.994Z\",\"status\":\"completed\",\"summary\":\"Check Beijing weather completed\",\"result\":\"- 3月21日：多云，16/5°C\",\"output_file\":\"/tmp/weather-beijing.output\"}\n</teammate-message>".to_string(),
+            )),
+        }];
+
+        let (input, _) = MessageProcessor::transform_messages(&messages, None);
+        let rewritten = input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(rewritten.contains("background_agent_completion"));
+        assert!(rewritten.contains(r#""result_status":"usable""#));
+        assert!(rewritten.contains("weather-beijing"));
+        assert!(rewritten.contains("Check Beijing weather completed"));
+        assert!(rewritten.contains("- 3月21日：多云，16/5°C"));
+        assert!(rewritten.contains("/tmp/weather-beijing.output"));
+        assert!(!rewritten.contains("<teammate-message"));
     }
 
     #[test]
