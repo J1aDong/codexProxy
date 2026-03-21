@@ -7378,6 +7378,79 @@ mod tests {
     }
 
     #[test]
+    fn test_route_level_custom_injection_prompt_only_applies_to_codex() {
+        let prompt = "Auto-install dependencies please.";
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "你好"}],
+            "system": "You are Claude Code.",
+            "stream": false
+        }))
+        .expect("valid request");
+
+        let server = super::ProxyServer::new(8889, "http://localhost:3000".to_string(), None)
+            .with_custom_injection_prompt(prompt.to_string());
+        let runtime = server.runtime_update();
+        let log_tx = broadcast::channel(8).0;
+
+        let openai_model = super::resolve_model_for_converter(
+            "openai",
+            request.model.as_deref().unwrap_or("claude-sonnet-4-6"),
+            &runtime.ctx.reasoning_mapping,
+            &runtime.ctx.codex_model_mapping,
+            &runtime.ctx.anthropic_model_mapping,
+            &runtime.ctx.openai_model_mapping,
+            &runtime.ctx.gemini_reasoning_effort,
+        );
+        let openai_backend = super::build_backend_by_converter("openai");
+        let (openai_body, _) = super::transform_request_with_optional_codex_effort_override(
+            "openai",
+            &openai_backend,
+            &request,
+            &log_tx,
+            &runtime.ctx,
+            &openai_model,
+            None,
+            false,
+        );
+        let openai_serialized = openai_body.to_string();
+        assert!(
+            !openai_serialized.contains(prompt),
+            "openai route should not include codex-only custom injection prompt"
+        );
+
+        let codex_model = super::resolve_model_for_converter(
+            "codex",
+            request.model.as_deref().unwrap_or("claude-sonnet-4-6"),
+            &runtime.ctx.reasoning_mapping,
+            &runtime.ctx.codex_model_mapping,
+            &runtime.ctx.anthropic_model_mapping,
+            &runtime.ctx.openai_model_mapping,
+            &runtime.ctx.gemini_reasoning_effort,
+        );
+        let codex_backend = super::build_backend_by_converter("codex");
+        let (codex_body, _) = super::transform_request_with_optional_codex_effort_override(
+            "codex",
+            &codex_backend,
+            &request,
+            &log_tx,
+            &runtime.ctx,
+            &codex_model,
+            None,
+            false,
+        );
+        let codex_serialized = codex_body.to_string();
+        assert!(
+            codex_serialized.contains(prompt),
+            "codex route should retain custom injection prompt"
+        );
+        assert!(
+            codex_serialized.contains("# AGENTS.md instructions"),
+            "codex route should wrap custom injection prompt as AGENTS-style instructions"
+        );
+    }
+
+    #[test]
     fn test_collect_skill_catalog_reminder_blocks_from_request() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-6",

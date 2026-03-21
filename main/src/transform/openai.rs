@@ -264,22 +264,10 @@ impl OpenAIChatBackend {
         }
     }
 
-    /// Build system message from Anthropic system field and custom injection prompt
-    fn build_system_message(
-        system: Option<&crate::models::SystemContent>,
-        custom_injection_prompt: &str,
-    ) -> Option<Value> {
-        let system_text = Self::flatten_system_text(system);
-        let custom_text = custom_injection_prompt.trim().to_string();
-
-        let merged = match (system_text, custom_text.is_empty()) {
-            (Some(system_text), true) => Some(system_text),
-            (Some(system_text), false) => Some(format!("{}\n\n{}", system_text, custom_text)),
-            (None, false) => Some(custom_text),
-            (None, true) => None,
-        }?;
-
-        Some(json!({ "role": "system", "content": merged }))
+    /// Build system message from Anthropic system field
+    fn build_system_message(system: Option<&crate::models::SystemContent>) -> Option<Value> {
+        let system_text = Self::flatten_system_text(system)?;
+        Some(json!({ "role": "system", "content": system_text }))
     }
     fn build_tool_choice(anthropic_body: &AnthropicRequest, tools: &[Value]) -> Option<Value> {
         if tools.is_empty() {
@@ -357,10 +345,9 @@ impl OpenAIRequestMapper {
             MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
 
         let mut messages = Vec::new();
-        if let Some(system_msg) = OpenAIChatBackend::build_system_message(
-            anthropic_body.system.as_ref(),
-            &ctx.custom_injection_prompt,
-        ) {
+        if let Some(system_msg) =
+            OpenAIChatBackend::build_system_message(anthropic_body.system.as_ref())
+        {
             messages.push(system_msg);
         }
         messages.extend(OpenAIChatBackend::build_messages(&transformed_messages));
@@ -1692,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_request_appends_custom_injection_prompt_to_system_message() {
+    fn transform_request_does_not_append_custom_injection_prompt_for_openai() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
             GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
@@ -1749,7 +1736,10 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(content.contains("You are Claude Code."));
-        assert!(content.contains("Always inspect repo instructions first."));
+        assert!(
+            !content.contains("Always inspect repo instructions first."),
+            "openai converter should not receive codex-only custom injection prompt"
+        );
         assert!(
             messages
                 .iter()
@@ -1823,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_request_creates_system_message_from_custom_injection_prompt_when_missing() {
+    fn transform_request_does_not_create_system_message_from_custom_injection_prompt_for_openai() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
             GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
@@ -1873,15 +1863,12 @@ mod tests {
 
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
-            Some("system")
+            Some("user")
         );
+        assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].get("content").and_then(Value::as_str),
-            Some("Always inspect repo instructions first.")
-        );
-        assert_eq!(
-            messages[1].get("role").and_then(Value::as_str),
-            Some("user")
+            Some("你好")
         );
     }
 
