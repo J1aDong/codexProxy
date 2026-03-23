@@ -186,7 +186,7 @@ fn test_legacy_skill_command_is_normalized_in_history() {
 }
 
 #[test]
-fn test_skill_deduplication() {
+fn test_skill_extraction_keeps_per_call_instances_for_downstream_replay() {
     let messages = vec![
         Message {
             role: "assistant".to_string(),
@@ -222,8 +222,10 @@ fn test_skill_deduplication() {
 
     let (input, skills) = MessageProcessor::transform_messages(&messages, None);
 
-    // Should only extract once
-    assert_eq!(skills.len(), 1);
+    // OpenAI replay needs one extracted payload per tool call instance.
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[0].tool_use_id.as_deref(), Some("call_1"));
+    assert_eq!(skills[1].tool_use_id.as_deref(), Some("call_2"));
 
     // But should have two outputs
     let outputs: Vec<_> = input

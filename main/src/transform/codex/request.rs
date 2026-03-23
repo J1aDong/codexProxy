@@ -1882,7 +1882,15 @@ impl TransformRequest {
                 "🎯 [Transform] Promoting {} extracted skill(s) into instructions",
                 extracted_skills.len()
             ));
+            let mut seen_skill_keys = std::collections::HashSet::new();
             for skill in &extracted_skills {
+                if !seen_skill_keys.insert(skill.dedupe_key()) {
+                    log(&format!(
+                        "🎯 [Transform] Skip duplicate extracted skill for instructions: {}",
+                        skill.name
+                    ));
+                    continue;
+                }
                 applied_static_instructions = merge_instruction_context(
                     applied_static_instructions.as_deref(),
                     Some(skill.as_str()),
@@ -4620,6 +4628,74 @@ hello",
         assert!(
             !input_text.contains("<skill>"),
             "extracted skill payloads should no longer be injected into input messages"
+        );
+    }
+
+    #[test]
+    fn transform_dedupes_duplicate_extracted_skills_when_merging_instructions() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "call_skill_1",
+                        "name": "Skill",
+                        "input": {"skill": "yat_commit"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_skill_1",
+                        "content": [
+                            {"text": "<command-name>yat_commit</command-name>", "type": "text"},
+                            {"text": "Base Path: /tmp/yat", "type": "text"},
+                            {"text": "仅在用户明确要求提交代码时使用", "type": "text"}
+                        ]
+                    }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "call_skill_2",
+                        "name": "Skill",
+                        "input": {"skill": "yat_commit"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_skill_2",
+                        "content": [
+                            {"text": "<command-name>yat_commit</command-name>", "type": "text"},
+                            {"text": "Base Path: /tmp/yat", "type": "text"},
+                            {"text": "仅在用户明确要求提交代码时使用", "type": "text"}
+                        ]
+                    }]
+                }
+            ],
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+        let instructions = instructions_text(&body).expect("instructions should be present");
+
+        assert_eq!(
+            instructions.matches("<name>yat_commit</name>").count(),
+            1,
+            "duplicate extracted skill payloads should be deduped when merged into instructions"
         );
     }
 

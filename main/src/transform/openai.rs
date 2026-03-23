@@ -1,10 +1,14 @@
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::models::AnthropicRequest;
+use crate::transform::processor::ExtractedSkillPayload;
 
-use super::{MessageProcessor, ResponseTransformer, TransformBackend, TransformContext};
+use super::{
+    MessageProcessor, ResponseTransformer, TransformBackend, TransformContext,
+};
 
 pub struct OpenAIChatBackend;
 
@@ -264,9 +268,47 @@ impl OpenAIChatBackend {
         }
     }
 
-    fn extract_user_scaffolding_to_system(codex_messages: &[Value]) -> (Option<String>, Vec<Value>) {
+    fn reminder_contains_skill_catalog(block_text: &str) -> bool {
+        let normalized = block_text.trim().to_ascii_lowercase();
+        normalized.contains("the following skills are available for use with the skill tool")
+            || normalized.contains("the following skills are available:")
+            || normalized.contains("available skills via skill tool:")
+            || normalized.contains("<available_skills>")
+    }
+
+    fn extract_promotable_system_reminders(text: &str) -> (Vec<String>, String) {
         const START: &str = "<system-reminder>";
         const END: &str = "</system-reminder>";
+
+        let mut promoted_parts = Vec::new();
+        let mut cleaned = String::new();
+        let mut cursor = 0usize;
+
+        while let Some(start_rel) = text[cursor..].find(START) {
+            let start_idx = cursor + start_rel;
+            let after_start = &text[start_idx + START.len()..];
+            let Some(end_rel) = after_start.find(END) else {
+                break;
+            };
+            let end_idx = start_idx + START.len() + end_rel + END.len();
+            let block_text = text[start_idx + START.len()..start_idx + START.len() + end_rel].trim();
+
+            if Self::reminder_contains_skill_catalog(block_text) {
+                cleaned.push_str(&text[cursor..end_idx]);
+            } else {
+                cleaned.push_str(&text[cursor..start_idx]);
+                if !block_text.is_empty() {
+                    promoted_parts.push(block_text.to_string());
+                }
+            }
+            cursor = end_idx;
+        }
+
+        cleaned.push_str(&text[cursor..]);
+        (promoted_parts, cleaned)
+    }
+
+    fn extract_user_scaffolding_to_system(codex_messages: &[Value]) -> (Option<String>, Vec<Value>) {
         let mut promoted_parts: Vec<String> = Vec::new();
         let mut cleaned_messages: Vec<Value> = Vec::new();
 
@@ -290,20 +332,9 @@ impl OpenAIChatBackend {
                     new_content.push(block.clone());
                     continue;
                 };
-                let mut remaining = text.to_string();
-
-                while let Some(start_idx) = remaining.find(START) {
-                    let after_start = &remaining[start_idx + START.len()..];
-                    let Some(end_rel) = after_start.find(END) else {
-                        break;
-                    };
-                    let end_idx = start_idx + START.len() + end_rel + END.len();
-                    let block_text = remaining[start_idx + START.len()..start_idx + START.len() + end_rel].trim();
-                    if !block_text.is_empty() {
-                        promoted_parts.push(block_text.to_string());
-                    }
-                    remaining = format!("{}{}", &remaining[..start_idx], &remaining[end_idx..]);
-                }
+                let (promoted_reminders, mut remaining) =
+                    Self::extract_promotable_system_reminders(text);
+                promoted_parts.extend(promoted_reminders);
 
                 if let Some(contents_idx) = remaining.find("Contents of /repo/") {
                     let after = &remaining[contents_idx..];
@@ -354,6 +385,69 @@ impl OpenAIChatBackend {
             Some(promoted_parts.join("\n\n"))
         };
         (promoted, cleaned_messages)
+    }
+
+    fn append_extracted_skill_outputs(
+        codex_messages: &[Value],
+        extracted_skills: &[ExtractedSkillPayload],
+    ) -> Vec<Value> {
+        if extracted_skills.is_empty() {
+            return codex_messages.to_vec();
+        }
+
+        let mut skills_by_call_id: HashMap<String, Vec<&ExtractedSkillPayload>> = HashMap::new();
+        for skill in extracted_skills {
+            let Some(call_id) = skill
+                .tool_use_id
+                .as_deref()
+                .map(|value: &str| value.trim())
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            skills_by_call_id
+                .entry(call_id.to_string())
+                .or_default()
+                .push(skill);
+        }
+
+        if skills_by_call_id.is_empty() {
+            return codex_messages.to_vec();
+        }
+
+        let mut enriched = Vec::with_capacity(codex_messages.len() + extracted_skills.len());
+        for item in codex_messages {
+            enriched.push(item.clone());
+
+            let is_tool_output =
+                item.get("type").and_then(|value| value.as_str()) == Some("function_call_output");
+            if !is_tool_output {
+                continue;
+            }
+
+            let Some(call_id) = item
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                .map(|value: &str| value.trim())
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            let Some(skill_payloads) = skills_by_call_id.remove(call_id) else {
+                continue;
+            };
+
+            for skill in skill_payloads {
+                enriched.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": skill.as_str(),
+                }));
+            }
+        }
+
+        enriched
     }
 
     fn build_system_message(
@@ -441,10 +535,12 @@ impl OpenAIRequestMapper {
         requested_model: &str,
     ) -> Value {
         let model = OpenAIChatBackend::normalize_model(requested_model);
-        let (transformed_messages, _) =
+        let (transformed_messages, extracted_skills) =
             MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
         let (promoted_context, cleaned_messages) =
             OpenAIChatBackend::extract_user_scaffolding_to_system(&transformed_messages);
+        let enriched_messages =
+            OpenAIChatBackend::append_extracted_skill_outputs(&cleaned_messages, &extracted_skills);
 
         let mut messages = Vec::new();
         if let Some(system_msg) =
@@ -452,7 +548,7 @@ impl OpenAIRequestMapper {
         {
             messages.push(system_msg);
         }
-        messages.extend(OpenAIChatBackend::build_messages(&cleaned_messages));
+        messages.extend(OpenAIChatBackend::build_messages(&enriched_messages));
 
         let mut body = json!({
             "model": model,
@@ -1853,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_request_moves_user_project_context_into_system_message() {
+    fn transform_request_keeps_skill_catalog_in_user_history_while_promoting_project_context() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
             GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
@@ -1905,10 +2001,106 @@ mod tests {
 
         assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
         let system = messages[0].get("content").and_then(Value::as_str).unwrap_or_default();
-        assert!(system.contains("pdf: Read PDF files"));
         assert!(system.contains("Rule A"));
+        assert!(
+            !system.contains("The following skills are available for use with the Skill tool"),
+            "skill catalog should not be promoted into the first system message"
+        );
         assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
-        assert_eq!(messages[1].get("content").and_then(Value::as_str), Some("你好"));
+        let user = messages[1].get("content").and_then(Value::as_str).unwrap_or_default();
+        assert!(user.contains("The following skills are available for use with the Skill tool"));
+        assert!(user.contains("pdf: Read PDF files"));
+        assert!(user.contains("你好"));
+    }
+
+    #[test]
+    fn transform_request_appends_loaded_skill_payload_after_tool_result() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                        id: Some("call_skill_1".to_string()),
+                        name: "Skill".to_string(),
+                        input: json!({"skill": "yat_commit"}),
+                        signature: None,
+                    }])),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: Some("call_skill_1".to_string()),
+                        id: None,
+                        content: Some(Value::String(
+                            "<command-name>yat_commit</command-name>\nBase Path: /tmp\n仅在用户明确要求提交代码时使用".to_string(),
+                        )),
+                    }])),
+                },
+            ],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("assistant"));
+        assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("tool"));
+        assert_eq!(
+            messages[1].get("tool_call_id").and_then(Value::as_str),
+            Some("call_skill_1")
+        );
+        assert_eq!(
+            messages[1].get("content").and_then(Value::as_str),
+            Some("Skill 'yat_commit' loaded.")
+        );
+        assert_eq!(messages[2].get("role").and_then(Value::as_str), Some("tool"));
+        assert_eq!(
+            messages[2].get("tool_call_id").and_then(Value::as_str),
+            Some("call_skill_1")
+        );
+        let loaded_skill = messages[2]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(loaded_skill.contains("<name>yat_commit</name>"));
+        assert!(loaded_skill.contains("仅在用户明确要求提交代码时使用"));
     }
 
     #[test]

@@ -3,12 +3,38 @@ use crate::models::{ContentBlock, ImageSource, ImageUrlValue, Message, MessageCo
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use tokio::sync::broadcast;
 
 pub const IMAGE_SYSTEM_HINT: &str = "\n<system_hint>IMAGE PROVIDED. You can see the image above directly. Analyze it as requested. DO NOT ask for file paths.</system_hint>\n";
 const MAX_SKILL_CONTENT_CHARS: usize = 4_000;
 const MAX_TOTAL_SKILL_CHARS: usize = 12_000;
 const SKILL_TRUNCATION_MARKER: &str = "\n[skill content truncated]";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractedSkillPayload {
+    pub tool_use_id: Option<String>,
+    pub name: String,
+    pub payload: String,
+}
+
+impl ExtractedSkillPayload {
+    pub fn as_str(&self) -> &str {
+        &self.payload
+    }
+
+    pub fn dedupe_key(&self) -> String {
+        MessageProcessor::build_skill_key(&self.name, &self.payload)
+    }
+}
+
+impl Deref for ExtractedSkillPayload {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.payload
+    }
+}
 
 pub struct MessageProcessor;
 
@@ -591,10 +617,9 @@ impl MessageProcessor {
     pub fn transform_messages(
         messages: &[Message],
         log_tx: Option<&broadcast::Sender<String>>,
-    ) -> (Vec<Value>, Vec<String>) {
+    ) -> (Vec<Value>, Vec<ExtractedSkillPayload>) {
         let mut input = Vec::new();
         let mut extracted_skills = Vec::new();
-        let mut extracted_skill_keys = std::collections::HashSet::new();
         let mut extracted_skill_chars = 0usize;
         let mut skill_tool_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -938,34 +963,29 @@ impl MessageProcessor {
                                     if let Some((s_name, s_content)) =
                                         Self::extract_skill_info(tool_content)
                                     {
-                                        let skill_key = Self::build_skill_key(&s_name, &s_content);
-                                        if !extracted_skill_keys.contains(&skill_key) {
-                                            let remaining_budget = MAX_TOTAL_SKILL_CHARS
-                                                .saturating_sub(extracted_skill_chars);
-                                            if let Some(skill_formatted) =
-                                                Self::build_limited_skill_payload(
-                                                    &s_name,
-                                                    &s_content,
-                                                    remaining_budget,
-                                                )
-                                            {
-                                                extracted_skill_chars +=
-                                                    skill_formatted.chars().count();
-                                                extracted_skills.push(skill_formatted);
-                                                extracted_skill_keys.insert(skill_key);
-                                                log(&format!(
-                                                    "🎯 Skill extracted: {} (total_chars={})",
-                                                    s_name, extracted_skill_chars
-                                                ));
-                                            } else {
-                                                log(&format!(
-                                                    "🎯 Skill skipped due budget limit: {}",
-                                                    s_name
-                                                ));
-                                            }
+                                        let remaining_budget = MAX_TOTAL_SKILL_CHARS
+                                            .saturating_sub(extracted_skill_chars);
+                                        if let Some(skill_formatted) =
+                                            Self::build_limited_skill_payload(
+                                                &s_name,
+                                                &s_content,
+                                                remaining_budget,
+                                            )
+                                        {
+                                            extracted_skill_chars +=
+                                                skill_formatted.chars().count();
+                                            extracted_skills.push(ExtractedSkillPayload {
+                                                tool_use_id: tool_use_id.clone(),
+                                                name: s_name.clone(),
+                                                payload: skill_formatted,
+                                            });
+                                            log(&format!(
+                                                "🎯 Skill extracted: {} (total_chars={})",
+                                                s_name, extracted_skill_chars
+                                            ));
                                         } else {
                                             log(&format!(
-                                                "🎯 Skill already extracted (deduped by name+content): {}",
+                                                "🎯 Skill skipped due budget limit: {}",
                                                 s_name
                                             ));
                                         }
@@ -1606,7 +1626,7 @@ impl MessageProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::MessageProcessor;
+    use super::{ExtractedSkillPayload, MessageProcessor};
     use crate::models::{ContentBlock, Message, MessageContent};
     use serde_json::{json, Value};
 
@@ -1655,6 +1675,51 @@ mod tests {
             content[1].get("text").and_then(Value::as_str),
             Some("[unsupported content]{\"query\":\"foo\",\"type\":\"search_result\"}")
         );
+    }
+
+    #[test]
+    fn test_extracted_skill_payload_carries_tool_use_id_and_name() {
+        let payload = ExtractedSkillPayload {
+            tool_use_id: Some("call_skill_1".to_string()),
+            name: "yat_commit".to_string(),
+            payload: "<skill><name>yat_commit</name></skill>".to_string(),
+        };
+
+        assert_eq!(payload.tool_use_id.as_deref(), Some("call_skill_1"));
+        assert_eq!(payload.name, "yat_commit");
+        assert!(payload.contains("<name>yat_commit</name>"));
+    }
+
+    #[test]
+    fn test_transform_messages_preserves_tool_use_id_in_extracted_skill_payload() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_skill_1".to_string()),
+                    name: "Skill".to_string(),
+                    input: json!({"skill": "yat_commit"}),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: Some("call_skill_1".to_string()),
+                    id: None,
+                    content: Some(Value::String(
+                        "<command-name>yat_commit</command-name>\nBase Path: /tmp\n仅在用户明确要求提交代码时使用".to_string(),
+                    )),
+                }])),
+            },
+        ];
+
+        let (_, skills) = MessageProcessor::transform_messages(&messages, None);
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].tool_use_id.as_deref(), Some("call_skill_1"));
+        assert_eq!(skills[0].name, "yat_commit");
+        assert!(skills[0].contains("仅在用户明确要求提交代码时使用"));
     }
 
     #[test]
