@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "codex-proxy-desktop"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "codex-proxy-core",
  "dirs 5.0.1",
