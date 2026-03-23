@@ -115,6 +115,98 @@ fn merge_instruction_context(first: Option<&str>, second: Option<&str>) -> Optio
     merged
 }
 
+fn extract_user_scaffolding_to_instructions(messages: &[Value]) -> (Option<String>, Vec<Value>) {
+    const START: &str = "<system-reminder>";
+    const END: &str = "</system-reminder>";
+    let mut promoted_parts: Vec<String> = Vec::new();
+    let mut cleaned_messages: Vec<Value> = Vec::new();
+
+    for item in messages {
+        let mut cloned = item.clone();
+        let is_user_message = cloned.get("type").and_then(|v| v.as_str()) == Some("message")
+            && cloned.get("role").and_then(|v| v.as_str()) == Some("user");
+        if !is_user_message {
+            cleaned_messages.push(cloned);
+            continue;
+        }
+
+        let Some(content) = cloned.get_mut("content").and_then(|v| v.as_array_mut()) else {
+            cleaned_messages.push(cloned);
+            continue;
+        };
+
+        let mut new_content: Vec<Value> = Vec::new();
+        for block in content.iter() {
+            let Some(text) = block.get("text").and_then(|v| v.as_str()) else {
+                new_content.push(block.clone());
+                continue;
+            };
+            let mut remaining = text.to_string();
+
+            while let Some(start_idx) = remaining.find(START) {
+                let after_start = &remaining[start_idx + START.len()..];
+                let Some(end_rel) = after_start.find(END) else {
+                    break;
+                };
+                let end_idx = start_idx + START.len() + end_rel + END.len();
+                let block_text = remaining[start_idx + START.len()..start_idx + START.len() + end_rel].trim();
+                if !block_text.is_empty() {
+                    promoted_parts.push(block_text.to_string());
+                }
+                remaining = format!("{}{}", &remaining[..start_idx], &remaining[end_idx..]);
+            }
+
+            if let Some(contents_idx) = remaining.find("Contents of /repo/") {
+                let after = &remaining[contents_idx..];
+                if after.contains("CLAUDE.md:") || after.contains("IFLOW.md:") || after.contains("CodeBuddy.md:") {
+                    let prefix = &remaining[..contents_idx];
+                    let lines: Vec<&str> = after.lines().collect();
+                    if lines.len() >= 2 {
+                        let rule_line = lines[1].trim();
+                        if !rule_line.is_empty() {
+                            promoted_parts.push(rule_line.to_string());
+                        }
+                        let remainder = if let Some(split_idx) = after.find("\n\n") {
+                            &after[split_idx + 2..]
+                        } else {
+                            ""
+                        };
+                        remaining = format!("{}{}", prefix, remainder);
+                    }
+                }
+            }
+
+            let trimmed = remaining.trim();
+            if !trimmed.is_empty() {
+                let mut new_block = block.clone();
+                if let Some(obj) = new_block.as_object_mut() {
+                    obj.insert("text".to_string(), Value::String(trimmed.to_string()));
+                }
+                new_content.push(new_block);
+            }
+        }
+
+        if let Some(obj) = cloned.as_object_mut() {
+            obj.insert("content".to_string(), Value::Array(new_content));
+        }
+        if cloned
+            .get("content")
+            .and_then(|v| v.as_array())
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false)
+        {
+            cleaned_messages.push(cloned);
+        }
+    }
+
+    let promoted = if promoted_parts.is_empty() {
+        None
+    } else {
+        Some(promoted_parts.join("\n\n"))
+    };
+    (promoted, cleaned_messages)
+}
+
 fn request_contains_environment_context(request_text_corpus: &str) -> bool {
     request_text_corpus
         .to_ascii_lowercase()
@@ -1693,6 +1785,8 @@ impl TransformRequest {
 
         let (chat_messages, extracted_skills) =
             MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
+        let (promoted_context, cleaned_chat_messages) =
+            extract_user_scaffolding_to_instructions(&chat_messages);
 
         // 构建 input 数组（只包含当前请求上下文，不注入静态模板文件）
         let mut final_input: Vec<Value> = Vec::new();
@@ -1726,7 +1820,11 @@ impl TransformRequest {
             custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
             plan_prompt_applied.then_some(ANTHROPIC_COMPAT_PLAN_MODE_PROMPT),
         );
-        let mut applied_static_instructions = proxy_instruction_context.clone();
+        let promoted_instruction_context = merge_instruction_context(
+            proxy_instruction_context.as_deref(),
+            promoted_context.as_deref(),
+        );
+        let mut applied_static_instructions = promoted_instruction_context.clone();
         // 归一化 system prompt，并提升到 Responses 顶层 instructions
         if let Some(system) = &anthropic_body.system {
             let mut system_text = system.to_string();
@@ -1748,7 +1846,7 @@ impl TransformRequest {
                 system_text.len()
             ));
             applied_static_instructions =
-                merge_instruction_context(Some(system_text.as_str()), proxy_instruction_context.as_deref());
+                merge_instruction_context(Some(system_text.as_str()), promoted_instruction_context.as_deref());
 
             if request_contains_environment_context(&request_text_corpus) {
                 log("📋 [Transform] Skip runtime <environment_context> injection (already present in request text)");
@@ -1777,7 +1875,7 @@ impl TransformRequest {
             }
         }
         // 追加对话历史
-        final_input.extend(chat_messages);
+        final_input.extend(cleaned_chat_messages);
         Self::sanitize_input_for_codex(&mut final_input);
         reconcile_function_call_pairs(&mut final_input);
 
@@ -1794,7 +1892,7 @@ impl TransformRequest {
             .unwrap_or(0);
         let static_heavy_payload_stats = build_static_heavy_payload_stats(
             applied_static_instructions.as_deref(),
-            proxy_instruction_context.as_deref(),
+            promoted_instruction_context.as_deref(),
             &transformed_tools,
             transformed_tools_bytes,
         );
@@ -2579,16 +2677,13 @@ hello"
         let mapping = ReasoningEffortMapping::default();
 
         let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
-        let texts = input_texts(&body);
-        let joined = texts.join(
-            "
-",
-        );
-
-        assert!(joined.contains("Skill catalog (condensed)"));
-        assert!(joined.contains("- figma-implement-design: Translate Figma nodes"));
-        assert!(joined.contains("- pdf: Read PDF files"));
-        assert!(!joined.contains("TRIGGER when"));
+        let instructions = instructions_text(&body).expect("instructions should be present");
+        assert!(instructions.contains("figma-implement-design"));
+        assert!(instructions.contains("pdf: Read PDF files"));
+        assert!(instructions.contains("TRIGGER when: user provides a Figma URL"));
+        let joined = input_texts(&body).join("\n");
+        assert!(!joined.contains("The following skills are available"));
+        assert!(joined.contains("hello"));
     }
 
     #[test]
@@ -4531,7 +4626,7 @@ hello",
     }
 
     #[test]
-    fn transform_preserves_skill_catalog_system_reminder_from_messages() {
+    fn transform_moves_skill_catalog_system_reminder_from_messages_into_instructions() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
             "messages": [{
@@ -4539,7 +4634,7 @@ hello",
                 "content":[
                     {
                         "type":"text",
-                        "text":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n</system-reminder>"
+                        "text":"<system-reminder>\nThe following skills are available for use with the Skill tool:\n- figma-implement-design: Translate Figma nodes\n- pdf: Read PDF files\n</system-reminder>\n\n你好"
                     }
                 ]
             }],
@@ -4550,21 +4645,20 @@ hello",
 
         let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
 
+        let instructions = instructions_text(&body).expect("instructions should be present");
+        assert!(instructions.contains("figma-implement-design"));
         let input_items = body
             .get("input")
             .and_then(|v| v.as_array())
             .expect("input array");
-        let preserved_count = input_items
+        let joined = input_items
             .iter()
             .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
             .flat_map(|blocks| blocks.iter())
             .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-            .filter(|text| text.contains("Skill catalog (condensed)"))
-            .count();
-
-        assert_eq!(
-            preserved_count, 1,
-            "skill catalog reminder from messages should be preserved for downstream model context"
-        );
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("The following skills are available"));
+        assert!(joined.contains("你好"));
     }
 }

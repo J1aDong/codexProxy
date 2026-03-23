@@ -264,10 +264,110 @@ impl OpenAIChatBackend {
         }
     }
 
-    /// Build system message from Anthropic system field
-    fn build_system_message(system: Option<&crate::models::SystemContent>) -> Option<Value> {
-        let system_text = Self::flatten_system_text(system)?;
-        Some(json!({ "role": "system", "content": system_text }))
+    fn extract_user_scaffolding_to_system(codex_messages: &[Value]) -> (Option<String>, Vec<Value>) {
+        const START: &str = "<system-reminder>";
+        const END: &str = "</system-reminder>";
+        let mut promoted_parts: Vec<String> = Vec::new();
+        let mut cleaned_messages: Vec<Value> = Vec::new();
+
+        for item in codex_messages {
+            let mut cloned = item.clone();
+            let is_user_message = cloned.get("type").and_then(|v| v.as_str()) == Some("message")
+                && cloned.get("role").and_then(|v| v.as_str()) == Some("user");
+            if !is_user_message {
+                cleaned_messages.push(cloned);
+                continue;
+            }
+
+            let Some(content) = cloned.get_mut("content").and_then(|v| v.as_array_mut()) else {
+                cleaned_messages.push(cloned);
+                continue;
+            };
+
+            let mut new_content: Vec<Value> = Vec::new();
+            for block in content.iter() {
+                let Some(text) = block.get("text").and_then(|v| v.as_str()) else {
+                    new_content.push(block.clone());
+                    continue;
+                };
+                let mut remaining = text.to_string();
+
+                while let Some(start_idx) = remaining.find(START) {
+                    let after_start = &remaining[start_idx + START.len()..];
+                    let Some(end_rel) = after_start.find(END) else {
+                        break;
+                    };
+                    let end_idx = start_idx + START.len() + end_rel + END.len();
+                    let block_text = remaining[start_idx + START.len()..start_idx + START.len() + end_rel].trim();
+                    if !block_text.is_empty() {
+                        promoted_parts.push(block_text.to_string());
+                    }
+                    remaining = format!("{}{}", &remaining[..start_idx], &remaining[end_idx..]);
+                }
+
+                if let Some(contents_idx) = remaining.find("Contents of /repo/") {
+                    let after = &remaining[contents_idx..];
+                    if after.contains("CLAUDE.md:") || after.contains("IFLOW.md:") || after.contains("CodeBuddy.md:") {
+                        let prefix = &remaining[..contents_idx];
+                        let lines: Vec<&str> = after.lines().collect();
+                        if lines.len() >= 2 {
+                            let rule_line = lines[1].trim();
+                            if !rule_line.is_empty() {
+                                promoted_parts.push(rule_line.to_string());
+                            }
+                            let remainder = if let Some(split_idx) = after.find("\n\n") {
+                                &after[split_idx + 2..]
+                            } else {
+                                ""
+                            };
+                            remaining = format!("{}{}", prefix, remainder);
+                        }
+                    }
+                }
+
+                let trimmed = remaining.trim();
+                if !trimmed.is_empty() {
+                    let mut new_block = block.clone();
+                    if let Some(obj) = new_block.as_object_mut() {
+                        obj.insert("text".to_string(), Value::String(trimmed.to_string()));
+                    }
+                    new_content.push(new_block);
+                }
+            }
+
+            if let Some(obj) = cloned.as_object_mut() {
+                obj.insert("content".to_string(), Value::Array(new_content));
+            }
+            if cloned
+                .get("content")
+                .and_then(|v| v.as_array())
+                .map(|arr| !arr.is_empty())
+                .unwrap_or(false)
+            {
+                cleaned_messages.push(cloned);
+            }
+        }
+
+        let promoted = if promoted_parts.is_empty() {
+            None
+        } else {
+            Some(promoted_parts.join("\n\n"))
+        };
+        (promoted, cleaned_messages)
+    }
+
+    fn build_system_message(
+        system: Option<&crate::models::SystemContent>,
+        promoted_context: Option<&str>,
+    ) -> Option<Value> {
+        let system_text = Self::flatten_system_text(system);
+        let merged = match (system_text, promoted_context.map(str::trim).filter(|s| !s.is_empty())) {
+            (Some(base), Some(extra)) => Some(format!("{}\n\n{}", base.trim(), extra)),
+            (Some(base), None) => Some(base),
+            (None, Some(extra)) => Some(extra.to_string()),
+            (None, None) => None,
+        }?;
+        Some(json!({ "role": "system", "content": merged }))
     }
     fn build_tool_choice(anthropic_body: &AnthropicRequest, tools: &[Value]) -> Option<Value> {
         if tools.is_empty() {
@@ -343,14 +443,16 @@ impl OpenAIRequestMapper {
         let model = OpenAIChatBackend::normalize_model(requested_model);
         let (transformed_messages, _) =
             MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
+        let (promoted_context, cleaned_messages) =
+            OpenAIChatBackend::extract_user_scaffolding_to_system(&transformed_messages);
 
         let mut messages = Vec::new();
         if let Some(system_msg) =
-            OpenAIChatBackend::build_system_message(anthropic_body.system.as_ref())
+            OpenAIChatBackend::build_system_message(anthropic_body.system.as_ref(), promoted_context.as_deref())
         {
             messages.push(system_msg);
         }
-        messages.extend(OpenAIChatBackend::build_messages(&transformed_messages));
+        messages.extend(OpenAIChatBackend::build_messages(&cleaned_messages));
 
         let mut body = json!({
             "model": model,
@@ -1748,6 +1850,65 @@ mod tests {
                     != Some("Always inspect repo instructions first.")),
             "custom prompt should remain in system content instead of user messages"
         );
+    }
+
+    #[test]
+    fn transform_request_moves_user_project_context_into_system_message() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping, SystemContent,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>\n\nContents of /repo/CLAUDE.md:\nRule A\n\n你好".to_string()
+                )),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+
+        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
+        let system = messages[0].get("content").and_then(Value::as_str).unwrap_or_default();
+        assert!(system.contains("pdf: Read PDF files"));
+        assert!(system.contains("Rule A"));
+        assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
+        assert_eq!(messages[1].get("content").and_then(Value::as_str), Some("你好"));
     }
 
     #[test]

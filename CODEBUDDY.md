@@ -1,0 +1,1 @@
+/Users/mr.j/myRoom/code/ai/MyProjects/codexProxy/CLAUDE.md
