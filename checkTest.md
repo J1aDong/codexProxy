@@ -20,4 +20,4 @@
 7.原生websearch
   websearch搜索下广东未来7天的天气
 
-8.
+8./compact压缩

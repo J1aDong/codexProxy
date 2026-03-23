@@ -23,6 +23,7 @@ const PLAN_MODE_TOOL_BLACKLIST: &[&str] = &[
     "ExitWorktree",
 ];
 const DEFAULT_REASONING_SUMMARY_MODE: &str = "auto";
+const COMPACT_SUMMARY_SYSTEM_MARKER: &str = "you are a helpful ai assistant tasked with summarizing conversations";
 const ENV_REASONING_SUMMARY_MODE: &str = "CODEX_PROXY_REASONING_SUMMARY";
 const ENV_INCLUDE_REASONING_ENCRYPTED_CONTENT: &str =
     "CODEX_PROXY_INCLUDE_REASONING_ENCRYPTED_CONTENT";
@@ -71,6 +72,19 @@ fn is_wrapped_agents_instructions(system_text: &str) -> bool {
     lower.contains("agents.md instructions")
         && lower.contains("<instructions>")
         && lower.contains("</instructions>")
+}
+
+fn is_compact_summary_request(request: &AnthropicRequest) -> bool {
+    request
+        .system
+        .as_ref()
+        .map(|system| {
+            system
+                .to_string()
+                .to_ascii_lowercase()
+                .contains(COMPACT_SUMMARY_SYSTEM_MARKER)
+        })
+        .unwrap_or(false)
 }
 
 fn normalized_contains(haystack: &str, needle: &str) -> bool {
@@ -1794,6 +1808,7 @@ impl TransformRequest {
         let request_text_corpus = collect_request_text_corpus(anthropic_body);
         let request_cwd = extract_request_cwd(&request_text_corpus);
         let request_session_hint = extract_request_session_hint(anthropic_body);
+        let compact_summary_request = is_compact_summary_request(anthropic_body);
         let augmentation = decide_request_augmentation(anthropic_body, &request_text_corpus);
         let apply_agent_augmentations = augmentation.is_agent();
         let apply_plan_augmentations = matches!(augmentation.mode, RequestAugmentationMode::Plan);
@@ -1887,6 +1902,9 @@ impl TransformRequest {
             apply_plan_augmentations,
         );
         adjust_agent_tool_semantics_for_request(anthropic_body, &mut transformed_tools);
+        if compact_summary_request {
+            transformed_tools.clear();
+        }
         let transformed_tools_bytes = serde_json::to_vec(&transformed_tools)
             .map(|buf| buf.len())
             .unwrap_or(0);
@@ -1903,13 +1921,19 @@ impl TransformRequest {
             transformed_tools.len()
         ));
 
-        let tool_choice = Self::build_tool_choice(
-            anthropic_body,
-            &transformed_tools,
-            &augmentation,
-            forced_skill_routing.as_ref().map(|_| "Skill"),
-        );
-        let parallel_tool_calls = Self::resolve_parallel_tool_calls(anthropic_body);
+        let tool_choice = (!compact_summary_request).then(|| {
+            Self::build_tool_choice(
+                anthropic_body,
+                &transformed_tools,
+                &augmentation,
+                forced_skill_routing.as_ref().map(|_| "Skill"),
+            )
+        }).flatten();
+        let parallel_tool_calls = if compact_summary_request {
+            false
+        } else {
+            Self::resolve_parallel_tool_calls(anthropic_body)
+        };
         log(&format!(
             "🧰 [Transform] Resolved tool_choice={} parallel_tool_calls={} (tools={})",
             serde_json::to_string(&tool_choice).unwrap_or_else(|_| "\"auto\"".to_string()),
@@ -1926,13 +1950,13 @@ impl TransformRequest {
             static_heavy_payload_stats.tools_fingerprint.as_deref(),
         );
         let thinking_disabled = anthropic_body.is_thinking_disabled();
-        let reasoning_summary_mode = if thinking_disabled {
+        let reasoning_summary_mode = if thinking_disabled || compact_summary_request {
             None
         } else {
             Some(resolve_reasoning_summary_mode())
         };
         let include_reasoning_encrypted_content =
-            !thinking_disabled && resolve_include_reasoning_encrypted_content();
+            !thinking_disabled && !compact_summary_request && resolve_include_reasoning_encrypted_content();
         let reasoning_summary_requested = reasoning_summary_mode.is_some();
         log(&format!(
             "🧠 [Transform] thinking_disabled={} reasoning.summary_requested={} reasoning.summary={} include.reasoning.encrypted_content={}",
@@ -1967,13 +1991,17 @@ impl TransformRequest {
         let mut body = json!({
             "model": final_codex_model,
             "input": final_input,
-            "tools": transformed_tools,
-            "parallel_tool_calls": parallel_tool_calls,
             "reasoning": reasoning,
             "store": false,
             "stream": true,
             "prompt_cache_key": prompt_cache_key
         });
+        if !compact_summary_request {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("tools".to_string(), Value::Array(transformed_tools.clone()));
+                obj.insert("parallel_tool_calls".to_string(), json!(parallel_tool_calls));
+            }
+        }
         if let Some(instructions) = applied_static_instructions.as_deref() {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("instructions".to_string(), json!(instructions));
@@ -2613,6 +2641,14 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(|v| v.as_str()))
             .map(|name| name.to_string())
             .collect()
+    }
+
+    fn sample_tool() -> Value {
+        json!({
+            "name": "Read",
+            "description": "Read files",
+            "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+        })
     }
 
     #[test]
@@ -3394,6 +3430,45 @@ hello"
         assert!(
             extract_request_cwd(corpus).is_none(),
             "cwd should only come from explicit environment_context block"
+        );
+    }
+
+    #[test]
+    fn compact_summary_requests_drop_tools_and_visible_reasoning_summary() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "请总结刚才的对话"}],
+            "system": "You are Claude Code, Anthropic's official CLI for Claude.\nYou are a helpful AI assistant tasked with summarizing conversations.",
+            "tools": [sample_tool()],
+            "tool_choice": {"type": "auto"},
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (body, _) =
+            TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
+
+        assert!(
+            body.get("tools").is_none(),
+            "compact summary requests should omit tools to avoid tool_use turns"
+        );
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "compact summary requests should omit parallel_tool_calls when tools are disabled"
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "compact summary requests should not keep tool_choice once tools are removed"
+        );
+        assert!(
+            body.pointer("/reasoning/summary").is_none(),
+            "compact summary requests should omit visible reasoning summaries"
+        );
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some(crate::models::get_reasoning_effort("claude-sonnet-4-5", &mapping).as_str()),
+            "compact summary requests should keep reasoning effort mapping"
         );
     }
 
