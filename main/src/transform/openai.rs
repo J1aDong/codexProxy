@@ -199,6 +199,30 @@ impl OpenAIChatBackend {
         openai_messages
     }
 
+    fn is_filtered_expansion_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "SendMessage"
+                | "CronCreate"
+                | "CronDelete"
+                | "CronList"
+                | "NotebookEdit"
+        )
+    }
+
+    fn is_allowed_openai_chat_tool(name: &str) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        if trimmed.starts_with("mcp__") {
+            return false;
+        }
+
+        !Self::is_filtered_expansion_tool(trimmed)
+    }
+
     /// Convert Anthropic tools to OpenAI tools format
     fn convert_tools(tools: Option<&Vec<Value>>) -> Option<Vec<Value>> {
         let tools = tools?;
@@ -210,6 +234,9 @@ impl OpenAIChatBackend {
             .iter()
             .filter_map(|tool| {
                 let name = tool.get("name").and_then(|n| n.as_str())?;
+                if !Self::is_allowed_openai_chat_tool(name) {
+                    return None;
+                }
                 let description = tool
                     .get("description")
                     .and_then(|d| d.as_str())
@@ -1909,6 +1936,95 @@ mod tests {
         assert!(system.contains("Rule A"));
         assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
         assert_eq!(messages[1].get("content").and_then(Value::as_str), Some("你好"));
+    }
+
+    #[test]
+    fn transform_request_filters_unrecognized_expansion_tools_and_keeps_core_gateway_tools() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("你好".to_string())),
+            }],
+            system: None,
+            tools: Some(vec![
+                json!({"name": "Read", "description": "Read files", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "Bash", "description": "Run commands", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "Agent", "description": "Launch agent", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "Skill", "description": "Run a skill", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "ToolSearch", "description": "Search deferred tools", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "DeferExecuteTool", "description": "Execute deferred tool", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "AskUserQuestion", "description": "Ask user a question", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "SendMessage", "description": "Send a team message", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "TeamCreate", "description": "Create team", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "CronCreate", "description": "Create cron", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "LSP", "description": "Language server", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "NotebookEdit", "description": "Edit notebook", "input_schema": {"type": "object", "properties": {}}}),
+                json!({"name": "mcp__context7__query-docs", "description": "Query docs", "input_schema": {"type": "object", "properties": {}}}),
+            ]),
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let tool_names: Vec<&str> = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools should be present")
+            .iter()
+            .filter_map(|tool| tool.get("function"))
+            .filter_map(|function| function.get("name"))
+            .filter_map(Value::as_str)
+            .collect();
+
+        assert_eq!(
+            tool_names,
+            vec![
+                "Read",
+                "Bash",
+                "Agent",
+                "Skill",
+                "ToolSearch",
+                "DeferExecuteTool",
+                "AskUserQuestion",
+            ]
+        );
+        let serialized = body.to_string();
+        assert!(!serialized.contains("SendMessage"));
+        assert!(!serialized.contains("TeamCreate"));
+        assert!(!serialized.contains("CronCreate"));
+        assert!(!serialized.contains("LSP"));
+        assert!(!serialized.contains("NotebookEdit"));
+        assert!(!serialized.contains("mcp__context7__query-docs"));
     }
 
     #[test]
