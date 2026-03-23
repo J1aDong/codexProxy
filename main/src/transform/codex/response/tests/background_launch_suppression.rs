@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn multi_background_launch_turn_suppresses_final_answer_text_until_completion_round() {
+fn multi_background_launch_turn_keeps_visible_final_answer_text() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
     <TransformResponse as crate::transform::ResponseTransformer>::configure_request_context(
@@ -89,17 +89,14 @@ fn multi_background_launch_turn_suppresses_final_answer_text_until_completion_ro
     let joined = transformer.transform_sse_line(&final_text).join("");
 
     assert!(
-        !joined.contains("\"type\":\"text_delta\""),
-        "launch round should suppress visible final-answer text when multiple background agents were launched"
+        joined.contains("\"type\":\"text_delta\""),
+        "launch round should keep visible final-answer text even when multiple background agents were launched"
     );
-    assert!(
-        !joined.contains("看完了。按当前预报"),
-        "launch round should not emit the early summary body"
-    );
+    assert!(joined.contains("看完了。按当前预报"));
 }
 
 #[test]
-fn completion_round_still_suppresses_final_answer_text_until_all_background_handoffs_arrive() {
+fn completion_round_keeps_visible_final_answer_text_before_all_background_handoffs_arrive() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
     <TransformResponse as crate::transform::ResponseTransformer>::configure_request_context(
@@ -135,10 +132,10 @@ fn completion_round_still_suppresses_final_answer_text_until_all_background_hand
     let joined = transformer.transform_sse_line(&final_text).join("");
 
     assert!(
-        !joined.contains("\"type\":\"text_delta\""),
-        "completion round must keep suppressing visible text until all launched background agents have terminal handoffs"
+        joined.contains("\"type\":\"text_delta\""),
+        "completion round should not suppress visible text while waiting for background-agent handoffs"
     );
-    assert!(!joined.contains("补个校正"));
+    assert!(joined.contains("补个校正"));
 }
 
 #[test]

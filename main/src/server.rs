@@ -2889,12 +2889,68 @@ fn extract_message_text(message: &Message) -> Option<String> {
     }
 }
 
+fn count_background_agent_completion_payloads_in_value(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => map
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(|kind| usize::from(kind == "background_agent_completion"))
+            .unwrap_or(0),
+        Value::Array(items) => items
+            .iter()
+            .map(count_background_agent_completion_payloads_in_value)
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn count_background_agent_completion_markers_in_text(text: &str) -> usize {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        let structured_count = count_background_agent_completion_payloads_in_value(&parsed);
+        if structured_count > 0 {
+            return structured_count;
+        }
+    }
+
+    let rewritten_count = trimmed
+        .matches("\"kind\":\"background_agent_completion\"")
+        .count();
+    if rewritten_count > 0 {
+        return rewritten_count;
+    }
+
+    trimmed
+        .matches("<task-notification>")
+        .filter(|_| trimmed.contains("<status>completed</status>"))
+        .count()
+        .min(trimmed.matches("<summary>Agent \"").count())
+}
+
+fn count_background_agent_completion_markers_in_message(message: &Message) -> usize {
+    match &message.content {
+        Some(MessageContent::Text(text)) => count_background_agent_completion_markers_in_text(text),
+        Some(MessageContent::Blocks(blocks)) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .map(count_background_agent_completion_markers_in_text)
+            .sum(),
+        None => 0,
+    }
+}
+
 fn request_contains_background_agent_completion(request: &AnthropicRequest) -> bool {
-    request.messages.iter().any(|message| {
-        extract_message_text(message)
-            .map(|text| text.contains("\"kind\":\"background_agent_completion\""))
-            .unwrap_or(false)
-    })
+    request
+        .messages
+        .iter()
+        .any(|message| count_background_agent_completion_markers_in_message(message) > 0)
 }
 
 fn count_historical_background_agent_launches(request: &AnthropicRequest) -> usize {
@@ -2924,20 +2980,7 @@ fn count_terminal_background_agent_completions(request: &AnthropicRequest) -> us
     request
         .messages
         .iter()
-        .filter_map(extract_message_text)
-        .map(|text| {
-            let rewritten_count = text.matches("\"kind\":\"background_agent_completion\"").count();
-            if rewritten_count > 0 {
-                return rewritten_count;
-            }
-
-            text.matches("<task-notification>")
-                .filter(|_| text.contains("<status>completed</status>"))
-                .count()
-                .min(
-                    text.matches("<summary>Agent \"").count(),
-                )
-        })
+        .map(count_background_agent_completion_markers_in_message)
         .sum()
 }
 
@@ -7689,7 +7732,34 @@ mod tests {
         }))
         .expect("valid request");
 
-        assert_eq!(super::count_terminal_background_agent_completions(&request), 2);
+        assert_eq!(
+            super::count_terminal_background_agent_completions(&request),
+            2
+        );
+    }
+
+    #[test]
+    fn test_background_agent_completion_detection_recognizes_structured_json_payloads() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "{\n  \"kind\": \"background_agent_completion\",\n  \"source\": \"idle_notification\",\n  \"status\": \"completed\",\n  \"summary\": \"Check Beijing weather completed\"\n}"
+                }]
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        assert!(super::request_contains_background_agent_completion(
+            &request
+        ));
+        assert_eq!(
+            super::count_terminal_background_agent_completions(&request),
+            1
+        );
     }
 
     #[test]

@@ -429,6 +429,7 @@ pub struct TransformResponse {
     active_text_parts: HashSet<EventPartKey>,
     text_dedupe_by_part: HashMap<EventPartKey, (TextEventSource, String)>,
     saw_tool_call: bool,
+    tool_stop_reason_pending: bool,
     saw_refusal: bool,
     refusal_text_buffer: String,
     sent_message_start: bool,
@@ -633,7 +634,7 @@ impl TransformResponse {
 
         self.diagnostics.plan_bridge_exit_plan_mode_emitted += 1;
         self.plan_bridge_emitted = true;
-        self.saw_tool_call = true;
+        self.mark_tool_turn_open();
         self.logger
             .log_raw("[PlanBridge] Emitting synthetic ExitPlanMode tool_use");
         self.emit_serialized_tool_call(output, &synthetic_tool);
@@ -1251,7 +1252,7 @@ impl TransformResponse {
         }
 
         for tool in &recovered_calls {
-            self.saw_tool_call = true;
+            self.mark_tool_turn_open();
             self.emit_serialized_tool_call(output, tool);
         }
         self.sync_phase_from_runtime();
@@ -1634,6 +1635,7 @@ impl TransformResponse {
             active_text_parts: HashSet::new(),
             text_dedupe_by_part: HashMap::new(),
             saw_tool_call: false,
+            tool_stop_reason_pending: false,
             saw_refusal: false,
             refusal_text_buffer: String::new(),
             sent_message_start: false,
@@ -2076,7 +2078,7 @@ impl TransformResponse {
             last_progress_message: None,
         });
         self.sort_buffered_tools();
-        self.saw_tool_call = true;
+        self.mark_tool_turn_open();
         self.transition_to(StreamPhase::BufferingToolCalls);
         Some(order_key)
     }
@@ -2601,7 +2603,23 @@ impl TransformResponse {
         serde_json::from_str::<Value>(arguments)
             .ok()
             .and_then(|parsed| parsed.as_object().cloned())
-            .and_then(|input| input.get("run_in_background").and_then(|value| value.as_bool()))
+            .and_then(|input| {
+                input
+                    .get("run_in_background")
+                    .and_then(|value| value.as_bool())
+            })
+            .unwrap_or(false)
+    }
+
+    fn task_output_targets_mailbox_agent_id(arguments: &str) -> bool {
+        Self::parse_tool_arguments_object(arguments)
+            .and_then(|input| {
+                Self::first_string_field(
+                    &input,
+                    &["task_id", "taskId", "agent_id", "agentId", "id", "shell_id"],
+                )
+            })
+            .map(|value| value.contains('@'))
             .unwrap_or(false)
     }
 
@@ -2631,6 +2649,13 @@ impl TransformResponse {
         }
 
         if tool_name.eq_ignore_ascii_case("TaskOutput") {
+            if Self::task_output_targets_mailbox_agent_id(arguments) {
+                return Some(
+                    "不要用 TaskOutput 轮询 agent_id；请等待 teammate-message 或 idle_notification 更新。"
+                        .to_string(),
+                );
+            }
+
             let is_non_blocking = !input
                 .get("block")
                 .and_then(|value| value.as_bool())
@@ -2644,6 +2669,15 @@ impl TransformResponse {
         }
 
         None
+    }
+
+    fn mark_tool_turn_open(&mut self) {
+        self.saw_tool_call = true;
+        self.tool_stop_reason_pending = true;
+    }
+
+    fn mark_tool_turn_resolved_by_final_answer(&mut self) {
+        self.tool_stop_reason_pending = false;
     }
 
     fn emit_background_task_progress(
@@ -2947,11 +2981,6 @@ data: {}
 
         if Self::tool_launches_background_agent(tool.name.as_str(), arguments.as_str()) {
             self.launched_background_agent_count += 1;
-            if self.launched_background_agent_count >= 2
-                && !self.contains_background_agent_completion
-            {
-                self.suppress_visible_final_answer_text = true;
-            }
         }
 
         if Self::build_background_task_progress_message(tool.name.as_str(), arguments.as_str())
@@ -3703,16 +3732,7 @@ data: {}
             return;
         }
 
-        if self.suppress_visible_final_answer_text
-            && !self.in_commentary_phase
-            && !(self.had_reasoning_in_response && !self.saw_message_item_added)
-        {
-            self.logger.log_raw(
-                "[Info] Suppressing visible final-answer text for multi-background-agent launch turn",
-            );
-            return;
-        }
-
+        self.mark_tool_turn_resolved_by_final_answer();
         self.emit_visible_text_fragment(output, fragment);
     }
 
@@ -3897,7 +3917,7 @@ data: {}
             emitted_arguments_len: 0,
             last_progress_message: None,
         };
-        self.saw_tool_call = true;
+        self.mark_tool_turn_open();
         self.emit_serialized_tool_call(output, &synthetic_tool);
         self.sync_phase_from_runtime();
 
@@ -4109,7 +4129,7 @@ data: {}
     }
 
     fn determine_stop_reason(&self, data: &Value, force_incomplete: bool) -> &'static str {
-        if self.saw_tool_call {
+        if self.tool_stop_reason_pending {
             return "tool_use";
         }
         if self.saw_refusal {
@@ -4609,6 +4629,7 @@ data: {}
                                 );
                             } else {
                                 self.in_commentary_phase = false;
+                                self.mark_tool_turn_resolved_by_final_answer();
                             }
                         }
                         "web_search_call" => {
@@ -4837,9 +4858,7 @@ impl ResponseTransformer for TransformResponse {
             .max(ctx.historical_background_agent_launch_count);
         self.terminal_background_agent_completion_count =
             ctx.terminal_background_agent_completion_count;
-        self.suppress_visible_final_answer_text = self.launched_background_agent_count >= 2
-            && self.terminal_background_agent_completion_count
-                < self.launched_background_agent_count;
+        self.suppress_visible_final_answer_text = false;
     }
 
     fn take_diagnostics_summary(&mut self) -> Option<Value> {

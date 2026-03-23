@@ -894,6 +894,133 @@ fn serialized_task_output_tool_use_emits_polling_progress_hint() {
 }
 
 #[test]
+fn task_output_mailbox_agent_id_emits_correction_instead_of_polling_hint() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_task_output_mailbox",
+                "type": "function_call",
+                "call_id": "call_task_output_mailbox",
+                "name": "TaskOutput"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_task_output_mailbox",
+                "type": "function_call",
+                "call_id": "call_task_output_mailbox",
+                "name": "TaskOutput",
+                "arguments": r#"{"task_id":"weather-beijing@debug-swarm","block":false,"timeout":5000}"#
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(
+        joined.contains("不要用 TaskOutput 轮询 agent_id"),
+        "mailbox-style agent ids should emit a corrective progress hint"
+    );
+    assert!(
+        !joined.contains("正在轮询后台任务结果"),
+        "mailbox-style agent ids must not encourage a TaskOutput polling loop"
+    );
+}
+
+#[test]
+fn tool_turn_with_final_answer_completes_as_end_turn() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_read_1",
+                "type": "function_call",
+                "call_id": "call_read_1",
+                "name": "Read"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_read_1",
+                "type": "function_call",
+                "call_id": "call_read_1",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"/tmp/report.md\"}"
+            }
+        })
+    );
+    let final_answer_item = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "msg_final_1",
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer"
+            }
+        })
+    );
+    let final_text = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": 1,
+            "item_id": "msg_final_1",
+            "delta": "我已经看完文件，下面是结论。"
+        })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": { "input_tokens": 14, "output_tokens": 22 }
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    events.extend(transformer.transform_sse_line(&final_answer_item));
+    events.extend(transformer.transform_sse_line(&final_text));
+    events.extend(transformer.transform_sse_line(&completed));
+    let joined = events.join("");
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(joined.contains("我已经看完文件，下面是结论。"));
+    assert!(
+        joined.contains("\"stop_reason\":\"end_turn\""),
+        "final answer after completed tool work must close as end_turn"
+    );
+    assert!(joined.contains("\"type\":\"message_stop\""));
+}
+
+#[test]
 fn retrieval_status_timeout_text_is_bridged_to_thinking_progress() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
