@@ -99,66 +99,6 @@ fn append_instruction_text(base: &str, extra: &str) -> String {
     format!("{}\n\n{}", trimmed_base, trimmed_extra)
 }
 
-fn wrap_agents_instructions(instructions_text: &str, request_cwd: Option<&str>) -> String {
-    if let Some(cwd) = request_cwd {
-        format!(
-            "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-            cwd, instructions_text
-        )
-    } else {
-        format!(
-            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-            instructions_text
-        )
-    }
-}
-
-fn inject_into_agents_wrapper(wrapper_text: &str, extra_text: &str) -> String {
-    let trimmed_extra = extra_text.trim();
-    if trimmed_extra.is_empty() || normalized_contains(wrapper_text, trimmed_extra) {
-        return wrapper_text.to_string();
-    }
-
-    let lower = wrapper_text.to_ascii_lowercase();
-    if let Some(idx) = lower.rfind("</instructions>") {
-        let prefix = &wrapper_text[..idx];
-        let suffix = &wrapper_text[idx..];
-        let trimmed_prefix = prefix.trim_end();
-        return format!("{}\n\n{}\n{}", trimmed_prefix, trimmed_extra, suffix);
-    }
-
-    append_instruction_text(wrapper_text, trimmed_extra)
-}
-
-fn build_agents_wrapper_payload(
-    system_text: Option<&str>,
-    request_cwd: Option<&str>,
-    custom_prompt: Option<&str>,
-) -> Option<String> {
-    let trimmed_system = system_text.map(str::trim).filter(|text| !text.is_empty());
-    let trimmed_custom = custom_prompt.map(str::trim).filter(|text| !text.is_empty());
-
-    match (trimmed_system, trimmed_custom) {
-        (None, None) => None,
-        (Some(system_text), None) => {
-            if is_wrapped_agents_instructions(system_text) {
-                Some(system_text.to_string())
-            } else {
-                Some(wrap_agents_instructions(system_text, request_cwd))
-            }
-        }
-        (Some(system_text), Some(custom_prompt)) => {
-            if is_wrapped_agents_instructions(system_text) {
-                Some(inject_into_agents_wrapper(system_text, custom_prompt))
-            } else {
-                let merged = append_instruction_text(system_text, custom_prompt);
-                Some(wrap_agents_instructions(&merged, request_cwd))
-            }
-        }
-        (None, Some(custom_prompt)) => Some(wrap_agents_instructions(custom_prompt, request_cwd)),
-    }
-}
-
 fn merge_instruction_context(first: Option<&str>, second: Option<&str>) -> Option<String> {
     let mut merged = None::<String>;
     for text in [first, second].into_iter().flatten() {
@@ -329,15 +269,6 @@ fn decide_request_augmentation(
     }
 
     let has_plan_signal = !reasons.is_empty();
-
-    if request
-        .system
-        .as_ref()
-        .map(|system| !system.to_string().trim().is_empty())
-        .unwrap_or(false)
-    {
-        reasons.push("system");
-    }
 
     if request
         .tools
@@ -638,27 +569,6 @@ fn build_static_heavy_payload_stats(
 
 fn format_optional_fingerprint(value: Option<&str>) -> &str {
     value.unwrap_or("-")
-}
-
-pub(crate) fn push_proxy_injected_text_message(
-    final_input: &mut Vec<Value>,
-    seen_texts: &mut HashSet<String>,
-    text: &str,
-) -> bool {
-    let normalized = normalize_text_for_exact_match(text);
-    if normalized.is_empty() || !seen_texts.insert(normalized) {
-        return false;
-    }
-
-    final_input.push(json!({
-        "type": "message",
-        "role": "user",
-        "content": [{
-            "type": "input_text",
-            "text": text
-        }]
-    }));
-    true
 }
 
 fn has_skill_tool(tools: Option<&Vec<Value>>) -> bool {
@@ -1803,18 +1713,21 @@ impl TransformRequest {
             augmentation.mode_label(),
             augmentation_reasons
         ));
-        let mut system_text_for_cache_key = None::<String>;
-        let mut wrapped_system_payload_text = None::<String>;
-        let mut injected_text_dedupe = HashSet::new();
         let trimmed_custom_injection_prompt = custom_injection_prompt.trim();
+        let forced_skill_routing = if apply_agent_augmentations && enable_skill_routing_hint {
+            detect_requested_skill_name(anthropic_body)
+        } else {
+            None
+        };
         let custom_prompt_applied = (apply_agent_augmentations || apply_plan_augmentations)
             && !trimmed_custom_injection_prompt.is_empty();
         let plan_prompt_applied = apply_plan_augmentations;
-        let merged_instruction_context = merge_instruction_context(
+        let proxy_instruction_context = merge_instruction_context(
             custom_prompt_applied.then_some(trimmed_custom_injection_prompt),
             plan_prompt_applied.then_some(ANTHROPIC_COMPAT_PLAN_MODE_PROMPT),
         );
-        // 注入 system prompt
+        let mut applied_static_instructions = proxy_instruction_context.clone();
+        // 归一化 system prompt，并提升到 Responses 顶层 instructions
         if let Some(system) = &anthropic_body.system {
             let mut system_text = system.to_string();
             let sanitized_system_text = strip_dynamic_system_header_lines(&system_text);
@@ -1830,93 +1743,41 @@ impl TransformRequest {
                     system_text = sanitized_plan_system_text;
                 }
             }
-            system_text_for_cache_key = Some(system_text.clone());
             log(&format!(
                 "📋 [Transform] System prompt: {} chars",
                 system_text.len()
             ));
-
-            let system_payload_text = build_agents_wrapper_payload(
-                Some(&system_text),
-                request_cwd.as_deref(),
-                merged_instruction_context.as_deref(),
-            )
-            .unwrap_or(system_text);
-            wrapped_system_payload_text = Some(system_payload_text.clone());
-            final_input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": system_payload_text
-                }]
-            }));
+            applied_static_instructions =
+                merge_instruction_context(Some(system_text.as_str()), proxy_instruction_context.as_deref());
 
             if request_contains_environment_context(&request_text_corpus) {
                 log("📋 [Transform] Skip runtime <environment_context> injection (already present in request text)");
             } else {
                 log("📋 [Transform] Skip runtime <environment_context> injection (no trusted request cwd)");
             }
-        } else if let Some(instruction_context) = merged_instruction_context.as_deref() {
+        } else if let Some(instruction_context) = proxy_instruction_context.as_deref() {
             let context_chars = count_normalized_chars(instruction_context);
             log(&format!(
-                "🎯 [Transform] Wrapping injected instruction context as AGENTS instructions ({} chars)",
+                "🎯 [Transform] Promoting injected instruction context to top-level instructions ({} chars)",
                 context_chars
             ));
-            if let Some(system_payload_text) = build_agents_wrapper_payload(
-                None,
-                request_cwd.as_deref(),
-                Some(instruction_context),
-            ) {
-                wrapped_system_payload_text = Some(system_payload_text.clone());
-                final_input.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": system_payload_text
-                    }]
-                }));
-            }
+            applied_static_instructions = Some(instruction_context.to_string());
         }
 
-        // 注入提取的 Skills
         if !extracted_skills.is_empty() {
             log(&format!(
-                "🎯 [Transform] Injecting {} skill(s)",
+                "🎯 [Transform] Promoting {} extracted skill(s) into instructions",
                 extracted_skills.len()
             ));
-            for skill in extracted_skills {
-                if !push_proxy_injected_text_message(
-                    &mut final_input,
-                    &mut injected_text_dedupe,
-                    &skill,
-                ) {
-                    log("🎯 [Transform] Skip duplicate proxy-injected skill payload");
-                }
+            for skill in &extracted_skills {
+                applied_static_instructions = merge_instruction_context(
+                    applied_static_instructions.as_deref(),
+                    Some(skill.as_str()),
+                );
             }
         }
         // 追加对话历史
         final_input.extend(chat_messages);
-        if apply_agent_augmentations && enable_skill_routing_hint {
-            if let Some(skill_name) = detect_requested_skill_name(anthropic_body) {
-                log(&format!(
-                    "🎯 [Transform] Skill intent matched, nudging Skill tool: {}",
-                    skill_name
-                ));
-                final_input.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": format!(
-                            "Skill routing hint: the latest user request targets skill `{}`.\nIf this skill is available, call the `Skill` tool first before normal text response.",
-                            skill_name
-                        )
-                    }]
-                }));
-            }
-        }
         Self::sanitize_input_for_codex(&mut final_input);
         reconcile_function_call_pairs(&mut final_input);
 
@@ -1932,8 +1793,8 @@ impl TransformRequest {
             .map(|buf| buf.len())
             .unwrap_or(0);
         let static_heavy_payload_stats = build_static_heavy_payload_stats(
-            wrapped_system_payload_text.as_deref(),
-            merged_instruction_context.as_deref(),
+            applied_static_instructions.as_deref(),
+            proxy_instruction_context.as_deref(),
             &transformed_tools,
             transformed_tools_bytes,
         );
@@ -1944,8 +1805,12 @@ impl TransformRequest {
             transformed_tools.len()
         ));
 
-        let tool_choice =
-            Self::build_tool_choice(anthropic_body, &transformed_tools, &augmentation);
+        let tool_choice = Self::build_tool_choice(
+            anthropic_body,
+            &transformed_tools,
+            &augmentation,
+            forced_skill_routing.as_ref().map(|_| "Skill"),
+        );
         let parallel_tool_calls = Self::resolve_parallel_tool_calls(anthropic_body);
         log(&format!(
             "🧰 [Transform] Resolved tool_choice={} parallel_tool_calls={} (tools={})",
@@ -1957,9 +1822,9 @@ impl TransformRequest {
             request_cwd.as_deref(),
             final_codex_model,
             request_session_hint.as_deref(),
-            merged_instruction_context.as_deref(),
             None,
-            system_text_for_cache_key.as_deref(),
+            applied_static_instructions.as_deref(),
+            None,
             static_heavy_payload_stats.tools_fingerprint.as_deref(),
         );
         let thinking_disabled = anthropic_body.is_thinking_disabled();
@@ -2011,6 +1876,11 @@ impl TransformRequest {
             "stream": true,
             "prompt_cache_key": prompt_cache_key
         });
+        if let Some(instructions) = applied_static_instructions.as_deref() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("instructions".to_string(), json!(instructions));
+            }
+        }
         if let Some(tool_choice) = tool_choice {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("tool_choice".to_string(), tool_choice);
@@ -2149,6 +2019,7 @@ impl TransformRequest {
         anthropic_body: &AnthropicRequest,
         transformed_tools: &[Value],
         augmentation: &RequestAugmentationDecision,
+        forced_tool_name: Option<&str>,
     ) -> Option<Value> {
         if matches!(augmentation.mode, RequestAugmentationMode::Plan)
             && request_targets_blacklisted_plan_mode_tool(anthropic_body)
@@ -2158,6 +2029,12 @@ impl TransformRequest {
 
         if transformed_tools.is_empty() {
             return Some(json!("none"));
+        }
+
+        if let Some(forced_tool_name) = forced_tool_name {
+            if anthropic_body.tool_choice.is_none() {
+                return Some(Self::resolve_named_tool_choice(forced_tool_name, transformed_tools));
+            }
         }
 
         let Some(tool_choice) = anthropic_body.tool_choice.as_ref() else {
@@ -2571,11 +2448,11 @@ mod tests {
     use super::{
         collect_request_text_corpus, compact_tool_description, decide_request_augmentation,
         detect_requested_skill_name, extract_request_cwd, fingerprint_json_value,
-        normalize_text_for_exact_match, push_proxy_injected_text_message,
         strip_dynamic_system_header_lines, RequestAugmentationMode, TransformRequest,
         ANTHROPIC_COMPAT_PLAN_MODE_PROMPT,
     };
     use crate::models::{AnthropicRequest, ReasoningEffortMapping};
+    use crate::transform::MessageProcessor;
     use serde_json::{json, Value};
 
     fn sample_request() -> AnthropicRequest {
@@ -2618,15 +2495,16 @@ mod tests {
             .collect()
     }
 
-    fn first_input_text(body: &Value) -> String {
-        body.get("input")
-            .and_then(|v| v.as_array())
-            .and_then(|items| items.first())
-            .and_then(|item| item.get("content").and_then(|v| v.as_array()))
-            .and_then(|blocks| blocks.first())
-            .and_then(|block| block.get("text").and_then(|v| v.as_str()))
-            .unwrap_or_default()
-            .to_string()
+    fn instructions_text(body: &Value) -> Option<String> {
+        body.get("instructions")
+            .and_then(|v| v.as_str())
+            .map(|text| text.to_string())
+    }
+
+    fn contains_wrapped_agents_user_input(body: &Value) -> bool {
+        input_texts(body)
+            .iter()
+            .any(|text| text.starts_with("# AGENTS.md instructions"))
     }
 
     fn tool_names(body: &Value) -> Vec<String> {
@@ -3246,7 +3124,18 @@ hello"
 
     #[test]
     fn prompt_cache_key_changes_when_custom_prompt_changes() {
-        let request = sample_request();
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":"hello"}],
+            "system": "System prompt",
+            "tools": [{
+                "name": "Read",
+                "description": "Read files",
+                "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
         let mapping = ReasoningEffortMapping::default();
 
         let (body_a, _) = TransformRequest::transform(
@@ -3267,7 +3156,7 @@ hello"
         assert_ne!(
             body_a.get("prompt_cache_key"),
             body_b.get("prompt_cache_key"),
-            "cache key should rotate when static prefix changes"
+            "cache key should rotate when active instructions change"
         );
     }
 
@@ -3294,18 +3183,10 @@ hello"
             "runtime environment context should not be injected when request has none"
         );
 
-        let first_system_text = input_items
-            .first()
-            .and_then(|item| item.get("content"))
-            .and_then(|v| v.as_array())
-            .and_then(|blocks| blocks.first())
-            .and_then(|block| block.get("text"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let instructions = instructions_text(&body).expect("instructions should be present");
         assert!(
-            first_system_text.starts_with("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n"),
-            "system wrapper should avoid local current_dir path when request cwd is missing"
+            instructions.contains("System prompt"),
+            "instructions should carry system text when no trusted cwd is available"
         );
     }
 
@@ -3325,22 +3206,10 @@ hello"
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
-        let input_items = body
-            .get("input")
-            .and_then(|v| v.as_array())
-            .expect("input array");
-        let first_system_text = input_items
-            .first()
-            .and_then(|item| item.get("content"))
-            .and_then(|v| v.as_array())
-            .and_then(|blocks| blocks.first())
-            .and_then(|block| block.get("text"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let instructions = instructions_text(&body).expect("instructions should be present");
         assert!(
-            first_system_text.contains("# AGENTS.md instructions for /Users/mr.j"),
-            "wrapper should use trusted cwd extracted from request context"
+            instructions.contains("System prompt"),
+            "trusted request cwd should no longer alter the instruction wrapper shape"
         );
     }
 
@@ -3501,7 +3370,7 @@ hello"
     }
 
     #[test]
-    fn tool_requests_remain_agent_shaped_when_thinking_disabled() {
+    fn tool_requests_keep_instruction_semantics_when_thinking_disabled() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hello"}],
@@ -3523,18 +3392,14 @@ hello"
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
+        let instructions = instructions_text(&body).expect("instructions should be present");
         assert!(
-            body.get("instructions").is_none(),
-            "tool-capable requests should prefer wrapped prompt context over hidden static instructions"
-        );
-        let first_text = first_input_text(&body);
-        assert!(
-            first_text.starts_with("# AGENTS.md instructions"),
-            "tool-capable requests should stay agent-shaped via wrapped instructions"
+            instructions.contains("global prompt"),
+            "custom prompt should move into top-level instructions"
         );
         assert!(
-            first_text.contains("global prompt"),
-            "custom prompt should stay in wrapped instruction context"
+            !contains_wrapped_agents_user_input(&body),
+            "tool-capable requests should no longer synthesize wrapped AGENTS user input"
         );
         assert!(
             body.pointer("/reasoning/summary").is_none(),
@@ -3615,31 +3480,6 @@ hello"
     }
 
     #[test]
-    fn proxy_injected_text_message_dedupes_exact_match_only() {
-        let mut input = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        assert!(push_proxy_injected_text_message(
-            &mut input,
-            &mut seen,
-            "alpha\r\n\r\n"
-        ));
-        assert!(!push_proxy_injected_text_message(
-            &mut input,
-            &mut seen,
-            "  alpha\n"
-        ));
-        assert!(push_proxy_injected_text_message(
-            &mut input,
-            &mut seen,
-            "alpha beta"
-        ));
-
-        assert_eq!(input.len(), 2);
-        assert_eq!(normalize_text_for_exact_match("\r\nalpha\r\n"), "alpha");
-    }
-
-    #[test]
     fn prompt_cache_key_ignores_inactive_agent_prefixes_for_passthrough_requests() {
         let request = sample_passthrough_request();
         let mapping = ReasoningEffortMapping::default();
@@ -3692,7 +3532,8 @@ hello"
 
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
-        assert!(body.get("instructions").is_none());
+        let instructions = instructions_text(&body);
+        assert!(instructions.is_none());
         let texts = input_texts(&body);
         assert_eq!(
             texts.len(),
@@ -3797,7 +3638,7 @@ hello"
     }
 
     #[test]
-    fn system_requests_include_agent_prefixes() {
+    fn system_requests_stay_passthrough_and_use_instructions() {
         let request = sample_request();
         let mapping = ReasoningEffortMapping::default();
         let augmentation = decide_request_augmentation(
@@ -3806,35 +3647,34 @@ hello"
 hello",
         );
 
-        assert_eq!(augmentation.mode, RequestAugmentationMode::Agent);
-        assert!(augmentation.reasons.contains(&"system"));
+        assert_eq!(augmentation.mode, RequestAugmentationMode::Passthrough);
+        assert!(
+            !augmentation.reasons.contains(&"system"),
+            "plain system prompts should not force agent augmentation"
+        );
 
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
+        let instructions = instructions_text(&body).expect("instructions should be present");
         assert!(
-            body.get("instructions").is_none(),
-            "system-only agent requests should rely on wrapped system instead of static instructions"
+            instructions.contains("System prompt"),
+            "instructions should preserve the original system prompt"
+        );
+        assert!(
+            !contains_wrapped_agents_user_input(&body),
+            "system requests should no longer synthesize wrapped AGENTS user input"
         );
         let texts = input_texts(&body);
         assert!(
             !texts.iter().any(|text| text == "global prompt"),
-            "agent-shaped requests should not inject the custom global prompt as a standalone user message"
-        );
-        let first_text = first_input_text(&body);
-        assert!(
-            first_text.contains("System prompt"),
-            "wrapped system text should preserve the original system prompt"
-        );
-        assert!(
-            first_text.contains("global prompt"),
-            "wrapped system text should also carry the custom global prompt"
+            "custom global prompt should remain out of standalone user messages when passthrough"
         );
         assert!(
             !texts
                 .iter()
                 .any(|text| text.contains("After emitting the <proposed_plan> block")),
-            "ordinary agent requests must not receive plan-mode prompt injection"
+            "ordinary system requests must not receive plan-mode prompt injection"
         );
     }
 
@@ -3866,10 +3706,10 @@ hello",
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
-        assert_eq!(
-            body.get("instructions").and_then(|v| v.as_str()),
-            None,
-            "agent requests without system should keep custom prompt in wrapped user input instead of hidden static instructions"
+        let instructions = instructions_text(&body).expect("instructions should be present");
+        assert!(
+            instructions.contains("global prompt"),
+            "agent requests without system should move custom prompt into top-level instructions"
         );
 
         let texts = input_texts(&body);
@@ -3878,14 +3718,9 @@ hello",
             "custom prompt should not appear as a standalone user message"
         );
 
-        let first_text = first_input_text(&body);
         assert!(
-            first_text.starts_with("# AGENTS.md instructions"),
-            "custom prompt should be wrapped as AGENTS-style instructions"
-        );
-        assert!(
-            first_text.contains("global prompt"),
-            "wrapped AGENTS instructions should contain the custom prompt"
+            !contains_wrapped_agents_user_input(&body),
+            "agent requests without system should no longer keep custom prompt in wrapped user input"
         );
     }
 
@@ -3926,32 +3761,32 @@ hello",
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
         let texts = input_texts(&body);
-        let first_text = first_input_text(&body);
+        let instructions = instructions_text(&body).expect("instructions should be present");
 
         assert!(
-            first_text.contains("Emit exactly one <proposed_plan> block in the turn."),
+            instructions.contains("Emit exactly one <proposed_plan> block in the turn."),
             "plan requests should inject the anthropic-compatible plan-mode prompt"
         );
         assert!(
-            first_text.contains("<proposed_plan>") && first_text.contains("</proposed_plan>"),
+            instructions.contains("<proposed_plan>") && instructions.contains("</proposed_plan>"),
             "plan requests should explicitly instruct the model to emit a proposed_plan block"
         );
         assert!(
-            first_text.contains(
+            instructions.contains(
                 "After the <proposed_plan> block, call ExitPlanMode to request approval."
             ),
             "plan requests should instruct the model to use ExitPlanMode after emitting the plan"
         );
         assert!(
-            first_text.contains("global prompt"),
-            "plan-mode requests should also carry the custom prompt in system context"
+            instructions.contains("global prompt"),
+            "plan-mode requests should also carry the custom prompt in instructions"
         );
         assert_eq!(
             texts.iter()
                 .filter(|text| text.trim() == ANTHROPIC_COMPAT_PLAN_MODE_PROMPT.trim())
                 .count(),
             0,
-            "plan-mode prompt should be merged into the wrapped system context, not sent as a standalone user message"
+            "plan-mode prompt should be merged into top-level instructions, not sent as a standalone user message"
         );
         assert_eq!(
             body.get("tool_choice"),
@@ -3979,20 +3814,20 @@ hello",
 
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
-        let first_text = first_input_text(&body);
+        let instructions = instructions_text(&body).expect("instructions should be present");
 
         assert!(
-            first_text.contains("Skill catalog (condensed)"),
+            instructions.contains("Skill catalog (condensed)"),
             "skill catalog reminder should still be preserved after plan-mode cleaning"
         );
         assert!(
-            !first_text.contains("Plan File Info")
-                && !first_text.contains("warm-cooking-token.md")
-                && !first_text.contains("Launch Plan agent(s)"),
+            !instructions.contains("Plan File Info")
+                && !instructions.contains("warm-cooking-token.md")
+                && !instructions.contains("Launch Plan agent(s)"),
             "claude-native plan orchestration text should be stripped before forwarding to codex"
         );
         assert!(
-            first_text.contains("Emit exactly one <proposed_plan> block in the turn."),
+            instructions.contains("Emit exactly one <proposed_plan> block in the turn."),
             "codex-native plan instructions should still be injected"
         );
     }
@@ -4167,26 +4002,22 @@ hello",
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
         let texts = input_texts(&body);
-        let first_text = first_input_text(&body);
+        let instructions = instructions_text(&body).expect("instructions should be present");
 
         assert!(
-            first_text.contains("Emit exactly one <proposed_plan> block in the turn."),
+            instructions.contains("Emit exactly one <proposed_plan> block in the turn."),
             "plan approval signal should still inject the anthropic-compatible plan prompt"
         );
         assert!(
-            first_text.contains("<proposed_plan>") && first_text.contains("</proposed_plan>"),
+            instructions.contains("<proposed_plan>") && instructions.contains("</proposed_plan>"),
             "plan approval signal should preserve the proposed_plan requirement"
         );
         assert!(
-            first_text.contains("Do not ask the user to type approval in normal text."),
+            instructions.contains("Do not ask the user to type approval in normal text."),
             "plan approval signal should discourage plain-text approval asks"
         );
         assert!(
-            first_text.starts_with("# AGENTS.md instructions"),
-            "plan approval requests without system text should still wrap the custom prompt as instructions"
-        );
-        assert!(
-            first_text.contains("global prompt"),
+            instructions.contains("global prompt"),
             "plan approval requests should not drop the custom prompt"
         );
         assert_eq!(
@@ -4194,7 +4025,7 @@ hello",
                 .filter(|text| text.trim() == ANTHROPIC_COMPAT_PLAN_MODE_PROMPT.trim())
                 .count(),
             0,
-            "plan-mode prompt should stay inside wrapped instructions even when no original system text exists"
+            "plan-mode prompt should stay in top-level instructions instead of input messages"
         );
     }
 
@@ -4244,7 +4075,7 @@ hello",
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
         let texts = input_texts(&body);
-        let first_text = first_input_text(&body);
+        let instructions = instructions_text(&body).expect("instructions should be present");
 
         assert!(
             !texts
@@ -4253,8 +4084,8 @@ hello",
             "non-plan requests should not inject the plan prompt"
         );
         assert!(
-            first_text.contains("global prompt"),
-            "ordinary agent requests should still carry the custom prompt"
+            instructions.contains("global prompt"),
+            "ordinary agent requests should still carry the custom prompt in instructions"
         );
     }
 
@@ -4315,8 +4146,8 @@ hello",
 
         assert_eq!(
             augmentation.mode,
-            RequestAugmentationMode::Agent,
-            "a prior user turn carrying the plan reminder should not force the next plain request into plan mode"
+            RequestAugmentationMode::Passthrough,
+            "a prior user turn carrying the plan reminder should not force the next plain request into agent or plan mode"
         );
         assert!(
             !augmentation.reasons.contains(&"recent_plan_mode_reminder"),
@@ -4341,9 +4172,10 @@ hello",
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
+        let instructions = instructions_text(&body).expect("instructions should be present");
         assert!(
-            body.get("instructions").is_none(),
-            "system-only requests with codex rules should skip static instructions"
+            instructions.contains("You are Codex, based on GPT-5."),
+            "system-only requests with codex rules should preserve system text in instructions"
         );
     }
 
@@ -4360,21 +4192,10 @@ hello",
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
-        let input_items = body
-            .get("input")
-            .and_then(|v| v.as_array())
-            .expect("input array");
-        let env_context_count = input_items
-            .iter()
-            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
-            .flat_map(|blocks| blocks.iter())
-            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-            .filter(|text| text.contains("<environment_context>"))
-            .count();
-
-        assert_eq!(
-            env_context_count, 1,
-            "runtime environment context should not be appended when already present"
+        let instructions = instructions_text(&body).expect("instructions should be present");
+        assert!(
+            instructions.contains("<environment_context>"),
+            "system-provided environment context should stay in top-level instructions"
         );
     }
 
@@ -4427,32 +4248,20 @@ hello",
         let (body, _) =
             TransformRequest::transform(&request, None, &mapping, "global prompt", "gpt-5.3-codex");
 
-        let input_items = body
-            .get("input")
-            .and_then(|v| v.as_array())
-            .expect("input array");
-        let first_system_text = input_items
-            .first()
-            .and_then(|item| item.get("content"))
-            .and_then(|v| v.as_array())
-            .and_then(|blocks| blocks.first())
-            .and_then(|block| block.get("text"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let instructions = instructions_text(&body).expect("instructions should be present");
 
-        let marker_count = first_system_text.matches("AGENTS.md instructions").count();
+        let marker_count = instructions.matches("AGENTS.md instructions").count();
         assert_eq!(
             marker_count, 1,
             "existing AGENTS wrapper should not be nested"
         );
         assert!(
-            first_system_text.contains("hello"),
+            instructions.contains("hello"),
             "wrapped system text should preserve the original instructions"
         );
         assert!(
-            first_system_text.contains("global prompt"),
-            "wrapped system text should absorb the custom prompt inside the existing wrapper"
+            instructions.contains("global prompt"),
+            "wrapped agent systems should still merge active custom prompts into instructions"
         );
     }
 
@@ -4499,7 +4308,7 @@ hello",
     }
 
     #[test]
-    fn transform_injects_skill_routing_hint_when_explicit_skill_token_detected() {
+    fn transform_routes_explicit_skill_token_via_structured_tool_choice() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-5",
             "messages": [{"role":"user","content":"请使用 /figma-implement-design 处理这个节点"}],
@@ -4530,18 +4339,19 @@ hello",
             .get("input")
             .and_then(|v| v.as_array())
             .expect("input array");
-        let hint_texts: Vec<&str> = input_items
+        let hint_text_count = input_items
             .iter()
             .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
             .flat_map(|blocks| blocks.iter())
             .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
             .filter(|text| text.contains("Skill routing hint"))
-            .collect();
+            .count();
 
-        assert_eq!(hint_texts.len(), 1, "expected one injected routing hint");
-        assert!(
-            hint_texts[0].contains("figma-implement-design"),
-            "routing hint should include matched skill name"
+        assert_eq!(hint_text_count, 0, "structured routing should avoid synthetic skill hint messages");
+        assert_eq!(
+            body.get("tool_choice"),
+            Some(&json!({"type":"function","name":"Skill"})),
+            "explicit skill requests should be routed via tool_choice=function(Skill)"
         );
     }
 
@@ -4578,6 +4388,68 @@ hello",
         assert_eq!(
             hint_text_count, 0,
             "skill routing hint should be disabled by default for passthrough parity"
+        );
+    }
+
+    #[test]
+    fn transform_moves_extracted_skill_payloads_into_instructions() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "call_skill_1",
+                        "name": "Skill",
+                        "input": {"skill": "figma-implement-design"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_skill_1",
+                        "content": [
+                            {"text": "<command-name>figma-implement-design</command-name>", "type": "text"},
+                            {"text": "Base Path: /tmp/figma", "type": "text"},
+                            {"text": "Use the figma skill for exact design implementation.", "type": "text"}
+                        ]
+                    }]
+                }
+            ],
+            "tools": [{
+                "name": "Skill",
+                "description": "Execute skill",
+                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
+            }],
+            "stream": true
+        }))
+        .expect("valid anthropic request");
+        let mapping = ReasoningEffortMapping::default();
+
+        let (messages_for_codex, extracted_skills) =
+            MessageProcessor::transform_messages(&request.messages, None);
+        assert!(
+            !messages_for_codex.is_empty(),
+            "skill extraction fixture should still produce codex input messages"
+        );
+        assert!(
+            !extracted_skills.is_empty(),
+            "skill extraction fixture should produce extracted skill payloads"
+        );
+
+        let (body, _) = TransformRequest::transform(&request, None, &mapping, "", "gpt-5.3-codex");
+
+        let instructions = instructions_text(&body).expect("instructions should be present");
+        assert!(
+            instructions.contains("<skill>") && instructions.contains("<name>figma-implement-design</name>"),
+            "extracted skill payloads should move into instructions"
+        );
+        let input_text = input_texts(&body).join("\n");
+        assert!(
+            !input_text.contains("<skill>"),
+            "extracted skill payloads should no longer be injected into input messages"
         );
     }
 
