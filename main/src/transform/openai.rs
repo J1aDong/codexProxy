@@ -7,7 +7,8 @@ use crate::models::AnthropicRequest;
 use crate::transform::processor::ExtractedSkillPayload;
 
 use super::{
-    MessageProcessor, ResponseTransformer, TransformBackend, TransformContext,
+    MessageProcessor, ResponseTransformRequestContext, ResponseTransformer, TransformBackend,
+    TransformContext,
 };
 
 pub struct OpenAIChatBackend;
@@ -291,7 +292,8 @@ impl OpenAIChatBackend {
                 break;
             };
             let end_idx = start_idx + START.len() + end_rel + END.len();
-            let block_text = text[start_idx + START.len()..start_idx + START.len() + end_rel].trim();
+            let block_text =
+                text[start_idx + START.len()..start_idx + START.len() + end_rel].trim();
 
             if Self::reminder_contains_skill_catalog(block_text) {
                 cleaned.push_str(&text[cursor..end_idx]);
@@ -308,7 +310,9 @@ impl OpenAIChatBackend {
         (promoted_parts, cleaned)
     }
 
-    fn extract_user_scaffolding_to_system(codex_messages: &[Value]) -> (Option<String>, Vec<Value>) {
+    fn extract_user_scaffolding_to_system(
+        codex_messages: &[Value],
+    ) -> (Option<String>, Vec<Value>) {
         let mut promoted_parts: Vec<String> = Vec::new();
         let mut cleaned_messages: Vec<Value> = Vec::new();
 
@@ -338,7 +342,10 @@ impl OpenAIChatBackend {
 
                 if let Some(contents_idx) = remaining.find("Contents of /repo/") {
                     let after = &remaining[contents_idx..];
-                    if after.contains("CLAUDE.md:") || after.contains("IFLOW.md:") || after.contains("CodeBuddy.md:") {
+                    if after.contains("CLAUDE.md:")
+                        || after.contains("IFLOW.md:")
+                        || after.contains("CodeBuddy.md:")
+                    {
                         let prefix = &remaining[..contents_idx];
                         let lines: Vec<&str> = after.lines().collect();
                         if lines.len() >= 2 {
@@ -455,7 +462,10 @@ impl OpenAIChatBackend {
         promoted_context: Option<&str>,
     ) -> Option<Value> {
         let system_text = Self::flatten_system_text(system);
-        let merged = match (system_text, promoted_context.map(str::trim).filter(|s| !s.is_empty())) {
+        let merged = match (
+            system_text,
+            promoted_context.map(str::trim).filter(|s| !s.is_empty()),
+        ) {
             (Some(base), Some(extra)) => Some(format!("{}\n\n{}", base.trim(), extra)),
             (Some(base), None) => Some(base),
             (None, Some(extra)) => Some(extra.to_string()),
@@ -543,9 +553,10 @@ impl OpenAIRequestMapper {
             OpenAIChatBackend::append_extracted_skill_outputs(&cleaned_messages, &extracted_skills);
 
         let mut messages = Vec::new();
-        if let Some(system_msg) =
-            OpenAIChatBackend::build_system_message(anthropic_body.system.as_ref(), promoted_context.as_deref())
-        {
+        if let Some(system_msg) = OpenAIChatBackend::build_system_message(
+            anthropic_body.system.as_ref(),
+            promoted_context.as_deref(),
+        ) {
             messages.push(system_msg);
         }
         messages.extend(OpenAIChatBackend::build_messages(&enriched_messages));
@@ -732,6 +743,7 @@ struct ToolCallState {
     id: String,
     name: String,
     arguments: String,
+    emitted_arguments_len: usize,
     block_index: Option<usize>,
     has_started: bool,
 }
@@ -741,6 +753,7 @@ pub struct OpenAIChatResponseTransformer {
     message_id: String,
     model: String,
     allow_visible_thinking: bool,
+    selected_choice_index: Option<usize>,
     content_index: usize,
     open_text_index: Option<usize>,
     open_text_block_kind: Option<TextBlockKind>,
@@ -748,6 +761,12 @@ pub struct OpenAIChatResponseTransformer {
     sent_message_stop: bool,
     tool_calls: Vec<Option<ToolCallState>>,
     saw_tool_call: bool,
+    contains_background_agent_completion: bool,
+    historical_background_agent_launch_count: usize,
+    launched_background_agent_count: usize,
+    terminal_background_agent_completion_count: usize,
+    lifecycle_progress_messages_emitted: usize,
+    pending_lifecycle_text: String,
     finish_reason: Option<String>,
     stop_sequence: Option<String>,
     usage: Option<Value>,
@@ -763,6 +782,7 @@ impl OpenAIChatResponseTransformer {
             message_id: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
             model: model.to_string(),
             allow_visible_thinking,
+            selected_choice_index: None,
             content_index: 0,
             open_text_index: None,
             open_text_block_kind: None,
@@ -770,10 +790,325 @@ impl OpenAIChatResponseTransformer {
             sent_message_stop: false,
             tool_calls: Vec::new(),
             saw_tool_call: false,
+            contains_background_agent_completion: false,
+            historical_background_agent_launch_count: 0,
+            launched_background_agent_count: 0,
+            terminal_background_agent_completion_count: 0,
+            lifecycle_progress_messages_emitted: 0,
+            pending_lifecycle_text: String::new(),
             finish_reason: None,
             stop_sequence: None,
             usage: None,
         }
+    }
+
+    fn tool_call_is_ready(state: &ToolCallState) -> bool {
+        !state.name.trim().is_empty()
+    }
+
+    fn known_background_agent_launch_count(&self) -> usize {
+        self.launched_background_agent_count
+            .max(self.historical_background_agent_launch_count)
+    }
+
+    fn pending_background_agent_count(&self) -> usize {
+        self.known_background_agent_launch_count()
+            .saturating_sub(self.terminal_background_agent_completion_count)
+    }
+
+    fn is_background_agent_round_active(&self) -> bool {
+        self.contains_background_agent_completion || self.pending_background_agent_count() > 0
+    }
+
+    fn extract_xml_tag_body<'a>(fragment: &'a str, tag: &str) -> Option<&'a str> {
+        let start_marker = format!("<{tag}>");
+        let end_marker = format!("</{tag}>");
+        let start = fragment.find(start_marker.as_str())? + start_marker.len();
+        let end = fragment[start..].find(end_marker.as_str())? + start;
+        Some(fragment[start..end].trim())
+    }
+
+    fn compact_task_completion_summary(summary: &str) -> String {
+        let trimmed = summary.trim();
+        if let Some(rest) = trimmed.strip_prefix("Agent \"") {
+            if let Some(end_quote) = rest.find('"') {
+                let name = rest[..end_quote].trim();
+                if !name.is_empty() {
+                    return format!("后台 explorer 已完成：{name}…");
+                }
+            }
+        }
+
+        if trimmed.is_empty() {
+            "后台任务已完成，正在汇总结果…".to_string()
+        } else {
+            format!("后台任务已完成：{trimmed}…")
+        }
+    }
+
+    fn tool_launches_background_agent(tool_name: &str, arguments: &str) -> bool {
+        if !tool_name.eq_ignore_ascii_case("Agent") {
+            return false;
+        }
+
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|parsed| parsed.as_object().cloned())
+            .and_then(|input| {
+                input
+                    .get("run_in_background")
+                    .and_then(|value| value.as_bool())
+            })
+            .unwrap_or(false)
+    }
+
+    fn task_output_targets_mailbox_agent_id(arguments: &str) -> bool {
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|parsed| parsed.as_object().cloned())
+            .and_then(|input| {
+                input
+                    .get("task_id")
+                    .or_else(|| input.get("taskId"))
+                    .or_else(|| input.get("agent_id"))
+                    .or_else(|| input.get("agentId"))
+                    .or_else(|| input.get("id"))
+                    .or_else(|| input.get("shell_id"))
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.contains('@'))
+            })
+            .unwrap_or(false)
+    }
+
+    fn build_background_task_progress_message(tool_name: &str, arguments: &str) -> Option<String> {
+        let parsed = serde_json::from_str::<Value>(arguments).ok()?;
+        let input = parsed.as_object()?;
+
+        if tool_name.eq_ignore_ascii_case("Agent") {
+            if !input
+                .get("run_in_background")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+
+            let description = input
+                .get("description")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+
+            return Some(match description {
+                Some(value) => format!("已启动后台 explorer：{value}…"),
+                None => "已启动后台 explorer，正在处理中…".to_string(),
+            });
+        }
+
+        if tool_name.eq_ignore_ascii_case("TaskOutput") {
+            if Self::task_output_targets_mailbox_agent_id(arguments) {
+                return Some(
+                    "不要用 TaskOutput 轮询 agent_id；请等待 teammate-message 或 idle_notification 更新。"
+                        .to_string(),
+                );
+            }
+
+            let is_non_blocking = !input
+                .get("block")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+
+            return Some(if is_non_blocking {
+                "正在轮询后台任务结果…".to_string()
+            } else {
+                "正在等待后台任务返回结果…".to_string()
+            });
+        }
+
+        None
+    }
+
+    fn build_task_lifecycle_progress_message(fragment: &str) -> Option<(String, bool)> {
+        let trimmed = fragment.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if trimmed.starts_with("<retrieval_status>") {
+            let status = Self::extract_xml_tag_body(trimmed, "retrieval_status")?;
+            let message = match status {
+                "timeout" | "running" => "某个 explorer 仍在运行，我继续等待结果…".to_string(),
+                other if !other.is_empty() => format!("后台任务状态更新：{other}…"),
+                _ => return None,
+            };
+            return Some((message, false));
+        }
+
+        if trimmed.starts_with("<task-notification>") {
+            let status = Self::extract_xml_tag_body(trimmed, "status").unwrap_or("");
+            let summary = Self::extract_xml_tag_body(trimmed, "summary").unwrap_or("");
+            let message = match status {
+                "completed" => Self::compact_task_completion_summary(summary),
+                "failed" => {
+                    if summary.trim().is_empty() {
+                        "后台任务执行失败，我继续处理剩余结果…".to_string()
+                    } else {
+                        format!("后台任务失败：{}…", summary.trim())
+                    }
+                }
+                _ => {
+                    if summary.trim().is_empty() {
+                        "收到后台任务进度更新…".to_string()
+                    } else {
+                        format!("后台任务进度更新：{}…", summary.trim())
+                    }
+                }
+            };
+            return Some((message, status == "completed"));
+        }
+
+        if trimmed.starts_with('{') {
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                if parsed.get("kind").and_then(|value| value.as_str())
+                    == Some("background_agent_completion")
+                {
+                    let status = parsed
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let summary = parsed
+                        .get("summary")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let message = if status.eq_ignore_ascii_case("completed") || !summary.is_empty()
+                    {
+                        Self::compact_task_completion_summary(summary)
+                    } else {
+                        "收到后台任务进度更新…".to_string()
+                    };
+                    return Some((message, true));
+                }
+            }
+        }
+
+        if trimmed.starts_with("Task is still running") {
+            return Some(("某个 explorer 仍在运行，我继续等待结果…".to_string(), false));
+        }
+
+        if trimmed.starts_with("No task output available") {
+            return Some(("后台任务暂时还没有新输出，我继续等待…".to_string(), false));
+        }
+
+        if trimmed.starts_with("Error: No task found with ID:") {
+            return Some((
+                "某个后台任务已结束或状态失效，我继续汇总现有结果…".to_string(),
+                false,
+            ));
+        }
+
+        None
+    }
+
+    fn looks_like_lifecycle_candidate(fragment: &str) -> bool {
+        let trimmed = fragment.trim();
+        trimmed.starts_with("<task-notification>")
+            || trimmed.starts_with("<retrieval_status>")
+            || trimmed.starts_with("Task is still running")
+            || trimmed.starts_with("No task output available")
+            || trimmed.starts_with("Error: No task found with ID:")
+            || (trimmed.starts_with('{') && trimmed.contains("background_agent_completion"))
+    }
+
+    fn emit_lifecycle_progress(
+        &mut self,
+        out: &mut Vec<String>,
+        message: &str,
+        terminal_completion: bool,
+    ) {
+        if terminal_completion {
+            self.terminal_background_agent_completion_count += 1;
+        }
+        self.lifecycle_progress_messages_emitted += 1;
+
+        if !self.allow_visible_thinking || message.is_empty() {
+            return;
+        }
+
+        self.open_thinking_block_if_needed(out);
+        out.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": self.open_text_index,
+                "delta": { "type": "thinking_delta", "thinking": message }
+            })
+        ));
+    }
+
+    fn maybe_emit_task_lifecycle_progress(
+        &mut self,
+        fragment: &str,
+        out: &mut Vec<String>,
+    ) -> bool {
+        if fragment.is_empty() {
+            return false;
+        }
+
+        if !self.pending_lifecycle_text.is_empty() {
+            self.pending_lifecycle_text.push_str(fragment);
+            if let Some((message, terminal_completion)) =
+                Self::build_task_lifecycle_progress_message(&self.pending_lifecycle_text)
+            {
+                self.pending_lifecycle_text.clear();
+                self.emit_lifecycle_progress(out, &message, terminal_completion);
+            }
+            return true;
+        }
+
+        if let Some((message, terminal_completion)) =
+            Self::build_task_lifecycle_progress_message(fragment)
+        {
+            self.emit_lifecycle_progress(out, &message, terminal_completion);
+            return true;
+        }
+
+        if self.is_background_agent_round_active() && Self::looks_like_lifecycle_candidate(fragment)
+        {
+            self.pending_lifecycle_text.push_str(fragment);
+            if let Some((message, terminal_completion)) =
+                Self::build_task_lifecycle_progress_message(&self.pending_lifecycle_text)
+            {
+                self.pending_lifecycle_text.clear();
+                self.emit_lifecycle_progress(out, &message, terminal_completion);
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn flush_pending_lifecycle_text_as_visible_text(&mut self, out: &mut Vec<String>) {
+        if self.pending_lifecycle_text.is_empty() {
+            return;
+        }
+
+        let pending = std::mem::take(&mut self.pending_lifecycle_text);
+        if let Some((message, terminal_completion)) =
+            Self::build_task_lifecycle_progress_message(&pending)
+        {
+            self.emit_lifecycle_progress(out, &message, terminal_completion);
+            return;
+        }
+
+        self.open_text_block_if_needed(out);
+        out.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": self.open_text_index,
+                "delta": { "type": "text_delta", "text": pending }
+            })
+        ));
     }
 
     fn ensure_message_start(&mut self, out: &mut Vec<String>) {
@@ -855,10 +1190,14 @@ impl OpenAIChatResponseTransformer {
     }
 
     fn open_tool_block_if_needed(&mut self, tool_index: usize, out: &mut Vec<String>) {
-        if let Some(Some(state)) = self.tool_calls.get(tool_index) {
-            if state.has_started {
-                return;
-            }
+        let Some(Some(existing_state)) = self.tool_calls.get(tool_index) else {
+            return;
+        };
+        if existing_state.has_started {
+            return;
+        }
+        if !Self::tool_call_is_ready(existing_state) {
+            return;
         }
 
         self.saw_tool_call = true;
@@ -892,7 +1231,36 @@ impl OpenAIChatResponseTransformer {
         ));
     }
 
+    fn emit_pending_tool_arguments(&mut self, tool_index: usize, out: &mut Vec<String>) {
+        let Some(Some(state)) = self.tool_calls.get_mut(tool_index) else {
+            return;
+        };
+        let Some(block_idx) = state.block_index else {
+            return;
+        };
+        if state.emitted_arguments_len >= state.arguments.len() {
+            return;
+        }
+
+        let pending = state.arguments[state.emitted_arguments_len..].to_string();
+        state.emitted_arguments_len = state.arguments.len();
+        if pending.is_empty() {
+            return;
+        }
+
+        out.push(format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": block_idx,
+                "delta": { "type": "input_json_delta", "partial_json": pending }
+            })
+        ));
+    }
+
     fn close_tool_block(&mut self, tool_index: usize, out: &mut Vec<String>) {
+        let mut closed_tool: Option<(String, String)> = None;
+
         if let Some(Some(state)) = self.tool_calls.get_mut(tool_index) {
             if let Some(idx) = state.block_index.take() {
                 state.has_started = false;
@@ -900,13 +1268,25 @@ impl OpenAIChatResponseTransformer {
                     "event: content_block_stop\ndata: {}\n\n",
                     json!({ "type": "content_block_stop", "index": idx })
                 ));
+                closed_tool = Some((state.name.clone(), state.arguments.clone()));
+            }
+        }
+
+        if let Some((tool_name, arguments)) = closed_tool {
+            if Self::tool_launches_background_agent(tool_name.as_str(), arguments.as_str()) {
+                self.launched_background_agent_count += 1;
+            }
+            if let Some(message) =
+                Self::build_background_task_progress_message(tool_name.as_str(), arguments.as_str())
+            {
+                self.emit_lifecycle_progress(out, &message, false);
             }
         }
     }
 
     fn map_finish_reason(reason: Option<&str>, saw_tool_call: bool) -> &'static str {
         match reason {
-            Some("tool_calls") => "tool_use",
+            Some("tool_calls") | Some("function_call") => "tool_use",
             Some("length") => "max_tokens",
             Some("content_filter") | Some("refusal") => "refusal",
             Some("stop") => "end_turn",
@@ -927,6 +1307,7 @@ impl OpenAIChatResponseTransformer {
         }
         self.sent_message_stop = true;
 
+        self.flush_pending_lifecycle_text_as_visible_text(out);
         self.close_text_block(out);
         for i in 0..self.tool_calls.len() {
             self.close_tool_block(i, out);
@@ -965,10 +1346,75 @@ impl OpenAIChatResponseTransformer {
         }
     }
 
-    fn first_choice<'a>(&self, data: &'a Value) -> Option<&'a Value> {
-        data.get("choices")
+    fn choice_has_useful_payload(choice: &Value) -> bool {
+        if choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            return true;
+        }
+
+        let Some(delta) = choice.get("delta") else {
+            return false;
+        };
+        if delta
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if delta
+            .get("refusal")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if delta
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if delta
+            .get("function_call")
+            .and_then(|v| v.as_object())
+            .is_some()
+        {
+            return true;
+        }
+        delta
+            .get("tool_calls")
             .and_then(|v| v.as_array())
-            .and_then(|v| v.first())
+            .map(|calls| !calls.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn first_choice<'a>(&mut self, data: &'a Value) -> Option<&'a Value> {
+        let choices = data.get("choices").and_then(|v| v.as_array())?;
+
+        if let Some(selected_index) = self.selected_choice_index {
+            if let Some(choice) = choices.get(selected_index) {
+                return Some(choice);
+            }
+        }
+
+        if let Some((idx, choice)) = choices
+            .iter()
+            .enumerate()
+            .find(|(_, choice)| Self::choice_has_useful_payload(choice))
+        {
+            self.selected_choice_index = Some(idx);
+            return Some(choice);
+        }
+
+        choices.first()
     }
 
     fn capture_choice_metadata(&mut self, choice: &Value) {
@@ -1017,6 +1463,9 @@ impl OpenAIChatResponseTransformer {
 
     fn emit_text_delta_if_any(&mut self, delta: &Value, out: &mut Vec<String>) {
         if let Some(content) = self.text_delta_from(delta) {
+            if self.maybe_emit_task_lifecycle_progress(&content, out) {
+                return;
+            }
             self.open_text_block_if_needed(out);
             out.push(format!(
                 "event: content_block_delta\ndata: {}\n\n",
@@ -1055,8 +1504,9 @@ impl OpenAIChatResponseTransformer {
         let current_state = self.tool_calls[index].clone();
         let mut new_state = current_state.unwrap_or_else(|| ToolCallState {
             id: format!("call_{}", index),
-            name: "unknown".to_string(),
+            name: String::new(),
             arguments: String::new(),
+            emitted_arguments_len: 0,
             block_index: None,
             has_started: false,
         });
@@ -1085,27 +1535,7 @@ impl OpenAIChatResponseTransformer {
 
         self.tool_calls[index] = Some(new_state);
         self.open_tool_block_if_needed(index, out);
-
-        if let Some(args_delta) = tool_call_delta
-            .get("function")
-            .and_then(|f| f.get("arguments"))
-            .and_then(|a| a.as_str())
-        {
-            if !args_delta.is_empty() {
-                if let Some(Some(state)) = self.tool_calls.get(index) {
-                    if let Some(block_idx) = state.block_index {
-                        out.push(format!(
-                            "event: content_block_delta\ndata: {}\n\n",
-                            json!({
-                                "type": "content_block_delta",
-                                "index": block_idx,
-                                "delta": { "type": "input_json_delta", "partial_json": args_delta }
-                            })
-                        ));
-                    }
-                }
-            }
-        }
+        self.emit_pending_tool_arguments(index, out);
     }
 
     fn emit_tool_call_deltas(&mut self, delta: &Value, out: &mut Vec<String>) {
@@ -1155,6 +1585,40 @@ impl ResponseTransformer for OpenAIChatResponseTransformer {
         self.emit_tool_call_deltas(delta, &mut output);
 
         output
+    }
+
+    fn configure_request_context(&mut self, ctx: &ResponseTransformRequestContext) {
+        self.contains_background_agent_completion = ctx.contains_background_agent_completion;
+        self.historical_background_agent_launch_count =
+            ctx.historical_background_agent_launch_count;
+        self.launched_background_agent_count = self
+            .launched_background_agent_count
+            .max(ctx.historical_background_agent_launch_count);
+        self.terminal_background_agent_completion_count =
+            ctx.terminal_background_agent_completion_count;
+    }
+
+    fn take_diagnostics_summary(&mut self) -> Option<Value> {
+        let launch_count = self.known_background_agent_launch_count() as u64;
+        let terminal_count = self.terminal_background_agent_completion_count as u64;
+        let pending_count = self.pending_background_agent_count() as u64;
+        let lifecycle_messages = self.lifecycle_progress_messages_emitted as u64;
+
+        if launch_count == 0
+            && terminal_count == 0
+            && lifecycle_messages == 0
+            && !self.contains_background_agent_completion
+        {
+            return None;
+        }
+
+        Some(json!({
+            "contains_background_agent_completion": self.contains_background_agent_completion,
+            "background_agent_launch_count": launch_count,
+            "terminal_background_agent_completion_count": terminal_count,
+            "pending_background_agent_count": pending_count,
+            "lifecycle_progress_messages_emitted": lifecycle_messages,
+        }))
     }
 }
 
@@ -1269,6 +1733,57 @@ mod tests {
 
         let done_events = transformer.transform_line("data: [DONE]");
         assert!(done_events.iter().any(|e| e.contains("message_stop")));
+    }
+
+    #[test]
+    fn anonymous_tool_call_argument_fragments_are_not_emitted_as_tool_use() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"让我"},"index":0}]}"#,
+        );
+
+        let malformed_events_1 = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"","arguments":"未来"}}]},"index":0}]}"#,
+        );
+        let malformed_events_2 = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"","arguments":"广州"}}]},"index":0}]}"#,
+        );
+
+        let joined = malformed_events_1
+            .iter()
+            .chain(malformed_events_2.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            !joined.contains("\"type\":\"tool_use\""),
+            "anonymous tool-call fragments should stay hidden instead of opening a tool_use block"
+        );
+        assert!(
+            !joined.contains("\"type\":\"input_json_delta\""),
+            "anonymous tool-call fragments should not stream as input_json_delta"
+        );
+
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"stop","index":0}]}"#,
+        );
+        let done_events = transformer.transform_line("data: [DONE]");
+        let parsed_events = parse_non_empty_sse_events(&done_events);
+        let message_delta = parsed_events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("message_delta should be emitted");
+
+        assert_eq!(
+            message_delta
+                .1
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(|value| value.as_str()),
+            Some("end_turn"),
+            "malformed tool-call fragments must not force tool_use stop_reason"
+        );
     }
 
     #[test]
@@ -1467,6 +1982,165 @@ mod tests {
     }
 
     #[test]
+    fn later_choice_with_text_is_selected_when_first_choice_is_empty() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let events = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"index":0,"delta":{}},{"index":1,"delta":{"content":"来自第二个 choice"}}]}"#,
+        );
+        let parsed = parse_non_empty_sse_events(&events);
+
+        assert!(parsed.iter().any(|(name, payload)| {
+            name == "content_block_delta"
+                && payload
+                    .get("delta")
+                    .and_then(|delta| delta.get("text"))
+                    .and_then(|value| value.as_str())
+                    == Some("来自第二个 choice")
+        }));
+    }
+
+    #[test]
+    fn selected_later_choice_is_sticky_across_followup_chunks() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"index":0,"delta":{}},{"index":1,"delta":{"content":"第一段"}}]}"#,
+        );
+        let events = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"index":0,"delta":{"content":"错误分支"}},{"index":1,"delta":{"content":"第二段"}}]}"#,
+        );
+        let parsed = parse_non_empty_sse_events(&events);
+
+        assert!(parsed.iter().any(|(name, payload)| {
+            name == "content_block_delta"
+                && payload
+                    .get("delta")
+                    .and_then(|delta| delta.get("text"))
+                    .and_then(|value| value.as_str())
+                    == Some("第二段")
+        }));
+        assert!(parsed.iter().all(|(_, payload)| {
+            payload
+                .get("delta")
+                .and_then(|delta| delta.get("text"))
+                .and_then(|value| value.as_str())
+                != Some("错误分支")
+        }));
+    }
+
+    #[test]
+    fn length_finish_reason_during_tool_call_ends_as_max_tokens() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"Agent","arguments":"{\"description\":\"search"}}]},"index":0}]}"#,
+        );
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":" more"}}]},"finish_reason":"length","index":0}]}"#,
+        );
+
+        let done_events = transformer.transform_line("data: [DONE]");
+        let parsed = parse_non_empty_sse_events(&done_events);
+        let message_delta = parsed
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("message_delta should be emitted");
+
+        assert_eq!(
+            message_delta
+                .1
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(|value| value.as_str()),
+            Some("max_tokens")
+        );
+    }
+
+    #[test]
+    fn background_agent_launch_tool_call_emits_thinking_progress_and_updates_counts() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_agent","type":"function","function":{"name":"Agent","arguments":"{\"description\":\"搜索天气\",\"run_in_background\":true}"}}]},"index":0}]}"#,
+        );
+        let _ = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}"#,
+        );
+        let done_events = transformer.transform_line("data: [DONE]");
+        let joined = done_events.join("");
+
+        assert!(
+            joined.contains("\"type\":\"thinking\"")
+                || joined.contains("\"type\":\"thinking_delta\""),
+            "background agent launch should be bridged into thinking progress"
+        );
+        assert!(joined.contains("已启动后台 explorer：搜索天气"));
+
+        let summary = transformer
+            .take_diagnostics_summary()
+            .expect("diagnostics summary should be available");
+        assert_eq!(
+            summary
+                .get("background_agent_launch_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .get("pending_background_agent_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn task_notification_completion_is_bridged_to_thinking_progress_and_updates_terminal_count() {
+        let mut transformer = OpenAIChatResponseTransformer::new("gpt-4o");
+        <OpenAIChatResponseTransformer as ResponseTransformer>::configure_request_context(
+            &mut transformer,
+            &ResponseTransformRequestContext {
+                codex_plan_file_path: None,
+                contains_background_agent_completion: true,
+                historical_background_agent_launch_count: 1,
+                terminal_background_agent_completion_count: 0,
+            },
+        );
+
+        let events = transformer.transform_line(
+            r#"data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n<summary>Agent \"Check Beijing weather\" completed</summary>\n</task-notification>"},"index":0}]}"#,
+        );
+        let joined = events.join("");
+
+        assert!(
+            joined.contains("\"type\":\"thinking\"")
+                || joined.contains("\"type\":\"thinking_delta\""),
+            "task notification completion should be bridged into thinking progress"
+        );
+        assert!(joined.contains("后台 explorer 已完成：Check Beijing weather"));
+        assert!(
+            !joined.contains("\"type\":\"text_delta\""),
+            "raw task notification text should stay hidden from visible text blocks"
+        );
+
+        let summary = transformer
+            .take_diagnostics_summary()
+            .expect("diagnostics summary should be available");
+        assert_eq!(
+            summary
+                .get("terminal_background_agent_completion_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .get("pending_background_agent_count")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn reasoning_content_is_hidden_when_visible_thinking_is_disabled() {
         let backend = OpenAIChatBackend;
         let mut transformer = backend.create_response_transformer("gpt-4o", false);
@@ -1518,6 +2192,23 @@ mod tests {
                 .iter()
                 .any(|event| event.contains("input_json_delta")),
             "deprecated function_call arguments delta should map to input_json_delta"
+        );
+
+        let done_events = transformer.transform_line("data: [DONE]");
+        let parsed_events = parse_non_empty_sse_events(&done_events);
+        let message_delta = parsed_events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("message_delta should be emitted on done");
+
+        assert_eq!(
+            message_delta
+                .1
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(|value| value.as_str()),
+            Some("tool_use"),
+            "deprecated function_call finish reason should map to tool_use stop_reason"
         );
     }
 
@@ -1999,15 +2690,27 @@ mod tests {
             .and_then(|value| value.as_array())
             .expect("messages should be present");
 
-        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("system"));
-        let system = messages[0].get("content").and_then(Value::as_str).unwrap_or_default();
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
+        let system = messages[0]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(system.contains("Rule A"));
         assert!(
             !system.contains("The following skills are available for use with the Skill tool"),
             "skill catalog should not be promoted into the first system message"
         );
-        assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("user"));
-        let user = messages[1].get("content").and_then(Value::as_str).unwrap_or_default();
+        assert_eq!(
+            messages[1].get("role").and_then(Value::as_str),
+            Some("user")
+        );
+        let user = messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(user.contains("The following skills are available for use with the Skill tool"));
         assert!(user.contains("pdf: Read PDF files"));
         assert!(user.contains("你好"));
@@ -2080,8 +2783,14 @@ mod tests {
             .expect("messages should be present");
 
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].get("role").and_then(Value::as_str), Some("assistant"));
-        assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("tool"));
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
+        assert_eq!(
+            messages[1].get("role").and_then(Value::as_str),
+            Some("tool")
+        );
         assert_eq!(
             messages[1].get("tool_call_id").and_then(Value::as_str),
             Some("call_skill_1")
@@ -2090,7 +2799,10 @@ mod tests {
             messages[1].get("content").and_then(Value::as_str),
             Some("Skill 'yat_commit' loaded.")
         );
-        assert_eq!(messages[2].get("role").and_then(Value::as_str), Some("tool"));
+        assert_eq!(
+            messages[2].get("role").and_then(Value::as_str),
+            Some("tool")
+        );
         assert_eq!(
             messages[2].get("tool_call_id").and_then(Value::as_str),
             Some("call_skill_1")
@@ -2101,6 +2813,209 @@ mod tests {
             .unwrap_or_default();
         assert!(loaded_skill.contains("<name>yat_commit</name>"));
         assert!(loaded_skill.contains("仅在用户明确要求提交代码时使用"));
+    }
+
+    #[test]
+    fn transform_request_preserves_background_agent_completion_handoff_in_user_history() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<task-notification>\n<task-id>aaf56deaf0a6f8f5b</task-id>\n<tool-use-id>call_agent_bg</tool-use-id>\n<output-file>/tmp/aaf56deaf0a6f8f5b.output</output-file>\n<status>completed</status>\n<summary>Agent \"Check Jiaxing weather\" completed</summary>\n<result>嘉兴未来 7 天天气大致如下：\n- 第1天：晴到薄雾，17/10°C</result>\n</task-notification>\nFull transcript available at: /tmp/aaf56deaf0a6f8f5b.output\n"
+                        .to_string(),
+                )),
+            }],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+        let handoff = messages[0]
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("handoff content should be stringified user text");
+
+        assert!(handoff.contains("\"kind\":\"background_agent_completion\""));
+        assert!(handoff.contains("\"tool_use_id\":\"call_agent_bg\""));
+        assert!(handoff.contains("\"result_status\":\"usable\""));
+        assert!(!handoff.contains("<task-notification>"));
+    }
+
+    #[test]
+    fn transform_request_marks_placeholder_background_agent_completion_as_incomplete() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<task-notification>\n<task-id>a0110ff52929529f5</task-id>\n<tool-use-id>call_agent_bg</tool-use-id>\n<output-file>/tmp/a0110ff52929529f5.output</output-file>\n<status>completed</status>\n<summary>Agent \"Check Beijing weather\" completed</summary>\n<result>我先查一个可验证的实时天气来源，获取北京未来 7 天逐日预报，再整理成简洁中文的按天概况和趋势总结。</result>\n</task-notification>\nFull transcript available at: /tmp/a0110ff52929529f5.output\n"
+                        .to_string(),
+                )),
+            }],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+        let handoff = messages[0]
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("handoff content should be stringified user text");
+
+        assert!(handoff.contains("\"kind\":\"background_agent_completion\""));
+        assert!(handoff.contains("\"result_status\":\"incomplete_placeholder\""));
+        assert!(handoff.contains("\"warning\":"));
+    }
+
+    #[test]
+    fn transform_request_stringifies_background_agent_tool_result_for_openai() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                        id: Some("call_agent_bg".to_string()),
+                        name: "Agent".to_string(),
+                        input: json!({"description": "Check weather", "run_in_background": true}),
+                        signature: None,
+                    }])),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: Some("call_agent_bg".to_string()),
+                        id: None,
+                        content: Some(Value::String(
+                            "Async agent launched successfully.\nagentId: a6b95ea1c5bd2a390 (internal ID - do not mention to user. Use SendMessage with to: 'a6b95ea1c5bd2a390' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes.\noutput_file: /private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output\nIf asked, you can check progress before completion by using Read or Bash tail on the output file."
+                                .to_string(),
+                        )),
+                    }])),
+                },
+            ],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+
+        assert_eq!(
+            messages[1].get("role").and_then(Value::as_str),
+            Some("tool")
+        );
+        let tool_output = messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("tool output should be stringified");
+        assert!(tool_output.contains("\"kind\":\"background_agent\""));
+        assert!(tool_output.contains("\"agent_id\":\"a6b95ea1c5bd2a390\""));
+        assert!(tool_output.contains("\"poll_with_task_output\":false"));
     }
 
     #[test]

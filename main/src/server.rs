@@ -7488,6 +7488,16 @@ mod tests {
             "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "你好"}],
             "system": "You are Claude Code.",
+            "tools": [{
+                "name": "Read",
+                "description": "Read files",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"}
+                    }
+                }
+            }],
             "stream": false
         }))
         .expect("valid request");
@@ -7543,14 +7553,13 @@ mod tests {
             None,
             false,
         );
-        let codex_serialized = codex_body.to_string();
+        let codex_instructions = codex_body
+            .get("instructions")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
         assert!(
-            codex_serialized.contains(prompt),
-            "codex route should retain custom injection prompt"
-        );
-        assert!(
-            codex_serialized.contains("# AGENTS.md instructions"),
-            "codex route should wrap custom injection prompt as AGENTS-style instructions"
+            codex_instructions.contains(prompt),
+            "codex route should retain custom injection prompt in top-level instructions"
         );
     }
 

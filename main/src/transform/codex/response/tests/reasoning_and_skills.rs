@@ -292,21 +292,19 @@ fn test_custom_injection_prompt() {
         "custom prompt should no longer be injected as a standalone user message"
     );
 
-    let first_text = input_arr
-        .first()
-        .and_then(|msg| msg.get("content"))
-        .and_then(|v| v.as_array())
-        .and_then(|blocks| blocks.first())
-        .and_then(|block| block.get("text"))
-        .and_then(|v| v.as_str())
+    let instructions = body
+        .get("instructions")
+        .and_then(|value| value.as_str())
         .unwrap_or_default();
 
     assert!(
-        first_text.starts_with("# AGENTS.md instructions"),
-        "custom prompt should be wrapped as AGENTS-style instructions"
+        instructions.contains(prompt),
+        "custom prompt should be moved into top-level instructions"
     );
     assert!(
-        first_text.contains(prompt),
-        "wrapped instructions should include the custom prompt"
+        !texts
+            .iter()
+            .any(|text| text.starts_with("# AGENTS.md instructions")),
+        "custom prompt should no longer be wrapped as AGENTS-style user input"
     );
 }
