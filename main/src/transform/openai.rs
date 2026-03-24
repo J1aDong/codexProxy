@@ -3009,7 +3009,7 @@ mod tests {
             messages[1].get("role").and_then(Value::as_str),
             Some("tool")
         );
-        let tool_output = messages[1]
+    let tool_output = messages[1]
             .get("content")
             .and_then(Value::as_str)
             .expect("tool output should be stringified");
