@@ -263,11 +263,8 @@ impl GeminiRequestMapper {
     ) -> Option<Vec<Value>> {
         let mut parts = Vec::new();
 
-        if let Some(system) = &anthropic_body.system {
-            let text = system.to_string();
-            if !text.trim().is_empty() {
-                parts.push(json!({ "text": text }));
-            }
+        if let Some(text) = crate::transform::shared::flatten_system_text(anthropic_body.system.as_ref()) {
+            parts.push(json!({ "text": text }));
         }
 
         for message in &anthropic_body.messages {

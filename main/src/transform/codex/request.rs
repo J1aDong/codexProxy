@@ -2093,9 +2093,9 @@ impl TransformRequest {
             return json!("auto");
         }
 
-        let wants_native_web_search = requested_name.eq_ignore_ascii_case("WebSearch")
-            || requested_name.eq_ignore_ascii_case("web_search")
-            || requested_name.eq_ignore_ascii_case("web-search");
+        let normalized_requested_name =
+            crate::transform::tool_router::normalize_tool_name(requested_name);
+        let wants_native_web_search = normalized_requested_name.as_deref() == Some("web_search");
         if wants_native_web_search
             && transformed_tools
                 .iter()
@@ -2219,7 +2219,8 @@ impl TransformRequest {
         let Some(name) = Self::tool_name(tool) else {
             return false;
         };
-        if !name.eq_ignore_ascii_case("WebSearch") {
+        let normalized_name = crate::transform::tool_router::normalize_tool_name(name);
+        if normalized_name.as_deref() != Some("web_search") {
             return false;
         }
 
@@ -2911,6 +2912,28 @@ hello"
         assert!(
             transformed[0].get("name").is_none(),
             "native web_search should not be serialized as a generic function tool"
+        );
+    }
+
+    #[test]
+    fn transform_tools_maps_hyphenated_web_search_name_to_native_web_search() {
+        let tools = vec![json!({
+            "name": "web-search",
+            "description": "Search the web",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            }
+        })];
+
+        let transformed = TransformRequest::transform_tools(Some(&tools), None, true, false);
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(
+            transformed[0].get("type").and_then(|value| value.as_str()),
+            Some("web_search")
         );
     }
 

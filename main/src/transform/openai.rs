@@ -243,30 +243,7 @@ impl OpenAIChatBackend {
     }
 
     fn flatten_system_text(system: Option<&crate::models::SystemContent>) -> Option<String> {
-        match system {
-            Some(crate::models::SystemContent::Text(s)) => {
-                let trimmed = s.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            }
-            Some(crate::models::SystemContent::Blocks(blocks)) if !blocks.is_empty() => {
-                let text = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        crate::models::SystemBlock::Text { text } => Some(text.clone()),
-                        crate::models::SystemBlock::PlainString(s) => Some(s.clone()),
-                        crate::models::SystemBlock::Other(value) => value
-                            .get("text")
-                            .and_then(|text| text.as_str())
-                            .map(|text| text.to_string())
-                            .or_else(|| serde_json::to_string(value).ok()),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let trimmed = text.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            }
-            _ => None,
-        }
+        crate::transform::shared::flatten_system_text(system)
     }
 
     fn reminder_contains_skill_catalog(block_text: &str) -> bool {
@@ -523,14 +500,7 @@ impl OpenAIChatBackend {
     }
 
     fn resolve_parallel_tool_calls(anthropic_body: &AnthropicRequest) -> bool {
-        anthropic_body
-            .tool_choice
-            .as_ref()
-            .and_then(|tool_choice| tool_choice.as_object())
-            .and_then(|tool_choice| tool_choice.get("disable_parallel_tool_use"))
-            .and_then(|value| value.as_bool())
-            .map(|disabled| !disabled)
-            .unwrap_or(true)
+        crate::transform::shared::resolve_parallel_tool_calls(anthropic_body)
     }
 }
 
