@@ -1180,10 +1180,29 @@ fn is_stateful_replay_input_item(item: &Value) -> bool {
 }
 
 fn trim_leading_stateful_replay_items(items: &[Value]) -> (Vec<Value>, usize) {
-    let trimmed = items
-        .iter()
-        .take_while(|item| is_stateful_replay_input_item(item))
-        .count();
+    let tool_result_call_ids = collect_function_call_output_call_ids(items)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut trimmed = 0usize;
+
+    for item in items {
+        if item.get("role").and_then(|value| value.as_str()) == Some("assistant") {
+            trimmed += 1;
+            continue;
+        }
+
+        if item.get("type").and_then(|value| value.as_str()) == Some("function_call") {
+            let call_id = item.get("call_id").and_then(|value| value.as_str());
+            if call_id.is_some_and(|call_id| tool_result_call_ids.contains(call_id)) {
+                break;
+            }
+            trimmed += 1;
+            continue;
+        }
+
+        break;
+    }
+
     (items[trimmed..].to_vec(), trimmed)
 }
 
@@ -8819,14 +8838,18 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         ];
 
         let (trimmed, replay_trimmed_items) = trim_leading_stateful_replay_items(&items);
-        assert_eq!(replay_trimmed_items, 2);
-        assert_eq!(trimmed.len(), 2);
+        assert_eq!(replay_trimmed_items, 1);
+        assert_eq!(trimmed.len(), 3);
         assert_eq!(
             trimmed[0].get("type").and_then(|value| value.as_str()),
+            Some("function_call")
+        );
+        assert_eq!(
+            trimmed[1].get("type").and_then(|value| value.as_str()),
             Some("function_call_output")
         );
         assert_eq!(
-            trimmed[1]
+            trimmed[2]
                 .pointer("/content/0/text")
                 .and_then(|value| value.as_str()),
             Some("next")
@@ -8962,16 +8985,89 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
-        assert_eq!(input.len(), 2);
+        assert_eq!(input.len(), 3);
         assert_eq!(
             input[0].get("type").and_then(|value| value.as_str()),
+            Some("function_call")
+        );
+        assert_eq!(
+            input[1].get("type").and_then(|value| value.as_str()),
             Some("function_call_output")
         );
         assert_eq!(
-            input[1]
+            input[2]
                 .pointer("/content/0/text")
                 .and_then(|value| value.as_str()),
             Some("next")
+        );
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_keeps_replayed_function_call_for_tool_result_only_turn() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: vec![
+                        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"review"}]}),
+                    ],
+                    output_items: vec![json!({"type":"function_call","call_id":"call_1","name":"TaskCreate","arguments":"{\"subject\":\"inspect\"}"})],
+                    static_prefix_summary: Some("pk_same".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"review"}]},
+                {"type":"function_call","call_id":"call_1","name":"TaskCreate","arguments":"{\"subject\":\"inspect\"}"},
+                {"type":"function_call_output","call_id":"call_1","output":"Task #1 created"}
+            ],
+            "store": false
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let (_meta, _turn_state) = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            &RequestEnvelopeHints::default(),
+            "test-chain",
+            "ep_1",
+            "req_tool_result_only",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert_eq!(
+            body.get("previous_response_id").and_then(|value| value.as_str()),
+            Some("resp_prev")
+        );
+        let input = body
+            .get("input")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(input.len(), 2);
+        assert_eq!(
+            input[0].get("type").and_then(|value| value.as_str()),
+            Some("function_call")
+        );
+        assert_eq!(
+            input[1].get("type").and_then(|value| value.as_str()),
+            Some("function_call_output")
         );
     }
 
