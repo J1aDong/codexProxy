@@ -164,6 +164,23 @@ impl UnifiedChatRequest {
     }
 }
 
+fn is_proxy_lifecycle_progress_text(text: &str) -> bool {
+    let normalized = text.replace('\r', "");
+    let lines: Vec<&str> = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    !lines.is_empty()
+        && lines.iter().all(|line| {
+            matches!(
+                *line,
+                "请求已发送，正在等待上游开始输出…" | "模型正在处理中…"
+            )
+        })
+}
+
 fn convert_message(message: &Message) -> Vec<UnifiedMessage> {
     match message.role.as_str() {
         "user" => convert_user_message(message),
@@ -274,7 +291,7 @@ fn convert_assistant_message(message: &Message) -> Vec<UnifiedMessage> {
 
     match &message.content {
         Some(MessageContent::Text(text)) => {
-            if !text.is_empty() {
+            if !text.is_empty() && !is_proxy_lifecycle_progress_text(text) {
                 content.push(UnifiedContent::Text { text: text.clone() });
             }
         }
@@ -282,7 +299,7 @@ fn convert_assistant_message(message: &Message) -> Vec<UnifiedMessage> {
             for block in blocks {
                 match block {
                     ContentBlock::Text { text } => {
-                        if !text.is_empty() {
+                        if !text.is_empty() && !is_proxy_lifecycle_progress_text(text) {
                             content.push(UnifiedContent::Text { text: text.clone() });
                         }
                     }
@@ -290,7 +307,9 @@ fn convert_assistant_message(message: &Message) -> Vec<UnifiedMessage> {
                         thinking: content_text,
                         signature,
                     } => {
-                        if !content_text.is_empty() {
+                        if !content_text.is_empty()
+                            && !is_proxy_lifecycle_progress_text(content_text)
+                        {
                             thinking = Some(UnifiedThinking {
                                 content: content_text.clone(),
                                 signature: signature.clone(),

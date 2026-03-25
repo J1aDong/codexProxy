@@ -470,6 +470,7 @@ impl StreamRuntimeOptions {
 }
 
 const STATEFUL_CHAIN_MAX_ENTRIES: usize = 128;
+const SKILL_CATALOG_CACHE_MAX_ENTRIES: usize = 128;
 const STATEFUL_CHAIN_HINT_HEADERS: [&str; 6] = [
     "x-codex-proxy-session",
     "x-claude-session-id",
@@ -505,6 +506,13 @@ type StatefulChainStore = Arc<Mutex<HashMap<String, StatefulChainEntry>>>;
 type StatefulChainUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type CodexV1UnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type CodexFastUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
+type SkillCatalogReminderStore = Arc<Mutex<HashMap<String, SkillCatalogCacheEntry>>>;
+
+#[derive(Clone)]
+struct SkillCatalogCacheEntry {
+    reminder_text: String,
+    updated_at: Instant,
+}
 
 fn is_stateful_endpoint_previous_response_id_unsupported(
     unsupported_store: &StatefulChainUnsupportedEndpointStore,
@@ -572,11 +580,24 @@ fn strip_stateful_output_metadata(value: &Value) -> Value {
     }
 }
 
+fn is_replayable_stateful_output_item(item: &Value) -> bool {
+    match item.get("type").and_then(|value| value.as_str()) {
+        Some("message") | Some("function_call") => true,
+        Some("reasoning") | Some("reasoning_summary") => false,
+        Some(_) | None => false,
+    }
+}
+
 fn extract_stateful_chain_output_items(snapshot: &Value) -> Vec<Value> {
     snapshot
         .get("output")
         .and_then(|value| value.as_array())
-        .map(|items| items.iter().map(strip_stateful_output_metadata).collect())
+        .map(|items| {
+            items.iter()
+                .filter(|item| is_replayable_stateful_output_item(item))
+                .map(strip_stateful_output_metadata)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -600,6 +621,32 @@ fn canonical_json_string(value: &Value) -> String {
     }
 }
 
+fn normalize_non_input_instructions(value: &Value) -> Value {
+    let Some(text) = value.as_str() else {
+        return value.clone();
+    };
+
+    let normalized = text.replace('\r', "");
+    let mut lines = normalized.lines();
+    let first_line = lines.next().unwrap_or_default();
+    if !first_line
+        .trim_start()
+        .starts_with("x-anthropic-billing-header:")
+    {
+        return Value::String(normalized);
+    }
+
+    let remaining = lines.collect::<Vec<_>>().join("\n");
+    Value::String(remaining)
+}
+
+fn normalize_non_input_fingerprint_value(key: &str, value: &Value) -> Value {
+    match key {
+        "instructions" => normalize_non_input_instructions(value),
+        _ => value.clone(),
+    }
+}
+
 fn compute_non_input_fingerprint(body: &Value) -> Option<String> {
     let obj = body.as_object()?;
     let keys_to_check = [
@@ -618,7 +665,8 @@ fn compute_non_input_fingerprint(body: &Value) -> Option<String> {
     let mut fingerprint_parts: Vec<(&str, String)> = Vec::new();
     for key in keys_to_check {
         if let Some(value) = obj.get(key) {
-            fingerprint_parts.push((key, canonical_json_string(value)));
+            let normalized = normalize_non_input_fingerprint_value(key, value);
+            fingerprint_parts.push((key, canonical_json_string(&normalized)));
         }
     }
 
@@ -872,6 +920,233 @@ fn derive_stateful_chain_key(
     )
 }
 
+fn derive_skill_catalog_cache_key(hint: Option<&str>, request: &AnthropicRequest) -> String {
+    if let Some(hint_value) = hint {
+        let normalized = hint_value.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return format!("hint:{}", normalized);
+        }
+    }
+
+    let model = request.model.as_deref().unwrap_or_default();
+    let system_text = request
+        .system
+        .as_ref()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let fingerprint = hash_to_u64(&[model, &system_text]);
+    format!("fallback:{:016x}", fingerprint)
+}
+
+fn extract_skill_catalog_reminder_blocks(text: &str) -> Vec<String> {
+    const START: &str = "<system-reminder>";
+    const END: &str = "</system-reminder>";
+    const SKILL_MARKERS: [&str; 4] = [
+        "the following skills are available",
+        "skills are available for use with the skill tool",
+        "skills available in this session",
+        "### available skills",
+    ];
+
+    let mut out = Vec::new();
+    let mut remaining = text;
+
+    loop {
+        let Some(start_idx) = remaining.find(START) else {
+            break;
+        };
+        let after_start = &remaining[start_idx + START.len()..];
+        let Some(end_rel) = after_start.find(END) else {
+            break;
+        };
+
+        let block_inner = &after_start[..end_rel];
+        let block_lower = block_inner.to_ascii_lowercase();
+        if SKILL_MARKERS
+            .iter()
+            .any(|marker| block_lower.contains(marker))
+        {
+            out.push(format!("{}{}{}", START, block_inner, END));
+        }
+
+        remaining = &after_start[end_rel + END.len()..];
+    }
+
+    out
+}
+
+fn collect_skill_catalog_reminder_blocks(request: &AnthropicRequest) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(system) = request.system.as_ref() {
+        for block in extract_skill_catalog_reminder_blocks(&system.to_string()) {
+            if seen.insert(block.clone()) {
+                blocks.push(block);
+            }
+        }
+    }
+
+    for message in &request.messages {
+        if let Some(text) = extract_message_text(message) {
+            for block in extract_skill_catalog_reminder_blocks(&text) {
+                if seen.insert(block.clone()) {
+                    blocks.push(block);
+                }
+            }
+        }
+    }
+
+    blocks
+}
+
+fn get_cached_skill_catalog_reminder(
+    reminder_store: &SkillCatalogReminderStore,
+    cache_key: &str,
+) -> Option<String> {
+    match reminder_store.lock() {
+        Ok(guard) => guard.get(cache_key).map(|entry| entry.reminder_text.clone()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .get(cache_key)
+            .map(|entry| entry.reminder_text.clone()),
+    }
+}
+
+fn upsert_skill_catalog_reminder(
+    reminder_store: &SkillCatalogReminderStore,
+    cache_key: &str,
+    reminder_blocks: &[String],
+) {
+    if reminder_blocks.is_empty() {
+        return;
+    }
+
+    let mut dedup = HashSet::new();
+    let merged = reminder_blocks
+        .iter()
+        .filter(|block| dedup.insert((*block).clone()))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if merged.trim().is_empty() {
+        return;
+    }
+
+    let mut guard = match reminder_store.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if guard.len() >= SKILL_CATALOG_CACHE_MAX_ENTRIES && !guard.contains_key(cache_key) {
+        if let Some((oldest_key, _)) = guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.updated_at)
+            .map(|(key, entry)| (key.clone(), entry.updated_at))
+        {
+            guard.remove(&oldest_key);
+        }
+    }
+
+    guard.insert(
+        cache_key.to_string(),
+        SkillCatalogCacheEntry {
+            reminder_text: merged,
+            updated_at: Instant::now(),
+        },
+    );
+}
+
+fn request_mentions_skill_tool(request: &AnthropicRequest) -> bool {
+    if !collect_skill_catalog_reminder_blocks(request).is_empty() {
+        return true;
+    }
+
+    for message in &request.messages {
+        if let Some(text) = extract_message_text(message) {
+            let lower = text.to_ascii_lowercase();
+            if lower.contains("/skill") || lower.contains("$skill") {
+                return true;
+            }
+            if lower.contains("skills are available")
+                || lower.contains("available skills")
+                || lower.contains("skill tool")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn ensure_skill_catalog_context_for_codex(
+    request: &mut AnthropicRequest,
+    reminder_store: &SkillCatalogReminderStore,
+    cache_key: &str,
+    request_id: &str,
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+) {
+    if !request_mentions_skill_tool(request) {
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[SkillCatalogCache] #{} skipped=true reason=no_skill_hint",
+                request_id
+            ),
+        );
+        return;
+    }
+
+    let current_blocks = collect_skill_catalog_reminder_blocks(request);
+    if !current_blocks.is_empty() {
+        upsert_skill_catalog_reminder(reminder_store, cache_key, &current_blocks);
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[SkillCatalogCache] #{} observed={} action=refresh",
+                request_id,
+                current_blocks.len()
+            ),
+        );
+        return;
+    }
+
+    let Some(cached_text) = get_cached_skill_catalog_reminder(reminder_store, cache_key) else {
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[SkillCatalogCache] #{} observed=0 action=miss key={}",
+                request_id,
+                tail_chars(cache_key, 24)
+            ),
+        );
+        return;
+    };
+
+    request.messages.insert(
+        0,
+        Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(cached_text)),
+        },
+    );
+
+    emit_stream_diag(
+        log_tx,
+        logger,
+        format!(
+            "[SkillCatalogCache] #{} observed=0 action=injected",
+            request_id
+        ),
+    );
+}
+
 fn common_prefix_len(a: &[Value], b: &[Value]) -> usize {
     let mut len = 0usize;
     for (lhs, rhs) in a.iter().zip(b.iter()) {
@@ -884,6 +1159,22 @@ fn common_prefix_len(a: &[Value], b: &[Value]) -> usize {
     len
 }
 
+fn is_stateful_replay_input_item(item: &Value) -> bool {
+    if item.get("role").and_then(|value| value.as_str()) == Some("assistant") {
+        return true;
+    }
+
+    item.get("type").and_then(|value| value.as_str()) == Some("function_call")
+}
+
+fn trim_leading_stateful_replay_items(items: &[Value]) -> (Vec<Value>, usize) {
+    let trimmed = items
+        .iter()
+        .take_while(|item| is_stateful_replay_input_item(item))
+        .count();
+    (items[trimmed..].to_vec(), trimmed)
+}
+
 fn derive_static_prefix_summary_from_upstream_body(body: &Value) -> Option<String> {
     body.get("prompt_cache_key")
         .and_then(|value| value.as_str())
@@ -894,6 +1185,44 @@ fn format_optional_bool_for_log(value: Option<bool>) -> String {
     value
         .map(|flag| flag.to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn log_instruction_footprint(
+    log_tx: &broadcast::Sender<String>,
+    request_id: &str,
+    body: &Value,
+    stateful_chain_mode: &str,
+) {
+    let instructions_chars = body
+        .get("instructions")
+        .and_then(|value| value.as_str())
+        .map(|value| value.chars().count())
+        .unwrap_or(0);
+    let input_items = body
+        .get("input")
+        .and_then(|value| value.as_array())
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let prompt_cache_key_tail = body
+        .get("prompt_cache_key")
+        .and_then(|value| value.as_str())
+        .map(|value| tail_chars(value, 32))
+        .unwrap_or_else(|| "-".to_string());
+    let previous_response_id = body
+        .get("previous_response_id")
+        .and_then(|value| value.as_str())
+        .map(|value| tail_chars(value, 20))
+        .unwrap_or_else(|| "-".to_string());
+
+    let _ = log_tx.send(format!(
+        "[InstructionFootprint] #{} instructions_chars={} input_items={} stateful_chain_mode={} prompt_cache_key={} previous_response_id={}",
+        request_id,
+        instructions_chars,
+        input_items,
+        stateful_chain_mode,
+        prompt_cache_key_tail,
+        previous_response_id
+    ));
 }
 
 fn prepare_stateful_chain_request(
@@ -1009,38 +1338,51 @@ fn prepare_stateful_chain_request(
                     ),
                 );
             } else {
-                let mut baseline = entry.full_input.clone();
-                if !entry.output_items.is_empty() {
-                    baseline.extend(entry.output_items.clone());
-                }
-                let baseline_len = baseline.len();
-                let prefix_len = common_prefix_len(&baseline, &full_input);
-                if prefix_len == baseline_len && full_input.len() > prefix_len {
-                    let incremental_input = full_input[prefix_len..].to_vec();
-                    obj.insert("input".to_string(), Value::Array(incremental_input));
-                    obj.insert(
-                        "previous_response_id".to_string(),
-                        json!(entry.response_id.clone()),
-                    );
-                    // 保存 turn-state 用于注入到请求头
-                    turn_state_to_inject = entry.turn_state.clone();
-                    emit_stream_diag(
-                        log_tx,
-                        logger,
-                        format!(
-                            "[StatefulChain] #{} enabled=true previous_response_id_attached=true trimmed_prefix_items={} original_input_items={} incremental_input_items={}",
-                            request_id,
-                            prefix_len,
-                            full_input.len(),
-                            full_input.len() - prefix_len
-                        ),
-                    );
+                let baseline_len = entry.full_input.len();
+                let prefix_len = common_prefix_len(&entry.full_input, &full_input);
+                if prefix_len == baseline_len {
+                    let candidate_suffix = &full_input[prefix_len..];
+                    let (incremental_input, replay_trimmed_items) =
+                        trim_leading_stateful_replay_items(candidate_suffix);
+                    if !incremental_input.is_empty() {
+                        obj.insert("input".to_string(), Value::Array(incremental_input.clone()));
+                        obj.insert(
+                            "previous_response_id".to_string(),
+                            json!(entry.response_id.clone()),
+                        );
+                        // 保存 turn-state 用于注入到请求头
+                        turn_state_to_inject = entry.turn_state.clone();
+                        emit_stream_diag(
+                            log_tx,
+                            logger,
+                            format!(
+                                "[StatefulChain] #{} enabled=true previous_response_id_attached=true trimmed_prefix_items={} replay_trimmed_items={} original_input_items={} incremental_input_items={}",
+                                request_id,
+                                prefix_len,
+                                replay_trimmed_items,
+                                full_input.len(),
+                                incremental_input.len()
+                            ),
+                        );
+                    } else {
+                        emit_stream_diag(
+                            log_tx,
+                            logger,
+                            format!(
+                                "[StatefulChain] #{} previous_response_id_skipped reason=no_incremental_input_after_replay_trim matched_prefix_items={} replay_trimmed_items={} current_items={}",
+                                request_id,
+                                prefix_len,
+                                replay_trimmed_items,
+                                full_input.len()
+                            ),
+                        );
+                    }
                 } else {
                     emit_stream_diag(
                         log_tx,
                         logger,
                         format!(
-                            "[StatefulChain] #{} previous_response_id_skipped reason=prefix_mismatch_or_no_delta matched_prefix_items={} stored_items={} stored_output_items={} current_items={}",
+                            "[StatefulChain] #{} previous_response_id_skipped reason=prefix_mismatch_or_no_delta matched_prefix_items={} stored_items={} stored_output_items_ignored={} current_items={}",
                             request_id,
                             prefix_len,
                             entry.full_input.len(),
@@ -2285,12 +2627,16 @@ fn log_usage_tokens(
         return;
     }
     let cached_input_tokens = extract_cached_input_tokens_from_response_usage(usage);
+    let uncached_input_tokens = input_tokens
+        .unwrap_or(0)
+        .saturating_sub(cached_input_tokens.unwrap_or(0));
     let _ = log_tx.send(format!(
-        "[Tokens] #{} input_tokens={} output_tokens={} cached_input_tokens={} source={}",
+        "[Tokens] #{} total_input_tokens={} cached_input_tokens={} uncached_input_tokens={} output_tokens={} source={}",
         request_id,
         input_tokens.unwrap_or(0),
-        output_tokens.unwrap_or(0),
         cached_input_tokens.unwrap_or(0),
+        uncached_input_tokens,
+        output_tokens.unwrap_or(0),
         source
     ));
 }
@@ -3959,6 +4305,8 @@ impl ProxyServer {
             Arc::new(Mutex::new(HashSet::new()));
         let codex_fast_unsupported_endpoints: CodexFastUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
+        let skill_catalog_reminders: SkillCatalogReminderStore =
+            Arc::new(Mutex::new(HashMap::new()));
         let runtime_handle = ProxyRuntimeHandle {
             state: Arc::new(RwLock::new(RuntimeConfigState::from(self.runtime_update()))),
         };
@@ -4024,6 +4372,8 @@ impl ProxyServer {
                                     Arc::clone(&codex_v1_unsupported_endpoints);
                                 let codex_fast_unsupported_endpoints =
                                     Arc::clone(&codex_fast_unsupported_endpoints);
+                                let skill_catalog_reminders =
+                                    Arc::clone(&skill_catalog_reminders);
                                 let runtime_handle = runtime_handle_for_server.clone();
                                 let log_tx = log_tx.clone();
                                 let log_tx_for_request = log_tx.clone();
@@ -4048,6 +4398,7 @@ impl ProxyServer {
                                             Arc::clone(&stateful_chain_unsupported_endpoints),
                                             Arc::clone(&codex_v1_unsupported_endpoints),
                                             Arc::clone(&codex_fast_unsupported_endpoints),
+                                            Arc::clone(&skill_catalog_reminders),
                                             log_tx_for_request.clone(),
                                         )
                                     });
@@ -4111,6 +4462,7 @@ async fn handle_request(
     stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore,
     codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore,
     codex_fast_unsupported_endpoints: CodexFastUnsupportedEndpointStore,
+    skill_catalog_reminders: SkillCatalogReminderStore,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path().to_string();
@@ -4308,7 +4660,7 @@ async fn handle_request(
     };
 
     // 再解析为结构体用于日志统计、模型路由等逻辑
-    let anthropic_body: AnthropicRequest =
+    let mut anthropic_body: AnthropicRequest =
         match serde_json::from_value(raw_request_body.clone()) {
             Ok(body) => body,
             Err(e) => {
@@ -4326,6 +4678,8 @@ async fn handle_request(
     let stateful_chain_hint_info =
         resolve_stateful_chain_hint_info(stateful_chain_hint_header, &anthropic_body);
     let stateful_chain_hint = stateful_chain_hint_info.value.clone();
+    let skill_catalog_cache_key =
+        derive_skill_catalog_cache_key(stateful_chain_hint.as_deref(), &anthropic_body);
 
     if is_messages && ignore_probe_requests {
         if let Some(probe_kind) = detect_probe_request(&anthropic_body) {
@@ -4443,6 +4797,17 @@ async fn handle_request(
             "[Req] #{} mode=count_tokens converter={} in={} out={}",
             request_id, route_selection.converter, input_model, route_selection.model_name,
         ));
+
+        if route_selection.converter.eq_ignore_ascii_case("codex") {
+            ensure_skill_catalog_context_for_codex(
+                &mut anthropic_body,
+                &skill_catalog_reminders,
+                &skill_catalog_cache_key,
+                &request_id,
+                &log_tx,
+                &logger,
+            );
+        }
 
         let unified_count_request = UnifiedChatRequest::from_anthropic(&anthropic_body);
         let mut token_count: Option<u64> = None;
@@ -4910,6 +5275,16 @@ async fn handle_request(
         }
 
         let request_backend = build_backend_by_converter(&route_selection.converter);
+        if route_selection.converter.eq_ignore_ascii_case("codex") {
+            ensure_skill_catalog_context_for_codex(
+                &mut anthropic_body,
+                &skill_catalog_reminders,
+                &skill_catalog_cache_key,
+                &request_id,
+                &log_tx,
+                &logger,
+            );
+        }
         let (mut upstream_body, session_id) = transform_request_with_optional_codex_effort_override(
             &route_selection.converter,
             &request_backend,
@@ -5076,6 +5451,15 @@ async fn handle_request(
                 codex_fast_mode,
                 tail_chars(&input_summary, 320),
             ));
+        }
+
+        if route_selection.converter.eq_ignore_ascii_case("codex") {
+            log_instruction_footprint(
+                &log_tx,
+                &request_id,
+                &upstream_body,
+                &stateful_chain_mode,
+            );
         }
 
         if let Some(ref l) = logger {
@@ -7204,12 +7588,15 @@ mod tests {
         backfill_non_stream_payload_from_codex_snapshot, body_uses_priority_service_tier,
         build_anthropic_message_from_codex_json_response, build_parallel_tool_degrade_key,
         chunk_contains_sibling_tool_call_error, classify_connection_error,
-        derive_stateful_chain_key, derive_stream_close_cause,
+        collect_skill_catalog_reminder_blocks, derive_skill_catalog_cache_key,
+        compute_non_input_fingerprint, derive_stateful_chain_key, derive_stream_close_cause,
         disable_parallel_tool_calls_in_upstream_body,
+        ensure_skill_catalog_context_for_codex,
         extract_cached_input_tokens_from_response_usage, extract_codex_plan_file_path_from_request,
         extract_codex_terminal_response_snapshot, extract_stateful_chain_hint_from_request,
         extract_stateful_chain_output_items, extract_tool_leak_retry_signal,
         extract_upstream_response_id,
+        get_cached_skill_catalog_reminder,
         get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
         is_business_stream_output, is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
         is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
@@ -7220,7 +7607,8 @@ mod tests {
         resolve_upstream_url_with_codex_path_preference, should_drop_post_message_stop_output,
         should_retry_codex_fast_without_service_tier, should_retry_codex_v1_path_with_legacy,
         should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
-        CodexFastUnsupportedEndpointStore, ConnErrorClass, SseFrameParser, StatefulChainEntry, StatefulChainRequestMeta,
+        trim_leading_stateful_replay_items, CodexFastUnsupportedEndpointStore, ConnErrorClass,
+        SkillCatalogReminderStore, SseFrameParser, StatefulChainEntry, StatefulChainRequestMeta,
         StatefulChainStore, StatefulChainUnsupportedEndpointStore, StreamEventCounters,
         StreamRuntimeOptions, UpstreamOperation,
     };
@@ -8149,6 +8537,78 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
     }
 
     #[test]
+    fn test_collect_skill_catalog_reminder_blocks_from_request() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>"
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let blocks = collect_skill_catalog_reminder_blocks(&request);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains("The following skills are available"));
+        assert!(blocks[0].contains("- pdf: Read PDF files"));
+    }
+
+    #[test]
+    fn test_skill_catalog_cache_injects_when_missing_and_refreshes_dynamically() {
+        let reminder_store: SkillCatalogReminderStore = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut request_with_catalog: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>"
+            }, {
+                "role": "user",
+                "content": "你好"
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let cache_key = derive_skill_catalog_cache_key(None, &request_with_catalog);
+        ensure_skill_catalog_context_for_codex(
+            &mut request_with_catalog,
+            &reminder_store,
+            &cache_key,
+            "req1",
+            &broadcast::channel(8).0,
+            &None,
+        );
+        let cached = get_cached_skill_catalog_reminder(&reminder_store, &cache_key)
+            .expect("catalog should be cached after observation");
+        assert!(cached.contains("- pdf: Read PDF files"));
+
+        let mut request_without_catalog: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": "你当前有些什么技能，请用/skill 从当前上下文告诉我"
+            }],
+            "stream": true
+        }))
+        .expect("valid request");
+
+        ensure_skill_catalog_context_for_codex(
+            &mut request_without_catalog,
+            &reminder_store,
+            &cache_key,
+            "req2",
+            &broadcast::channel(8).0,
+            &None,
+        );
+        let injected_text =
+            super::extract_message_text(&request_without_catalog.messages[0]).unwrap_or_default();
+        assert!(injected_text.contains("The following skills are available"));
+        assert!(injected_text.contains("- pdf: Read PDF files"));
+    }
+
+    #[test]
     fn test_prepare_stateful_chain_request_attaches_previous_response_id_and_trims_input() {
         let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
         let unsupported_store: StatefulChainUnsupportedEndpointStore =
@@ -8218,7 +8678,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
     }
 
     #[test]
-    fn test_prepare_stateful_chain_request_uses_output_items_in_prefix() {
+    fn test_prepare_stateful_chain_request_ignores_output_items_for_prefix_matching() {
         let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
         let unsupported_store: StatefulChainUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
@@ -8234,6 +8694,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                     ],
                     output_items: vec![
                         json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}),
+                        json!({"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"/tmp/a\"}"}),
                     ],
                     static_prefix_summary: Some("pk_same".to_string()),
                     non_input_fingerprint: None,
@@ -8281,6 +8742,167 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
     }
 
     #[test]
+    fn test_trim_leading_stateful_replay_items_drops_assistant_and_function_call_prefix() {
+        let items = vec![
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}),
+            json!({"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"/tmp/a\"}"}),
+            json!({"type":"function_call_output","call_id":"call_1","output":"file contents"}),
+            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}),
+        ];
+
+        let (trimmed, replay_trimmed_items) = trim_leading_stateful_replay_items(&items);
+        assert_eq!(replay_trimmed_items, 2);
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(
+            trimmed[0].get("type").and_then(|value| value.as_str()),
+            Some("function_call_output")
+        );
+        assert_eq!(
+            trimmed[1]
+                .pointer("/content/0/text")
+                .and_then(|value| value.as_str()),
+            Some("next")
+        );
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_trims_replayed_assistant_suffix_before_attaching_previous_response_id(
+    ) {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: vec![
+                        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
+                    ],
+                    output_items: vec![json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]})],
+                    static_prefix_summary: Some("pk_same".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+            ],
+            "store": false
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let (_meta, _turn_state) = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            &RequestEnvelopeHints::default(),
+            "test-chain",
+            "ep_1",
+            "req_trim_replay",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert_eq!(
+            body.get("previous_response_id").and_then(|value| value.as_str()),
+            Some("resp_prev")
+        );
+        let input = body
+            .get("input")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(input.len(), 1);
+        assert_eq!(
+            input[0]
+                .pointer("/content/0/text")
+                .and_then(|value| value.as_str()),
+            Some("next")
+        );
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_keeps_new_tool_result_suffix_after_trimming_replayed_function_call(
+    ) {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: vec![
+                        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
+                    ],
+                    output_items: vec![json!({"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"/tmp/a\"}"})],
+                    static_prefix_summary: Some("pk_same".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"/tmp/a\"}"},
+                {"type":"function_call_output","call_id":"call_1","output":"file contents"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+            ],
+            "store": false
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let (_meta, _turn_state) = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            &RequestEnvelopeHints::default(),
+            "test-chain",
+            "ep_1",
+            "req_tool_result",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        let input = body
+            .get("input")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(input.len(), 2);
+        assert_eq!(
+            input[0].get("type").and_then(|value| value.as_str()),
+            Some("function_call_output")
+        );
+        assert_eq!(
+            input[1]
+                .pointer("/content/0/text")
+                .and_then(|value| value.as_str()),
+            Some("next")
+        );
+    }
+
+    #[test]
     fn test_extract_stateful_chain_output_items_strips_metadata() {
         let snapshot = json!({
             "output": [{
@@ -8301,6 +8923,42 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         assert_eq!(
             items[0].pointer("/content/0/text").and_then(|v| v.as_str()),
             Some("hi")
+        );
+    }
+
+    #[test]
+    fn test_extract_stateful_chain_output_items_drops_reasoning_items() {
+        let snapshot = json!({
+            "output": [
+                {
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking"}]
+                },
+                {
+                    "id": "msg_1",
+                    "status": "completed",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                },
+                {
+                    "id": "fc_1",
+                    "status": "completed",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"/tmp/a\"}"
+                }
+            ]
+        });
+
+        let items = extract_stateful_chain_output_items(&snapshot);
+        assert_eq!(items.len(), 2, "reasoning items should not participate in prefix matching");
+        assert_eq!(items[0].get("type").and_then(|value| value.as_str()), Some("message"));
+        assert_eq!(
+            items[1].get("type").and_then(|value| value.as_str()),
+            Some("function_call")
         );
     }
     #[test]
@@ -8499,6 +9157,96 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         .expect("stateful meta");
 
         assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_ignores_volatile_billing_header_in_instructions() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+
+        let previous_body = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"你好"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"你好，有什么我可以帮你处理的？"}]}
+            ],
+            "instructions": "x-anthropic-billing-header: cc_version=2.1.81.9d4; cc_entrypoint=cli; cch=old01;\nYou are Claude Code, Anthropic's official CLI for Claude.\n\nStable instructions.",
+            "prompt_cache_key": "codex-proxy:gpt_5_4:conversation_turn:session:sess-1",
+            "reasoning": {"effort":"xhigh","summary":"detailed"},
+            "store": false,
+            "stream": true,
+            "tools": [{"type":"function","name":"Read","description":"Read file","parameters":{"type":"object","properties":{}}}]
+        });
+
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: previous_body
+                        .get("input")
+                        .and_then(|value| value.as_array())
+                        .cloned()
+                        .expect("previous input"),
+                    output_items: Vec::new(),
+                    static_prefix_summary: Some(
+                        "codex-proxy:gpt_5_4:conversation_turn:session:sess-1".to_string(),
+                    ),
+                    non_input_fingerprint: compute_non_input_fingerprint(&previous_body),
+                    turn_state: None,
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut current_body = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"你好"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"你好，有什么我可以帮你处理的？"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"你会些什么"}]}
+            ],
+            "instructions": "x-anthropic-billing-header: cc_version=2.1.81.9d4; cc_entrypoint=cli; cch=new99;\nYou are Claude Code, Anthropic's official CLI for Claude.\n\nStable instructions.",
+            "prompt_cache_key": "codex-proxy:gpt_5_4:conversation_turn:session:sess-1",
+            "reasoning": {"effort":"xhigh","summary":"detailed"},
+            "store": false,
+            "stream": true,
+            "tools": [{"type":"function","name":"Read","description":"Read file","parameters":{"type":"object","properties":{}}}]
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let (_meta, _turn_state) = prepare_stateful_chain_request(
+            &mut current_body,
+            &chain_store,
+            &unsupported_store,
+            &RequestEnvelopeHints::default(),
+            "test-chain",
+            "ep_1",
+            "req_billing_header",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert_eq!(
+            current_body
+                .get("previous_response_id")
+                .and_then(|value| value.as_str()),
+            Some("resp_prev"),
+            "volatile billing header changes should not break previous_response_id chaining"
+        );
+        assert_eq!(
+            current_body
+                .get("input")
+                .and_then(|value| value.as_array())
+                .map(|items| items.len()),
+            Some(1),
+            "request body should be trimmed down to the incremental suffix"
+        );
     }
 
     #[test]

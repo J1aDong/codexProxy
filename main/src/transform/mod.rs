@@ -816,6 +816,48 @@ mod tests {
     }
 
     #[test]
+    fn unified_request_drops_proxy_lifecycle_progress_from_assistant_history() {
+        use crate::models::{ContentBlock, Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    ContentBlock::Thinking {
+                        thinking: "请求已发送，正在等待上游开始输出…\n模型正在处理中…\n".to_string(),
+                        signature: Some(String::new()),
+                    },
+                    ContentBlock::Text {
+                        text: "你好，有什么我可以帮你处理的？".to_string(),
+                    },
+                ])),
+            }],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(256),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        assert_eq!(unified.messages.len(), 1);
+        let assistant = &unified.messages[0];
+        assert_eq!(assistant.role.as_str(), "assistant");
+        assert!(assistant.thinking.is_none(), "proxy lifecycle placeholder should not survive as thinking history");
+        assert_eq!(
+            assistant.content_text().as_deref(),
+            Some("你好，有什么我可以帮你处理的？")
+        );
+    }
+
+    #[test]
     fn codex_adapter_restores_prompt_cache_key_and_default_store_flag() {
         use crate::models::{Message, MessageContent};
 
@@ -1005,6 +1047,84 @@ mod tests {
 
         assert!(input_text.contains("hello"));
         assert!(!input_text.contains("The following skills are available"));
+    }
+
+    #[test]
+    fn codex_adapter_dedupes_repeated_user_system_reminders_in_instructions() {
+        use crate::models::{Message, MessageContent};
+
+        let repeated_block = "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>";
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Text(format!("{repeated_block}\n\nhello"))),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Text(format!("{repeated_block}\n\nworld"))),
+                },
+            ],
+            system: Some(SystemContent::Text(
+                "x-anthropic-billing-header: cc_version=2.1.81; cch=abc;\nYou are Claude Code."
+                    .to_string(),
+            )),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let hints = crate::transform::request_envelope_hints_from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "codex".to_string(),
+            codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let body = crate::transform::providers::CodexAdapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &ctx,
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                true,
+                &hints,
+            )
+            .body;
+
+        let instructions = body
+            .get("instructions")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            instructions.matches("The following skills are available").count(),
+            1,
+            "repeated reminder blocks should be merged only once"
+        );
+        assert!(
+            !instructions.contains("x-anthropic-billing-header:"),
+            "dynamic billing headers should be stripped before building codex instructions"
+        );
     }
 
     #[test]

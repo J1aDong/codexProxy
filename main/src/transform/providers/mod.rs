@@ -7,6 +7,7 @@ use crate::transform::unified::{
     UnifiedChatRequest, UnifiedContent, UnifiedMessage, UnifiedMessageRole, UnifiedToolChoice,
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -269,6 +270,11 @@ fn encode_codex_body(
     hints: &RequestEnvelopeHints,
 ) -> Value {
     let (promoted_context, cleaned_messages) = extract_user_scaffolding_to_codex_instructions(unified);
+    let applied_system_text = system_text(unified)
+        .map(|text| strip_dynamic_system_header_lines(&text))
+        .filter(|text| !text.trim().is_empty());
+    let applied_instructions =
+        merge_instruction_context(applied_system_text.as_deref(), promoted_context.as_deref());
     let mut input = Vec::new();
 
     for message in &cleaned_messages {
@@ -315,15 +321,12 @@ fn encode_codex_body(
         "prompt_cache_key": build_prompt_cache_key(
             route_model,
             hints,
-            merge_instruction_context(system_text(unified).as_deref(), promoted_context.as_deref())
-                .as_deref(),
+            applied_instructions.as_deref(),
             codex_tools_fingerprint(unified).as_deref(),
         ),
     });
 
-    if let Some(instructions) =
-        merge_instruction_context(system_text(unified).as_deref(), promoted_context.as_deref())
-    {
+    if let Some(instructions) = applied_instructions {
         body["instructions"] = json!(instructions);
     }
     if let Some(max_tokens) = unified.max_tokens {
@@ -883,6 +886,43 @@ fn normalize_codex_tool_schema(schema: &Value) -> Value {
     normalized
 }
 
+fn normalize_text_for_exact_match(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn normalized_contains(haystack: &str, needle: &str) -> bool {
+    let normalized_needle = normalize_text_for_exact_match(needle);
+    if normalized_needle.is_empty() {
+        return false;
+    }
+
+    normalize_text_for_exact_match(haystack).contains(&normalized_needle)
+}
+
+fn append_instruction_text(base: &str, extra: &str) -> String {
+    let trimmed_base = base.trim();
+    let trimmed_extra = extra.trim();
+
+    if trimmed_base.is_empty() {
+        return trimmed_extra.to_string();
+    }
+    if trimmed_extra.is_empty() {
+        return trimmed_base.to_string();
+    }
+    if normalized_contains(trimmed_base, trimmed_extra) {
+        return trimmed_base.to_string();
+    }
+
+    format!("{}\n\n{}", trimmed_base, trimmed_extra)
+}
+
 fn merge_instruction_context(first: Option<&str>, second: Option<&str>) -> Option<String> {
     let mut merged = None::<String>;
     for text in [first, second].into_iter().flatten() {
@@ -891,11 +931,23 @@ fn merge_instruction_context(first: Option<&str>, second: Option<&str>) -> Optio
             continue;
         }
         merged = Some(match merged {
-            Some(existing) => format!("{}\n\n{}", existing, trimmed),
+            Some(existing) => append_instruction_text(&existing, trimmed),
             None => trimmed.to_string(),
         });
     }
     merged
+}
+
+fn strip_dynamic_system_header_lines(text: &str) -> String {
+    let filtered = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("x-anthropic-billing-header:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalize_text_for_exact_match(&filtered)
 }
 
 fn extract_user_scaffolding_to_codex_instructions(
@@ -905,6 +957,7 @@ fn extract_user_scaffolding_to_codex_instructions(
     const END: &str = "</system-reminder>";
 
     let mut promoted_parts = Vec::new();
+    let mut seen_promoted_parts = HashSet::new();
     let mut cleaned_messages = Vec::new();
 
     for message in &unified.messages {
@@ -930,8 +983,11 @@ fn extract_user_scaffolding_to_codex_instructions(
                         let block_text =
                             remaining[start_idx + START.len()..start_idx + START.len() + end_rel]
                                 .trim();
-                        if !block_text.is_empty() {
-                            promoted_parts.push(block_text.to_string());
+                        let normalized_block = normalize_text_for_exact_match(block_text);
+                        if !normalized_block.is_empty()
+                            && seen_promoted_parts.insert(normalized_block.clone())
+                        {
+                            promoted_parts.push(normalized_block);
                         }
                         remaining =
                             format!("{}{}", &remaining[..start_idx], &remaining[end_idx..]);
@@ -946,10 +1002,13 @@ fn extract_user_scaffolding_to_codex_instructions(
                             let prefix = &remaining[..contents_idx];
                             let lines: Vec<&str> = after.lines().collect();
                             if lines.len() >= 2 {
-                                let rule_line = lines[1].trim();
-                                if !rule_line.is_empty() {
-                                    promoted_parts.push(rule_line.to_string());
-                                }
+                            let rule_line = lines[1].trim();
+                            let normalized_rule_line = normalize_text_for_exact_match(rule_line);
+                            if !normalized_rule_line.is_empty()
+                                && seen_promoted_parts.insert(normalized_rule_line.clone())
+                            {
+                                promoted_parts.push(normalized_rule_line);
+                            }
                                 let remainder = if let Some(split_idx) = after.find("\n\n") {
                                     &after[split_idx + 2..]
                                 } else {
@@ -1004,7 +1063,7 @@ fn sanitize_cache_key_segment(input: &str, max_len: usize) -> String {
 }
 
 fn normalize_cache_material(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n").trim().to_string()
+    normalize_text_for_exact_match(text)
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
