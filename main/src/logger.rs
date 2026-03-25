@@ -296,7 +296,7 @@ impl AppLogger {
 
         let log_content = format!(
             "\n[{}] ════════════════════════════════════════════════════════════════\n\
-             [{}] 📤 OUTGOING REQUEST ({})\n\
+             [{}] [上游请求] 📤 OUTGOING REQUEST ({})\n\
              [{}] ════════════════════════════════════════════════════════════════\n\
              {}\n\
              \n\
@@ -310,7 +310,7 @@ impl AppLogger {
     }
 
     /// 记录原始 Anthropic 请求
-    pub fn log_anthropic_request(&self, body_bytes: &[u8]) {
+    pub fn log_anthropic_request(&self, method: &str, path: &str, body_bytes: &[u8]) {
         if !is_debug_log_enabled() {
             return;
         }
@@ -327,36 +327,45 @@ impl AppLogger {
 
         let log_content = format!(
             "\n[{}] ════════════════════════════════════════════════════════════════\n\
-             [{}] 📥 INCOMING ANTHROPIC REQUEST\n\
+             [{}] [下游请求] 📥 INCOMING ANTHROPIC REQUEST\n\
+             [{}] [下游请求] {} {}\n\
              [{}] ════════════════════════════════════════════════════════════════\n\
              {}\n\
              ════════════════════════════════════════════════════════════════════════\n",
-            timestamp, timestamp, timestamp, pretty_body
+            timestamp, timestamp, timestamp, method, path, timestamp, pretty_body
         );
 
         self.append_content(&log_content);
     }
 
     /// 记录上游响应
-    pub fn log_upstream_response(&self, status: u16, line: &str) {
+    pub fn log_upstream_response(&self, status: u16, url: &str, line: &str) {
         if !is_debug_log_enabled() {
             return;
         }
 
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-        let line = format!("[{}] 📩 [Upstream {}] {}\n", timestamp, status, line);
+        let line = format!(
+            "[{}] [上游响应] 📩 [Upstream {}] url={} {}\n",
+            timestamp, status, url, line
+        );
 
         self.append_content(&line);
     }
 
     /// 记录转换后的 Anthropic 响应
-    pub fn log_anthropic_response(&self, line: &str) {
+    pub fn log_anthropic_response(&self, path: &str, line: &str) {
         if !is_debug_log_enabled() {
             return;
         }
 
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-        let line = format!("[{}] 📤 [To Client] {}\n", timestamp, line.trim());
+        let line = format!(
+            "[{}] [下游响应] 📤 [To Client] path={} {}\n",
+            timestamp,
+            path,
+            line.trim()
+        );
 
         self.append_content(&line);
     }

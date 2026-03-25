@@ -387,6 +387,18 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
     format!("...{}", tail)
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max_chars).collect();
+    format!("{}... (truncated, len={})", clipped, char_count)
+}
+
 fn summarize_request_messages(messages: &[Message]) -> String {
     let msg_summaries: Vec<String> = messages
         .iter()
@@ -1175,6 +1187,31 @@ fn trim_leading_stateful_replay_items(items: &[Value]) -> (Vec<Value>, usize) {
     (items[trimmed..].to_vec(), trimmed)
 }
 
+fn collect_function_call_output_call_ids(items: &[Value]) -> Vec<String> {
+    items.iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("function_call_output"))
+        .filter_map(|item| item.get("call_id").and_then(|value| value.as_str()))
+        .filter(|call_id| !call_id.trim().is_empty())
+        .map(|call_id| call_id.to_string())
+        .collect()
+}
+
+fn output_items_contain_function_call_call_ids(output_items: &[Value], call_ids: &[String]) -> bool {
+    if call_ids.is_empty() {
+        return true;
+    }
+
+    let available_call_ids = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("function_call"))
+        .filter_map(|item| item.get("call_id").and_then(|value| value.as_str()))
+        .collect::<HashSet<_>>();
+
+    call_ids
+        .iter()
+        .all(|call_id| available_call_ids.contains(call_id.as_str()))
+}
+
 fn derive_static_prefix_summary_from_upstream_body(body: &Value) -> Option<String> {
     body.get("prompt_cache_key")
         .and_then(|value| value.as_str())
@@ -1344,7 +1381,25 @@ fn prepare_stateful_chain_request(
                     let candidate_suffix = &full_input[prefix_len..];
                     let (incremental_input, replay_trimmed_items) =
                         trim_leading_stateful_replay_items(candidate_suffix);
-                    if !incremental_input.is_empty() {
+                    let tool_result_call_ids =
+                        collect_function_call_output_call_ids(&incremental_input);
+                    let tool_result_chain_supported =
+                        output_items_contain_function_call_call_ids(
+                            &entry.output_items,
+                            &tool_result_call_ids,
+                        );
+                    if !tool_result_chain_supported {
+                        emit_stream_diag(
+                            log_tx,
+                            logger,
+                            format!(
+                                "[StatefulChain] #{} previous_response_id_skipped reason=tool_result_call_id_not_found tool_result_count={} stored_output_items={}",
+                                request_id,
+                                tool_result_call_ids.len(),
+                                entry.output_items.len()
+                            ),
+                        );
+                    } else if !incremental_input.is_empty() {
                         obj.insert("input".to_string(), Value::Array(incremental_input.clone()));
                         obj.insert(
                             "previous_response_id".to_string(),
@@ -1790,21 +1845,10 @@ fn emit_stream_terminal_summary(
     );
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max_chars).collect();
-    format!("{}... (truncated, len={})", clipped, char_count)
-}
-
 fn maybe_log_stream_upstream(
     logger: &Option<Arc<AppLogger>>,
     status: u16,
+    url: &str,
     text: &str,
     opts: StreamRuntimeOptions,
     counter: &mut u64,
@@ -1821,12 +1865,12 @@ fn maybe_log_stream_upstream(
         }
     }
 
-    let msg = truncate_chars(text, opts.stream_log_max_chars);
-    l.log_upstream_response(status, &msg);
+    l.log_upstream_response(status, url, text);
 }
 
 fn maybe_log_stream_downstream(
     logger: &Option<Arc<AppLogger>>,
+    path: &str,
     text: &str,
     opts: StreamRuntimeOptions,
     counter: &mut u64,
@@ -1843,8 +1887,7 @@ fn maybe_log_stream_downstream(
         }
     }
 
-    let msg = truncate_chars(text, opts.stream_log_max_chars);
-    l.log_anthropic_response(&msg);
+    l.log_anthropic_response(path, text);
 }
 
 fn emit_stream_diag(
@@ -4467,7 +4510,7 @@ async fn handle_request(
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path().to_string();
     let normalized_path = path.trim_end_matches('/');
-    let method = req.method();
+    let method = req.method().clone();
     let request_id: String = Uuid::new_v4()
         .simple()
         .to_string()
@@ -5081,7 +5124,7 @@ async fn handle_request(
         .unwrap_or(1);
 
     if let Some(ref l) = logger {
-        l.log_anthropic_request(&body_bytes);
+        l.log_anthropic_request(method.as_str(), normalized_path, &body_bytes);
     }
 
     let mut attempt_index = 0usize;
@@ -5927,7 +5970,7 @@ async fn handle_request(
                 ));
 
                 if let Some(ref l) = logger {
-                    l.log_upstream_response(status, &error_text);
+                    l.log_upstream_response(status, &resolved_target_url, &error_text);
                 }
 
                 if action == UpstreamOutcomeAction::RetryNextCandidate
@@ -6012,7 +6055,7 @@ async fn handle_request(
         let body_text = response.text().await.unwrap_or_default();
 
         if let Some(ref l) = AppLogger::get() {
-            l.log_upstream_response(upstream_status, &body_text);
+            l.log_upstream_response(upstream_status, &resolved_target_url_for_stream, &body_text);
             l.log("════════════════════════════════════════════════════════════════");
             l.log("✅ Request completed");
             l.log("════════════════════════════════════════════════════════════════");
@@ -6042,7 +6085,7 @@ async fn handle_request(
         {
             let body_text = response.text().await.unwrap_or_default();
             if let Some(ref l) = logger {
-                l.log_upstream_response(upstream_status, &body_text);
+                l.log_upstream_response(upstream_status, &resolved_target_url_for_stream, &body_text);
             }
             let parsed = match serde_json::from_str::<Value>(&body_text) {
                 Ok(value) => value,
@@ -6153,12 +6196,16 @@ async fn handle_request(
                                     }
                                 }
                                 if let Some(ref l) = logger {
-                                    l.log_upstream_response(upstream_status, &frame);
+                                    l.log_upstream_response(
+                                        upstream_status,
+                                        &resolved_target_url_for_stream,
+                                        &frame,
+                                    );
                                 }
                                 for event_chunk in transformer.transform_event(&frame) {
                                     metrics.mark_downstream_output(&event_chunk);
                                     if let Some(ref l) = logger {
-                                        l.log_anthropic_response(&event_chunk);
+                                        l.log_anthropic_response(normalized_path, &event_chunk);
                                     }
                                     apply_sse_chunk_to_non_stream_message(
                                         &event_chunk,
@@ -6178,13 +6225,17 @@ async fn handle_request(
                                     latest_upstream_response_id = Some(response_id);
                                 }
                                 if let Some(ref l) = logger {
-                                    l.log_upstream_response(upstream_status, &line);
+                                    l.log_upstream_response(
+                                        upstream_status,
+                                        &resolved_target_url_for_stream,
+                                        &line,
+                                    );
                                 }
 
                                 for event_chunk in transformer.transform_line(&line) {
                                     metrics.mark_downstream_output(&event_chunk);
                                     if let Some(ref l) = logger {
-                                        l.log_anthropic_response(&event_chunk);
+                                        l.log_anthropic_response(normalized_path, &event_chunk);
                                     }
                                     apply_sse_chunk_to_non_stream_message(
                                         &event_chunk,
@@ -6241,12 +6292,16 @@ async fn handle_request(
                     }
                 }
                 if let Some(ref l) = logger {
-                    l.log_upstream_response(upstream_status, &remaining);
+                    l.log_upstream_response(
+                        upstream_status,
+                        &resolved_target_url_for_stream,
+                        &remaining,
+                    );
                 }
                 for event_chunk in transformer.transform_event(&remaining) {
                     metrics.mark_downstream_output(&event_chunk);
                     if let Some(ref l) = logger {
-                        l.log_anthropic_response(&event_chunk);
+                        l.log_anthropic_response(normalized_path, &event_chunk);
                     }
                     apply_sse_chunk_to_non_stream_message(
                         &event_chunk,
@@ -6264,13 +6319,17 @@ async fn handle_request(
                 latest_upstream_response_id = Some(response_id);
             }
             if let Some(ref l) = logger {
-                l.log_upstream_response(upstream_status, &line_buffer);
+                l.log_upstream_response(
+                    upstream_status,
+                    &resolved_target_url_for_stream,
+                    &line_buffer,
+                );
             }
 
             for event_chunk in transformer.transform_line(&line_buffer) {
                 metrics.mark_downstream_output(&event_chunk);
                 if let Some(ref l) = logger {
-                    l.log_anthropic_response(&event_chunk);
+                    l.log_anthropic_response(normalized_path, &event_chunk);
                 }
                 apply_sse_chunk_to_non_stream_message(
                     &event_chunk,
@@ -6448,6 +6507,7 @@ async fn handle_request(
     let parallel_tool_degrade_until_for_stream = parallel_tool_degrade_until.clone();
     let parallel_tool_degrade_key_for_stream = parallel_tool_degrade_key_for_stream.clone();
     let response_transform_request_ctx_for_stream = response_transform_request_ctx.clone();
+    let downstream_path_for_stream = normalized_path.to_string();
     tokio::spawn(async move {
         let _permit_guard = permit_for_stream;
         let mut stream = response.bytes_stream();
@@ -6519,6 +6579,7 @@ async fn handle_request(
                                     maybe_log_stream_upstream(
                                         &logger_for_stream,
                                         current_upstream_status,
+                                        &upstream_url_for_stream,
                                         &frame,
                                         stream_opts_for_task,
                                         &mut upstream_log_counter,
@@ -6550,6 +6611,7 @@ async fn handle_request(
                                         event_counters.mark_downstream_chunk(&output);
                                         maybe_log_stream_downstream(
                                             &logger_for_stream,
+                                            &downstream_path_for_stream,
                                             &output,
                                             stream_opts_for_task,
                                             &mut downstream_log_counter,
@@ -6604,6 +6666,7 @@ async fn handle_request(
                                     maybe_log_stream_upstream(
                                         &logger_for_stream,
                                         current_upstream_status,
+                                        &upstream_url_for_stream,
                                         &line,
                                         stream_opts_for_task,
                                         &mut upstream_log_counter,
@@ -6635,6 +6698,7 @@ async fn handle_request(
                                         event_counters.mark_downstream_chunk(&output);
                                         maybe_log_stream_downstream(
                                             &logger_for_stream,
+                                            &downstream_path_for_stream,
                                             &output,
                                             stream_opts_for_task,
                                             &mut downstream_log_counter,
@@ -6795,6 +6859,7 @@ async fn handle_request(
                     maybe_log_stream_upstream(
                         &logger_for_stream,
                         current_upstream_status,
+                        &upstream_url_for_stream,
                         &remaining,
                         stream_opts_for_task,
                         &mut upstream_log_counter,
@@ -6826,6 +6891,7 @@ async fn handle_request(
                         event_counters.mark_downstream_chunk(&output);
                         maybe_log_stream_downstream(
                             &logger_for_stream,
+                            &downstream_path_for_stream,
                             &output,
                             stream_opts_for_task,
                             &mut downstream_log_counter,
@@ -6856,6 +6922,7 @@ async fn handle_request(
                 maybe_log_stream_upstream(
                     &logger_for_stream,
                     current_upstream_status,
+                    &upstream_url_for_stream,
                     &line_buffer,
                     stream_opts_for_task,
                     &mut upstream_log_counter,
@@ -6887,6 +6954,7 @@ async fn handle_request(
                     event_counters.mark_downstream_chunk(&output);
                     maybe_log_stream_downstream(
                         &logger_for_stream,
+                        &downstream_path_for_stream,
                         &output,
                         stream_opts_for_task,
                         &mut downstream_log_counter,
@@ -8884,6 +8952,11 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         )
         .expect("stateful meta");
 
+        assert_eq!(
+            body.get("previous_response_id").and_then(|value| value.as_str()),
+            Some("resp_prev"),
+            "matching tool-result call_id should preserve previous_response_id chaining"
+        );
         let input = body
             .get("input")
             .and_then(|value| value.as_array())
@@ -8900,6 +8973,69 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
                 .and_then(|value| value.as_str()),
             Some("next")
         );
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_skips_previous_response_id_when_tool_result_call_id_is_unknown(
+    ) {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut guard = chain_store.lock().expect("lock");
+            guard.insert(
+                "test-chain".to_string(),
+                StatefulChainEntry {
+                    response_id: "resp_prev".to_string(),
+                    endpoint_key: "ep_1".to_string(),
+                    full_input: vec![
+                        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
+                    ],
+                    output_items: Vec::new(),
+                    static_prefix_summary: Some("pk_same".to_string()),
+                    non_input_fingerprint: None,
+                    turn_state: None,
+                    updated_at: Instant::now(),
+                },
+            );
+        }
+
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"function_call","call_id":"call_missing","name":"TaskCreate","arguments":"{\"subject\":\"demo\"}"},
+                {"type":"function_call_output","call_id":"call_missing","output":"Task #1 created"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+            ],
+            "store": false
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let (_meta, _turn_state) = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            &RequestEnvelopeHints::default(),
+            "test-chain",
+            "ep_1",
+            "req_tool_result_missing",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert!(
+            body.get("previous_response_id").is_none(),
+            "unknown tool-result call_id must fall back to full input"
+        );
+        let input = body
+            .get("input")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(input.len(), 4, "full input should remain untouched on fallback");
     }
 
     #[test]
