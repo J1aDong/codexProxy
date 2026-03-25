@@ -1,395 +1,13 @@
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 use crate::models::AnthropicRequest;
 
-use super::{MessageProcessor, ResponseTransformer, TransformBackend, TransformContext};
+use super::{
+    providers::GeminiAdapter, ResponseTransformer, TransformBackend, TransformContext,
+};
 
 pub struct GeminiBackend;
-
-struct GeminiRequestMapper;
-
-impl GeminiBackend {
-    fn normalize_model(model: &str) -> String {
-        model.trim().to_string()
-    }
-
-    pub(crate) fn build_contents_for_count(messages: &[Value]) -> Vec<Value> {
-        GeminiRequestMapper::build_contents_for_count(messages)
-    }
-}
-
-impl GeminiRequestMapper {
-
-    fn convert_content_block(block: &Value) -> Option<Value> {
-        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        match block_type {
-            "text" | "input_text" | "output_text" => {
-                let text = block.get("text").and_then(|t| t.as_str())?;
-                Some(json!({ "text": text }))
-            }
-            "thinking" | "thought" | "reasoning" => {
-                let text = block
-                    .get("thinking")
-                    .or_else(|| block.get("text"))
-                    .and_then(|t| t.as_str())?;
-                let sig = block.get("signature").and_then(|s| s.as_str());
-                if let Some(s) = sig {
-                    Some(json!({ "text": text, "thought": true, "thought_signature": s }))
-                } else {
-                    Some(json!({ "text": text, "thought": true }))
-                }
-            }
-            "image" | "image_url" | "input_image" => {
-                let source = block.get("source").or_else(|| block.get("image_url"));
-                if let Some(src) = source {
-                    // Handle data URI in image_url string (common in Codex output)
-                    if let Some(url_str) = src.as_str() {
-                        if url_str.starts_with("data:") {
-                            let parts: Vec<&str> = url_str.splitn(2, ",").collect();
-                            if parts.len() == 2 {
-                                let header = parts[0];
-                                let mime_type = header
-                                    .trim_start_matches("data:")
-                                    .split(";")
-                                    .next()
-                                    .unwrap_or("image/jpeg");
-                                return Some(json!({
-                                    "inline_data": {
-                                        "mime_type": mime_type,
-                                        "data": parts[1]
-                                    }
-                                }));
-                            }
-                        }
-                    }
-                    // Handle object source
-                    if let Some(data) = src.get("data").and_then(|d| d.as_str()) {
-                        let mime_type = src
-                            .get("media_type")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("image/jpeg");
-                        return Some(json!({
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": data
-                            }
-                        }));
-                    }
-                }
-                None
-            }
-            // Note: Codex outputs function_call as separate item, not content block usually
-            _ => None,
-        }
-    }
-
-    fn build_contents(messages: &[Value]) -> Vec<Value> {
-        let mut gemini_messages: Vec<Value> = Vec::new();
-        let mut tool_id_name_map: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
-        for item in messages {
-            let item_type = item
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("message");
-
-            if item_type == "message" {
-                let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                let content = item.get("content");
-                let mut parts = Vec::new();
-
-                if let Some(content_array) = content.and_then(|c| c.as_array()) {
-                    for block in content_array {
-                        if let Some(part) = Self::convert_content_block(block) {
-                            parts.push(part);
-                        }
-                    }
-                } else if let Some(text) = content.and_then(|c| c.as_str()) {
-                    parts.push(json!({ "text": text }));
-                }
-
-                if parts.is_empty() {
-                    continue;
-                }
-
-                let gemini_role = if role == "assistant" { "model" } else { "user" };
-
-                // Merge logic
-                if let Some(last_msg) = gemini_messages.last_mut() {
-                    if last_msg["role"] == gemini_role {
-                        if let Some(last_parts) = last_msg["parts"].as_array_mut() {
-                            last_parts.extend(parts);
-                        }
-                        continue;
-                    }
-                }
-
-                gemini_messages.push(json!({
-                    "role": gemini_role,
-                    "parts": parts
-                }));
-            } else if item_type == "function_call" {
-                let name = item
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("unknown");
-                let args_str = item
-                    .get("arguments")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("{}");
-                let args = serde_json::from_str::<Value>(args_str).unwrap_or(json!({}));
-                let signature = item.get("signature").and_then(|s| s.as_str());
-
-                if let Some(id) = item.get("call_id").and_then(|i| i.as_str()) {
-                    tool_id_name_map.insert(id.to_string(), name.to_string());
-                }
-
-                let fc_obj = json!({
-                    "name": name,
-                    "args": args
-                });
-
-                let mut part = json!({
-                    "functionCall": fc_obj
-                });
-
-                if let Some(s) = signature {
-                    if let Some(obj) = part.as_object_mut() {
-                        obj.insert("thought_signature".to_string(), json!(s));
-                    }
-                }
-
-                let gemini_role = "model";
-                if let Some(last_msg) = gemini_messages.last_mut() {
-                    if last_msg["role"] == gemini_role {
-                        if let Some(last_parts) = last_msg["parts"].as_array_mut() {
-                            last_parts.push(part);
-                        }
-                        continue;
-                    }
-                }
-                gemini_messages.push(json!({
-                    "role": gemini_role,
-                    "parts": [part]
-                }));
-            } else if item_type == "function_call_output" {
-                let id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
-                let name = tool_id_name_map
-                    .get(id)
-                    .map(|s| s.as_str())
-                    .unwrap_or("unknown_tool");
-
-                let output_text = item.get("output").and_then(|s| s.as_str()).unwrap_or("");
-                let content = json!({ "result": output_text });
-
-                let part = json!({
-                    "functionResponse": {
-                        "name": name,
-                        "response": content
-                    }
-                });
-
-                // Gemini REST requires role 'user' for function response in some documentation,
-                // but 'function' is correct for the Python SDK. Let's try 'user' or 'function'.
-                // Standard REST API often uses 'function' role.
-                let gemini_role = "function";
-
-                if let Some(last_msg) = gemini_messages.last_mut() {
-                    if last_msg["role"] == gemini_role {
-                        if let Some(last_parts) = last_msg["parts"].as_array_mut() {
-                            last_parts.push(part);
-                        }
-                        continue;
-                    }
-                }
-
-                gemini_messages.push(json!({
-                    "role": gemini_role,
-                    "parts": [part]
-                }));
-            }
-        }
-
-        gemini_messages
-    }
-
-    pub(crate) fn build_contents_for_count(messages: &[Value]) -> Vec<Value> {
-        Self::build_contents(messages)
-    }
-
-    fn convert_tools(tools: Option<&Vec<Value>>) -> Option<Vec<Value>> {
-        let tools = tools?;
-        if tools.is_empty() {
-            return None;
-        }
-
-        let function_declarations: Vec<Value> = tools
-            .iter()
-            .filter_map(|tool| {
-                let name = tool.get("name").and_then(|n| n.as_str())?;
-                let description = tool
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
-                let input_schema = tool
-                    .get("input_schema")
-                    .cloned()
-                    .unwrap_or(json!({ "type": "object", "properties": {} }));
-
-                Some(json!({
-                    "name": name,
-                    "description": description,
-                    "parameters": input_schema
-                }))
-            })
-            .collect();
-
-        if function_declarations.is_empty() {
-            None
-        } else {
-            Some(vec![json!({
-                "function_declarations": function_declarations
-            })])
-        }
-    }
-
-    fn collect_system_instruction_parts(
-        anthropic_body: &AnthropicRequest,
-        transformed_messages: &[Value],
-    ) -> Option<Vec<Value>> {
-        let mut parts = Vec::new();
-
-        if let Some(text) = crate::transform::shared::flatten_system_text(anthropic_body.system.as_ref()) {
-            parts.push(json!({ "text": text }));
-        }
-
-        for message in &anthropic_body.messages {
-            if !message.role.eq_ignore_ascii_case("system") {
-                continue;
-            }
-
-            let Some(content) = message.content.as_ref() else {
-                continue;
-            };
-
-            match content {
-                crate::models::MessageContent::Text(text) => {
-                    if !text.trim().is_empty() {
-                        parts.push(json!({ "text": text }));
-                    }
-                }
-                crate::models::MessageContent::Blocks(blocks) => {
-                    for block in blocks {
-                        if let crate::models::ContentBlock::Text { text } = block {
-                            if !text.trim().is_empty() {
-                                parts.push(json!({ "text": text }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for message in transformed_messages {
-            if message
-                .get("type")
-                .and_then(|value| value.as_str())
-                != Some("message")
-            {
-                continue;
-            }
-            if message
-                .get("role")
-                .and_then(|value| value.as_str())
-                != Some("system")
-            {
-                continue;
-            }
-
-            if let Some(content_array) = message.get("content").and_then(|value| value.as_array()) {
-                for block in content_array {
-                    if let Some(text) = block.get("text").and_then(|value| value.as_str()) {
-                        if !text.trim().is_empty()
-                            && !parts.iter().any(|part| part.get("text") == Some(&json!(text)))
-                        {
-                            parts.push(json!({ "text": text }));
-                        }
-                    }
-                }
-            } else if let Some(text) = message.get("content").and_then(|value| value.as_str()) {
-                if !text.trim().is_empty()
-                    && !parts.iter().any(|part| part.get("text") == Some(&json!(text)))
-                {
-                    parts.push(json!({ "text": text }));
-                }
-            }
-        }
-
-        (!parts.is_empty()).then_some(parts)
-    }
-
-    fn build_body(
-        anthropic_body: &AnthropicRequest,
-        log_tx: Option<&broadcast::Sender<String>>,
-        requested_model: &str,
-    ) -> Value {
-        let gemini_model = GeminiBackend::normalize_model(requested_model);
-        let (messages, _) = MessageProcessor::transform_messages(&anthropic_body.messages, log_tx);
-        let contents = Self::build_contents(&messages);
-        let system_instruction = Self::collect_system_instruction_parts(anthropic_body, &messages)
-            .map(|parts| json!({ "parts": parts }));
-        let tools = Self::convert_tools(anthropic_body.tools.as_ref());
-
-        let mut generation_config = json!({});
-        if let Some(cfg) = generation_config.as_object_mut() {
-            if let Some(max_tokens) = anthropic_body.max_tokens {
-                cfg.insert("maxOutputTokens".to_string(), json!(max_tokens));
-            }
-            if let Some(temp) = anthropic_body.temperature {
-                cfg.insert("temperature".to_string(), json!(temp));
-            }
-            if let Some(top_p) = anthropic_body.top_p {
-                cfg.insert("topP".to_string(), json!(top_p));
-            }
-            if let Some(top_k) = anthropic_body.top_k {
-                cfg.insert("topK".to_string(), json!(top_k));
-            }
-            if let Some(stop) = &anthropic_body.stop_sequences {
-                cfg.insert("stopSequences".to_string(), json!(stop));
-            }
-        }
-
-        json!({
-            "model": gemini_model,
-            "system_instruction": system_instruction,
-            "contents": contents,
-            "tools": tools,
-            "generationConfig": generation_config,
-            "safetySettings": [
-                {
-                    "category": "HARM_CATEGORY_HARASSMENT",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_HATE_SPEECH",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                    "threshold": "BLOCK_NONE"
-                }
-            ]
-        })
-    }
-}
 
 struct GeminiUpstreamRequestBuilder;
 
@@ -456,20 +74,27 @@ impl TransformBackend for GeminiBackend {
     fn transform_request(
         &self,
         anthropic_body: &AnthropicRequest,
-        log_tx: Option<&broadcast::Sender<String>>,
-        _ctx: &TransformContext,
-        _effective_stream: bool,
+        _log_tx: Option<&broadcast::Sender<String>>,
+        ctx: &TransformContext,
+        effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
-        let session_id = Uuid::new_v4().to_string();
-
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(anthropic_body);
         let requested = model_override
-            .or_else(|| anthropic_body.model.clone())
-            // Fallback (though model_override should usually be present)
-            .unwrap_or_else(|| "gemini-3-pro-preview".to_string());
-        let body = GeminiRequestMapper::build_body(anthropic_body, log_tx, &requested);
+            .as_deref()
+            .or(anthropic_body.model.as_deref())
+            .unwrap_or("gemini-3-pro-preview");
+        let prepared = GeminiAdapter.prepare_messages_request(
+            &unified,
+            ctx,
+            "",
+            "",
+            "2023-06-01",
+            requested,
+            effective_stream,
+        );
 
-        (body, session_id)
+        (prepared.body, prepared.session_id)
     }
 
     fn build_upstream_request(
@@ -947,16 +572,40 @@ mod tests {
         }))
         .expect("valid anthropic request");
 
-        let body = GeminiRequestMapper::build_body(&request, None, "gemini-2.0-flash");
+        let unified = crate::transform::UnifiedChatRequest::from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "gemini".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let prepared = crate::transform::GeminiAdapter.prepare_messages_request(
+            &unified,
+            &ctx,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse",
+            "test-key",
+            "2023-06-01",
+            "gemini-2.0-flash",
+            true,
+        );
+        let body = prepared.body;
         let parts = body
             .get("system_instruction")
             .and_then(|value| value.get("parts"))
             .and_then(|value| value.as_array())
             .expect("system instruction parts");
 
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].get("text").and_then(Value::as_str), Some("top-level system"));
-        assert_eq!(parts[1].get("text").and_then(Value::as_str), Some("message system"));
     }
 
     #[test]

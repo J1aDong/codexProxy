@@ -1,10 +1,11 @@
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use super::request::TransformRequest;
 use super::response::TransformResponse;
 use crate::models::AnthropicRequest;
-use crate::transform::{ResponseTransformer, TransformBackend, TransformContext};
+use crate::transform::{
+    providers::CodexAdapter, ResponseTransformer, TransformBackend, TransformContext,
+};
 
 /// Codex 后端 —— 将 Anthropic 请求转为 Codex Responses API 格式
 pub struct CodexBackend;
@@ -115,22 +116,22 @@ impl TransformBackend for CodexBackend {
     fn transform_request(
         &self,
         anthropic_body: &AnthropicRequest,
-        log_tx: Option<&broadcast::Sender<String>>,
+        _log_tx: Option<&broadcast::Sender<String>>,
         ctx: &TransformContext,
         effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
-        TransformRequest::transform_with_options(
-            anthropic_body,
-            log_tx,
-            &ctx.reasoning_mapping,
-            &ctx.custom_injection_prompt,
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(anthropic_body);
+        let prepared = CodexAdapter.prepare_messages_request(
+            &unified,
+            ctx,
+            "",
+            "",
+            "2023-06-01",
             model_override.as_deref().unwrap_or(&ctx.codex_model),
-            ctx.enable_codex_tool_schema_compaction,
-            ctx.enable_codex_fast_mode,
-            ctx.enable_skill_routing_hint,
             effective_stream,
-        )
+        );
+        (prepared.body, prepared.session_id)
     }
 
     fn build_upstream_request(

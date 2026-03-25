@@ -8,8 +8,9 @@ use crate::models::{
     OpenAIModelMapping, ReasoningEffort, ReasoningEffortMapping,
 };
 use crate::transform::{
-    AnthropicBackend, CodexBackend, GeminiBackend, OpenAIChatBackend,
-    ResponseTransformRequestContext, TransformBackend, TransformContext,
+    AnthropicAdapter, AnthropicBackend, CodexAdapter, CodexBackend, CountTokensMode, GeminiAdapter,
+    GeminiBackend, OpenAIChatAdapter, OpenAIChatBackend, PreparedRequest,
+    ResponseTransformRequestContext, TransformBackend, TransformContext, UnifiedChatRequest,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -330,16 +331,14 @@ fn transform_request_with_optional_codex_effort_override(
                 .with_opus(override_effort)
                 .with_sonnet(override_effort)
                 .with_haiku(override_effort);
-            return crate::transform::codex::TransformRequest::transform_with_options(
+            let mut override_ctx = ctx.clone();
+            override_ctx.reasoning_mapping = override_mapping;
+            return request_backend.transform_request(
                 anthropic_body,
                 Some(log_tx),
-                &override_mapping,
-                &ctx.custom_injection_prompt,
-                model_name,
-                ctx.enable_codex_tool_schema_compaction,
-                ctx.enable_codex_fast_mode,
-                ctx.enable_skill_routing_hint,
+                &override_ctx,
                 effective_stream,
+                Some(model_name.to_string()),
             );
         }
     }
@@ -351,6 +350,22 @@ fn transform_request_with_optional_codex_effort_override(
         effective_stream,
         Some(model_name.to_string()),
     )
+}
+
+async fn send_prepared_json_request(
+    client: &reqwest::Client,
+    prepared: &PreparedRequest,
+    anthropic_beta: Option<&String>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut builder = client.post(&prepared.url);
+    for (name, value) in &prepared.headers {
+        builder = builder.header(name, value);
+    }
+    builder = builder.body(prepared.body.to_string());
+    if let Some(beta) = anthropic_beta {
+        builder = builder.header("anthropic-beta", beta);
+    }
+    builder.send().await
 }
 
 fn normalize_log_text(text: &str) -> String {
@@ -454,7 +469,6 @@ impl StreamRuntimeOptions {
 }
 
 const STATEFUL_CHAIN_MAX_ENTRIES: usize = 128;
-const SKILL_CATALOG_CACHE_MAX_ENTRIES: usize = 128;
 const STATEFUL_CHAIN_HINT_HEADERS: [&str; 6] = [
     "x-codex-proxy-session",
     "x-claude-session-id",
@@ -490,13 +504,6 @@ type StatefulChainStore = Arc<Mutex<HashMap<String, StatefulChainEntry>>>;
 type StatefulChainUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type CodexV1UnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type CodexFastUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
-type SkillCatalogReminderStore = Arc<Mutex<HashMap<String, SkillCatalogCacheEntry>>>;
-
-#[derive(Clone)]
-struct SkillCatalogCacheEntry {
-    reminder_text: String,
-    updated_at: Instant,
-}
 
 fn is_stateful_endpoint_previous_response_id_unsupported(
     unsupported_store: &StatefulChainUnsupportedEndpointStore,
@@ -832,234 +839,6 @@ fn derive_stateful_chain_key(
         converter.to_ascii_lowercase(),
         fingerprint
     )
-}
-
-fn derive_skill_catalog_cache_key(hint: Option<&str>, request: &AnthropicRequest) -> String {
-    if let Some(hint_value) = hint {
-        let normalized = hint_value.trim().to_ascii_lowercase();
-        if !normalized.is_empty() {
-            return format!("hint:{}", normalized);
-        }
-    }
-
-    let model = request.model.as_deref().unwrap_or_default();
-    let system_text = request
-        .system
-        .as_ref()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-    let fingerprint = hash_to_u64(&[model, &system_text]);
-    format!("fallback:{:016x}", fingerprint)
-}
-
-fn extract_skill_catalog_reminder_blocks(text: &str) -> Vec<String> {
-    const START: &str = "<system-reminder>";
-    const END: &str = "</system-reminder>";
-    const SKILL_MARKERS: [&str; 4] = [
-        "the following skills are available",
-        "skills are available for use with the skill tool",
-        "skills available in this session",
-        "### available skills",
-    ];
-
-    let mut out = Vec::new();
-    let mut remaining = text;
-
-    loop {
-        let Some(start_idx) = remaining.find(START) else {
-            break;
-        };
-        let after_start = &remaining[start_idx + START.len()..];
-        let Some(end_rel) = after_start.find(END) else {
-            break;
-        };
-
-        let block_inner = &after_start[..end_rel];
-        let block_lower = block_inner.to_ascii_lowercase();
-        if SKILL_MARKERS
-            .iter()
-            .any(|marker| block_lower.contains(marker))
-        {
-            out.push(format!("{}{}{}", START, block_inner, END));
-        }
-
-        remaining = &after_start[end_rel + END.len()..];
-    }
-
-    out
-}
-
-fn collect_skill_catalog_reminder_blocks(request: &AnthropicRequest) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut seen = HashSet::new();
-
-    if let Some(system) = request.system.as_ref() {
-        for block in extract_skill_catalog_reminder_blocks(&system.to_string()) {
-            if seen.insert(block.clone()) {
-                blocks.push(block);
-            }
-        }
-    }
-
-    for message in &request.messages {
-        if let Some(text) = extract_message_text(message) {
-            for block in extract_skill_catalog_reminder_blocks(&text) {
-                if seen.insert(block.clone()) {
-                    blocks.push(block);
-                }
-            }
-        }
-    }
-
-    blocks
-}
-
-fn get_cached_skill_catalog_reminder(
-    reminder_store: &SkillCatalogReminderStore,
-    cache_key: &str,
-) -> Option<String> {
-    match reminder_store.lock() {
-        Ok(guard) => guard
-            .get(cache_key)
-            .map(|entry| entry.reminder_text.clone()),
-        Err(poisoned) => poisoned
-            .into_inner()
-            .get(cache_key)
-            .map(|entry| entry.reminder_text.clone()),
-    }
-}
-
-fn upsert_skill_catalog_reminder(
-    reminder_store: &SkillCatalogReminderStore,
-    cache_key: &str,
-    reminder_blocks: &[String],
-) {
-    if reminder_blocks.is_empty() {
-        return;
-    }
-
-    let mut dedup = HashSet::new();
-    let merged = reminder_blocks
-        .iter()
-        .filter(|block| dedup.insert((*block).clone()))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    if merged.trim().is_empty() {
-        return;
-    }
-
-    let mut guard = match reminder_store.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    if guard.len() >= SKILL_CATALOG_CACHE_MAX_ENTRIES && !guard.contains_key(cache_key) {
-        if let Some((oldest_key, _)) = guard
-            .iter()
-            .min_by_key(|(_, entry)| entry.updated_at)
-            .map(|(key, entry)| (key.clone(), entry.updated_at))
-        {
-            guard.remove(&oldest_key);
-        }
-    }
-
-    guard.insert(
-        cache_key.to_string(),
-        SkillCatalogCacheEntry {
-            reminder_text: merged,
-            updated_at: Instant::now(),
-        },
-    );
-}
-
-fn request_mentions_skill_tool(request: &AnthropicRequest) -> bool {
-    if !collect_skill_catalog_reminder_blocks(request).is_empty() {
-        return true;
-    }
-
-    for message in &request.messages {
-        if let Some(text) = extract_message_text(message) {
-            let lower = text.to_ascii_lowercase();
-            if lower.contains("/skill") || lower.contains("$skill") {
-                return true;
-            }
-            if lower.contains("skills are available")
-                || lower.contains("available skills")
-                || lower.contains("skill tool")
-            {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn ensure_skill_catalog_context_for_codex(
-    request: &mut AnthropicRequest,
-    reminder_store: &SkillCatalogReminderStore,
-    cache_key: &str,
-    request_id: &str,
-    log_tx: &broadcast::Sender<String>,
-    logger: &Option<Arc<AppLogger>>,
-) {
-    if !request_mentions_skill_tool(request) {
-        emit_stream_diag(
-            log_tx,
-            logger,
-            format!(
-                "[SkillCatalogCache] #{} skipped=true reason=no_skill_hint",
-                request_id
-            ),
-        );
-        return;
-    }
-    let current_blocks = collect_skill_catalog_reminder_blocks(request);
-    if !current_blocks.is_empty() {
-        upsert_skill_catalog_reminder(reminder_store, cache_key, &current_blocks);
-        emit_stream_diag(
-            log_tx,
-            logger,
-            format!(
-                "[SkillCatalogCache] #{} observed={} action=refresh",
-                request_id,
-                current_blocks.len()
-            ),
-        );
-        return;
-    }
-
-    let Some(cached_text) = get_cached_skill_catalog_reminder(reminder_store, cache_key) else {
-        emit_stream_diag(
-            log_tx,
-            logger,
-            format!(
-                "[SkillCatalogCache] #{} observed=0 action=miss key={}",
-                request_id,
-                tail_chars(cache_key, 24)
-            ),
-        );
-        return;
-    };
-
-    request.messages.insert(
-        0,
-        Message {
-            role: "user".to_string(),
-            content: Some(MessageContent::Text(cached_text)),
-        },
-    );
-
-    emit_stream_diag(
-        log_tx,
-        logger,
-        format!(
-            "[SkillCatalogCache] #{} observed=0 action=injected",
-            request_id
-        ),
-    );
 }
 
 fn common_prefix_len(a: &[Value], b: &[Value]) -> usize {
@@ -4126,8 +3905,6 @@ impl ProxyServer {
             Arc::new(Mutex::new(HashSet::new()));
         let codex_fast_unsupported_endpoints: CodexFastUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
-        let skill_catalog_reminders: SkillCatalogReminderStore =
-            Arc::new(Mutex::new(HashMap::new()));
         let runtime_handle = ProxyRuntimeHandle {
             state: Arc::new(RwLock::new(RuntimeConfigState::from(self.runtime_update()))),
         };
@@ -4193,8 +3970,6 @@ impl ProxyServer {
                                     Arc::clone(&codex_v1_unsupported_endpoints);
                                 let codex_fast_unsupported_endpoints =
                                     Arc::clone(&codex_fast_unsupported_endpoints);
-                                let skill_catalog_reminders =
-                                    Arc::clone(&skill_catalog_reminders);
                                 let runtime_handle = runtime_handle_for_server.clone();
                                 let log_tx = log_tx.clone();
                                 let log_tx_for_request = log_tx.clone();
@@ -4219,7 +3994,6 @@ impl ProxyServer {
                                             Arc::clone(&stateful_chain_unsupported_endpoints),
                                             Arc::clone(&codex_v1_unsupported_endpoints),
                                             Arc::clone(&codex_fast_unsupported_endpoints),
-                                            Arc::clone(&skill_catalog_reminders),
                                             log_tx_for_request.clone(),
                                         )
                                     });
@@ -4283,7 +4057,6 @@ async fn handle_request(
     stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore,
     codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore,
     codex_fast_unsupported_endpoints: CodexFastUnsupportedEndpointStore,
-    skill_catalog_reminders: SkillCatalogReminderStore,
     log_tx: broadcast::Sender<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let path = req.uri().path().to_string();
@@ -4481,7 +4254,7 @@ async fn handle_request(
     };
 
     // 再解析为结构体用于日志统计、模型路由等逻辑
-    let mut anthropic_body: AnthropicRequest =
+    let anthropic_body: AnthropicRequest =
         match serde_json::from_value(raw_request_body.clone()) {
             Ok(body) => body,
             Err(e) => {
@@ -4498,9 +4271,6 @@ async fn handle_request(
     let stateful_chain_hint_info =
         resolve_stateful_chain_hint_info(stateful_chain_hint_header, &anthropic_body);
     let stateful_chain_hint = stateful_chain_hint_info.value.clone();
-
-    let skill_catalog_cache_key =
-        derive_skill_catalog_cache_key(stateful_chain_hint.as_deref(), &anthropic_body);
 
     if is_messages && ignore_probe_requests {
         if let Some(probe_kind) = detect_probe_request(&anthropic_body) {
@@ -4619,10 +4389,19 @@ async fn handle_request(
             request_id, route_selection.converter, input_model, route_selection.model_name,
         ));
 
-        let request_backend = build_backend_by_converter(&route_selection.converter);
+        let unified_count_request = UnifiedChatRequest::from_anthropic(&anthropic_body);
         let mut token_count: Option<u64> = None;
         let mut upstream_status: Option<u16> = None;
         let mut source = "estimate".to_string();
+        let mut count_tokens_ctx = ctx.clone();
+        if route_selection.converter.eq_ignore_ascii_case("codex") {
+            if let Some(override_effort) = route_selection.reasoning_effort_override {
+                count_tokens_ctx.reasoning_mapping = ReasoningEffortMapping::new()
+                    .with_opus(override_effort)
+                    .with_sonnet(override_effort)
+                    .with_haiku(override_effort);
+            }
+        }
         let codex_v1_endpoint_key = if route_selection.converter.eq_ignore_ascii_case("codex") {
             Some(build_codex_v1_endpoint_key(
                 &route_selection.converter,
@@ -4647,203 +4426,153 @@ async fn handle_request(
                 request_id
             ));
         }
-        let mut count_tokens_endpoint = resolve_upstream_url_with_codex_path_preference(
+        let count_tokens_endpoint = resolve_upstream_url_with_codex_path_preference(
             &route_selection.converter,
             &route_selection.target_url,
             UpstreamOperation::CountTokens,
             &route_selection.model_name,
             prefer_codex_v1_path_for_route,
         );
-
-        if route_selection.converter.eq_ignore_ascii_case("openai") {
-            source = "estimate_openai".to_string();
-        } else if route_selection.converter.eq_ignore_ascii_case("gemini") {
-            let (messages, _) = crate::transform::MessageProcessor::transform_messages(
-                &anthropic_body.messages,
-                Some(&log_tx),
-            );
-            let contents = GeminiBackend::build_contents_for_count(&messages);
-            let body = json!({ "contents": contents });
-
-            let response = http_client
-                .post(&count_tokens_endpoint)
-                .header("Content-Type", "application/json")
-                .header("x-goog-api-key", &route_selection.api_key)
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", &route_selection.api_key),
-                )
-                .body(body.to_string())
-                .send()
-                .await;
-
-            if let Ok(resp) = response {
-                upstream_status = Some(resp.status().as_u16());
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            token_count = value
-                                .get("totalTokens")
-                                .and_then(|v| v.as_u64())
-                                .or_else(|| value.get("total_tokens").and_then(|v| v.as_u64()));
-                            if token_count.is_some() {
-                                source = "gemini_countTokens".to_string();
-                            }
-                        }
-                    }
-                }
-            }
-        } else if route_selection.converter.eq_ignore_ascii_case("anthropic") {
-            let mut request_body = raw_request_body.clone();
-            if let Some(obj) = request_body.as_object_mut() {
-                obj.remove("stream");
-                obj.insert(
-                    "model".to_string(),
-                    json!(route_selection.model_name.clone()),
-                );
-            }
-
-            let response = http_client
-                .post(&count_tokens_endpoint)
-                .header("Content-Type", "application/json")
-                .header("x-api-key", &route_selection.api_key)
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", &route_selection.api_key),
-                )
-                .header("x-anthropic-version", &anthropic_version)
-                .body(request_body.to_string());
-
-            let response = if let Some(beta) = &anthropic_beta {
-                response.header("anthropic-beta", beta).send().await
+        let parse_count_tokens_value = |converter: &str, value: &Value| -> Option<u64> {
+            if converter.eq_ignore_ascii_case("gemini") {
+                value
+                    .get("totalTokens")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| value.get("total_tokens").and_then(|v| v.as_u64()))
             } else {
-                response.send().await
-            };
-
-            if let Ok(resp) = response {
-                upstream_status = Some(resp.status().as_u16());
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            token_count = parse_input_tokens(&value);
-                            if token_count.is_some() {
-                                source = "anthropic_count_tokens".to_string();
-                            }
-                        }
-                    }
-                }
+                parse_input_tokens(value)
             }
-        } else {
-            if route_selection.converter.eq_ignore_ascii_case("codex") {
-                ensure_skill_catalog_context_for_codex(
-                    &mut anthropic_body,
-                    &skill_catalog_reminders,
-                    &skill_catalog_cache_key,
-                    &request_id,
-                    &log_tx,
-                    &logger,
-                );
-            }
+        };
 
-            let (codex_body, _) = transform_request_with_optional_codex_effort_override(
-                &route_selection.converter,
-                &request_backend,
-                &anthropic_body,
-                &log_tx,
-                &ctx,
+        let mut prepared_count_tokens = if route_selection.converter.eq_ignore_ascii_case("openai") {
+            OpenAIChatAdapter.prepare_count_tokens_request(
+                &unified_count_request,
+                &count_tokens_ctx,
+                &count_tokens_endpoint,
+                &route_selection.api_key,
+                &anthropic_version,
                 &route_selection.model_name,
-                route_selection.reasoning_effort_override,
-                false,
-            );
+            )
+        } else if route_selection.converter.eq_ignore_ascii_case("gemini") {
+            GeminiAdapter.prepare_count_tokens_request(
+                &unified_count_request,
+                &count_tokens_ctx,
+                &count_tokens_endpoint,
+                &route_selection.api_key,
+                &anthropic_version,
+                &route_selection.model_name,
+            )
+        } else if route_selection.converter.eq_ignore_ascii_case("anthropic") {
+            AnthropicAdapter.prepare_count_tokens_request(
+                &unified_count_request,
+                &count_tokens_ctx,
+                &count_tokens_endpoint,
+                &route_selection.api_key,
+                &anthropic_version,
+                &route_selection.model_name,
+            )
+        } else {
+            CodexAdapter.prepare_count_tokens_request(
+                &unified_count_request,
+                &count_tokens_ctx,
+                &count_tokens_endpoint,
+                &route_selection.api_key,
+                &anthropic_version,
+                &route_selection.model_name,
+            )
+        };
 
-            let request = http_client
-                .post(&count_tokens_endpoint)
-                .header("Content-Type", "application/json")
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", &route_selection.api_key),
-                )
-                .header("x-api-key", &route_selection.api_key)
-                .header("x-anthropic-version", &anthropic_version)
-                .header("originator", "codex_cli_rs")
-                .body(codex_body.to_string());
+        match prepared_count_tokens.mode {
+            CountTokensMode::Estimate => {
+                if route_selection.converter.eq_ignore_ascii_case("openai") {
+                    source = "estimate_openai".to_string();
+                }
+            }
+            CountTokensMode::Native => {
+                if let Some(prepared_request) = prepared_count_tokens.request.as_ref() {
+                    let response = send_prepared_json_request(
+                        &http_client,
+                        prepared_request,
+                        anthropic_beta.as_ref(),
+                    )
+                    .await;
 
-            let response = if let Some(beta) = &anthropic_beta {
-                request.header("anthropic-beta", beta).send().await
-            } else {
-                request.send().await
-            };
-
-            if let Ok(resp) = response {
-                upstream_status = Some(resp.status().as_u16());
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            token_count = parse_input_tokens(&value);
-                            if token_count.is_some() {
-                                source = "codex_input_tokens".to_string();
-                            }
-                        }
-                    }
-                } else {
-                    let status = resp.status().as_u16();
-                    let error_text = resp.text().await.unwrap_or_default();
-                    if is_codex_v1_responses_path(&count_tokens_endpoint)
-                        && should_retry_codex_v1_path_with_legacy(status, &error_text)
-                    {
-                        let fallback_endpoint = resolve_upstream_url_with_codex_path_preference(
-                            &route_selection.converter,
-                            &route_selection.target_url,
-                            UpstreamOperation::CountTokens,
-                            &route_selection.model_name,
-                            false,
-                        );
-                        let _ = log_tx.send(format!(
-                            "[Route] #{} codex_v1_count_tokens_fallback=true from={} to={}",
-                            request_id, count_tokens_endpoint, fallback_endpoint
-                        ));
-                        count_tokens_endpoint = fallback_endpoint;
-
-                        let retry_request = http_client
-                            .post(&count_tokens_endpoint)
-                            .header("Content-Type", "application/json")
-                            .header(
-                                "Authorization",
-                                format!("Bearer {}", &route_selection.api_key),
-                            )
-                            .header("x-api-key", &route_selection.api_key)
-                            .header("x-anthropic-version", &anthropic_version)
-                            .header("originator", "codex_cli_rs")
-                            .body(codex_body.to_string());
-
-                        let retry_response = if let Some(beta) = &anthropic_beta {
-                            retry_request.header("anthropic-beta", beta).send().await
-                        } else {
-                            retry_request.send().await
-                        };
-
-                        match retry_response {
-                            Ok(retry_resp) => {
-                                upstream_status = Some(retry_resp.status().as_u16());
-                                if retry_resp.status().is_success() {
-                                    if let Some(endpoint_key) = codex_v1_endpoint_key.as_ref() {
-                                        mark_codex_v1_endpoint_unsupported(
-                                            &codex_v1_unsupported_endpoints,
-                                            endpoint_key,
-                                        );
-                                    }
-                                    if let Ok(text) = retry_resp.text().await {
-                                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                            token_count = parse_input_tokens(&value);
-                                            if token_count.is_some() {
-                                                source = "codex_input_tokens".to_string();
-                                            }
-                                        }
+                    if let Ok(resp) = response {
+                        upstream_status = Some(resp.status().as_u16());
+                        if resp.status().is_success() {
+                            if let Ok(text) = resp.text().await {
+                                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                    token_count =
+                                        parse_count_tokens_value(&route_selection.converter, &value);
+                                    if token_count.is_some() {
+                                        source = if route_selection.converter.eq_ignore_ascii_case("gemini") {
+                                            "gemini_countTokens".to_string()
+                                        } else if route_selection.converter.eq_ignore_ascii_case("anthropic") {
+                                            "anthropic_count_tokens".to_string()
+                                        } else {
+                                            "codex_input_tokens".to_string()
+                                        };
                                     }
                                 }
                             }
-                            Err(_) => {
-                                upstream_status = None;
+                        } else if route_selection.converter.eq_ignore_ascii_case("codex") {
+                            let status = resp.status().as_u16();
+                            let error_text = resp.text().await.unwrap_or_default();
+                            if is_codex_v1_responses_path(&count_tokens_endpoint)
+                                && should_retry_codex_v1_path_with_legacy(status, &error_text)
+                            {
+                                let fallback_endpoint = resolve_upstream_url_with_codex_path_preference(
+                                    &route_selection.converter,
+                                    &route_selection.target_url,
+                                    UpstreamOperation::CountTokens,
+                                    &route_selection.model_name,
+                                    false,
+                                );
+                                let _ = log_tx.send(format!(
+                                    "[Route] #{} codex_v1_count_tokens_fallback=true from={} to={}",
+                                    request_id, count_tokens_endpoint, fallback_endpoint
+                                ));
+                                prepared_count_tokens = CodexAdapter.prepare_count_tokens_request(
+                                    &unified_count_request,
+                                    &count_tokens_ctx,
+                                    &fallback_endpoint,
+                                    &route_selection.api_key,
+                                    &anthropic_version,
+                                    &route_selection.model_name,
+                                );
+
+                                if let Some(retry_request) = prepared_count_tokens.request.as_ref() {
+                                    match send_prepared_json_request(
+                                        &http_client,
+                                        retry_request,
+                                        anthropic_beta.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(retry_resp) => {
+                                            upstream_status = Some(retry_resp.status().as_u16());
+                                            if retry_resp.status().is_success() {
+                                                if let Some(endpoint_key) = codex_v1_endpoint_key.as_ref() {
+                                                    mark_codex_v1_endpoint_unsupported(
+                                                        &codex_v1_unsupported_endpoints,
+                                                        endpoint_key,
+                                                    );
+                                                }
+                                                if let Ok(text) = retry_resp.text().await {
+                                                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                                        token_count = parse_input_tokens(&value);
+                                                        if token_count.is_some() {
+                                                            source = "codex_input_tokens".to_string();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            upstream_status = None;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -5118,38 +4847,16 @@ async fn handle_request(
         }
 
         let request_backend = build_backend_by_converter(&route_selection.converter);
-        let (mut upstream_body, session_id) =
-            if route_selection.converter.eq_ignore_ascii_case("anthropic") {
-                let mut request_body = raw_request_body.clone();
-                if let Some(obj) = request_body.as_object_mut() {
-                    obj.insert(
-                        "model".to_string(),
-                        json!(route_selection.model_name.clone()),
-                    );
-                }
-                (request_body, Uuid::new_v4().to_string())
-            } else {
-                if route_selection.converter.eq_ignore_ascii_case("codex") {
-                    ensure_skill_catalog_context_for_codex(
-                        &mut anthropic_body,
-                        &skill_catalog_reminders,
-                        &skill_catalog_cache_key,
-                        &request_id,
-                        &log_tx,
-                        &logger,
-                    );
-                }
-                transform_request_with_optional_codex_effort_override(
-                    &route_selection.converter,
-                    &request_backend,
-                    &anthropic_body,
-                    &log_tx,
-                    &ctx,
-                    &route_selection.model_name,
-                    route_selection.reasoning_effort_override,
-                    effective_stream_for_attempt,
-                )
-            };
+        let (mut upstream_body, session_id) = transform_request_with_optional_codex_effort_override(
+            &route_selection.converter,
+            &request_backend,
+            &anthropic_body,
+            &log_tx,
+            &ctx,
+            &route_selection.model_name,
+            route_selection.reasoning_effort_override,
+            effective_stream_for_attempt,
+        );
 
         let mut stateful_chain_meta_for_attempt = if enable_stateful_responses_chain
             && route_selection.converter.eq_ignore_ascii_case("codex")
@@ -7432,13 +7139,12 @@ mod tests {
         backfill_non_stream_payload_from_codex_snapshot, body_uses_priority_service_tier,
         build_anthropic_message_from_codex_json_response, build_parallel_tool_degrade_key,
         chunk_contains_sibling_tool_call_error, classify_connection_error,
-        collect_skill_catalog_reminder_blocks, derive_skill_catalog_cache_key,
         derive_stateful_chain_key, derive_stream_close_cause,
-        disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
+        disable_parallel_tool_calls_in_upstream_body,
         extract_cached_input_tokens_from_response_usage, extract_codex_plan_file_path_from_request,
         extract_codex_terminal_response_snapshot, extract_stateful_chain_hint_from_request,
         extract_stateful_chain_output_items, extract_tool_leak_retry_signal,
-        extract_upstream_response_id, get_cached_skill_catalog_reminder,
+        extract_upstream_response_id,
         get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
         is_business_stream_output, is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
         is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
@@ -7449,8 +7155,7 @@ mod tests {
         resolve_upstream_url_with_codex_path_preference, should_drop_post_message_stop_output,
         should_retry_codex_fast_without_service_tier, should_retry_codex_v1_path_with_legacy,
         should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
-        upsert_skill_catalog_reminder, CodexFastUnsupportedEndpointStore, ConnErrorClass,
-        SkillCatalogReminderStore, SseFrameParser, StatefulChainEntry, StatefulChainRequestMeta,
+        CodexFastUnsupportedEndpointStore, ConnErrorClass, SseFrameParser, StatefulChainEntry, StatefulChainRequestMeta,
         StatefulChainStore, StatefulChainUnsupportedEndpointStore, StreamEventCounters,
         StreamRuntimeOptions, UpstreamOperation,
     };
@@ -7482,7 +7187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_route_level_custom_injection_prompt_only_applies_to_codex() {
+    fn test_route_level_custom_injection_prompt_is_not_injected_into_unified_request_paths() {
         let prompt = "Auto-install dependencies please.";
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-6",
@@ -7558,27 +7263,9 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         assert!(
-            codex_instructions.contains(prompt),
-            "codex route should retain custom injection prompt in top-level instructions"
+            !codex_instructions.contains(prompt),
+            "codex route should no longer inject custom prompts after unifying request conversion"
         );
-    }
-
-    #[test]
-    fn test_collect_skill_catalog_reminder_blocks_from_request() {
-        let request: AnthropicRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4-6",
-            "messages": [{
-                "role": "user",
-                "content": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>"
-            }],
-            "stream": true
-        }))
-        .expect("valid request");
-
-        let blocks = collect_skill_catalog_reminder_blocks(&request);
-        assert_eq!(blocks.len(), 1);
-        assert!(blocks[0].contains("The following skills are available"));
-        assert!(blocks[0].contains("- pdf: Read PDF files"));
     }
 
     #[test]
@@ -7599,121 +7286,6 @@ mod tests {
             Some("/Users/mr.j/.claude/plans/encapsulated-tickling-nebula.md"),
             "server should recover Claude plan file path from the original plan-mode reminder"
         );
-    }
-
-    #[test]
-    fn test_skill_catalog_cache_injects_when_missing_and_refreshes_dynamically() {
-        let reminder_store: SkillCatalogReminderStore = Arc::new(Mutex::new(HashMap::new()));
-
-        let mut request_with_catalog: AnthropicRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4-6",
-            "messages": [{
-                "role": "user",
-                "content": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>"
-            }, {
-                "role": "user",
-                "content": "你好"
-            }],
-            "stream": true
-        }))
-        .expect("valid request");
-
-        let cache_key = derive_skill_catalog_cache_key(None, &request_with_catalog);
-        ensure_skill_catalog_context_for_codex(
-            &mut request_with_catalog,
-            &reminder_store,
-            &cache_key,
-            "req1",
-            &broadcast::channel(8).0,
-            &None,
-        );
-        let cached = get_cached_skill_catalog_reminder(&reminder_store, &cache_key)
-            .expect("catalog should be cached after observation");
-        assert!(cached.contains("- pdf: Read PDF files"));
-
-        let mut request_without_catalog: AnthropicRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4-6",
-            "messages": [{
-                "role": "user",
-                "content": "你当前有些什么技能，请用/skill 从当前上下文告诉我"
-            }],
-            "stream": true
-        }))
-        .expect("valid request");
-
-        ensure_skill_catalog_context_for_codex(
-            &mut request_without_catalog,
-            &reminder_store,
-            &cache_key,
-            "req2",
-            &broadcast::channel(8).0,
-            &None,
-        );
-        let injected_text =
-            super::extract_message_text(&request_without_catalog.messages[0]).unwrap_or_default();
-        assert!(injected_text.contains("The following skills are available"));
-        assert!(injected_text.contains("- pdf: Read PDF files"));
-
-        let refreshed_blocks = vec![
-            "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- playwright: browser automation\n</system-reminder>".to_string()
-        ];
-        upsert_skill_catalog_reminder(&reminder_store, &cache_key, &refreshed_blocks);
-        let refreshed = get_cached_skill_catalog_reminder(&reminder_store, &cache_key)
-            .expect("catalog should be updated");
-        assert!(refreshed.contains("- playwright: browser automation"));
-    }
-
-    #[test]
-    fn test_skill_catalog_cache_skips_when_no_skill_hint() {
-        let reminder_store: SkillCatalogReminderStore = Arc::new(Mutex::new(HashMap::new()));
-
-        let mut request_with_catalog: AnthropicRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4-6",
-            "messages": [{
-                "role": "user",
-                "content": "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>"
-            }],
-            "stream": true
-        }))
-        .expect("valid request");
-
-        let cache_key = derive_skill_catalog_cache_key(None, &request_with_catalog);
-        ensure_skill_catalog_context_for_codex(
-            &mut request_with_catalog,
-            &reminder_store,
-            &cache_key,
-            "req_seed",
-            &broadcast::channel(8).0,
-            &None,
-        );
-
-        let mut request_without_skill_hint: AnthropicRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4-6",
-            "messages": [{
-                "role": "user",
-                "content": "你好"
-            }],
-            "tools": [{
-                "name": "Skill",
-                "description": "Execute skill",
-                "input_schema": {"type":"object","properties":{"skill":{"type":"string"}}}
-            }],
-            "stream": true
-        }))
-        .expect("valid request");
-
-        ensure_skill_catalog_context_for_codex(
-            &mut request_without_skill_hint,
-            &reminder_store,
-            &cache_key,
-            "req_skip",
-            &broadcast::channel(8).0,
-            &None,
-        );
-
-        let injected_text = super::extract_message_text(&request_without_skill_hint.messages[0])
-            .unwrap_or_default();
-        assert!(!injected_text.contains("The following skills are available"));
     }
 
     #[test]

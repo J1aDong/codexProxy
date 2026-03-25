@@ -1,11 +1,10 @@
 pub mod anthropic;
-pub mod baseline;
 pub mod codex;
 pub mod gemini;
 pub mod openai;
+pub mod providers;
 pub mod processor;
-pub mod shared;
-pub mod tool_router;
+pub mod unified;
 
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -71,6 +70,42 @@ pub struct CanonicalToolResult {
     pub tool_use_id: String,
     pub content: Value,
     pub is_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedRequest {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Value,
+    pub session_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountTokensMode {
+    Native,
+    Estimate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedCountTokensRequest {
+    pub mode: CountTokensMode,
+    pub request: Option<PreparedRequest>,
+}
+
+impl PreparedCountTokensRequest {
+    pub fn native(request: PreparedRequest) -> Self {
+        Self {
+            mode: CountTokensMode::Native,
+            request: Some(request),
+        }
+    }
+
+    pub fn estimate() -> Self {
+        Self {
+            mode: CountTokensMode::Estimate,
+            request: None,
+        }
+    }
 }
 
 /// 转换上下文 —— 从 ProxyServer 配置派生，传入 transform 方法
@@ -174,12 +209,12 @@ pub use anthropic::AnthropicBackend;
 pub use codex::CodexBackend;
 pub use gemini::GeminiBackend;
 pub use openai::OpenAIChatBackend;
-pub use processor::MessageProcessor;
+pub use providers::{AnthropicAdapter, CodexAdapter, GeminiAdapter, OpenAIChatAdapter};
+pub use unified::UnifiedChatRequest;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        tool_router::{RequestScopedToolRouter, ToolInterceptionAction},
         AnthropicBackend, BackendBehavior, CanonicalTransformModel, CodexBackend, GeminiBackend,
         OpenAIChatBackend, ResponseTransformer, TransformBackend,
     };
@@ -226,51 +261,278 @@ mod tests {
     }
 
     #[test]
-    fn shared_helpers_flatten_system_text_and_resolve_parallel_tool_calls() {
-        let system = SystemContent::Blocks(vec![
-            SystemBlock::Text {
-                text: "alpha".to_string(),
-            },
-            SystemBlock::PlainString("beta".to_string()),
-        ]);
-        assert_eq!(
-            super::shared::flatten_system_text(Some(&system)).as_deref(),
-            Some("alpha\nbeta")
-        );
+    fn unified_chat_request_converts_core_anthropic_blocks() {
+        use crate::models::{
+            ContentBlock, ImageUrlValue, Message, MessageContent, RequestThinkingConfig,
+        };
 
         let request = AnthropicRequest {
-            model: Some("claude-sonnet-4-5".to_string()),
-            messages: vec![],
+            model: Some("claude-3-5-sonnet-20241022".to_string()),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Blocks(vec![
+                        ContentBlock::Text {
+                            text: "hello".to_string(),
+                        },
+                        ContentBlock::InputImage {
+                            image_url: Some(ImageUrlValue::Str(
+                                "data:image/png;base64,abc".to_string(),
+                            )),
+                            url: None,
+                            detail: Some("auto".to_string()),
+                        },
+                    ])),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Some(MessageContent::Blocks(vec![
+                        ContentBlock::Thinking {
+                            thinking: "reason step".to_string(),
+                            signature: Some("sig-1".to_string()),
+                        },
+                        ContentBlock::Text {
+                            text: "working".to_string(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: Some("toolu_1".to_string()),
+                            name: "search".to_string(),
+                            input: json!({"q":"rust"}),
+                            signature: None,
+                        },
+                    ])),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Blocks(vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: Some("toolu_1".to_string()),
+                            id: None,
+                            content: Some(json!({"text":"done"})),
+                        },
+                    ])),
+                },
+            ],
+            system: Some(SystemContent::Blocks(vec![
+                SystemBlock::Text {
+                    text: "sys-a".to_string(),
+                },
+                SystemBlock::PlainString("sys-b".to_string()),
+            ])),
+            tools: Some(vec![json!({
+                "name": "search",
+                "description": "Search docs",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string" }
+                    },
+                    "required": ["q"]
+                }
+            })]),
+            metadata: None,
+            tool_choice: Some(json!({"type":"tool","name":"search"})),
+            thinking: Some(RequestThinkingConfig {
+                kind: Some("enabled".to_string()),
+                extra: std::collections::HashMap::from([(
+                    "budget_tokens".to_string(),
+                    json!(2048),
+                )]),
+            }),
+            stream: true,
+            max_tokens: Some(4096),
+            temperature: Some(0.2),
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+
+        assert_eq!(unified.model, "claude-3-5-sonnet-20241022");
+        assert_eq!(unified.messages.len(), 4);
+        assert_eq!(unified.messages[0].role.as_str(), "system");
+        assert_eq!(
+            unified.messages[0].content_text().as_deref(),
+            Some("sys-a\nsys-b")
+        );
+        assert_eq!(unified.messages[1].role.as_str(), "user");
+        assert_eq!(unified.messages[1].content_items().len(), 2);
+        assert_eq!(unified.messages[2].role.as_str(), "assistant");
+        assert_eq!(unified.messages[2].tool_calls.len(), 1);
+        assert_eq!(unified.messages[2].tool_calls[0].function.name, "search");
+        assert_eq!(
+            unified.messages[2]
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.signature.as_deref()),
+            Some("sig-1")
+        );
+        assert_eq!(unified.messages[3].role.as_str(), "tool");
+        assert_eq!(unified.messages[3].tool_call_id.as_deref(), Some("toolu_1"));
+        assert_eq!(unified.tools.as_ref().map(|tools| tools.len()), Some(1));
+        assert_eq!(
+            unified.tool_choice.as_ref().map(|choice| choice.kind()),
+            Some("function")
+        );
+        assert_eq!(
+            unified.reasoning.as_ref().map(|reasoning| reasoning.enabled),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn provider_adapters_prepare_requests_from_unified_chat_request() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-3-5-sonnet-20241022".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+            }],
+            system: Some(SystemContent::Text("system prompt".to_string())),
+            tools: Some(vec![json!({
+                "name": "lookup",
+                "description": "Lookup",
+                "input_schema": {"type":"object","properties":{"id":{"type":"string"}}}
+            })]),
+            metadata: None,
+            tool_choice: Some(json!({"type":"auto"})),
+            thinking: None,
+            stream: true,
+            max_tokens: Some(1024),
+            temperature: Some(0.3),
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: "unused".to_string(),
+            converter: "codex".to_string(),
+            codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let codex = crate::transform::providers::CodexAdapter;
+        let codex_req = codex.prepare_messages_request(
+            &unified,
+            &ctx,
+            "https://example.com/v1/responses",
+            "test-key",
+            "2023-06-01",
+            "gpt-5.3-codex",
+            true,
+        );
+        assert_eq!(codex_req.url, "https://example.com/v1/responses");
+        assert_eq!(codex_req.body["model"], "gpt-5.3-codex");
+        assert!(codex_req.body["input"].is_array());
+
+        let openai = crate::transform::providers::OpenAIChatAdapter;
+        let openai_req = openai.prepare_messages_request(
+            &unified,
+            &ctx,
+            "https://api.openai.com/v1/chat/completions",
+            "test-key",
+            "2023-06-01",
+            "gpt-4o-mini",
+            true,
+        );
+        assert_eq!(openai_req.url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(openai_req.body["model"], "gpt-4o-mini");
+        assert!(openai_req.body["messages"].is_array());
+
+        let gemini = crate::transform::providers::GeminiAdapter;
+        let gemini_req = gemini.prepare_messages_request(
+            &unified,
+            &ctx,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse",
+            "test-key",
+            "2023-06-01",
+            "gemini-2.0-flash",
+            true,
+        );
+        assert!(gemini_req.body["contents"].is_array());
+        assert_eq!(
+            gemini_req.url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
+        );
+
+        let anthropic = crate::transform::providers::AnthropicAdapter;
+        let anthropic_req = anthropic.prepare_messages_request(
+            &unified,
+            &ctx,
+            "https://api.anthropic.com/v1/messages",
+            "test-key",
+            "2023-06-01",
+            "claude-3-7-sonnet-latest",
+            true,
+        );
+        assert_eq!(anthropic_req.body["model"], "claude-3-7-sonnet-latest");
+        assert!(anthropic_req.body["messages"].is_array());
+    }
+
+    #[test]
+    fn openai_count_tokens_preparation_uses_estimate_mode() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-3-5-sonnet-20241022".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello world".to_string())),
+            }],
             system: None,
             tools: None,
             metadata: None,
-            tool_choice: Some(json!({
-                "type": "auto",
-                "disable_parallel_tool_use": true
-            })),
+            tool_choice: None,
             thinking: None,
-            stream: true,
-            max_tokens: Some(128),
+            stream: false,
+            max_tokens: Some(512),
             temperature: None,
             top_p: None,
             top_k: None,
             stop_sequences: None,
         };
-        assert!(!super::shared::resolve_parallel_tool_calls(&request));
-    }
 
-    #[test]
-    fn request_scoped_tool_router_intercepts_web_search_variants_and_passthroughs_unknown_tools() {
-        let router = RequestScopedToolRouter::new(["web_search"]);
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
 
-        for tool_name in ["WebSearch", "websearch", "web_search"] {
-            let intercepted = router.decide_by_name(tool_name);
-            assert_eq!(intercepted.action, ToolInterceptionAction::Intercept);
-            assert_eq!(intercepted.normalized_tool_name.as_deref(), Some("web_search"));
-        }
+        let mode = crate::transform::providers::OpenAIChatAdapter.prepare_count_tokens_request(
+            &unified,
+            &ctx,
+            "https://api.openai.com/v1/chat/completions",
+            "test-key",
+            "2023-06-01",
+            "gpt-4o-mini",
+        );
 
-        let passthrough = router.decide_by_name("Read");
-        assert_eq!(passthrough.action, ToolInterceptionAction::PassThrough);
-        assert!(passthrough.normalized_tool_name.is_none());
+        assert!(matches!(
+            mode.mode,
+            crate::transform::CountTokensMode::Estimate
+        ));
     }
 }

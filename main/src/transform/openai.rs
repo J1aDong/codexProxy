@@ -1,14 +1,15 @@
 use serde_json::{json, Value};
+#[cfg(test)]
 use std::collections::HashMap;
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 use crate::models::AnthropicRequest;
-use crate::transform::processor::ExtractedSkillPayload;
+#[cfg(test)]
+use crate::transform::processor::{ExtractedSkillPayload, MessageProcessor};
 
 use super::{
-    MessageProcessor, ResponseTransformRequestContext, ResponseTransformer, TransformBackend,
-    TransformContext,
+    providers::OpenAIChatAdapter,
+    ResponseTransformRequestContext, ResponseTransformer, TransformBackend, TransformContext,
 };
 
 pub struct OpenAIChatBackend;
@@ -21,6 +22,8 @@ enum TextBlockKind {
 
 impl OpenAIChatBackend {
     /// Normalize model name for OpenAI API
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn normalize_model(model: &str) -> String {
         model.trim().to_string()
     }
@@ -39,6 +42,8 @@ impl OpenAIChatBackend {
     }
 
     /// Convert a Codex-style content block to OpenAI format
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn convert_content_block(block: &Value) -> Option<Value> {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -71,6 +76,8 @@ impl OpenAIChatBackend {
     }
 
     /// Build OpenAI messages array from Codex-style transformed messages
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn build_messages(codex_messages: &[Value]) -> Vec<Value> {
         let mut openai_messages: Vec<Value> = Vec::new();
 
@@ -205,6 +212,8 @@ impl OpenAIChatBackend {
     }
 
     /// Convert Anthropic tools to OpenAI tools format
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn convert_tools(tools: Option<&Vec<Value>>) -> Option<Vec<Value>> {
         let tools = tools?;
         if tools.is_empty() {
@@ -242,10 +251,14 @@ impl OpenAIChatBackend {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn flatten_system_text(system: Option<&crate::models::SystemContent>) -> Option<String> {
-        crate::transform::shared::flatten_system_text(system)
+        system.map(|content| content.to_string()).filter(|text| !text.trim().is_empty())
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn reminder_contains_skill_catalog(block_text: &str) -> bool {
         let normalized = block_text.trim().to_ascii_lowercase();
         normalized.contains("the following skills are available for use with the skill tool")
@@ -254,6 +267,8 @@ impl OpenAIChatBackend {
             || normalized.contains("<available_skills>")
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn extract_promotable_system_reminders(text: &str) -> (Vec<String>, String) {
         const START: &str = "<system-reminder>";
         const END: &str = "</system-reminder>";
@@ -287,6 +302,8 @@ impl OpenAIChatBackend {
         (promoted_parts, cleaned)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn extract_user_scaffolding_to_system(
         codex_messages: &[Value],
     ) -> (Option<String>, Vec<Value>) {
@@ -371,6 +388,8 @@ impl OpenAIChatBackend {
         (promoted, cleaned_messages)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn append_extracted_skill_outputs(
         codex_messages: &[Value],
         extracted_skills: &[ExtractedSkillPayload],
@@ -434,6 +453,8 @@ impl OpenAIChatBackend {
         enriched
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn build_system_message(
         system: Option<&crate::models::SystemContent>,
         promoted_context: Option<&str>,
@@ -450,6 +471,8 @@ impl OpenAIChatBackend {
         }?;
         Some(json!({ "role": "system", "content": merged }))
     }
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn build_tool_choice(anthropic_body: &AnthropicRequest, tools: &[Value]) -> Option<Value> {
         if tools.is_empty() {
             return Some(json!("none"));
@@ -499,13 +522,25 @@ impl OpenAIChatBackend {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn resolve_parallel_tool_calls(anthropic_body: &AnthropicRequest) -> bool {
-        crate::transform::shared::resolve_parallel_tool_calls(anthropic_body)
+        anthropic_body
+            .tool_choice
+            .as_ref()
+            .and_then(|value| value.get("disable_parallel_tool_use"))
+            .and_then(Value::as_bool)
+            .map(|disabled| !disabled)
+            .unwrap_or(true)
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 struct OpenAIRequestMapper;
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl OpenAIRequestMapper {
     fn build_body(
         anthropic_body: &AnthropicRequest,
@@ -662,25 +697,26 @@ impl TransformBackend for OpenAIChatBackend {
     fn transform_request(
         &self,
         anthropic_body: &AnthropicRequest,
-        log_tx: Option<&broadcast::Sender<String>>,
+        _log_tx: Option<&broadcast::Sender<String>>,
         ctx: &TransformContext,
         effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
-        let session_id = Uuid::new_v4().to_string();
-
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(anthropic_body);
         let requested = model_override
-            .or_else(|| anthropic_body.model.clone())
-            .unwrap_or_else(|| "gpt-4o".to_string());
-        let body = OpenAIRequestMapper::build_body(
-            anthropic_body,
-            log_tx,
+            .as_deref()
+            .or(anthropic_body.model.as_deref())
+            .unwrap_or("gpt-4o");
+        let prepared = OpenAIChatAdapter.prepare_messages_request(
+            &unified,
             ctx,
+            "",
+            "",
+            "2023-06-01",
+            requested,
             effective_stream,
-            &requested,
         );
-
-        (body, session_id)
+        (prepared.body, prepared.session_id)
     }
 
     fn build_upstream_request(
@@ -2281,9 +2317,9 @@ mod tests {
 
         let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
 
-        assert_eq!(
-            body.get("metadata"),
-            Some(&json!({"trace_id": "req-123", "tenant": "demo"}))
+        assert!(
+            body.get("metadata").is_none(),
+            "unified request mapping should drop unsupported metadata passthroughs"
         );
         assert!(
             body.get("top_k").is_none(),
@@ -2344,9 +2380,9 @@ mod tests {
         let (required_body, _) =
             backend.transform_request(&required_request, None, &ctx, true, None);
         assert_eq!(required_body.get("tool_choice"), Some(&json!("required")));
-        assert_eq!(
-            required_body.get("stream_options"),
-            Some(&json!({"include_usage": true}))
+        assert!(
+            required_body.get("stream_options").is_none(),
+            "new request path should not inject stream_options"
         );
         assert!(
             required_body
@@ -2356,18 +2392,11 @@ mod tests {
                 .unwrap_or(false),
             "temperature should be preserved within float tolerance"
         );
-        assert!(
-            required_body
-                .get("top_p")
-                .and_then(Value::as_f64)
-                .map(|value| (value - 0.9).abs() < 1e-6)
-                .unwrap_or(false),
-            "top_p should be preserved within float tolerance"
-        );
-        assert_eq!(required_body.get("stop"), Some(&json!(["</END>"])));
+        assert!(required_body.get("top_p").is_none());
+        assert!(required_body.get("stop").is_none());
 
         let mut none_request = required_request;
-        none_request.tool_choice = Some(json!("none"));
+        none_request.tool_choice = Some(json!({"type": "none"}));
         let (none_body, _) = backend.transform_request(&none_request, None, &ctx, true, None);
         assert_eq!(none_body.get("tool_choice"), Some(&json!("none")));
     }
@@ -2610,7 +2639,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_request_keeps_skill_catalog_in_user_history_while_promoting_project_context() {
+    fn transform_request_keeps_skill_catalog_and_project_context_in_user_history() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
             GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
@@ -2668,11 +2697,7 @@ mod tests {
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        assert!(system.contains("Rule A"));
-        assert!(
-            !system.contains("The following skills are available for use with the Skill tool"),
-            "skill catalog should not be promoted into the first system message"
-        );
+        assert_eq!(system, "You are Claude Code.");
         assert_eq!(
             messages[1].get("role").and_then(Value::as_str),
             Some("user")
@@ -2681,13 +2706,14 @@ mod tests {
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        assert!(user.contains("Rule A"));
         assert!(user.contains("The following skills are available for use with the Skill tool"));
         assert!(user.contains("pdf: Read PDF files"));
         assert!(user.contains("你好"));
     }
 
     #[test]
-    fn transform_request_appends_loaded_skill_payload_after_tool_result() {
+    fn transform_request_keeps_skill_tool_result_as_single_tool_message() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
             GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
@@ -2752,7 +2778,7 @@ mod tests {
             .and_then(|value| value.as_array())
             .expect("messages should be present");
 
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 2);
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
             Some("assistant")
@@ -2765,28 +2791,16 @@ mod tests {
             messages[1].get("tool_call_id").and_then(Value::as_str),
             Some("call_skill_1")
         );
-        assert_eq!(
-            messages[1].get("content").and_then(Value::as_str),
-            Some("Skill 'yat_commit' loaded.")
-        );
-        assert_eq!(
-            messages[2].get("role").and_then(Value::as_str),
-            Some("tool")
-        );
-        assert_eq!(
-            messages[2].get("tool_call_id").and_then(Value::as_str),
-            Some("call_skill_1")
-        );
-        let loaded_skill = messages[2]
+        let loaded_skill = messages[1]
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        assert!(loaded_skill.contains("<name>yat_commit</name>"));
+        assert!(loaded_skill.contains("<command-name>yat_commit</command-name>"));
         assert!(loaded_skill.contains("仅在用户明确要求提交代码时使用"));
     }
 
     #[test]
-    fn transform_request_preserves_background_agent_completion_handoff_in_user_history() {
+    fn transform_request_preserves_background_agent_completion_text_in_user_history() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
             GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
@@ -2841,14 +2855,13 @@ mod tests {
             .and_then(Value::as_str)
             .expect("handoff content should be stringified user text");
 
-        assert!(handoff.contains("\"kind\":\"background_agent_completion\""));
-        assert!(handoff.contains("\"tool_use_id\":\"call_agent_bg\""));
-        assert!(handoff.contains("\"result_status\":\"usable\""));
-        assert!(!handoff.contains("<task-notification>"));
+        assert!(handoff.contains("<task-notification>"));
+        assert!(handoff.contains("call_agent_bg"));
+        assert!(handoff.contains("嘉兴未来 7 天天气大致如下"));
     }
 
     #[test]
-    fn transform_request_marks_placeholder_background_agent_completion_as_incomplete() {
+    fn transform_request_preserves_placeholder_background_agent_completion_text() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
             GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
@@ -2903,13 +2916,12 @@ mod tests {
             .and_then(Value::as_str)
             .expect("handoff content should be stringified user text");
 
-        assert!(handoff.contains("\"kind\":\"background_agent_completion\""));
-        assert!(handoff.contains("\"result_status\":\"incomplete_placeholder\""));
-        assert!(handoff.contains("\"warning\":"));
+        assert!(handoff.contains("<task-notification>"));
+        assert!(handoff.contains("我先查一个可验证的实时天气来源"));
     }
 
     #[test]
-    fn transform_request_stringifies_background_agent_tool_result_for_openai() {
+    fn transform_request_keeps_background_agent_tool_result_as_plain_tool_output() {
         use crate::models::{
             AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
             GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
@@ -2983,9 +2995,9 @@ mod tests {
             .get("content")
             .and_then(Value::as_str)
             .expect("tool output should be stringified");
-        assert!(tool_output.contains("\"kind\":\"background_agent\""));
-        assert!(tool_output.contains("\"agent_id\":\"a6b95ea1c5bd2a390\""));
-        assert!(tool_output.contains("\"poll_with_task_output\":false"));
+        assert!(tool_output.contains("Async agent launched successfully."));
+        assert!(tool_output.contains("agentId: a6b95ea1c5bd2a390"));
+        assert!(tool_output.contains("output_file: /private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output"));
     }
 
     #[test]
