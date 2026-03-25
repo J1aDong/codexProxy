@@ -1,7 +1,8 @@
 use super::{
-    CountTokensMode, PreparedCountTokensRequest, PreparedRequest, TransformContext,
+    CountTokensMode, PreparedCountTokensRequest, PreparedRequest, RequestEnvelopeHints,
+    TransformContext,
 };
-use crate::models::{AnthropicRequest, ContentBlock, MessageContent, get_reasoning_effort};
+use crate::models::get_reasoning_effort;
 use crate::transform::unified::{
     UnifiedChatRequest, UnifiedContent, UnifiedMessage, UnifiedMessageRole, UnifiedToolChoice,
 };
@@ -19,12 +20,6 @@ pub struct OpenAIChatAdapter;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GeminiAdapter;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CodexRequestHints {
-    pub request_cwd: Option<String>,
-    pub session_hint: Option<String>,
-}
 
 impl AnthropicAdapter {
     pub fn prepare_messages_request(
@@ -82,7 +77,7 @@ impl CodexAdapter {
             anthropic_version,
             route_model,
             effective_stream,
-            &CodexRequestHints::default(),
+            &RequestEnvelopeHints::default(),
         )
     }
 
@@ -95,7 +90,7 @@ impl CodexAdapter {
         anthropic_version: &str,
         route_model: &str,
         effective_stream: bool,
-        hints: &CodexRequestHints,
+        hints: &RequestEnvelopeHints,
     ) -> PreparedRequest {
         PreparedRequest {
             url: codex_messages_url(target_url),
@@ -121,7 +116,7 @@ impl CodexAdapter {
             api_key,
             anthropic_version,
             route_model,
-            &CodexRequestHints::default(),
+            &RequestEnvelopeHints::default(),
         )
     }
 
@@ -133,7 +128,7 @@ impl CodexAdapter {
         api_key: &str,
         anthropic_version: &str,
         route_model: &str,
-        hints: &CodexRequestHints,
+        hints: &RequestEnvelopeHints,
     ) -> PreparedCountTokensRequest {
         PreparedCountTokensRequest::native(PreparedRequest {
             url: codex_count_tokens_url(target_url),
@@ -271,11 +266,12 @@ fn encode_codex_body(
     ctx: &TransformContext,
     route_model: &str,
     effective_stream: bool,
-    hints: &CodexRequestHints,
+    hints: &RequestEnvelopeHints,
 ) -> Value {
+    let (promoted_context, cleaned_messages) = extract_user_scaffolding_to_codex_instructions(unified);
     let mut input = Vec::new();
 
-    for message in &unified.messages {
+    for message in &cleaned_messages {
         match message.role {
             UnifiedMessageRole::System => {}
             UnifiedMessageRole::User => {
@@ -316,11 +312,19 @@ fn encode_codex_body(
         "input": input,
         "store": false,
         "stream": effective_stream,
-        "prompt_cache_key": build_prompt_cache_key(route_model, hints, system_text(unified).as_deref(), codex_tools_fingerprint(unified).as_deref()),
+        "prompt_cache_key": build_prompt_cache_key(
+            route_model,
+            hints,
+            merge_instruction_context(system_text(unified).as_deref(), promoted_context.as_deref())
+                .as_deref(),
+            codex_tools_fingerprint(unified).as_deref(),
+        ),
     });
 
-    if let Some(system) = system_text(unified) {
-        body["instructions"] = json!(system);
+    if let Some(instructions) =
+        merge_instruction_context(system_text(unified).as_deref(), promoted_context.as_deref())
+    {
+        body["instructions"] = json!(instructions);
     }
     if let Some(max_tokens) = unified.max_tokens {
         body["max_output_tokens"] = json!(max_tokens);
@@ -490,11 +494,12 @@ fn encode_codex_tools(unified: &UnifiedChatRequest) -> Option<Vec<Value>> {
     unified.tools.as_ref().map(|tools| {
         tools.iter()
             .map(|tool| {
+                let parameters = normalize_codex_tool_schema(&tool.function.parameters);
                 json!({
                     "type": "function",
                     "name": tool.function.name,
                     "description": tool.function.description,
-                    "parameters": tool.function.parameters,
+                    "parameters": parameters,
                 })
             })
             .collect()
@@ -866,6 +871,120 @@ fn data_tail(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
+fn normalize_codex_tool_schema(schema: &Value) -> Value {
+    let mut normalized = schema.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        if obj.get("type").and_then(|value| value.as_str()) == Some("object")
+            && !obj.contains_key("properties")
+        {
+            obj.insert("properties".to_string(), json!({}));
+        }
+    }
+    normalized
+}
+
+fn merge_instruction_context(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    let mut merged = None::<String>;
+    for text in [first, second].into_iter().flatten() {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        merged = Some(match merged {
+            Some(existing) => format!("{}\n\n{}", existing, trimmed),
+            None => trimmed.to_string(),
+        });
+    }
+    merged
+}
+
+fn extract_user_scaffolding_to_codex_instructions(
+    unified: &UnifiedChatRequest,
+) -> (Option<String>, Vec<UnifiedMessage>) {
+    const START: &str = "<system-reminder>";
+    const END: &str = "</system-reminder>";
+
+    let mut promoted_parts = Vec::new();
+    let mut cleaned_messages = Vec::new();
+
+    for message in &unified.messages {
+        if message.role != UnifiedMessageRole::User {
+            cleaned_messages.push(message.clone());
+            continue;
+        }
+
+        let mut cloned = message.clone();
+        let mut new_content = Vec::new();
+
+        for item in &message.content {
+            match item {
+                UnifiedContent::Text { text } => {
+                    let mut remaining = text.clone();
+
+                    while let Some(start_idx) = remaining.find(START) {
+                        let after_start = &remaining[start_idx + START.len()..];
+                        let Some(end_rel) = after_start.find(END) else {
+                            break;
+                        };
+                        let end_idx = start_idx + START.len() + end_rel + END.len();
+                        let block_text =
+                            remaining[start_idx + START.len()..start_idx + START.len() + end_rel]
+                                .trim();
+                        if !block_text.is_empty() {
+                            promoted_parts.push(block_text.to_string());
+                        }
+                        remaining =
+                            format!("{}{}", &remaining[..start_idx], &remaining[end_idx..]);
+                    }
+
+                    if let Some(contents_idx) = remaining.find("Contents of /repo/") {
+                        let after = &remaining[contents_idx..];
+                        if after.contains("CLAUDE.md:")
+                            || after.contains("IFLOW.md:")
+                            || after.contains("CodeBuddy.md:")
+                        {
+                            let prefix = &remaining[..contents_idx];
+                            let lines: Vec<&str> = after.lines().collect();
+                            if lines.len() >= 2 {
+                                let rule_line = lines[1].trim();
+                                if !rule_line.is_empty() {
+                                    promoted_parts.push(rule_line.to_string());
+                                }
+                                let remainder = if let Some(split_idx) = after.find("\n\n") {
+                                    &after[split_idx + 2..]
+                                } else {
+                                    ""
+                                };
+                                remaining = format!("{}{}", prefix, remainder);
+                            }
+                        }
+                    }
+
+                    let trimmed = remaining.trim();
+                    if !trimmed.is_empty() {
+                        new_content.push(UnifiedContent::Text {
+                            text: trimmed.to_string(),
+                        });
+                    }
+                }
+                other => new_content.push(other.clone()),
+            }
+        }
+
+        cloned.content = new_content;
+        if !cloned.content.is_empty() || !cloned.tool_calls.is_empty() {
+            cleaned_messages.push(cloned);
+        }
+    }
+
+    let promoted = if promoted_parts.is_empty() {
+        None
+    } else {
+        Some(promoted_parts.join("\n\n"))
+    };
+    (promoted, cleaned_messages)
+}
+
 fn sanitize_cache_key_segment(input: &str, max_len: usize) -> String {
     let mut segment = String::with_capacity(input.len().min(max_len));
     for ch in input.chars() {
@@ -928,7 +1047,7 @@ fn codex_tools_fingerprint(unified: &UnifiedChatRequest) -> Option<String> {
 
 fn build_prompt_cache_key(
     route_model: &str,
-    hints: &CodexRequestHints,
+    hints: &RequestEnvelopeHints,
     applied_static_instructions: Option<&str>,
     tools_fingerprint: Option<&str>,
 ) -> String {
@@ -940,7 +1059,12 @@ fn build_prompt_cache_key(
     {
         let model_segment = sanitize_cache_key_segment(route_model, 48);
         let hint_segment = sanitize_cache_key_segment(hint, 72);
-        return format!("codex-proxy:{}:session:{}", model_segment, hint_segment);
+        return format!(
+            "codex-proxy:{}:{}:session:{}",
+            model_segment,
+            hints.request_kind.as_str(),
+            hint_segment
+        );
     }
 
     let mut key_material = Vec::new();
@@ -961,168 +1085,10 @@ fn build_prompt_cache_key(
         .unwrap_or_else(|| "default".to_string());
 
     format!(
-        "codex-proxy:{}:{}:{:016x}",
-        model_segment, cwd_segment, key_hash
+        "codex-proxy:{}:{}:{}:{:016x}",
+        model_segment,
+        hints.request_kind.as_str(),
+        cwd_segment,
+        key_hash
     )
-}
-
-pub fn codex_request_hints_from_anthropic(request: &AnthropicRequest) -> CodexRequestHints {
-    CodexRequestHints {
-        request_cwd: extract_request_cwd(&collect_request_text_corpus(request)),
-        session_hint: extract_request_session_hint(request),
-    }
-}
-
-fn collect_request_text_corpus(request: &AnthropicRequest) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(system_text) = request.system.as_ref().map(|s| s.to_string()) {
-        let trimmed = system_text.trim();
-        if !trimmed.is_empty() {
-            parts.push(trimmed.to_string());
-        }
-    }
-
-    for message in &request.messages {
-        let Some(content) = message.content.as_ref() else {
-            continue;
-        };
-        match content {
-            MessageContent::Text(text) => {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
-            }
-            MessageContent::Blocks(blocks) => {
-                for block in blocks {
-                    if let ContentBlock::Text { text } = block {
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            parts.push(trimmed.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    parts.join("\n")
-}
-
-fn extract_request_cwd(request_text_corpus: &str) -> Option<String> {
-    const ENV_START: &str = "<environment_context>";
-    const ENV_END: &str = "</environment_context>";
-    const CWD_START: &str = "<cwd>";
-    const CWD_END: &str = "</cwd>";
-    const MAX_TRUSTED_REQUEST_CWD_CHARS: usize = 512;
-
-    let mut remaining = request_text_corpus;
-    while let Some(env_start_idx) = remaining.find(ENV_START) {
-        let after_env_start = &remaining[env_start_idx + ENV_START.len()..];
-        let Some(env_end_rel) = after_env_start.find(ENV_END) else {
-            break;
-        };
-        let env_block = &after_env_start[..env_end_rel];
-        let Some(cwd_start_idx) = env_block.find(CWD_START) else {
-            remaining = &after_env_start[env_end_rel + ENV_END.len()..];
-            continue;
-        };
-        let after_cwd = &env_block[cwd_start_idx + CWD_START.len()..];
-        let Some(cwd_end_rel) = after_cwd.find(CWD_END) else {
-            remaining = &after_env_start[env_end_rel + ENV_END.len()..];
-            continue;
-        };
-
-        let cwd = after_cwd[..cwd_end_rel].trim();
-        if !cwd.is_empty() && cwd.chars().count() <= MAX_TRUSTED_REQUEST_CWD_CHARS {
-            return Some(cwd.to_string());
-        }
-        remaining = &after_env_start[env_end_rel + ENV_END.len()..];
-    }
-
-    None
-}
-
-fn extract_session_hint_from_user_id(user_id: &str) -> Option<String> {
-    let lower = user_id.to_ascii_lowercase();
-    if let Some(idx) = lower.find("session_") {
-        let tail = &user_id[idx + "session_".len()..];
-        let token = tail
-            .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
-            .next()
-            .unwrap_or("");
-        if !token.is_empty() {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
-fn extract_session_hint_from_metadata(request: &AnthropicRequest) -> Option<String> {
-    let metadata = request.metadata.as_ref()?;
-    let read_str = |key: &str| {
-        metadata
-            .get(key)
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string())
-    };
-    if let Some(value) = read_str("session_id") {
-        return Some(value);
-    }
-    if let Some(value) = read_str("conversation_id") {
-        return Some(value);
-    }
-    if let Some(user_id) = metadata.get("user_id").and_then(|value| value.as_str()) {
-        return extract_session_hint_from_user_id(user_id);
-    }
-    None
-}
-
-fn extract_request_session_hint(request: &AnthropicRequest) -> Option<String> {
-    if let Some(value) = extract_session_hint_from_metadata(request) {
-        return Some(value);
-    }
-
-    let mut candidates = Vec::new();
-    if let Some(system_text) = request.system.as_ref().map(|s| s.to_string()) {
-        candidates.push(system_text);
-    }
-    for message in &request.messages {
-        if let Some(content) = message.content.as_ref() {
-            match content {
-                MessageContent::Text(text) => candidates.push(text.clone()),
-                MessageContent::Blocks(blocks) => {
-                    for block in blocks {
-                        if let ContentBlock::Text { text } = block {
-                            candidates.push(text.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for text in candidates {
-        let lower = text.to_ascii_lowercase();
-        for marker in ["session_id", "conversation_id"] {
-            if let Some(idx) = lower.find(marker) {
-                let tail = &text[idx..];
-                if let Some(start) = tail.find(':') {
-                    let after = tail[start + 1..].trim();
-                    let token = after
-                        .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
-                        .next()
-                        .unwrap_or("");
-                    if !token.is_empty() {
-                        return Some(token.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }

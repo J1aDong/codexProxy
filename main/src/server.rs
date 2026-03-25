@@ -9,10 +9,10 @@ use crate::models::{
 };
 use crate::transform::{
     AnthropicAdapter, AnthropicBackend, CodexAdapter, CodexBackend, CountTokensMode, GeminiAdapter,
-    GeminiBackend, OpenAIChatAdapter, OpenAIChatBackend, PreparedRequest,
+    GeminiBackend, OpenAIChatAdapter, OpenAIChatBackend, PreparedRequest, RequestEnvelopeHints,
     ResponseTransformRequestContext, TransformBackend, TransformContext, UnifiedChatRequest,
 };
-use crate::transform::providers::codex_request_hints_from_anthropic;
+use crate::transform::request_envelope_hints_from_anthropic;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -712,6 +712,28 @@ fn extract_stateful_chain_hint(req: &Request<hyper::body::Incoming>) -> Option<S
     None
 }
 fn extract_session_hint_from_user_id(user_id: &str) -> Option<String> {
+    let trimmed = user_id.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(session_id) = value
+                .get("session_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(session_id.to_string());
+            }
+            if let Some(conversation_id) = value
+                .get("conversation_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(conversation_id.to_string());
+            }
+        }
+    }
+
     let lower = user_id.to_ascii_lowercase();
     if let Some(idx) = lower.find("session_") {
         let tail = &user_id[idx + "session_".len()..];
@@ -817,6 +839,7 @@ fn normalize_stateful_prefix_preview(preview: &str) -> String {
 
 fn derive_stateful_chain_key(
     hint: Option<&str>,
+    request_kind: crate::transform::ClaudeCodeRequestKind,
     converter: &str,
     model: &str,
     request: &AnthropicRequest,
@@ -824,7 +847,12 @@ fn derive_stateful_chain_key(
     if let Some(hint_value) = hint {
         let normalized = hint_value.trim().to_ascii_lowercase();
         if !normalized.is_empty() {
-            return format!("hint:{}:{}", converter.to_ascii_lowercase(), normalized);
+            return format!(
+                "hint:{}:{}:{}",
+                converter.to_ascii_lowercase(),
+                request_kind.as_str(),
+                normalized
+            );
         }
     }
 
@@ -834,10 +862,12 @@ fn derive_stateful_chain_key(
         .map(|s| s.to_string())
         .unwrap_or_default();
     let prefix_signature = build_message_prefix_signature(request);
-    let fingerprint = hash_to_u64(&[converter, model, &system_text, &prefix_signature]);
+    let kind = request_kind.as_str();
+    let fingerprint = hash_to_u64(&[converter, kind, model, &system_text, &prefix_signature]);
     format!(
-        "fallback:{}:{:016x}",
+        "fallback:{}:{}:{:016x}",
         converter.to_ascii_lowercase(),
+        kind,
         fingerprint
     )
 }
@@ -870,6 +900,7 @@ fn prepare_stateful_chain_request(
     body: &mut Value,
     chain_store: &StatefulChainStore,
     unsupported_endpoints: &StatefulChainUnsupportedEndpointStore,
+    request_hints: &RequestEnvelopeHints,
     chain_key: &str,
     endpoint_key: &str,
     request_id: &str,
@@ -881,6 +912,28 @@ fn prepare_stateful_chain_request(
     let obj = body.as_object_mut()?;
     let full_input = obj.get("input").and_then(|v| v.as_array()).cloned()?;
     obj.insert("store".to_string(), json!(true));
+
+    if request_hints.request_kind == crate::transform::ClaudeCodeRequestKind::SessionTitle {
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[StatefulChain] #{} previous_response_id_skipped reason=request_kind_session_title",
+                request_id
+            ),
+        );
+        return Some((
+            StatefulChainRequestMeta {
+                chain_key: chain_key.to_string(),
+                endpoint_key: endpoint_key.to_string(),
+                full_input,
+                static_prefix_summary,
+                static_prefix_same_as_prior: None,
+                non_input_fingerprint: current_non_input_fingerprint,
+            },
+            None,
+        ));
+    }
 
     if is_stateful_endpoint_previous_response_id_unsupported(unsupported_endpoints, endpoint_key) {
         emit_stream_diag(
@@ -4269,6 +4322,7 @@ async fn handle_request(
             }
         };
 
+    let request_hints = request_envelope_hints_from_anthropic(&anthropic_body);
     let stateful_chain_hint_info =
         resolve_stateful_chain_hint_info(stateful_chain_hint_header, &anthropic_body);
     let stateful_chain_hint = stateful_chain_hint_info.value.clone();
@@ -4445,10 +4499,11 @@ async fn handle_request(
             }
         };
 
+        let request_hints = request_envelope_hints_from_anthropic(&anthropic_body);
         let codex_hints = route_selection
             .converter
             .eq_ignore_ascii_case("codex")
-            .then(|| codex_request_hints_from_anthropic(&anthropic_body));
+            .then_some(request_hints.clone());
 
         let mut prepared_count_tokens = if route_selection.converter.eq_ignore_ascii_case("openai") {
             OpenAIChatAdapter.prepare_count_tokens_request(
@@ -4889,6 +4944,7 @@ async fn handle_request(
             );
             let chain_key = derive_stateful_chain_key(
                 stateful_chain_hint.as_deref(),
+                request_hints.request_kind,
                 &route_selection.converter,
                 &route_selection.model_name,
                 &anthropic_body,
@@ -4897,6 +4953,7 @@ async fn handle_request(
                 &mut upstream_body,
                 &stateful_chain_store,
                 &stateful_chain_unsupported_endpoints,
+                &request_hints,
                 &chain_key,
                 &endpoint_key,
                 &request_id,
@@ -7167,6 +7224,7 @@ mod tests {
         StatefulChainStore, StatefulChainUnsupportedEndpointStore, StreamEventCounters,
         StreamRuntimeOptions, UpstreamOperation,
     };
+    use crate::transform::{request_envelope_hints_from_anthropic, RequestEnvelopeHints};
     use crate::models::AnthropicRequest;
     use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
@@ -8131,6 +8189,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             &mut body,
             &chain_store,
             &unsupported_store,
+            &RequestEnvelopeHints::default(),
             "test-chain",
             "ep_1",
             "req_1",
@@ -8200,6 +8259,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             &mut body,
             &chain_store,
             &unsupported_store,
+            &RequestEnvelopeHints::default(),
             "test-chain",
             "ep_1",
             "req_1",
@@ -8286,6 +8346,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             &mut body,
             &chain_store,
             &unsupported_store,
+            &RequestEnvelopeHints::default(),
             "test-chain",
             "ep_unsupported",
             "req_1",
@@ -8344,6 +8405,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             &mut body,
             &chain_store,
             &unsupported_store,
+            &RequestEnvelopeHints::default(),
             "test-chain",
             "ep_1",
             "req_changed",
@@ -8391,6 +8453,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             &mut body,
             &chain_store,
             &unsupported_store,
+            &RequestEnvelopeHints::default(),
             "test-chain",
             "ep_1",
             "req_same",
@@ -8400,6 +8463,42 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         .expect("stateful meta");
 
         assert_eq!(meta.static_prefix_same_as_prior, Some(true));
+    }
+
+    #[test]
+    fn test_prepare_stateful_chain_request_skips_session_title_requests() {
+        let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: StatefulChainUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        let mut body = json!({
+            "model": "gpt-5.4",
+            "input": [json!({"role":"user","content":[{"type":"input_text","text":"你好"}]})],
+            "prompt_cache_key": "codex-proxy:gpt_5_4:session_title:session:sess-1",
+            "store": false
+        });
+
+        let (log_tx, _log_rx) = tokio::sync::broadcast::channel::<String>(8);
+        let logger = None;
+        let hints = RequestEnvelopeHints {
+            request_kind: crate::transform::ClaudeCodeRequestKind::SessionTitle,
+            session_hint: Some("sess-1".to_string()),
+            request_cwd: None,
+        };
+
+        let (_meta, _turn_state) = prepare_stateful_chain_request(
+            &mut body,
+            &chain_store,
+            &unsupported_store,
+            &hints,
+            "hint:codex:session_title:sess-1",
+            "ep_1",
+            "req_title",
+            &log_tx,
+            &logger,
+        )
+        .expect("stateful meta");
+
+        assert!(body.get("previous_response_id").is_none());
     }
 
     #[test]
@@ -8458,6 +8557,26 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
     }
 
     #[test]
+    fn test_extract_stateful_chain_hint_from_json_encoded_metadata_user_id() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [],
+            "metadata": {
+                "user_id": "{\"device_id\":\"abc\",\"account_uuid\":\"\",\"session_id\":\"f79b77e5-98f3-4949-93c8-b2771ebdf684\"}"
+            },
+            "stream": true
+        }))
+        .expect("valid request");
+
+        let hint = extract_stateful_chain_hint_from_request(&request);
+        assert_eq!(
+            hint.as_deref(),
+            Some("f79b77e5-98f3-4949-93c8-b2771ebdf684"),
+            "json-encoded metadata user_id should yield the embedded session_id instead of the literal `id` token"
+        );
+    }
+
+    #[test]
     fn test_resolve_stateful_chain_hint_from_metadata() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-6",
@@ -8483,9 +8602,14 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             "stream": true
         }))
         .expect("request");
-        let key =
-            derive_stateful_chain_key(Some("session-123"), "codex", "gpt-5.3-codex", &request);
-        assert_eq!(key, "hint:codex:session-123");
+        let key = derive_stateful_chain_key(
+            Some("session-123"),
+            crate::transform::ClaudeCodeRequestKind::ConversationTurn,
+            "codex",
+            "gpt-5.3-codex",
+            &request,
+        );
+        assert_eq!(key, "hint:codex:conversation_turn:session-123");
     }
 
     #[test]
@@ -8510,9 +8634,84 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         }))
         .expect("request_b");
 
-        let key_a = derive_stateful_chain_key(None, "codex", "gpt-5.3-codex", &request_a);
-        let key_b = derive_stateful_chain_key(None, "codex", "gpt-5.3-codex", &request_b);
+        let key_a = derive_stateful_chain_key(
+            None,
+            crate::transform::ClaudeCodeRequestKind::ConversationTurn,
+            "codex",
+            "gpt-5.3-codex",
+            &request_a,
+        );
+        let key_b = derive_stateful_chain_key(
+            None,
+            crate::transform::ClaudeCodeRequestKind::ConversationTurn,
+            "codex",
+            "gpt-5.3-codex",
+            &request_b,
+        );
         assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_request_envelope_hints_classify_title_request() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role":"user","content":"你好"}],
+            "stream": true,
+            "system": [
+                {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type":"text","text":"Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. Return JSON with a single \"title\" field."}
+            ]
+        }))
+        .expect("request");
+
+        let hints = request_envelope_hints_from_anthropic(&request);
+        assert_eq!(
+            hints.request_kind,
+            crate::transform::ClaudeCodeRequestKind::SessionTitle
+        );
+    }
+
+    #[test]
+    fn test_stateful_chain_key_separates_title_and_conversation_requests() {
+        let title_request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role":"user","content":"你好"}],
+            "stream": true,
+            "metadata": {"user_id":"{\"session_id\":\"sess-1\"}"},
+            "system": [
+                {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type":"text","text":"Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. Return JSON with a single \"title\" field."}
+            ]
+        }))
+        .expect("title request");
+        let conversation_request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role":"user","content":"你好"}],
+            "stream": true,
+            "metadata": {"user_id":"{\"session_id\":\"sess-1\"}"},
+            "system": [{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}]
+        }))
+        .expect("conversation request");
+
+        let title_hints = request_envelope_hints_from_anthropic(&title_request);
+        let conversation_hints = request_envelope_hints_from_anthropic(&conversation_request);
+
+        let title_key = derive_stateful_chain_key(
+            title_hints.session_hint.as_deref(),
+            title_hints.request_kind,
+            "codex",
+            "gpt-5.4",
+            &title_request,
+        );
+        let conversation_key = derive_stateful_chain_key(
+            conversation_hints.session_hint.as_deref(),
+            conversation_hints.request_kind,
+            "codex",
+            "gpt-5.4",
+            &conversation_request,
+        );
+
+        assert_ne!(title_key, conversation_key);
     }
 
     #[test]

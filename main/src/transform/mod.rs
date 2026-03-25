@@ -11,8 +11,9 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::models::{
-    AnthropicModelMapping, AnthropicRequest, CodexModelMapping, GeminiReasoningEffortMapping,
-    OpenAIMaxTokensMapping, OpenAIModelMapping, ReasoningEffortMapping,
+    AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
+    GeminiReasoningEffortMapping, MessageContent, OpenAIMaxTokensMapping, OpenAIModelMapping,
+    ReasoningEffortMapping,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -71,6 +72,230 @@ pub struct CanonicalToolResult {
     pub tool_use_id: String,
     pub content: Value,
     pub is_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClaudeCodeRequestKind {
+    SessionTitle,
+    ConversationTurn,
+    #[default]
+    Unknown,
+}
+
+impl ClaudeCodeRequestKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionTitle => "session_title",
+            Self::ConversationTurn => "conversation_turn",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestEnvelopeHints {
+    pub request_kind: ClaudeCodeRequestKind,
+    pub session_hint: Option<String>,
+    pub request_cwd: Option<String>,
+}
+
+pub fn request_envelope_hints_from_anthropic(request: &AnthropicRequest) -> RequestEnvelopeHints {
+    RequestEnvelopeHints {
+        request_kind: classify_claude_code_request_kind(request),
+        session_hint: extract_request_session_hint(request),
+        request_cwd: extract_request_cwd(&collect_request_text_corpus(request)),
+    }
+}
+
+fn classify_claude_code_request_kind(request: &AnthropicRequest) -> ClaudeCodeRequestKind {
+    let system_text = request
+        .system
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let has_title_prompt = system_text.contains("Generate a concise, sentence-case title")
+        && system_text.contains("Return JSON with a single \"title\" field.");
+    if has_title_prompt {
+        ClaudeCodeRequestKind::SessionTitle
+    } else {
+        ClaudeCodeRequestKind::ConversationTurn
+    }
+}
+
+fn collect_request_text_corpus(request: &AnthropicRequest) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(system_text) = request.system.as_ref().map(|s| s.to_string()) {
+        let trimmed = system_text.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    for message in &request.messages {
+        let Some(content) = message.content.as_ref() else {
+            continue;
+        };
+        match content {
+            MessageContent::Text(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    if let ContentBlock::Text { text } = block {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    parts.join("\n")
+}
+
+fn extract_request_cwd(request_text_corpus: &str) -> Option<String> {
+    const ENV_START: &str = "<environment_context>";
+    const ENV_END: &str = "</environment_context>";
+    const CWD_START: &str = "<cwd>";
+    const CWD_END: &str = "</cwd>";
+    const MAX_TRUSTED_REQUEST_CWD_CHARS: usize = 512;
+
+    let mut remaining = request_text_corpus;
+    while let Some(env_start_idx) = remaining.find(ENV_START) {
+        let after_env_start = &remaining[env_start_idx + ENV_START.len()..];
+        let Some(env_end_rel) = after_env_start.find(ENV_END) else {
+            break;
+        };
+        let env_block = &after_env_start[..env_end_rel];
+        let Some(cwd_start_idx) = env_block.find(CWD_START) else {
+            remaining = &after_env_start[env_end_rel + ENV_END.len()..];
+            continue;
+        };
+        let after_cwd = &env_block[cwd_start_idx + CWD_START.len()..];
+        let Some(cwd_end_rel) = after_cwd.find(CWD_END) else {
+            remaining = &after_env_start[env_end_rel + ENV_END.len()..];
+            continue;
+        };
+
+        let cwd = after_cwd[..cwd_end_rel].trim();
+        if !cwd.is_empty() && cwd.chars().count() <= MAX_TRUSTED_REQUEST_CWD_CHARS {
+            return Some(cwd.to_string());
+        }
+        remaining = &after_env_start[env_end_rel + ENV_END.len()..];
+    }
+
+    None
+}
+
+fn extract_session_hint_from_user_id(user_id: &str) -> Option<String> {
+    let trimmed = user_id.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(session_id) = value
+                .get("session_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(session_id.to_string());
+            }
+            if let Some(conversation_id) = value
+                .get("conversation_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(conversation_id.to_string());
+            }
+        }
+    }
+
+    let lower = user_id.to_ascii_lowercase();
+    if let Some(idx) = lower.find("session_") {
+        let tail = &user_id[idx + "session_".len()..];
+        let token = tail
+            .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
+            .next()
+            .unwrap_or("");
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn extract_session_hint_from_metadata(request: &AnthropicRequest) -> Option<String> {
+    let metadata = request.metadata.as_ref()?;
+    let read_str = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    };
+    if let Some(value) = read_str("session_id") {
+        return Some(value);
+    }
+    if let Some(value) = read_str("conversation_id") {
+        return Some(value);
+    }
+    if let Some(user_id) = metadata.get("user_id").and_then(|value| value.as_str()) {
+        return extract_session_hint_from_user_id(user_id);
+    }
+    None
+}
+
+fn extract_request_session_hint(request: &AnthropicRequest) -> Option<String> {
+    if let Some(value) = extract_session_hint_from_metadata(request) {
+        return Some(value);
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(system_text) = request.system.as_ref().map(|s| s.to_string()) {
+        candidates.push(system_text);
+    }
+    for message in &request.messages {
+        if let Some(content) = message.content.as_ref() {
+            match content {
+                MessageContent::Text(text) => candidates.push(text.clone()),
+                MessageContent::Blocks(blocks) => {
+                    for block in blocks {
+                        if let ContentBlock::Text { text } = block {
+                            candidates.push(text.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for text in candidates {
+        let lower = text.to_ascii_lowercase();
+        for marker in ["session_id", "conversation_id"] {
+            if let Some(idx) = lower.find(marker) {
+                let tail = &text[idx..];
+                if let Some(start) = tail.find(':') {
+                    let after = tail[start + 1..].trim();
+                    let token = after
+                        .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
+                        .next()
+                        .unwrap_or("");
+                    if !token.is_empty() {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -621,7 +846,7 @@ mod tests {
 
         let unified_a = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
         let unified_b = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
-        let hints = crate::transform::providers::codex_request_hints_from_anthropic(&request);
+        let hints = crate::transform::request_envelope_hints_from_anthropic(&request);
         let ctx = crate::transform::TransformContext {
             reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
             codex_model_mapping: crate::models::CodexModelMapping::default(),
@@ -675,6 +900,183 @@ mod tests {
         assert!(
             key_a.contains("session"),
             "session-aware codex requests should restore stable cache keys"
+        );
+    }
+
+    #[test]
+    fn codex_request_hints_parse_json_encoded_user_id_session_id() {
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![],
+            system: None,
+            tools: None,
+            metadata: Some(json!({
+                "user_id": "{\"device_id\":\"abc\",\"account_uuid\":\"\",\"session_id\":\"f79b77e5-98f3-4949-93c8-b2771ebdf684\"}"
+            })),
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let hints = crate::transform::request_envelope_hints_from_anthropic(&request);
+        assert_eq!(
+            hints.session_hint.as_deref(),
+            Some("f79b77e5-98f3-4949-93c8-b2771ebdf684")
+        );
+    }
+
+    #[test]
+    fn codex_adapter_promotes_user_system_reminders_into_instructions() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- pdf: Read PDF files\n</system-reminder>\n\nhello".to_string(),
+                )),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let hints = crate::transform::request_envelope_hints_from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "codex".to_string(),
+            codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let body = crate::transform::providers::CodexAdapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &ctx,
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                true,
+                &hints,
+            )
+            .body;
+
+        let instructions = body
+            .get("instructions")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(instructions.contains("The following skills are available"));
+        assert!(instructions.contains("pdf: Read PDF files"));
+
+        let input_text = body
+            .get("input")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("content").and_then(|value| value.as_array()))
+            .flatten()
+            .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(input_text.contains("hello"));
+        assert!(!input_text.contains("The following skills are available"));
+    }
+
+    #[test]
+    fn codex_adapter_normalizes_empty_object_tool_schema_for_responses_api() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("你好".to_string())),
+            }],
+            system: None,
+            tools: Some(vec![json!({
+                "name": "mcp__dart__list_devices",
+                "description": "Lists available Flutter devices.",
+                "input_schema": {
+                    "type": "object"
+                }
+            })]),
+            metadata: None,
+            tool_choice: Some(json!({"type":"auto"})),
+            thinking: None,
+            stream: true,
+            max_tokens: Some(256),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let hints = crate::transform::request_envelope_hints_from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "codex".to_string(),
+            codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let body = crate::transform::providers::CodexAdapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &ctx,
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                true,
+                &hints,
+            )
+            .body;
+
+        let parameters = body
+            .pointer("/tools/0/parameters")
+            .expect("codex tool schema");
+        assert_eq!(parameters.get("type").and_then(|value| value.as_str()), Some("object"));
+        assert!(
+            parameters.get("properties").is_some(),
+            "Codex tool schemas with object type must include an explicit properties object"
+        );
+        assert_eq!(
+            parameters.get("properties").and_then(|value| value.as_object()).map(|value| value.len()),
+            Some(0)
         );
     }
 }

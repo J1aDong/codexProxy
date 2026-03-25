@@ -22,10 +22,6 @@ impl ExtractedSkillPayload {
     pub fn as_str(&self) -> &str {
         &self.payload
     }
-
-    pub fn dedupe_key(&self) -> String {
-        MessageProcessor::build_skill_key(&self.name, &self.payload)
-    }
 }
 
 impl Deref for ExtractedSkillPayload {

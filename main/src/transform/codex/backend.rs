@@ -4,8 +4,8 @@ use tokio::sync::broadcast;
 use super::response::TransformResponse;
 use crate::models::AnthropicRequest;
 use crate::transform::{
-    providers::{codex_request_hints_from_anthropic, CodexAdapter},
-    ResponseTransformer, TransformBackend, TransformContext,
+    providers::CodexAdapter, request_envelope_hints_from_anthropic, ResponseTransformer,
+    TransformBackend, TransformContext,
 };
 
 /// Codex 后端 —— 将 Anthropic 请求转为 Codex Responses API 格式
@@ -123,7 +123,7 @@ impl TransformBackend for CodexBackend {
         model_override: Option<String>,
     ) -> (Value, String) {
         let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(anthropic_body);
-        let hints = codex_request_hints_from_anthropic(anthropic_body);
+        let hints = request_envelope_hints_from_anthropic(anthropic_body);
         let prepared = CodexAdapter.prepare_messages_request_with_hints(
             &unified,
             ctx,
