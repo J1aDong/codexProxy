@@ -1,7 +1,7 @@
 use super::{
     CountTokensMode, PreparedCountTokensRequest, PreparedRequest, TransformContext,
 };
-use crate::models::get_reasoning_effort;
+use crate::models::{AnthropicRequest, ContentBlock, MessageContent, get_reasoning_effort};
 use crate::transform::unified::{
     UnifiedChatRequest, UnifiedContent, UnifiedMessage, UnifiedMessageRole, UnifiedToolChoice,
 };
@@ -19,6 +19,12 @@ pub struct OpenAIChatAdapter;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GeminiAdapter;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodexRequestHints {
+    pub request_cwd: Option<String>,
+    pub session_hint: Option<String>,
+}
 
 impl AnthropicAdapter {
     pub fn prepare_messages_request(
@@ -68,10 +74,33 @@ impl CodexAdapter {
         route_model: &str,
         effective_stream: bool,
     ) -> PreparedRequest {
+        self.prepare_messages_request_with_hints(
+            unified,
+            ctx,
+            target_url,
+            api_key,
+            anthropic_version,
+            route_model,
+            effective_stream,
+            &CodexRequestHints::default(),
+        )
+    }
+
+    pub fn prepare_messages_request_with_hints(
+        &self,
+        unified: &UnifiedChatRequest,
+        ctx: &TransformContext,
+        target_url: &str,
+        api_key: &str,
+        anthropic_version: &str,
+        route_model: &str,
+        effective_stream: bool,
+        hints: &CodexRequestHints,
+    ) -> PreparedRequest {
         PreparedRequest {
             url: codex_messages_url(target_url),
             headers: codex_headers(api_key, anthropic_version, true),
-            body: encode_codex_body(unified, ctx, route_model, effective_stream),
+            body: encode_codex_body(unified, ctx, route_model, effective_stream, hints),
             session_id: Uuid::new_v4().to_string(),
         }
     }
@@ -85,10 +114,31 @@ impl CodexAdapter {
         anthropic_version: &str,
         route_model: &str,
     ) -> PreparedCountTokensRequest {
+        self.prepare_count_tokens_request_with_hints(
+            unified,
+            ctx,
+            target_url,
+            api_key,
+            anthropic_version,
+            route_model,
+            &CodexRequestHints::default(),
+        )
+    }
+
+    pub fn prepare_count_tokens_request_with_hints(
+        &self,
+        unified: &UnifiedChatRequest,
+        ctx: &TransformContext,
+        target_url: &str,
+        api_key: &str,
+        anthropic_version: &str,
+        route_model: &str,
+        hints: &CodexRequestHints,
+    ) -> PreparedCountTokensRequest {
         PreparedCountTokensRequest::native(PreparedRequest {
             url: codex_count_tokens_url(target_url),
             headers: codex_headers(api_key, anthropic_version, false),
-            body: encode_codex_body(unified, ctx, route_model, false),
+            body: encode_codex_body(unified, ctx, route_model, false, hints),
             session_id: Uuid::new_v4().to_string(),
         })
     }
@@ -221,6 +271,7 @@ fn encode_codex_body(
     ctx: &TransformContext,
     route_model: &str,
     effective_stream: bool,
+    hints: &CodexRequestHints,
 ) -> Value {
     let mut input = Vec::new();
 
@@ -263,7 +314,9 @@ fn encode_codex_body(
     let mut body = json!({
         "model": route_model,
         "input": input,
+        "store": false,
         "stream": effective_stream,
+        "prompt_cache_key": build_prompt_cache_key(route_model, hints, system_text(unified).as_deref(), codex_tools_fingerprint(unified).as_deref()),
     });
 
     if let Some(system) = system_text(unified) {
@@ -811,4 +864,265 @@ fn data_tail(url: &str) -> String {
     url.split_once(',')
         .map(|(_, tail)| tail.to_string())
         .unwrap_or_else(|| url.to_string())
+}
+
+fn sanitize_cache_key_segment(input: &str, max_len: usize) -> String {
+    let mut segment = String::with_capacity(input.len().min(max_len));
+    for ch in input.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() { ch } else { '_' };
+        segment.push(normalized);
+        if segment.len() >= max_len {
+            break;
+        }
+    }
+
+    let trimmed = segment.trim_matches('_');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_cache_material(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n").trim().to_string()
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_value).collect()),
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut normalized = serde_json::Map::new();
+            for key in keys {
+                if let Some(child) = map.get(&key) {
+                    normalized.insert(key, canonicalize_json_value(child));
+                }
+            }
+            Value::Object(normalized)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn fingerprint_json_value(value: &Value) -> String {
+    let normalized = canonicalize_json_value(value);
+    let bytes = serde_json::to_vec(&normalized).unwrap_or_default();
+    format!("{:016x}", fnv1a64(&bytes))
+}
+
+fn codex_tools_fingerprint(unified: &UnifiedChatRequest) -> Option<String> {
+    let tools = encode_codex_tools(unified)?;
+    Some(fingerprint_json_value(&Value::Array(tools)))
+}
+
+fn build_prompt_cache_key(
+    route_model: &str,
+    hints: &CodexRequestHints,
+    applied_static_instructions: Option<&str>,
+    tools_fingerprint: Option<&str>,
+) -> String {
+    if let Some(hint) = hints
+        .session_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let model_segment = sanitize_cache_key_segment(route_model, 48);
+        let hint_segment = sanitize_cache_key_segment(hint, 72);
+        return format!("codex-proxy:{}:session:{}", model_segment, hint_segment);
+    }
+
+    let mut key_material = Vec::new();
+    if let Some(instructions) = applied_static_instructions {
+        key_material.extend_from_slice(normalize_cache_material(&instructions).as_bytes());
+    }
+    key_material.push(0x1f);
+    if let Some(tools_fingerprint) = tools_fingerprint {
+        key_material.extend_from_slice(tools_fingerprint.as_bytes());
+    }
+
+    let key_hash = fnv1a64(&key_material);
+    let model_segment = sanitize_cache_key_segment(route_model, 48);
+    let cwd_segment = hints
+        .request_cwd
+        .as_deref()
+        .map(|cwd| sanitize_cache_key_segment(cwd, 64))
+        .unwrap_or_else(|| "default".to_string());
+
+    format!(
+        "codex-proxy:{}:{}:{:016x}",
+        model_segment, cwd_segment, key_hash
+    )
+}
+
+pub fn codex_request_hints_from_anthropic(request: &AnthropicRequest) -> CodexRequestHints {
+    CodexRequestHints {
+        request_cwd: extract_request_cwd(&collect_request_text_corpus(request)),
+        session_hint: extract_request_session_hint(request),
+    }
+}
+
+fn collect_request_text_corpus(request: &AnthropicRequest) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(system_text) = request.system.as_ref().map(|s| s.to_string()) {
+        let trimmed = system_text.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    for message in &request.messages {
+        let Some(content) = message.content.as_ref() else {
+            continue;
+        };
+        match content {
+            MessageContent::Text(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    if let ContentBlock::Text { text } = block {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    parts.join("\n")
+}
+
+fn extract_request_cwd(request_text_corpus: &str) -> Option<String> {
+    const ENV_START: &str = "<environment_context>";
+    const ENV_END: &str = "</environment_context>";
+    const CWD_START: &str = "<cwd>";
+    const CWD_END: &str = "</cwd>";
+    const MAX_TRUSTED_REQUEST_CWD_CHARS: usize = 512;
+
+    let mut remaining = request_text_corpus;
+    while let Some(env_start_idx) = remaining.find(ENV_START) {
+        let after_env_start = &remaining[env_start_idx + ENV_START.len()..];
+        let Some(env_end_rel) = after_env_start.find(ENV_END) else {
+            break;
+        };
+        let env_block = &after_env_start[..env_end_rel];
+        let Some(cwd_start_idx) = env_block.find(CWD_START) else {
+            remaining = &after_env_start[env_end_rel + ENV_END.len()..];
+            continue;
+        };
+        let after_cwd = &env_block[cwd_start_idx + CWD_START.len()..];
+        let Some(cwd_end_rel) = after_cwd.find(CWD_END) else {
+            remaining = &after_env_start[env_end_rel + ENV_END.len()..];
+            continue;
+        };
+
+        let cwd = after_cwd[..cwd_end_rel].trim();
+        if !cwd.is_empty() && cwd.chars().count() <= MAX_TRUSTED_REQUEST_CWD_CHARS {
+            return Some(cwd.to_string());
+        }
+        remaining = &after_env_start[env_end_rel + ENV_END.len()..];
+    }
+
+    None
+}
+
+fn extract_session_hint_from_user_id(user_id: &str) -> Option<String> {
+    let lower = user_id.to_ascii_lowercase();
+    if let Some(idx) = lower.find("session_") {
+        let tail = &user_id[idx + "session_".len()..];
+        let token = tail
+            .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
+            .next()
+            .unwrap_or("");
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn extract_session_hint_from_metadata(request: &AnthropicRequest) -> Option<String> {
+    let metadata = request.metadata.as_ref()?;
+    let read_str = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    };
+    if let Some(value) = read_str("session_id") {
+        return Some(value);
+    }
+    if let Some(value) = read_str("conversation_id") {
+        return Some(value);
+    }
+    if let Some(user_id) = metadata.get("user_id").and_then(|value| value.as_str()) {
+        return extract_session_hint_from_user_id(user_id);
+    }
+    None
+}
+
+fn extract_request_session_hint(request: &AnthropicRequest) -> Option<String> {
+    if let Some(value) = extract_session_hint_from_metadata(request) {
+        return Some(value);
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(system_text) = request.system.as_ref().map(|s| s.to_string()) {
+        candidates.push(system_text);
+    }
+    for message in &request.messages {
+        if let Some(content) = message.content.as_ref() {
+            match content {
+                MessageContent::Text(text) => candidates.push(text.clone()),
+                MessageContent::Blocks(blocks) => {
+                    for block in blocks {
+                        if let ContentBlock::Text { text } = block {
+                            candidates.push(text.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for text in candidates {
+        let lower = text.to_ascii_lowercase();
+        for marker in ["session_id", "conversation_id"] {
+            if let Some(idx) = lower.find(marker) {
+                let tail = &text[idx..];
+                if let Some(start) = tail.find(':') {
+                    let after = tail[start + 1..].trim();
+                    let token = after
+                        .split(|ch: char| ch.is_whitespace() || ch == ';' || ch == ',' || ch == '"')
+                        .next()
+                        .unwrap_or("");
+                    if !token.is_empty() {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }

@@ -3,8 +3,9 @@ pub mod codex;
 pub mod gemini;
 pub mod openai;
 pub mod providers;
-pub mod processor;
 pub mod unified;
+#[cfg(test)]
+mod processor;
 
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -534,5 +535,146 @@ mod tests {
             mode.mode,
             crate::transform::CountTokensMode::Estimate
         ));
+    }
+
+    #[test]
+    fn unified_request_preserves_local_image_paths_for_codex() {
+        use crate::models::{ContentBlock, ImageSource, Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-3-5-sonnet-20241022".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::Image {
+                    source: Some(ImageSource {
+                        source_type: Some("file".to_string()),
+                        media_type: Some("image/png".to_string()),
+                        mime_type: None,
+                        data: None,
+                        url: None,
+                        uri: None,
+                        path: Some("/tmp/screenshot.png".to_string()),
+                    }),
+                    source_raw: None,
+                    image_url: None,
+                }])),
+            }],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(256),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let user = unified
+            .messages
+            .iter()
+            .find(|message| message.role.as_str() == "user")
+            .expect("user message");
+        let image = user
+            .content_items()
+            .iter()
+            .find_map(|item| match item {
+                crate::transform::unified::UnifiedContent::ImageUrl { url, .. } => Some(url),
+                _ => None,
+            })
+            .expect("image item");
+
+        assert_eq!(image, "file:///tmp/screenshot.png");
+    }
+
+    #[test]
+    fn codex_adapter_restores_prompt_cache_key_and_default_store_flag() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<environment_context><cwd>/Users/mr.j/project</cwd></environment_context>\nhello".to_string(),
+                )),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: Some(vec![json!({
+                "name": "Read",
+                "description": "Read files",
+                "input_schema": {"type":"object","properties":{"file_path":{"type":"string"}}}
+            })]),
+            metadata: Some(json!({"user_id": "acct__session_abc-123"})),
+            tool_choice: Some(json!({"type":"auto"})),
+            thinking: None,
+            stream: true,
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified_a = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let unified_b = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let hints = crate::transform::providers::codex_request_hints_from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "codex".to_string(),
+            codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let adapter = crate::transform::providers::CodexAdapter;
+        let prepared_a = adapter.prepare_messages_request_with_hints(
+            &unified_a,
+            &ctx,
+            "https://api.openai.com/v1/responses",
+            "test-key",
+            "2023-06-01",
+            "gpt-5.3-codex",
+            true,
+            &hints,
+        );
+        let prepared_b = adapter.prepare_messages_request_with_hints(
+            &unified_b,
+            &ctx,
+            "https://api.openai.com/v1/responses",
+            "test-key",
+            "2023-06-01",
+            "gpt-5.3-codex",
+            true,
+            &hints,
+        );
+
+        let key_a = prepared_a
+            .body
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .expect("prompt_cache_key");
+        let key_b = prepared_b
+            .body
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .expect("prompt_cache_key");
+
+        assert_eq!(prepared_a.body.get("store"), Some(&json!(false)));
+        assert_eq!(key_a, key_b);
+        assert!(
+            key_a.contains("session"),
+            "session-aware codex requests should restore stable cache keys"
+        );
     }
 }

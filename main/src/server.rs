@@ -12,6 +12,7 @@ use crate::transform::{
     GeminiBackend, OpenAIChatAdapter, OpenAIChatBackend, PreparedRequest,
     ResponseTransformRequestContext, TransformBackend, TransformContext, UnifiedChatRequest,
 };
+use crate::transform::providers::codex_request_hints_from_anthropic;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -4444,6 +4445,11 @@ async fn handle_request(
             }
         };
 
+        let codex_hints = route_selection
+            .converter
+            .eq_ignore_ascii_case("codex")
+            .then(|| codex_request_hints_from_anthropic(&anthropic_body));
+
         let mut prepared_count_tokens = if route_selection.converter.eq_ignore_ascii_case("openai") {
             OpenAIChatAdapter.prepare_count_tokens_request(
                 &unified_count_request,
@@ -4472,13 +4478,14 @@ async fn handle_request(
                 &route_selection.model_name,
             )
         } else {
-            CodexAdapter.prepare_count_tokens_request(
+            CodexAdapter.prepare_count_tokens_request_with_hints(
                 &unified_count_request,
                 &count_tokens_ctx,
                 &count_tokens_endpoint,
                 &route_selection.api_key,
                 &anthropic_version,
                 &route_selection.model_name,
+                codex_hints.as_ref().expect("codex hints"),
             )
         };
 
@@ -4532,13 +4539,14 @@ async fn handle_request(
                                     "[Route] #{} codex_v1_count_tokens_fallback=true from={} to={}",
                                     request_id, count_tokens_endpoint, fallback_endpoint
                                 ));
-                                prepared_count_tokens = CodexAdapter.prepare_count_tokens_request(
+                                prepared_count_tokens = CodexAdapter.prepare_count_tokens_request_with_hints(
                                     &unified_count_request,
                                     &count_tokens_ctx,
                                     &fallback_endpoint,
                                     &route_selection.api_key,
                                     &anthropic_version,
                                     &route_selection.model_name,
+                                    codex_hints.as_ref().expect("codex hints"),
                                 );
 
                                 if let Some(retry_request) = prepared_count_tokens.request.as_ref() {

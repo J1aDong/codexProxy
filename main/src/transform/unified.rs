@@ -349,6 +349,21 @@ fn resolve_image_content(
             ));
         }
 
+        if let Some(path) = value.path.as_ref() {
+            let normalized = if path.starts_with("file://") {
+                path.clone()
+            } else {
+                format!("file://{}", path)
+            };
+            return Some((
+                normalized,
+                value
+                    .media_type
+                    .clone()
+                    .or_else(|| value.mime_type.clone()),
+            ));
+        }
+
         value.data.as_ref().map(|data| {
             let media_type = value
                 .media_type
