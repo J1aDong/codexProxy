@@ -7,10 +7,11 @@ use crate::models::{
     GeminiReasoningEffortMapping, Message, MessageContent, OpenAIMaxTokensMapping,
     OpenAIModelMapping, ReasoningEffort, ReasoningEffortMapping,
 };
+use crate::transform::codex::build_codex_unified_request;
 use crate::transform::{
     AnthropicAdapter, AnthropicBackend, CodexAdapter, CodexBackend, CountTokensMode, GeminiAdapter,
     GeminiBackend, OpenAIChatAdapter, OpenAIChatBackend, PreparedRequest, RequestEnvelopeHints,
-    ResponseTransformRequestContext, TransformBackend, TransformContext, UnifiedChatRequest,
+    ResponseTransformRequestContext, TransformBackend, TransformContext,
 };
 use crate::transform::request_envelope_hints_from_anthropic;
 use bytes::Bytes;
@@ -1186,6 +1187,10 @@ fn trim_leading_stateful_replay_items(items: &[Value]) -> (Vec<Value>, usize) {
     let mut trimmed = 0usize;
 
     for item in items {
+        if !is_stateful_replay_input_item(item) {
+            break;
+        }
+
         if item.get("role").and_then(|value| value.as_str()) == Some("assistant") {
             trimmed += 1;
             continue;
@@ -1884,7 +1889,7 @@ fn maybe_log_stream_upstream(
         }
     }
 
-    l.log_upstream_response(status, url, text);
+    l.log_upstream_response(status, url, &truncate_chars(text, opts.stream_log_max_chars));
 }
 
 fn maybe_log_stream_downstream(
@@ -1906,7 +1911,7 @@ fn maybe_log_stream_downstream(
         }
     }
 
-    l.log_anthropic_response(path, text);
+    l.log_anthropic_response(path, &truncate_chars(text, opts.stream_log_max_chars));
 }
 
 fn emit_stream_diag(
@@ -4871,7 +4876,13 @@ async fn handle_request(
             );
         }
 
-        let unified_count_request = UnifiedChatRequest::from_anthropic(&anthropic_body);
+        let (unified_count_request, codex_hints) =
+            if route_selection.converter.eq_ignore_ascii_case("codex") {
+                let (unified, hints) = build_codex_unified_request(&anthropic_body);
+                (unified, Some(hints))
+            } else {
+                (crate::transform::UnifiedChatRequest::from_anthropic(&anthropic_body), None)
+            };
         let mut token_count: Option<u64> = None;
         let mut upstream_status: Option<u16> = None;
         let mut source = "estimate".to_string();
@@ -4925,12 +4936,6 @@ async fn handle_request(
                 parse_input_tokens(value)
             }
         };
-
-        let request_hints = request_envelope_hints_from_anthropic(&anthropic_body);
-        let codex_hints = route_selection
-            .converter
-            .eq_ignore_ascii_case("codex")
-            .then_some(request_hints.clone());
 
         let mut prepared_count_tokens = if route_selection.converter.eq_ignore_ascii_case("openai") {
             OpenAIChatAdapter.prepare_count_tokens_request(

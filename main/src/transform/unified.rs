@@ -162,6 +162,39 @@ impl UnifiedChatRequest {
             reasoning: convert_reasoning(request),
         }
     }
+
+    pub fn has_system_text(&self) -> bool {
+        self.messages.iter().any(|message| {
+            message.role == UnifiedMessageRole::System
+                && message
+                    .content_text()
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false)
+        })
+    }
+
+    pub fn append_system_texts<I, S>(&mut self, texts: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for text in texts {
+            let text = text.as_ref();
+            if text.trim().is_empty() {
+                continue;
+            }
+
+            self.messages.push(UnifiedMessage {
+                role: UnifiedMessageRole::System,
+                content: vec![UnifiedContent::Text {
+                    text: text.to_string(),
+                }],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                thinking: None,
+            });
+        }
+    }
 }
 
 fn is_proxy_lifecycle_progress_text(text: &str) -> bool {
@@ -471,5 +504,86 @@ fn stringify_value(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_message(role: UnifiedMessageRole, text: &str) -> UnifiedMessage {
+        UnifiedMessage {
+            role,
+            content: vec![UnifiedContent::Text {
+                text: text.to_string(),
+            }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            thinking: None,
+        }
+    }
+
+    #[test]
+    fn append_system_texts_preserves_existing_history_order() {
+        let mut request = UnifiedChatRequest {
+            messages: vec![
+                text_message(UnifiedMessageRole::System, "base system"),
+                text_message(UnifiedMessageRole::User, "hello"),
+                text_message(UnifiedMessageRole::Assistant, "hi"),
+                text_message(UnifiedMessageRole::Tool, "{\"ok\":true}"),
+            ],
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: Some(256),
+            temperature: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+        };
+
+        request.append_system_texts(["extension a", "extension b"]);
+
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system", "user", "assistant", "tool", "system", "system"]
+        );
+        assert_eq!(
+            request.messages[1].content_text().as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            request.messages[2].content_text().as_deref(),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn append_system_texts_skips_blank_entries_and_marks_system_presence() {
+        let mut request = UnifiedChatRequest {
+            messages: vec![text_message(UnifiedMessageRole::User, "hello")],
+            model: String::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+        };
+
+        assert!(!request.has_system_text());
+
+        request.append_system_texts(["  ", "\n", "extension"]);
+
+        assert!(request.has_system_text());
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[1].role, UnifiedMessageRole::System);
+        assert_eq!(
+            request.messages[1].content_text().as_deref(),
+            Some("extension")
+        );
     }
 }

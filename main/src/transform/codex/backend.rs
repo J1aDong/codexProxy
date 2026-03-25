@@ -5,11 +5,26 @@ use super::response::TransformResponse;
 use crate::models::AnthropicRequest;
 use crate::transform::{
     providers::CodexAdapter, request_envelope_hints_from_anthropic, ResponseTransformer,
-    TransformBackend, TransformContext,
+    RequestEnvelopeHints, TransformBackend, TransformContext, UnifiedChatRequest,
 };
 
 /// Codex 后端 —— 将 Anthropic 请求转为 Codex Responses API 格式
 pub struct CodexBackend;
+
+pub(crate) fn build_codex_unified_request(
+    anthropic_body: &AnthropicRequest,
+) -> (UnifiedChatRequest, RequestEnvelopeHints) {
+    let mut unified = UnifiedChatRequest::from_anthropic(anthropic_body);
+    let hints = request_envelope_hints_from_anthropic(anthropic_body);
+
+    if hints.request_kind == crate::transform::ClaudeCodeRequestKind::ConversationTurn
+        && unified.has_system_text()
+    {
+        unified.append_system_texts(crate::prompts::codex_system_prompt_extensions());
+    }
+
+    (unified, hints)
+}
 
 struct CodexUpstreamRequestBuilder;
 
@@ -122,8 +137,7 @@ impl TransformBackend for CodexBackend {
         effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
-        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(anthropic_body);
-        let hints = request_envelope_hints_from_anthropic(anthropic_body);
+        let (unified, hints) = build_codex_unified_request(anthropic_body);
         let prepared = CodexAdapter.prepare_messages_request_with_hints(
             &unified,
             ctx,

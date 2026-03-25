@@ -1,6 +1,7 @@
 pub mod load_balancer;
 pub mod logger;
 pub mod models;
+mod prompts;
 mod server;
 pub mod transform;
 

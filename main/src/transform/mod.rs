@@ -455,6 +455,23 @@ mod tests {
         }
     }
 
+    fn codex_test_ctx() -> crate::transform::TransformContext {
+        crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "codex".to_string(),
+            codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        }
+    }
+
     #[test]
     fn backend_contracts_describe_identity_vs_override_roles() {
         let anthropic_contract = AnthropicBackend.contract();
@@ -1198,5 +1215,203 @@ mod tests {
             parameters.get("properties").and_then(|value| value.as_object()).map(|value| value.len()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn codex_conversation_requests_append_teammate_prompt_extension() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(256),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let (unified, hints) = crate::transform::codex::build_codex_unified_request(&request);
+        let body = crate::transform::providers::CodexAdapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &codex_test_ctx(),
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                true,
+                &hints,
+            )
+            .body;
+
+        let instructions = body
+            .get("instructions")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(instructions.contains("You are Claude Code."));
+        assert!(instructions.contains("Codex Teammate Compatibility"));
+    }
+
+    #[test]
+    fn codex_session_title_requests_do_not_append_teammate_prompt_extension() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("你好".to_string())),
+            }],
+            system: Some(SystemContent::Text(
+                "Generate a concise, sentence-case title for the conversation above.\nReturn JSON with a single \"title\" field.".to_string(),
+            )),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: false,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let (unified, hints) = crate::transform::codex::build_codex_unified_request(&request);
+        let body = crate::transform::providers::CodexAdapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &codex_test_ctx(),
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                false,
+                &hints,
+            )
+            .body;
+
+        let instructions = body
+            .get("instructions")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(instructions.contains("Generate a concise, sentence-case title"));
+        assert!(!instructions.contains("Codex Teammate Compatibility"));
+    }
+
+    #[test]
+    fn codex_teammate_extension_does_not_create_new_instructions_without_system_prompt() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+            }],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let (unified, hints) = crate::transform::codex::build_codex_unified_request(&request);
+        assert!(!unified.has_system_text());
+
+        let body = crate::transform::providers::CodexAdapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &codex_test_ctx(),
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                true,
+                &hints,
+            )
+            .body;
+
+        assert!(body.get("instructions").is_none());
+    }
+
+    #[test]
+    fn codex_count_tokens_uses_same_teammate_prompt_extension() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: false,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let (unified, hints) = crate::transform::codex::build_codex_unified_request(&request);
+        let adapter = crate::transform::providers::CodexAdapter;
+        let messages_body = adapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &codex_test_ctx(),
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                true,
+                &hints,
+            )
+            .body;
+        let count_tokens_body = adapter
+            .prepare_count_tokens_request_with_hints(
+                &unified,
+                &codex_test_ctx(),
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                &hints,
+            )
+            .request
+            .expect("count_tokens request")
+            .body;
+
+        let messages_instructions = messages_body
+            .get("instructions")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let count_tokens_instructions = count_tokens_body
+            .get("instructions")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        assert!(messages_instructions.contains("Codex Teammate Compatibility"));
+        assert_eq!(messages_instructions, count_tokens_instructions);
     }
 }
