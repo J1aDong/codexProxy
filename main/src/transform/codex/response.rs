@@ -2407,6 +2407,26 @@ impl TransformResponse {
         value.replace('\'', "'\"'\"'")
     }
 
+    fn normalize_agent_tool_arguments(arguments: &str) -> Option<String> {
+        let mut parsed = serde_json::from_str::<Value>(arguments).ok()?;
+        let obj = parsed.as_object_mut()?;
+
+        let should_strip_default_team = obj
+            .get("team_name")
+            .or_else(|| obj.get("teamName"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .map(|value| value.is_empty() || value.eq_ignore_ascii_case("default"))
+            .unwrap_or(false);
+
+        if should_strip_default_team {
+            obj.remove("team_name");
+            obj.remove("teamName");
+        }
+
+        serde_json::to_string(&parsed).ok()
+    }
+
     fn normalize_bash_tool_arguments(arguments: &str) -> Option<String> {
         let obj = Self::parse_tool_arguments_object(arguments)?;
         let mut normalized = Map::new();
@@ -2555,6 +2575,9 @@ impl TransformResponse {
     }
 
     fn normalize_tool_arguments_by_name(tool_name: &str, arguments: &str) -> Option<String> {
+        if tool_name.eq_ignore_ascii_case("agent") {
+            return Self::normalize_agent_tool_arguments(arguments);
+        }
         if tool_name.eq_ignore_ascii_case("skill") {
             return Self::normalize_skill_tool_arguments(arguments);
         }

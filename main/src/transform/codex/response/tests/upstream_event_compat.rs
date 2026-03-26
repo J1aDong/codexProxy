@@ -1,5 +1,33 @@
 use super::*;
 use serde_json::json;
+
+fn collect_tool_input_json(events: &[String]) -> String {
+    events
+        .iter()
+        .filter_map(|event| {
+            event
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .and_then(|value| {
+                    value
+                        .get("delta")
+                        .and_then(|delta| delta.get("type"))
+                        .and_then(|value| value.as_str())
+                        .filter(|kind| *kind == "input_json_delta")
+                        .and_then(|_| {
+                            value
+                                .get("delta")
+                                .and_then(|delta| delta.get("partial_json"))
+                                .and_then(|value| value.as_str())
+                                .map(|value| value.to_string())
+                        })
+                })
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 #[test]
 fn response_incomplete_emits_terminal_events_with_max_tokens() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
@@ -938,6 +966,112 @@ fn task_output_mailbox_agent_id_emits_correction_instead_of_polling_hint() {
         !joined.contains("正在轮询后台任务结果"),
         "mailbox-style agent ids must not encourage a TaskOutput polling loop"
     );
+}
+
+#[test]
+fn serialized_agent_tool_use_strips_default_team_name() {
+    let normalized = TransformResponse::normalize_tool_arguments_by_name(
+        "Agent",
+        r#"{"description":"调研天气数据源","name":"explore-weather-sources","subagent_type":"Explore","team_name":"default"}"#,
+    )
+    .expect("agent arguments should normalize");
+
+    assert!(normalized.contains("\"subagent_type\":\"Explore\""));
+    assert!(!normalized.contains("\"team_name\":\"default\""));
+}
+
+#[test]
+fn serialized_agent_tool_use_preserves_explicit_non_default_team_name() {
+    let normalized = TransformResponse::normalize_tool_arguments_by_name(
+        "Agent",
+        r#"{"description":"分配任务","name":"researcher","subagent_type":"Explore","team_name":"debug-swarm"}"#,
+    )
+    .expect("agent arguments should normalize");
+
+    assert!(normalized.contains("\"team_name\":\"debug-swarm\""));
+}
+
+#[test]
+fn streamed_agent_tool_use_strips_default_team_name_from_input_json_delta() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_default_team",
+                "type": "function_call",
+                "call_id": "call_agent_default_team",
+                "name": "Agent"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_default_team",
+                "type": "function_call",
+                "call_id": "call_agent_default_team",
+                "name": "Agent",
+                "arguments": r#"{"description":"查广东天气趋势","subagent_type":"Explore","team_name":"default"}"#
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+    let input_json = collect_tool_input_json(&events);
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(input_json.contains("\"subagent_type\":\"Explore\""));
+    assert!(!input_json.contains("\"team_name\":\"default\""));
+}
+
+#[test]
+fn streamed_agent_tool_use_preserves_explicit_non_default_team_name_in_input_json_delta() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_named_team_stream",
+                "type": "function_call",
+                "call_id": "call_agent_named_team_stream",
+                "name": "Agent"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_named_team_stream",
+                "type": "function_call",
+                "call_id": "call_agent_named_team_stream",
+                "name": "Agent",
+                "arguments": r#"{"description":"分配任务","subagent_type":"Explore","team_name":"debug-swarm"}"#
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+    let input_json = collect_tool_input_json(&events);
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(input_json.contains("\"team_name\":\"debug-swarm\""));
 }
 
 #[test]
