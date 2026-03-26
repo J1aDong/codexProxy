@@ -41,10 +41,12 @@
 
 普通 `subagent`：
 
-- 允许：`description`、`prompt`、`subagent_type`、`model`、`run_in_background`、`isolation`、`mode`
+- 允许：`description`、`prompt`、`subagent_type`、`model`、`run_in_background`、`mode`
 - `name` 可选；有 `name` 不代表它是 teammate
 - 禁止默认补 `team_name`
 - 禁止补 `team_name: "default"`
+- 默认不要传 `isolation`
+- 只有用户明确要求 `worktree` / 隔离工作树时，才允许传 `isolation: "worktree"`
 - 禁止因为系统提示出现 mailbox 或 teammate 就改走 team
 
 `team teammate`：

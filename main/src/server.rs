@@ -3230,6 +3230,71 @@ fn count_terminal_background_agent_completions(request: &AnthropicRequest) -> us
         .sum()
 }
 
+fn strip_tagged_sections(text: &str, tag_name: &str) -> String {
+    let mut remaining = text;
+    let mut output = String::new();
+    let open_tag = format!("<{tag_name}>");
+    let close_tag = format!("</{tag_name}>");
+
+    loop {
+        let Some(start) = remaining.find(open_tag.as_str()) else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start + open_tag.len()..];
+        let Some(end_rel) = after_start.find(close_tag.as_str()) else {
+            break;
+        };
+        remaining = &after_start[end_rel + close_tag.len()..];
+    }
+
+    output
+}
+
+fn strip_non_user_authored_markup(text: &str) -> String {
+    let mut sanitized = text.to_string();
+    for tag_name in ["system-reminder", "environment_context", "task-notification"] {
+        sanitized = strip_tagged_sections(&sanitized, tag_name);
+    }
+    sanitized
+}
+
+fn latest_user_authored_text(request: &AnthropicRequest) -> String {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role.eq_ignore_ascii_case("user"))
+        .and_then(|message| message.content.as_ref())
+        .map(|content| match content {
+            MessageContent::Text(text) => strip_non_user_authored_markup(text),
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        let sanitized = strip_non_user_authored_markup(text);
+                        let trimmed = sanitized.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        })
+        .unwrap_or_default()
+}
+
+fn request_explicitly_asks_for_worktree(request: &AnthropicRequest) -> bool {
+    latest_user_authored_text(request)
+        .to_ascii_lowercase()
+        .contains("worktree")
+}
+
 fn extract_plan_file_path_from_text(text: &str) -> Option<String> {
     const PLAN_PREFIX: &str = "You should create your plan at ";
     const PLAN_SUFFIX: &str = " using the Write tool";
@@ -4821,6 +4886,7 @@ async fn handle_request(
         terminal_background_agent_completion_count: count_terminal_background_agent_completions(
             &anthropic_body,
         ),
+        allow_agent_worktree_isolation: request_explicitly_asks_for_worktree(&anthropic_body),
     };
     let logger = AppLogger::get();
 
@@ -7694,6 +7760,7 @@ mod tests {
         is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
         mark_codex_fast_endpoint_unsupported, mark_parallel_tool_degrade,
         observe_upstream_chunk_events, prepare_stateful_chain_request, record_stateful_chain_entry,
+        request_explicitly_asks_for_worktree,
         remove_priority_service_tier_from_upstream_body, resolve_effective_stream,
         resolve_stateful_chain_hint_info, resolve_upstream_url,
         resolve_upstream_url_with_codex_path_preference, should_drop_post_message_stop_output,
@@ -9697,6 +9764,62 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         );
 
         assert_ne!(title_key, conversation_key);
+    }
+
+    #[test]
+    fn test_request_explicitly_asks_for_worktree_ignores_system_reminder_mentions() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>\nOnly use EnterWorktree when the user explicitly asks for worktree.\n</system-reminder>"
+                    },
+                    {
+                        "type": "text",
+                        "text": "帮我开两个 subagent 看一下目录结构"
+                    }
+                ]
+            }],
+            "stream": true
+        }))
+        .expect("request");
+
+        assert!(!request_explicitly_asks_for_worktree(&request));
+    }
+
+    #[test]
+    fn test_request_explicitly_asks_for_worktree_uses_latest_user_turn_only() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role":"user","content":"请用 worktree 开一个隔离 agent"},
+                {"role":"assistant","content":"我先看看"},
+                {"role":"user","content":"先只读分析这个日志"}
+            ],
+            "stream": true
+        }))
+        .expect("request");
+
+        assert!(!request_explicitly_asks_for_worktree(&request));
+    }
+
+    #[test]
+    fn test_request_explicitly_asks_for_worktree_detects_latest_user_turn() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role":"user","content":"先看下现状"},
+                {"role":"assistant","content":"我继续排查"},
+                {"role":"user","content":"请在 worktree 里开一个 agent 做隔离分析"}
+            ],
+            "stream": true
+        }))
+        .expect("request");
+
+        assert!(request_explicitly_asks_for_worktree(&request));
     }
 
     #[test]

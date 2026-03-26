@@ -2110,6 +2110,7 @@ mod tests {
                 contains_background_agent_completion: true,
                 historical_background_agent_launch_count: 1,
                 terminal_background_agent_completion_count: 0,
+                allow_agent_worktree_isolation: false,
             },
         );
 

@@ -992,6 +992,18 @@ fn serialized_agent_tool_use_preserves_explicit_non_default_team_name() {
 }
 
 #[test]
+fn serialized_agent_tool_use_strips_worktree_isolation_by_default() {
+    let normalized = TransformResponse::normalize_tool_arguments_by_name(
+        "Agent",
+        r#"{"description":"梳理模块结构","name":"explore-arch","subagent_type":"Explore","isolation":"worktree"}"#,
+    )
+    .expect("agent arguments should normalize");
+
+    assert!(normalized.contains("\"subagent_type\":\"Explore\""));
+    assert!(!normalized.contains("\"isolation\":\"worktree\""));
+}
+
+#[test]
 fn streamed_agent_tool_use_strips_default_team_name_from_input_json_delta() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
@@ -1034,6 +1046,48 @@ fn streamed_agent_tool_use_strips_default_team_name_from_input_json_delta() {
 }
 
 #[test]
+fn streamed_agent_tool_use_strips_worktree_isolation_without_explicit_request() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_default_worktree",
+                "type": "function_call",
+                "call_id": "call_agent_default_worktree",
+                "name": "Agent"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_default_worktree",
+                "type": "function_call",
+                "call_id": "call_agent_default_worktree",
+                "name": "Agent",
+                "arguments": r#"{"description":"分析 agribot","subagent_type":"Explore","isolation":"worktree"}"#
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+    let input_json = collect_tool_input_json(&events);
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(input_json.contains("\"subagent_type\":\"Explore\""));
+    assert!(!input_json.contains("\"isolation\":\"worktree\""));
+}
+
+#[test]
 fn streamed_agent_tool_use_preserves_explicit_non_default_team_name_in_input_json_delta() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
 
@@ -1072,6 +1126,57 @@ fn streamed_agent_tool_use_preserves_explicit_non_default_team_name_in_input_jso
 
     assert!(joined.contains("\"type\":\"tool_use\""));
     assert!(input_json.contains("\"team_name\":\"debug-swarm\""));
+}
+
+#[test]
+fn streamed_agent_tool_use_preserves_worktree_isolation_when_explicitly_allowed() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    <TransformResponse as crate::transform::ResponseTransformer>::configure_request_context(
+        &mut transformer,
+        &crate::transform::ResponseTransformRequestContext {
+            codex_plan_file_path: None,
+            contains_background_agent_completion: false,
+            historical_background_agent_launch_count: 0,
+            terminal_background_agent_completion_count: 0,
+            allow_agent_worktree_isolation: true,
+        },
+    );
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_allowed_worktree",
+                "type": "function_call",
+                "call_id": "call_agent_allowed_worktree",
+                "name": "Agent"
+            }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_allowed_worktree",
+                "type": "function_call",
+                "call_id": "call_agent_allowed_worktree",
+                "name": "Agent",
+                "arguments": r#"{"description":"请在 worktree 中分析","subagent_type":"Explore","isolation":"worktree"}"#
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let joined = events.join("");
+    let input_json = collect_tool_input_json(&events);
+
+    assert!(joined.contains("\"type\":\"tool_use\""));
+    assert!(input_json.contains("\"isolation\":\"worktree\""));
 }
 
 #[test]

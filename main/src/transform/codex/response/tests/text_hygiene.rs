@@ -226,6 +226,7 @@ fn test_proposed_plan_bridge_writes_plan_file_and_emits_exit_plan_mode() {
             contains_background_agent_completion: false,
             historical_background_agent_launch_count: 0,
             terminal_background_agent_completion_count: 0,
+            allow_agent_worktree_isolation: false,
         },
     );
 

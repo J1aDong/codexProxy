@@ -22,6 +22,7 @@ pub struct ResponseTransformRequestContext {
     pub contains_background_agent_completion: bool,
     pub historical_background_agent_launch_count: usize,
     pub terminal_background_agent_completion_count: usize,
+    pub allow_agent_worktree_isolation: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

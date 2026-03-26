@@ -11,6 +11,7 @@ fn multi_background_launch_turn_keeps_visible_final_answer_text() {
             contains_background_agent_completion: false,
             historical_background_agent_launch_count: 0,
             terminal_background_agent_completion_count: 0,
+            allow_agent_worktree_isolation: false,
         },
     );
 
@@ -106,6 +107,7 @@ fn completion_round_keeps_visible_final_answer_text_before_all_background_handof
             contains_background_agent_completion: true,
             historical_background_agent_launch_count: 3,
             terminal_background_agent_completion_count: 2,
+            allow_agent_worktree_isolation: false,
         },
     );
 
@@ -149,6 +151,7 @@ fn completion_round_allows_final_answer_text_after_all_background_handoffs_arriv
             contains_background_agent_completion: true,
             historical_background_agent_launch_count: 3,
             terminal_background_agent_completion_count: 3,
+            allow_agent_worktree_isolation: false,
         },
     );
 
@@ -192,6 +195,7 @@ fn completion_round_allows_final_answer_text_after_background_handoffs_arrive() 
             contains_background_agent_completion: true,
             historical_background_agent_launch_count: 0,
             terminal_background_agent_completion_count: 0,
+            allow_agent_worktree_isolation: false,
         },
     );
 
@@ -235,6 +239,7 @@ fn single_background_launch_turn_keeps_visible_final_answer_text() {
             contains_background_agent_completion: false,
             historical_background_agent_launch_count: 0,
             terminal_background_agent_completion_count: 0,
+            allow_agent_worktree_isolation: false,
         },
     );
 

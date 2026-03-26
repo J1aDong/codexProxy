@@ -442,6 +442,7 @@ pub struct TransformResponse {
     latest_proposed_plan_body: Option<String>,
     codex_plan_file_path: Option<String>,
     contains_background_agent_completion: bool,
+    allow_agent_worktree_isolation: bool,
     plan_bridge_emitted: bool,
 
     // Cross-chunk leak suppression state
@@ -1648,6 +1649,7 @@ impl TransformResponse {
             latest_proposed_plan_body: None,
             codex_plan_file_path: None,
             contains_background_agent_completion: false,
+            allow_agent_worktree_isolation: false,
             plan_bridge_emitted: false,
             suppressing_cross_chunk_leak: false,
             suppressing_suggestion_mode_prompt: false,
@@ -2407,7 +2409,10 @@ impl TransformResponse {
         value.replace('\'', "'\"'\"'")
     }
 
-    fn normalize_agent_tool_arguments(arguments: &str) -> Option<String> {
+    fn normalize_agent_tool_arguments(
+        arguments: &str,
+        allow_worktree_isolation: bool,
+    ) -> Option<String> {
         let mut parsed = serde_json::from_str::<Value>(arguments).ok()?;
         let obj = parsed.as_object_mut()?;
 
@@ -2422,6 +2427,18 @@ impl TransformResponse {
         if should_strip_default_team {
             obj.remove("team_name");
             obj.remove("teamName");
+        }
+
+        let should_strip_worktree_isolation = !allow_worktree_isolation
+            && obj
+                .get("isolation")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .map(|value| value.eq_ignore_ascii_case("worktree"))
+                .unwrap_or(false);
+
+        if should_strip_worktree_isolation {
+            obj.remove("isolation");
         }
 
         serde_json::to_string(&parsed).ok()
@@ -2574,9 +2591,13 @@ impl TransformResponse {
         serde_json::to_string(&Value::Object(normalized)).ok()
     }
 
-    fn normalize_tool_arguments_by_name(tool_name: &str, arguments: &str) -> Option<String> {
+    fn normalize_tool_arguments_by_name_with_policy(
+        tool_name: &str,
+        arguments: &str,
+        allow_agent_worktree_isolation: bool,
+    ) -> Option<String> {
         if tool_name.eq_ignore_ascii_case("agent") {
-            return Self::normalize_agent_tool_arguments(arguments);
+            return Self::normalize_agent_tool_arguments(arguments, allow_agent_worktree_isolation);
         }
         if tool_name.eq_ignore_ascii_case("skill") {
             return Self::normalize_skill_tool_arguments(arguments);
@@ -2602,9 +2623,16 @@ impl TransformResponse {
         None
     }
 
+    fn normalize_tool_arguments_by_name(tool_name: &str, arguments: &str) -> Option<String> {
+        Self::normalize_tool_arguments_by_name_with_policy(tool_name, arguments, false)
+    }
+
     fn normalized_tool_arguments(&mut self, tool: &BufferedToolCall) -> String {
-        if let Some(normalized) =
-            Self::normalize_tool_arguments_by_name(tool.name.as_str(), &tool.arguments_buffer)
+        if let Some(normalized) = Self::normalize_tool_arguments_by_name_with_policy(
+            tool.name.as_str(),
+            &tool.arguments_buffer,
+            self.allow_agent_worktree_isolation,
+        )
         {
             if normalized != tool.arguments_buffer {
                 self.logger.log_raw(&format!(
@@ -4876,6 +4904,7 @@ impl ResponseTransformer for TransformResponse {
     fn configure_request_context(&mut self, ctx: &ResponseTransformRequestContext) {
         self.codex_plan_file_path = ctx.codex_plan_file_path.clone();
         self.contains_background_agent_completion = ctx.contains_background_agent_completion;
+        self.allow_agent_worktree_isolation = ctx.allow_agent_worktree_isolation;
         self.launched_background_agent_count = self
             .launched_background_agent_count
             .max(ctx.historical_background_agent_launch_count);
