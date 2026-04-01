@@ -3,9 +3,7 @@ use tokio::sync::broadcast;
 
 use crate::models::AnthropicRequest;
 
-use super::{
-    providers::GeminiAdapter, ResponseTransformer, TransformBackend, TransformContext,
-};
+use super::{providers::GeminiAdapter, ResponseTransformer, TransformBackend, TransformContext};
 
 pub struct GeminiBackend;
 
@@ -14,8 +12,7 @@ struct GeminiUpstreamRequestBuilder;
 impl GeminiUpstreamRequestBuilder {
     fn uses_cli_style_headers(target_url: &str) -> bool {
         let lower = target_url.to_ascii_lowercase();
-        !(lower.contains("generativelanguage.googleapis.com")
-            || lower.contains("googleapis.com"))
+        !(lower.contains("generativelanguage.googleapis.com") || lower.contains("googleapis.com"))
     }
 
     fn build_endpoint(target_url: &str, model: &str) -> String {
@@ -25,7 +22,10 @@ impl GeminiUpstreamRequestBuilder {
             target_url.replace("{model}", model)
         } else {
             let base = target_url.trim_end_matches('/');
-            format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", base, model)
+            format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                base, model
+            )
         }
     }
 
@@ -605,7 +605,10 @@ mod tests {
             .expect("system instruction parts");
 
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].get("text").and_then(Value::as_str), Some("top-level system"));
+        assert_eq!(
+            parts[0].get("text").and_then(Value::as_str),
+            Some("top-level system")
+        );
     }
 
     #[test]
@@ -627,7 +630,10 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
         );
         assert_eq!(
-            request.headers().get("x-goog-api-key").and_then(|value| value.to_str().ok()),
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok()),
             Some("test-key")
         );
         assert!(
@@ -651,7 +657,10 @@ mod tests {
         .expect("request should build");
 
         assert_eq!(
-            request.headers().get("x-goog-api-client").and_then(|value| value.to_str().ok()),
+            request
+                .headers()
+                .get("x-goog-api-client")
+                .and_then(|value| value.to_str().ok()),
             Some("GeminiCLI/1.0")
         );
     }

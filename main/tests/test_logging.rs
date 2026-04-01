@@ -55,7 +55,6 @@ fn test_app_logger() {
     println!("✅ AppLogger 测试通过");
 }
 
-
 #[test]
 fn test_reasoning_effort_mapping() {
     let default_mapping = ReasoningEffortMapping::default();

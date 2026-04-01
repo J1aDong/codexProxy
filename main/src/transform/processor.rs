@@ -66,14 +66,13 @@ impl MessageProcessor {
     }
 
     fn extract_background_transcript_path(text: &str) -> Option<String> {
-        text.lines()
-            .find_map(|line| {
-                line.trim()
-                    .strip_prefix("Full transcript available at:")
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.to_string())
-            })
+        text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("Full transcript available at:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        })
     }
 
     fn looks_like_placeholder_agent_result(result: &str) -> bool {
@@ -134,7 +133,17 @@ impl MessageProcessor {
             let top_level_execution = entry
                 .get("type")
                 .and_then(|value| value.as_str())
-                .map(|value| matches!(value, "function_call" | "function_call_output" | "tool_use" | "tool_result" | "server_tool_use" | "server_tool_result"))
+                .map(|value| {
+                    matches!(
+                        value,
+                        "function_call"
+                            | "function_call_output"
+                            | "tool_use"
+                            | "tool_result"
+                            | "server_tool_use"
+                            | "server_tool_result"
+                    )
+                })
                 .unwrap_or(false);
             let nested_execution = entry
                 .get("message")
@@ -221,10 +230,8 @@ impl MessageProcessor {
         status: Option<&str>,
     ) -> String {
         let result_text = result.unwrap_or("").trim();
-        let result_status = Self::classify_background_agent_completion_from_transcript(
-            output_file,
-            result_text,
-        );
+        let result_status =
+            Self::classify_background_agent_completion_from_transcript(output_file, result_text);
 
         let mut payload = json!({
             "kind": "background_agent_completion",
@@ -254,7 +261,8 @@ impl MessageProcessor {
             payload["output_file"] = json!(output_file);
         }
         if result_status != "usable" {
-            payload["warning"] = json!("This completion should not be treated as a usable final result.");
+            payload["warning"] =
+                json!("This completion should not be treated as a usable final result.");
         }
 
         payload.to_string()
@@ -314,7 +322,9 @@ impl MessageProcessor {
         let has_handoff_content = status
             .map(|value| value.eq_ignore_ascii_case("completed"))
             .unwrap_or(false)
-            || result.map(|value| !value.trim().is_empty()).unwrap_or(false)
+            || result
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
             || output_file
                 .map(|value| !value.trim().is_empty())
                 .unwrap_or(false);
@@ -1755,14 +1765,25 @@ mod tests {
             .cloned()
             .unwrap_or(Value::Null);
 
-        let output = rewritten.as_object().expect("structured agent launch metadata");
-        assert_eq!(output.get("kind").and_then(Value::as_str), Some("background_agent"));
+        let output = rewritten
+            .as_object()
+            .expect("structured agent launch metadata");
+        assert_eq!(
+            output.get("kind").and_then(Value::as_str),
+            Some("background_agent")
+        );
         assert_eq!(
             output.get("agent_id").and_then(Value::as_str),
             Some("agent_vehicle@debug-swarm")
         );
-        assert_eq!(output.get("team_name").and_then(Value::as_str), Some("debug-swarm"));
-        assert_eq!(output.get("name").and_then(Value::as_str), Some("agent_vehicle"));
+        assert_eq!(
+            output.get("team_name").and_then(Value::as_str),
+            Some("debug-swarm")
+        );
+        assert_eq!(
+            output.get("name").and_then(Value::as_str),
+            Some("agent_vehicle")
+        );
         assert_eq!(
             output.get("poll_with_task_output").and_then(Value::as_bool),
             Some(false)
@@ -1805,8 +1826,13 @@ mod tests {
             .cloned()
             .unwrap_or(Value::Null);
 
-        let output = rewritten.as_object().expect("structured async agent launch metadata");
-        assert_eq!(output.get("kind").and_then(Value::as_str), Some("background_agent"));
+        let output = rewritten
+            .as_object()
+            .expect("structured async agent launch metadata");
+        assert_eq!(
+            output.get("kind").and_then(Value::as_str),
+            Some("background_agent")
+        );
         assert_eq!(
             output.get("agent_id").and_then(Value::as_str),
             Some("a6b95ea1c5bd2a390")
@@ -1815,7 +1841,10 @@ mod tests {
             output.get("output_file").and_then(Value::as_str),
             Some("/private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output")
         );
-        assert_eq!(output.get("status").and_then(Value::as_str), Some("running"));
+        assert_eq!(
+            output.get("status").and_then(Value::as_str),
+            Some("running")
+        );
         assert_eq!(
             output.get("poll_with_task_output").and_then(Value::as_bool),
             Some(false)
@@ -2023,7 +2052,8 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_messages_rewrites_teammate_idle_notification_result_into_structured_handoff() {
+    fn test_transform_messages_rewrites_teammate_idle_notification_result_into_structured_handoff()
+    {
         let messages = vec![Message {
             role: "user".to_string(),
             content: Some(MessageContent::Text(
@@ -2052,7 +2082,8 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_messages_marks_task_notification_as_planning_only_from_transcript_structure() {
+    fn test_transform_messages_marks_task_notification_as_planning_only_from_transcript_structure()
+    {
         let transcript_path = std::env::temp_dir().join(format!(
             "codex_proxy_bg_planning_only_{}.jsonl",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2141,7 +2172,8 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_messages_does_not_rewrite_background_command_task_notification_as_agent_completion() {
+    fn test_transform_messages_does_not_rewrite_background_command_task_notification_as_agent_completion(
+    ) {
         let raw = "<task-notification>\n<task-id>bxiggtdu6</task-id>\n<tool-use-id>call_VTH8KAQi15QvcdrDBcTgjVWW</tool-use-id>\n<output-file>/tmp/bxiggtdu6.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run the full Codex response test suite after adding multi-background launch text suppression\" completed (exit code 0)</summary>\n</task-notification>\nFull transcript available at: /tmp/bxiggtdu6.output\n";
         let messages = vec![Message {
             role: "user".to_string(),

@@ -2,10 +2,10 @@ pub mod anthropic;
 pub mod codex;
 pub mod gemini;
 pub mod openai;
-pub mod providers;
-pub mod unified;
 #[cfg(test)]
 mod processor;
+pub mod providers;
+pub mod unified;
 
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -480,7 +480,10 @@ mod tests {
             anthropic_contract.canonical_model,
             CanonicalTransformModel::AnthropicMessages
         );
-        assert_eq!(anthropic_contract.backend_behavior, BackendBehavior::Identity);
+        assert_eq!(
+            anthropic_contract.backend_behavior,
+            BackendBehavior::Identity
+        );
         assert!(anthropic_contract.preserves_canonical_sse);
 
         for contract in [
@@ -548,13 +551,11 @@ mod tests {
                 },
                 Message {
                     role: "user".to_string(),
-                    content: Some(MessageContent::Blocks(vec![
-                        ContentBlock::ToolResult {
-                            tool_use_id: Some("toolu_1".to_string()),
-                            id: None,
-                            content: Some(json!({"text":"done"})),
-                        },
-                    ])),
+                    content: Some(MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: Some("toolu_1".to_string()),
+                        id: None,
+                        content: Some(json!({"text":"done"})),
+                    }])),
                 },
             ],
             system: Some(SystemContent::Blocks(vec![
@@ -620,7 +621,10 @@ mod tests {
             Some("function")
         );
         assert_eq!(
-            unified.reasoning.as_ref().map(|reasoning| reasoning.enabled),
+            unified
+                .reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.enabled),
             Some(true)
         );
     }
@@ -843,7 +847,8 @@ mod tests {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Blocks(vec![
                     ContentBlock::Thinking {
-                        thinking: "请求已发送，正在等待上游开始输出…\n模型正在处理中…\n".to_string(),
+                        thinking: "请求已发送，正在等待上游开始输出…\n模型正在处理中…\n"
+                            .to_string(),
                         signature: Some(String::new()),
                     },
                     ContentBlock::Text {
@@ -868,7 +873,10 @@ mod tests {
         assert_eq!(unified.messages.len(), 1);
         let assistant = &unified.messages[0];
         assert_eq!(assistant.role.as_str(), "assistant");
-        assert!(assistant.thinking.is_none(), "proxy lifecycle placeholder should not survive as thinking history");
+        assert!(
+            assistant.thinking.is_none(),
+            "proxy lifecycle placeholder should not survive as thinking history"
+        );
         assert_eq!(
             assistant.content_text().as_deref(),
             Some("你好，有什么我可以帮你处理的？")
@@ -1135,7 +1143,9 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         assert_eq!(
-            instructions.matches("The following skills are available").count(),
+            instructions
+                .matches("The following skills are available")
+                .count(),
             1,
             "repeated reminder blocks should be merged only once"
         );
@@ -1207,13 +1217,19 @@ mod tests {
         let parameters = body
             .pointer("/tools/0/parameters")
             .expect("codex tool schema");
-        assert_eq!(parameters.get("type").and_then(|value| value.as_str()), Some("object"));
+        assert_eq!(
+            parameters.get("type").and_then(|value| value.as_str()),
+            Some("object")
+        );
         assert!(
             parameters.get("properties").is_some(),
             "Codex tool schemas with object type must include an explicit properties object"
         );
         assert_eq!(
-            parameters.get("properties").and_then(|value| value.as_object()).map(|value| value.len()),
+            parameters
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .map(|value| value.len()),
             Some(0)
         );
     }

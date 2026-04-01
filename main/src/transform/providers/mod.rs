@@ -269,7 +269,8 @@ fn encode_codex_body(
     effective_stream: bool,
     hints: &RequestEnvelopeHints,
 ) -> Value {
-    let (promoted_context, cleaned_messages) = extract_user_scaffolding_to_codex_instructions(unified);
+    let (promoted_context, cleaned_messages) =
+        extract_user_scaffolding_to_codex_instructions(unified);
     let applied_system_text = system_text(unified)
         .map(|text| strip_dynamic_system_header_lines(&text))
         .filter(|text| !text.trim().is_empty());
@@ -341,7 +342,12 @@ fn encode_codex_body(
     if let Some(choice) = encode_codex_tool_choice(unified) {
         body["tool_choice"] = choice;
     }
-    if unified.reasoning.as_ref().map(|reasoning| reasoning.enabled).unwrap_or(false) {
+    if unified
+        .reasoning
+        .as_ref()
+        .map(|reasoning| reasoning.enabled)
+        .unwrap_or(false)
+    {
         body["reasoning"] = json!({
             "effort": unified
                 .reasoning
@@ -401,7 +407,12 @@ fn encode_openai_body(
     let max_tokens = ctx
         .openai_max_tokens_mapping
         .get_limit(route_model)
-        .map(|limit| unified.max_tokens.map(|value| value.min(limit)).unwrap_or(limit))
+        .map(|limit| {
+            unified
+                .max_tokens
+                .map(|value| value.min(limit))
+                .unwrap_or(limit)
+        })
         .or(unified.max_tokens);
 
     let mut body = json!({
@@ -481,7 +492,8 @@ fn encode_gemini_body(unified: &UnifiedChatRequest, route_model: &str) -> Value 
 
 fn encode_anthropic_tools(unified: &UnifiedChatRequest) -> Option<Vec<Value>> {
     unified.tools.as_ref().map(|tools| {
-        tools.iter()
+        tools
+            .iter()
             .map(|tool| {
                 json!({
                     "name": tool.function.name,
@@ -495,7 +507,8 @@ fn encode_anthropic_tools(unified: &UnifiedChatRequest) -> Option<Vec<Value>> {
 
 fn encode_codex_tools(unified: &UnifiedChatRequest) -> Option<Vec<Value>> {
     unified.tools.as_ref().map(|tools| {
-        tools.iter()
+        tools
+            .iter()
             .map(|tool| {
                 let parameters = normalize_codex_tool_schema(&tool.function.parameters);
                 json!({
@@ -511,7 +524,8 @@ fn encode_codex_tools(unified: &UnifiedChatRequest) -> Option<Vec<Value>> {
 
 fn encode_openai_tools(unified: &UnifiedChatRequest) -> Option<Vec<Value>> {
     unified.tools.as_ref().map(|tools| {
-        tools.iter()
+        tools
+            .iter()
             .map(|tool| {
                 json!({
                     "type": "function",
@@ -664,22 +678,20 @@ fn openai_message_content(message: &UnifiedMessage) -> Value {
         }
     }
 
-    json!(
-        message
-            .content
-            .iter()
-            .map(|item| match item {
-                UnifiedContent::Text { text } => json!({
-                    "type": "text",
-                    "text": text,
-                }),
-                UnifiedContent::ImageUrl { url, .. } => json!({
-                    "type": "image_url",
-                    "image_url": { "url": url },
-                }),
-            })
-            .collect::<Vec<_>>()
-    )
+    json!(message
+        .content
+        .iter()
+        .map(|item| match item {
+            UnifiedContent::Text { text } => json!({
+                "type": "text",
+                "text": text,
+            }),
+            UnifiedContent::ImageUrl { url, .. } => json!({
+                "type": "image_url",
+                "image_url": { "url": url },
+            }),
+        })
+        .collect::<Vec<_>>())
 }
 
 fn gemini_parts_for_user(message: &UnifiedMessage) -> Vec<Value> {
@@ -724,8 +736,8 @@ fn gemini_parts_for_assistant(message: &UnifiedMessage) -> Vec<Value> {
         }
     }
     for call in &message.tool_calls {
-        let args = serde_json::from_str::<Value>(&call.function.arguments)
-            .unwrap_or_else(|_| json!({}));
+        let args =
+            serde_json::from_str::<Value>(&call.function.arguments).unwrap_or_else(|_| json!({}));
         parts.push(json!({
             "functionCall": {
                 "name": call.function.name,
@@ -763,7 +775,11 @@ fn assistant_text_for_provider(message: &UnifiedMessage) -> String {
     parts.join("\n")
 }
 
-fn anthropic_headers(api_key: &str, anthropic_version: &str, stream: bool) -> Vec<(String, String)> {
+fn anthropic_headers(
+    api_key: &str,
+    anthropic_version: &str,
+    stream: bool,
+) -> Vec<(String, String)> {
     let accept = if stream {
         "text/event-stream"
     } else {
@@ -980,17 +996,16 @@ fn extract_user_scaffolding_to_codex_instructions(
                             break;
                         };
                         let end_idx = start_idx + START.len() + end_rel + END.len();
-                        let block_text =
-                            remaining[start_idx + START.len()..start_idx + START.len() + end_rel]
-                                .trim();
+                        let block_text = remaining
+                            [start_idx + START.len()..start_idx + START.len() + end_rel]
+                            .trim();
                         let normalized_block = normalize_text_for_exact_match(block_text);
                         if !normalized_block.is_empty()
                             && seen_promoted_parts.insert(normalized_block.clone())
                         {
                             promoted_parts.push(normalized_block);
                         }
-                        remaining =
-                            format!("{}{}", &remaining[..start_idx], &remaining[end_idx..]);
+                        remaining = format!("{}{}", &remaining[..start_idx], &remaining[end_idx..]);
                     }
 
                     if let Some(contents_idx) = remaining.find("Contents of /repo/") {
@@ -1002,13 +1017,14 @@ fn extract_user_scaffolding_to_codex_instructions(
                             let prefix = &remaining[..contents_idx];
                             let lines: Vec<&str> = after.lines().collect();
                             if lines.len() >= 2 {
-                            let rule_line = lines[1].trim();
-                            let normalized_rule_line = normalize_text_for_exact_match(rule_line);
-                            if !normalized_rule_line.is_empty()
-                                && seen_promoted_parts.insert(normalized_rule_line.clone())
-                            {
-                                promoted_parts.push(normalized_rule_line);
-                            }
+                                let rule_line = lines[1].trim();
+                                let normalized_rule_line =
+                                    normalize_text_for_exact_match(rule_line);
+                                if !normalized_rule_line.is_empty()
+                                    && seen_promoted_parts.insert(normalized_rule_line.clone())
+                                {
+                                    promoted_parts.push(normalized_rule_line);
+                                }
                                 let remainder = if let Some(split_idx) = after.find("\n\n") {
                                     &after[split_idx + 2..]
                                 } else {

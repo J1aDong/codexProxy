@@ -2632,8 +2632,7 @@ impl TransformResponse {
             tool.name.as_str(),
             &tool.arguments_buffer,
             self.allow_agent_worktree_isolation,
-        )
-        {
+        ) {
             if normalized != tool.arguments_buffer {
                 self.logger.log_raw(&format!(
                     "[Info] Normalized {} tool arguments for Claude-compatible schema",

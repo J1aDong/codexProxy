@@ -8,8 +8,8 @@ use crate::models::AnthropicRequest;
 use crate::transform::processor::{ExtractedSkillPayload, MessageProcessor};
 
 use super::{
-    providers::OpenAIChatAdapter,
-    ResponseTransformRequestContext, ResponseTransformer, TransformBackend, TransformContext,
+    providers::OpenAIChatAdapter, ResponseTransformRequestContext, ResponseTransformer,
+    TransformBackend, TransformContext,
 };
 
 pub struct OpenAIChatBackend;
@@ -254,7 +254,9 @@ impl OpenAIChatBackend {
     #[cfg(test)]
     #[allow(dead_code)]
     fn flatten_system_text(system: Option<&crate::models::SystemContent>) -> Option<String> {
-        system.map(|content| content.to_string()).filter(|text| !text.trim().is_empty())
+        system
+            .map(|content| content.to_string())
+            .filter(|text| !text.trim().is_empty())
     }
 
     #[cfg(test)]
@@ -2992,13 +2994,14 @@ mod tests {
             messages[1].get("role").and_then(Value::as_str),
             Some("tool")
         );
-    let tool_output = messages[1]
+        let tool_output = messages[1]
             .get("content")
             .and_then(Value::as_str)
             .expect("tool output should be stringified");
         assert!(tool_output.contains("Async agent launched successfully."));
         assert!(tool_output.contains("agentId: a6b95ea1c5bd2a390"));
-        assert!(tool_output.contains("output_file: /private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output"));
+        assert!(tool_output
+            .contains("output_file: /private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output"));
     }
 
     #[test]

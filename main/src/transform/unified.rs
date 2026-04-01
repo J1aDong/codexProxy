@@ -24,7 +24,9 @@ impl UnifiedMessageRole {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnifiedContent {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     ImageUrl {
         url: String,
         media_type: Option<String>,
@@ -247,11 +249,10 @@ fn convert_user_message(message: &Message) -> Vec<UnifiedMessage> {
                         }
                     }
                     ContentBlock::Image {
-                        source,
-                        image_url,
-                        ..
+                        source, image_url, ..
                     } => {
-                        if let Some(image) = resolve_image_content(source.as_ref(), image_url.as_ref(), None)
+                        if let Some(image) =
+                            resolve_image_content(source.as_ref(), image_url.as_ref(), None)
                         {
                             pending_content.push(image);
                         }
@@ -261,11 +262,7 @@ fn convert_user_message(message: &Message) -> Vec<UnifiedMessage> {
                             pending_content.push(image);
                         }
                     }
-                    ContentBlock::InputImage {
-                        image_url,
-                        url,
-                        ..
-                    } => {
+                    ContentBlock::InputImage { image_url, url, .. } => {
                         if let Some(image) =
                             resolve_image_content(None, image_url.as_ref(), url.as_deref())
                         {
@@ -349,13 +346,16 @@ fn convert_assistant_message(message: &Message) -> Vec<UnifiedMessage> {
                             });
                         }
                     }
-                    ContentBlock::ToolUse { id, name, input, .. } => {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         let call_id = id.clone().unwrap_or_else(|| "tool_call".to_string());
                         tool_calls.push(UnifiedToolCall {
                             id: call_id,
                             function: UnifiedFunctionCall {
                                 name: name.clone(),
-                                arguments: serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string()),
+                                arguments: serde_json::to_string(input)
+                                    .unwrap_or_else(|_| "{}".to_string()),
                             },
                         });
                     }
@@ -394,10 +394,7 @@ fn resolve_image_content(
         if let Some(url) = value.url.as_ref().or(value.uri.as_ref()) {
             return Some((
                 url.clone(),
-                value
-                    .media_type
-                    .clone()
-                    .or_else(|| value.mime_type.clone()),
+                value.media_type.clone().or_else(|| value.mime_type.clone()),
             ));
         }
 
@@ -409,10 +406,7 @@ fn resolve_image_content(
             };
             return Some((
                 normalized,
-                value
-                    .media_type
-                    .clone()
-                    .or_else(|| value.mime_type.clone()),
+                value.media_type.clone().or_else(|| value.mime_type.clone()),
             ));
         }
 
@@ -422,7 +416,10 @@ fn resolve_image_content(
                 .clone()
                 .or_else(|| value.mime_type.clone())
                 .unwrap_or_else(|| "image/png".to_string());
-            (format!("data:{};base64,{}", media_type, data), Some(media_type))
+            (
+                format!("data:{};base64,{}", media_type, data),
+                Some(media_type),
+            )
         })
     });
 
@@ -551,14 +548,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["system", "user", "assistant", "tool", "system", "system"]
         );
-        assert_eq!(
-            request.messages[1].content_text().as_deref(),
-            Some("hello")
-        );
-        assert_eq!(
-            request.messages[2].content_text().as_deref(),
-            Some("hi")
-        );
+        assert_eq!(request.messages[1].content_text().as_deref(), Some("hello"));
+        assert_eq!(request.messages[2].content_text().as_deref(), Some("hi"));
     }
 
     #[test]
