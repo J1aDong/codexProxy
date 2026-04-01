@@ -7,13 +7,14 @@ use crate::models::{
     GeminiReasoningEffortMapping, Message, MessageContent, OpenAIMaxTokensMapping,
     OpenAIModelMapping, ReasoningEffort, ReasoningEffortMapping,
 };
+use crate::transform::anthropic::build_raw_passthrough_body;
 use crate::transform::codex::build_codex_unified_request;
-use crate::transform::{
-    AnthropicAdapter, AnthropicBackend, CodexAdapter, CodexBackend, CountTokensMode, GeminiAdapter,
-    GeminiBackend, OpenAIChatAdapter, OpenAIChatBackend, PreparedRequest, RequestEnvelopeHints,
-    ResponseTransformRequestContext, TransformBackend, TransformContext,
-};
 use crate::transform::request_envelope_hints_from_anthropic;
+use crate::transform::{
+    AnthropicBackend, CodexAdapter, CodexBackend, CountTokensMode, GeminiAdapter, GeminiBackend,
+    OpenAIChatAdapter, OpenAIChatBackend, PreparedCountTokensRequest, PreparedRequest,
+    RequestEnvelopeHints, ResponseTransformRequestContext, TransformBackend, TransformContext,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -606,7 +607,8 @@ fn extract_stateful_chain_output_items(snapshot: &Value) -> Vec<Value> {
         .get("output")
         .and_then(|value| value.as_array())
         .map(|items| {
-            items.iter()
+            items
+                .iter()
                 .filter(|item| is_replayable_stateful_output_item(item))
                 .map(strip_stateful_output_metadata)
                 .collect()
@@ -1018,7 +1020,9 @@ fn get_cached_skill_catalog_reminder(
     cache_key: &str,
 ) -> Option<String> {
     match reminder_store.lock() {
-        Ok(guard) => guard.get(cache_key).map(|entry| entry.reminder_text.clone()),
+        Ok(guard) => guard
+            .get(cache_key)
+            .map(|entry| entry.reminder_text.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
@@ -1212,15 +1216,21 @@ fn trim_leading_stateful_replay_items(items: &[Value]) -> (Vec<Value>, usize) {
 }
 
 fn collect_function_call_output_call_ids(items: &[Value]) -> Vec<String> {
-    items.iter()
-        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("function_call_output"))
+    items
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(|value| value.as_str()) == Some("function_call_output")
+        })
         .filter_map(|item| item.get("call_id").and_then(|value| value.as_str()))
         .filter(|call_id| !call_id.trim().is_empty())
         .map(|call_id| call_id.to_string())
         .collect()
 }
 
-fn output_items_contain_function_call_call_ids(output_items: &[Value], call_ids: &[String]) -> bool {
+fn output_items_contain_function_call_call_ids(
+    output_items: &[Value],
+    call_ids: &[String],
+) -> bool {
     if call_ids.is_empty() {
         return true;
     }
@@ -1407,11 +1417,10 @@ fn prepare_stateful_chain_request(
                         trim_leading_stateful_replay_items(candidate_suffix);
                     let tool_result_call_ids =
                         collect_function_call_output_call_ids(&incremental_input);
-                    let tool_result_chain_supported =
-                        output_items_contain_function_call_call_ids(
-                            &entry.output_items,
-                            &tool_result_call_ids,
-                        );
+                    let tool_result_chain_supported = output_items_contain_function_call_call_ids(
+                        &entry.output_items,
+                        &tool_result_call_ids,
+                    );
                     if !tool_result_chain_supported {
                         emit_stream_diag(
                             log_tx,
@@ -1889,7 +1898,11 @@ fn maybe_log_stream_upstream(
         }
     }
 
-    l.log_upstream_response(status, url, &truncate_chars(text, opts.stream_log_max_chars));
+    l.log_upstream_response(
+        status,
+        url,
+        &truncate_chars(text, opts.stream_log_max_chars),
+    );
 }
 
 fn maybe_log_stream_downstream(
@@ -1915,6 +1928,17 @@ fn maybe_log_stream_downstream(
 }
 
 fn emit_stream_diag(
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+    msg: String,
+) {
+    let _ = log_tx.send(msg.clone());
+    if let Some(l) = logger {
+        l.log(&msg);
+    }
+}
+
+fn emit_error_diag(
     log_tx: &broadcast::Sender<String>,
     logger: &Option<Arc<AppLogger>>,
     msg: String,
@@ -3254,7 +3278,11 @@ fn strip_tagged_sections(text: &str, tag_name: &str) -> String {
 
 fn strip_non_user_authored_markup(text: &str) -> String {
     let mut sanitized = text.to_string();
-    for tag_name in ["system-reminder", "environment_context", "task-notification"] {
+    for tag_name in [
+        "system-reminder",
+        "environment_context",
+        "task-notification",
+    ] {
         sanitized = strip_tagged_sections(&sanitized, tag_name);
     }
     sanitized
@@ -4566,7 +4594,9 @@ impl ProxyServer {
                                 });
                             }
                             Err(e) => {
-                                let _ = log_tx.send(format!("[Error] Accept failed: {}", e));
+                                let msg = format!("[Error] Accept failed: {}", e);
+                                let _ = log_tx.send(msg.clone());
+                                logger.log(&msg);
                             }
                         }
                     }
@@ -4947,7 +4977,10 @@ async fn handle_request(
                 let (unified, hints) = build_codex_unified_request(&anthropic_body);
                 (unified, Some(hints))
             } else {
-                (crate::transform::UnifiedChatRequest::from_anthropic(&anthropic_body), None)
+                (
+                    crate::transform::UnifiedChatRequest::from_anthropic(&anthropic_body),
+                    None,
+                )
             };
         let mut token_count: Option<u64> = None;
         let mut upstream_status: Option<u16> = None;
@@ -5003,7 +5036,8 @@ async fn handle_request(
             }
         };
 
-        let mut prepared_count_tokens = if route_selection.converter.eq_ignore_ascii_case("openai") {
+        let mut prepared_count_tokens = if route_selection.converter.eq_ignore_ascii_case("openai")
+        {
             OpenAIChatAdapter.prepare_count_tokens_request(
                 &unified_count_request,
                 &count_tokens_ctx,
@@ -5022,14 +5056,23 @@ async fn handle_request(
                 &route_selection.model_name,
             )
         } else if route_selection.converter.eq_ignore_ascii_case("anthropic") {
-            AnthropicAdapter.prepare_count_tokens_request(
-                &unified_count_request,
-                &count_tokens_ctx,
-                &count_tokens_endpoint,
-                &route_selection.api_key,
-                &anthropic_version,
-                &route_selection.model_name,
-            )
+            PreparedCountTokensRequest::native(PreparedRequest {
+                url: count_tokens_endpoint.clone(),
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("x-api-key".to_string(), route_selection.api_key.clone()),
+                    (
+                        "Authorization".to_string(),
+                        format!("Bearer {}", route_selection.api_key),
+                    ),
+                    ("x-anthropic-version".to_string(), anthropic_version.clone()),
+                ],
+                body: build_raw_passthrough_body(
+                    &raw_request_body,
+                    Some(&route_selection.model_name),
+                ),
+                session_id: Uuid::new_v4().to_string(),
+            })
         } else {
             CodexAdapter.prepare_count_tokens_request_with_hints(
                 &unified_count_request,
@@ -5062,12 +5105,20 @@ async fn handle_request(
                         if resp.status().is_success() {
                             if let Ok(text) = resp.text().await {
                                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                    token_count =
-                                        parse_count_tokens_value(&route_selection.converter, &value);
+                                    token_count = parse_count_tokens_value(
+                                        &route_selection.converter,
+                                        &value,
+                                    );
                                     if token_count.is_some() {
-                                        source = if route_selection.converter.eq_ignore_ascii_case("gemini") {
+                                        source = if route_selection
+                                            .converter
+                                            .eq_ignore_ascii_case("gemini")
+                                        {
                                             "gemini_countTokens".to_string()
-                                        } else if route_selection.converter.eq_ignore_ascii_case("anthropic") {
+                                        } else if route_selection
+                                            .converter
+                                            .eq_ignore_ascii_case("anthropic")
+                                        {
                                             "anthropic_count_tokens".to_string()
                                         } else {
                                             "codex_input_tokens".to_string()
@@ -5081,28 +5132,31 @@ async fn handle_request(
                             if is_codex_v1_responses_path(&count_tokens_endpoint)
                                 && should_retry_codex_v1_path_with_legacy(status, &error_text)
                             {
-                                let fallback_endpoint = resolve_upstream_url_with_codex_path_preference(
-                                    &route_selection.converter,
-                                    &route_selection.target_url,
-                                    UpstreamOperation::CountTokens,
-                                    &route_selection.model_name,
-                                    false,
-                                );
+                                let fallback_endpoint =
+                                    resolve_upstream_url_with_codex_path_preference(
+                                        &route_selection.converter,
+                                        &route_selection.target_url,
+                                        UpstreamOperation::CountTokens,
+                                        &route_selection.model_name,
+                                        false,
+                                    );
                                 let _ = log_tx.send(format!(
                                     "[Route] #{} codex_v1_count_tokens_fallback=true from={} to={}",
                                     request_id, count_tokens_endpoint, fallback_endpoint
                                 ));
-                                prepared_count_tokens = CodexAdapter.prepare_count_tokens_request_with_hints(
-                                    &unified_count_request,
-                                    &count_tokens_ctx,
-                                    &fallback_endpoint,
-                                    &route_selection.api_key,
-                                    &anthropic_version,
-                                    &route_selection.model_name,
-                                    codex_hints.as_ref().expect("codex hints"),
-                                );
+                                prepared_count_tokens = CodexAdapter
+                                    .prepare_count_tokens_request_with_hints(
+                                        &unified_count_request,
+                                        &count_tokens_ctx,
+                                        &fallback_endpoint,
+                                        &route_selection.api_key,
+                                        &anthropic_version,
+                                        &route_selection.model_name,
+                                        codex_hints.as_ref().expect("codex hints"),
+                                    );
 
-                                if let Some(retry_request) = prepared_count_tokens.request.as_ref() {
+                                if let Some(retry_request) = prepared_count_tokens.request.as_ref()
+                                {
                                     match send_prepared_json_request(
                                         &http_client,
                                         retry_request,
@@ -5113,17 +5167,22 @@ async fn handle_request(
                                         Ok(retry_resp) => {
                                             upstream_status = Some(retry_resp.status().as_u16());
                                             if retry_resp.status().is_success() {
-                                                if let Some(endpoint_key) = codex_v1_endpoint_key.as_ref() {
+                                                if let Some(endpoint_key) =
+                                                    codex_v1_endpoint_key.as_ref()
+                                                {
                                                     mark_codex_v1_endpoint_unsupported(
                                                         &codex_v1_unsupported_endpoints,
                                                         endpoint_key,
                                                     );
                                                 }
                                                 if let Ok(text) = retry_resp.text().await {
-                                                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                                    if let Ok(value) =
+                                                        serde_json::from_str::<Value>(&text)
+                                                    {
                                                         token_count = parse_input_tokens(&value);
                                                         if token_count.is_some() {
-                                                            source = "codex_input_tokens".to_string();
+                                                            source =
+                                                                "codex_input_tokens".to_string();
                                                         }
                                                     }
                                                 }
@@ -5418,16 +5477,26 @@ async fn handle_request(
                 &logger,
             );
         }
-        let (mut upstream_body, session_id) = transform_request_with_optional_codex_effort_override(
-            &route_selection.converter,
-            &request_backend,
-            &anthropic_body,
-            &log_tx,
-            &ctx,
-            &route_selection.model_name,
-            route_selection.reasoning_effort_override,
-            effective_stream_for_attempt,
-        );
+        let (mut upstream_body, session_id) = if route_selection
+            .converter
+            .eq_ignore_ascii_case("anthropic")
+        {
+            (
+                build_raw_passthrough_body(&raw_request_body, Some(&route_selection.model_name)),
+                Uuid::new_v4().to_string(),
+            )
+        } else {
+            transform_request_with_optional_codex_effort_override(
+                &route_selection.converter,
+                &request_backend,
+                &anthropic_body,
+                &log_tx,
+                &ctx,
+                &route_selection.model_name,
+                route_selection.reasoning_effort_override,
+                effective_stream_for_attempt,
+            )
+        };
 
         let mut stateful_chain_meta_for_attempt = if enable_stateful_responses_chain
             && route_selection.converter.eq_ignore_ascii_case("codex")
@@ -5587,12 +5656,7 @@ async fn handle_request(
         }
 
         if route_selection.converter.eq_ignore_ascii_case("codex") {
-            log_instruction_footprint(
-                &log_tx,
-                &request_id,
-                &upstream_body,
-                &stateful_chain_mode,
-            );
+            log_instruction_footprint(&log_tx, &request_id, &upstream_body, &stateful_chain_mode);
         }
 
         if let Some(ref l) = logger {
@@ -5640,7 +5704,10 @@ async fn handle_request(
                     UpstreamOutcomeAction::ReturnToClient
                 };
 
-                let _ = log_tx.send(format!(
+                emit_error_diag(
+                    &log_tx,
+                    &logger,
+                    format!(
                     "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={}",
                     request_id,
                     path,
@@ -5654,8 +5721,9 @@ async fn handle_request(
                     input_model,
                     route_selection.model_name,
                     route_effort,
-                ));
-                let _ = log_tx.send(format!("[Error] Request failed: {}", e));
+                ),
+                );
+                emit_error_diag(&log_tx, &logger, format!("[Error] Request failed: {}", e));
 
                 if action == UpstreamOutcomeAction::RetryNextCandidate
                     && load_balancer_runtime.is_some()
@@ -6016,7 +6084,10 @@ async fn handle_request(
                     UpstreamOutcomeAction::ReturnToClient
                 };
 
-                let _ = log_tx.send(format!(
+                emit_error_diag(
+                    &log_tx,
+                    &logger,
+                    format!(
                     "[Error] #{} ctx incoming_api={} configured_api={} upstream_api={} mode={} slot={} endpoint={} route_key={} converter={} in_model={} out_model={} effort={} status={} retry_after={}",
                     request_id,
                     path,
@@ -6032,7 +6103,8 @@ async fn handle_request(
                     route_effort,
                     status,
                     retry_after,
-                ));
+                ),
+                );
 
                 if let Some((cooldown_model, cooldown_secs, reason)) = extract_cooldown_info(
                     status,
@@ -6054,10 +6126,14 @@ async fn handle_request(
                     ));
                 }
 
-                let _ = log_tx.send(format!(
-                    "[Error] #{} Upstream returned {}: {}",
-                    request_id, status, error_text
-                ));
+                emit_error_diag(
+                    &log_tx,
+                    &logger,
+                    format!(
+                        "[Error] #{} Upstream returned {}: {}",
+                        request_id, status, error_text
+                    ),
+                );
 
                 if let Some(ref l) = logger {
                     l.log_upstream_response(status, &resolved_target_url, &error_text);
@@ -6175,15 +6251,23 @@ async fn handle_request(
         {
             let body_text = response.text().await.unwrap_or_default();
             if let Some(ref l) = logger {
-                l.log_upstream_response(upstream_status, &resolved_target_url_for_stream, &body_text);
+                l.log_upstream_response(
+                    upstream_status,
+                    &resolved_target_url_for_stream,
+                    &body_text,
+                );
             }
             let parsed = match serde_json::from_str::<Value>(&body_text) {
                 Ok(value) => value,
                 Err(error) => {
-                    let _ = log_tx.send(format!(
-                        "[Error] #{} Failed to parse non-stream Codex JSON response: {}",
-                        request_id, error
-                    ));
+                    emit_error_diag(
+                        &log_tx,
+                        &logger,
+                        format!(
+                            "[Error] #{} Failed to parse non-stream Codex JSON response: {}",
+                            request_id, error
+                        ),
+                    );
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
                         .header("Content-Type", "application/json")
@@ -6342,7 +6426,11 @@ async fn handle_request(
                     }
                     Err(e) => {
                         metrics.emit(&log_tx, &request_id, stream_opts.enable_stream_metrics);
-                        let _ = log_tx.send(format!("[Error] #{} Stream error: {}", request_id, e));
+                        emit_error_diag(
+                            &log_tx,
+                            &logger,
+                            format!("[Error] #{} Stream error: {}", request_id, e),
+                        );
                         return Ok(Response::builder()
                                 .status(StatusCode::BAD_GATEWAY)
                                 .header("Content-Type", "application/json")
@@ -6355,10 +6443,11 @@ async fn handle_request(
                 Ok(None) => break,
                 Err(_) => {
                     metrics.emit(&log_tx, &request_id, stream_opts.enable_stream_metrics);
-                    let _ = log_tx.send(format!(
-                        "[Error] #{} Upstream read timeout (300s)",
-                        request_id
-                    ));
+                    emit_error_diag(
+                        &log_tx,
+                        &logger,
+                        format!("[Error] #{} Upstream read timeout (300s)", request_id),
+                    );
                     return Ok(Response::builder()
                         .status(StatusCode::GATEWAY_TIMEOUT)
                         .header("Content-Type", "application/json")
@@ -6504,10 +6593,14 @@ async fn handle_request(
         log_non_stream_assistant_preview(&log_tx, &request_id, &payload);
 
         if contains_tool_call_text_leak(payload.get("content").unwrap_or(&json!([]))) {
-            let _ = log_tx.send(format!(
-                "[Error] #{} Detected tool-call text leak in non-stream response (likely upstream tool-call formatting mismatch)",
-                request_id
-            ));
+            emit_error_diag(
+                &log_tx,
+                &logger,
+                format!(
+                    "[Error] #{} Detected tool-call text leak in non-stream response (likely upstream tool-call formatting mismatch)",
+                    request_id
+                ),
+            );
             return Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("Content-Type", "application/json")
@@ -6836,10 +6929,11 @@ async fn handle_request(
                             }
                         }
                         Err(e) => {
-                            let _ = log_tx_clone.send(format!(
-                                "[Error] #{} Stream error: {}",
-                                request_id_for_stream, e
-                            ));
+                            emit_error_diag(
+                                &log_tx_clone,
+                                &logger_for_stream,
+                                format!("[Error] #{} Stream error: {}", request_id_for_stream, e),
+                            );
                             decision.stream_close_cause = Some("upstream_stream_error");
                             break;
                         }
@@ -6883,11 +6977,15 @@ async fn handle_request(
                                 }
                             }
                             if silent_elapsed >= hard_timeout {
-                                let _ = log_tx_clone.send(format!(
-                                    "[Error] #{} Upstream read timeout ({}s)",
-                                    request_id_for_stream,
-                                    hard_timeout.as_secs()
-                                ));
+                                emit_error_diag(
+                                    &log_tx_clone,
+                                    &logger_for_stream,
+                                    format!(
+                                        "[Error] #{} Upstream read timeout ({}s)",
+                                        request_id_for_stream,
+                                        hard_timeout.as_secs()
+                                    ),
+                                );
                                 decision.stream_close_cause = Some("upstream_read_timeout");
                                 break;
                             }
@@ -6924,11 +7022,15 @@ async fn handle_request(
                             continue;
                         }
 
-                        let _ = log_tx_clone.send(format!(
-                            "[Error] #{} Upstream read timeout ({}s)",
-                            request_id_for_stream,
-                            hard_timeout.as_secs()
-                        ));
+                        emit_error_diag(
+                            &log_tx_clone,
+                            &logger_for_stream,
+                            format!(
+                                "[Error] #{} Upstream read timeout ({}s)",
+                                request_id_for_stream,
+                                hard_timeout.as_secs()
+                            ),
+                        );
                         decision.stream_close_cause = Some("upstream_read_timeout");
                         break;
                     }
@@ -7746,23 +7848,20 @@ mod tests {
         backfill_non_stream_payload_from_codex_snapshot, body_uses_priority_service_tier,
         build_anthropic_message_from_codex_json_response, build_parallel_tool_degrade_key,
         chunk_contains_sibling_tool_call_error, classify_connection_error,
-        collect_skill_catalog_reminder_blocks, derive_skill_catalog_cache_key,
-        compute_non_input_fingerprint, derive_stateful_chain_key, derive_stream_close_cause,
-        disable_parallel_tool_calls_in_upstream_body,
-        ensure_skill_catalog_context_for_codex,
+        collect_skill_catalog_reminder_blocks, compute_non_input_fingerprint,
+        derive_skill_catalog_cache_key, derive_stateful_chain_key, derive_stream_close_cause,
+        disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
         extract_cached_input_tokens_from_response_usage, extract_codex_plan_file_path_from_request,
         extract_codex_terminal_response_snapshot, extract_stateful_chain_hint_from_request,
         extract_stateful_chain_output_items, extract_tool_leak_retry_signal,
-        extract_upstream_response_id,
-        get_cached_skill_catalog_reminder,
+        extract_upstream_response_id, get_cached_skill_catalog_reminder,
         get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
         is_business_stream_output, is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
         is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
         mark_codex_fast_endpoint_unsupported, mark_parallel_tool_degrade,
         observe_upstream_chunk_events, prepare_stateful_chain_request, record_stateful_chain_entry,
-        request_explicitly_asks_for_worktree,
-        remove_priority_service_tier_from_upstream_body, resolve_effective_stream,
-        resolve_stateful_chain_hint_info, resolve_upstream_url,
+        remove_priority_service_tier_from_upstream_body, request_explicitly_asks_for_worktree,
+        resolve_effective_stream, resolve_stateful_chain_hint_info, resolve_upstream_url,
         resolve_upstream_url_with_codex_path_preference, should_drop_post_message_stop_output,
         should_retry_codex_fast_without_service_tier, should_retry_codex_v1_path_with_legacy,
         should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
@@ -7771,8 +7870,8 @@ mod tests {
         StatefulChainStore, StatefulChainUnsupportedEndpointStore, StreamEventCounters,
         StreamRuntimeOptions, UpstreamOperation,
     };
-    use crate::transform::{request_envelope_hints_from_anthropic, RequestEnvelopeHints};
     use crate::models::AnthropicRequest;
+    use crate::transform::{request_envelope_hints_from_anthropic, RequestEnvelopeHints};
     use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
@@ -8979,7 +9078,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         .expect("stateful meta");
 
         assert_eq!(
-            body.get("previous_response_id").and_then(|value| value.as_str()),
+            body.get("previous_response_id")
+                .and_then(|value| value.as_str()),
             Some("resp_prev")
         );
         let input = body
@@ -9048,7 +9148,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         .expect("stateful meta");
 
         assert_eq!(
-            body.get("previous_response_id").and_then(|value| value.as_str()),
+            body.get("previous_response_id")
+                .and_then(|value| value.as_str()),
             Some("resp_prev"),
             "matching tool-result call_id should preserve previous_response_id chaining"
         );
@@ -9075,7 +9176,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
     }
 
     #[test]
-    fn test_prepare_stateful_chain_request_keeps_replayed_function_call_for_tool_result_only_turn() {
+    fn test_prepare_stateful_chain_request_keeps_replayed_function_call_for_tool_result_only_turn()
+    {
         let chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
         let unsupported_store: StatefulChainUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
@@ -9124,7 +9226,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         .expect("stateful meta");
 
         assert_eq!(
-            body.get("previous_response_id").and_then(|value| value.as_str()),
+            body.get("previous_response_id")
+                .and_then(|value| value.as_str()),
             Some("resp_prev")
         );
         let input = body
@@ -9203,7 +9306,11 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
-        assert_eq!(input.len(), 4, "full input should remain untouched on fallback");
+        assert_eq!(
+            input.len(),
+            4,
+            "full input should remain untouched on fallback"
+        );
     }
 
     #[test]
@@ -9258,8 +9365,15 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         });
 
         let items = extract_stateful_chain_output_items(&snapshot);
-        assert_eq!(items.len(), 2, "reasoning items should not participate in prefix matching");
-        assert_eq!(items[0].get("type").and_then(|value| value.as_str()), Some("message"));
+        assert_eq!(
+            items.len(),
+            2,
+            "reasoning items should not participate in prefix matching"
+        );
+        assert_eq!(
+            items[0].get("type").and_then(|value| value.as_str()),
+            Some("message")
+        );
         assert_eq!(
             items[1].get("type").and_then(|value| value.as_str()),
             Some("function_call")

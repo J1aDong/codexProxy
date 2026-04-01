@@ -1,13 +1,27 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use super::providers::AnthropicAdapter;
-use super::{
-    ResponseTransformer, TransformBackend, TransformBackendContract, TransformContext,
-};
+use super::{ResponseTransformer, TransformBackend, TransformBackendContract, TransformContext};
 use crate::models::AnthropicRequest;
 
 pub struct AnthropicBackend;
+
+pub fn build_raw_passthrough_body(raw_request_body: &Value, model_override: Option<&str>) -> Value {
+    let mut body = raw_request_body.clone();
+    let Some(model) = model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return body;
+    };
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".to_string(), json!(model));
+    }
+
+    body
+}
 
 struct AnthropicUpstreamRequestBuilder;
 
@@ -153,10 +167,12 @@ impl TransformBackend for AnthropicBackend {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnthropicPassthroughResponseTransformer, AnthropicUpstreamRequestBuilder,
+        build_raw_passthrough_body, AnthropicPassthroughResponseTransformer,
+        AnthropicUpstreamRequestBuilder,
     };
     use crate::models::{AnthropicRequest, Message};
     use crate::transform::ResponseTransformer;
+    use serde_json::json;
     use uuid::Uuid;
 
     #[test]
@@ -209,7 +225,10 @@ mod tests {
         .expect("request should build");
 
         assert_eq!(
-            request.headers().get("x-api-key").and_then(|value| value.to_str().ok()),
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
             Some("test-key")
         );
         assert_eq!(
@@ -227,7 +246,10 @@ mod tests {
             Some("2023-06-01")
         );
         assert_eq!(
-            request.headers().get("Accept").and_then(|value| value.to_str().ok()),
+            request
+                .headers()
+                .get("Accept")
+                .and_then(|value| value.to_str().ok()),
             Some("text/event-stream")
         );
     }
@@ -241,6 +263,46 @@ mod tests {
         assert_eq!(
             chunks[0],
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\ndata: {\"usage\":{\"output_tokens\":1}}\n\n"
+        );
+    }
+
+    #[test]
+    fn build_raw_passthrough_body_preserves_original_fields_and_nested_shapes() {
+        let raw = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": [
+                                {"type": "text", "text": "ok"},
+                                {"type": "json", "value": {"status": "done"}}
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "metadata": {"user_id": "{\"session_id\":\"sess-1\"}"},
+            "top_p": 0.8,
+            "top_k": 32,
+            "stop_sequences": ["</tool_result>"],
+            "stream": true
+        });
+
+        let body = build_raw_passthrough_body(&raw, Some("claude-opus-4-1"));
+
+        assert_eq!(body["model"], "claude-opus-4-1");
+        assert_eq!(body["metadata"]["user_id"], "{\"session_id\":\"sess-1\"}");
+        assert_eq!(body["top_p"], 0.8);
+        assert_eq!(body["top_k"], 32);
+        assert_eq!(body["stop_sequences"][0], "</tool_result>");
+        assert!(body["messages"][0]["content"][0]["content"].is_array());
+        assert_eq!(
+            body["messages"][0]["content"][0]["content"][1]["value"]["status"],
+            "done"
         );
     }
 }
