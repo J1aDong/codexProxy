@@ -652,19 +652,109 @@ fn codex_content_blocks(message: &UnifiedMessage, is_assistant: bool) -> Vec<Val
 
     for item in &message.content {
         match item {
-            UnifiedContent::Text { text } => blocks.push(json!({
-                "type": if is_assistant { "output_text" } else { "input_text" },
-                "text": text,
-            })),
-            UnifiedContent::ImageUrl { url, .. } => blocks.push(json!({
-                "type": "input_image",
-                "image_url": url,
-                "detail": "auto",
-            })),
+            UnifiedContent::Text { text } => {
+                let text = if is_assistant {
+                    Some(text.clone())
+                } else {
+                    sanitize_codex_user_text(text)
+                };
+                if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
+                    blocks.push(json!({
+                        "type": if is_assistant { "output_text" } else { "input_text" },
+                        "text": text,
+                    }));
+                }
+            }
+            UnifiedContent::ImageUrl { url, .. } => {
+                if let Some(image_url) = sanitize_codex_image_url(url) {
+                    blocks.push(json!({
+                        "type": "input_image",
+                        "image_url": image_url,
+                        "detail": "auto",
+                    }));
+                }
+            }
         }
     }
 
     blocks
+}
+
+fn sanitize_codex_user_text(text: &str) -> Option<String> {
+    let mut sanitized_lines = Vec::new();
+    let mut placeholder_added = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            sanitized_lines.push(String::new());
+            continue;
+        }
+
+        if is_claude_code_image_source_marker(trimmed) {
+            if !placeholder_added {
+                sanitized_lines.push("[Image attached]".to_string());
+                placeholder_added = true;
+            }
+            continue;
+        }
+
+        sanitized_lines.push(line.to_string());
+    }
+
+    let sanitized = sanitized_lines
+        .join("\n")
+        .trim()
+        .to_string();
+
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn is_claude_code_image_source_marker(line: &str) -> bool {
+    let Some(source) = line
+        .strip_prefix("[Image: source:")
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+
+    is_local_file_reference(source.trim())
+}
+
+fn sanitize_codex_image_url(url: &str) -> Option<&str> {
+    if is_local_file_reference(url) {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+fn is_local_file_reference(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.starts_with("file://")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("\\\\")
+    {
+        return true;
+    }
+
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
 fn openai_message_content(message: &UnifiedMessage) -> Value {

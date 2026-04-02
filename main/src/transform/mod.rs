@@ -785,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_request_preserves_local_image_paths_for_codex() {
+    fn unified_request_preserves_local_image_paths_before_provider_sanitization() {
         use crate::models::{ContentBlock, ImageSource, Message, MessageContent};
 
         let request = AnthropicRequest {
@@ -835,6 +835,139 @@ mod tests {
             .expect("image item");
 
         assert_eq!(image, "file:///tmp/screenshot.png");
+    }
+
+    #[test]
+    fn codex_adapter_sanitizes_claude_code_image_source_text_markers() {
+        use crate::models::{ContentBlock, ImageSource, Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-opus-4-6".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    ContentBlock::Image {
+                        source: Some(ImageSource {
+                            source_type: Some("base64".to_string()),
+                            media_type: Some("image/png".to_string()),
+                            mime_type: None,
+                            data: Some("abc123".to_string()),
+                            url: None,
+                            uri: None,
+                            path: None,
+                        }),
+                        source_raw: None,
+                        image_url: None,
+                    },
+                    ContentBlock::Text {
+                        text: "[Image: source: /Users/mr.j/.claude/image-cache/session/1.png]"
+                            .to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "[Image #1] 这个图片描述下".to_string(),
+                    },
+                ])),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(256),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let (unified, hints) = crate::transform::codex::build_codex_unified_request(&request);
+        let body = crate::transform::providers::CodexAdapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &codex_test_ctx(),
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                true,
+                &hints,
+            )
+            .body;
+
+        let body_text = body.to_string();
+        assert!(
+            !body_text.contains("/Users/mr.j/.claude/image-cache"),
+            "Codex request should not leak Claude Code local image cache paths"
+        );
+        assert!(
+            body_text.contains("data:image/png;base64,abc123"),
+            "Codex request should preserve inline image data"
+        );
+        assert!(
+            body_text.contains("[Image #1] 这个图片描述下"),
+            "non-path user text should remain intact"
+        );
+    }
+
+    #[test]
+    fn codex_adapter_drops_local_file_image_urls_from_input_images() {
+        use crate::models::{ContentBlock, ImageSource, Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-5".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::Image {
+                    source: Some(ImageSource {
+                        source_type: Some("file".to_string()),
+                        media_type: Some("image/png".to_string()),
+                        mime_type: None,
+                        data: None,
+                        url: None,
+                        uri: None,
+                        path: Some("/tmp/screenshot.png".to_string()),
+                    }),
+                    source_raw: None,
+                    image_url: None,
+                }])),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(256),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let (unified, hints) = crate::transform::codex::build_codex_unified_request(&request);
+        let body = crate::transform::providers::CodexAdapter
+            .prepare_messages_request_with_hints(
+                &unified,
+                &codex_test_ctx(),
+                "https://api.openai.com/v1/responses",
+                "test-key",
+                "2023-06-01",
+                "gpt-5.3-codex",
+                true,
+                &hints,
+            )
+            .body;
+
+        let body_text = body.to_string();
+        assert!(
+            !body_text.contains("file:///tmp/screenshot.png"),
+            "Codex request should not include local file URLs in input_image blocks"
+        );
+        assert!(
+            !body_text.contains("/tmp/screenshot.png"),
+            "Codex request should not include local file paths in any serialized field"
+        );
     }
 
     #[test]
