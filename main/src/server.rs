@@ -1296,6 +1296,7 @@ fn log_instruction_footprint(
     ));
 }
 
+#[cfg(test)]
 fn prepare_stateful_chain_request(
     body: &mut Value,
     chain_store: &StatefulChainStore,
@@ -1306,6 +1307,32 @@ fn prepare_stateful_chain_request(
     request_id: &str,
     log_tx: &broadcast::Sender<String>,
     logger: &Option<Arc<AppLogger>>,
+) -> Option<(StatefulChainRequestMeta, Option<String>)> {
+    prepare_stateful_chain_request_with_policy(
+        body,
+        chain_store,
+        unsupported_endpoints,
+        request_hints,
+        chain_key,
+        endpoint_key,
+        request_id,
+        log_tx,
+        logger,
+        false,
+    )
+}
+
+fn prepare_stateful_chain_request_with_policy(
+    body: &mut Value,
+    chain_store: &StatefulChainStore,
+    unsupported_endpoints: &StatefulChainUnsupportedEndpointStore,
+    request_hints: &RequestEnvelopeHints,
+    chain_key: &str,
+    endpoint_key: &str,
+    request_id: &str,
+    log_tx: &broadcast::Sender<String>,
+    logger: &Option<Arc<AppLogger>>,
+    force_full_replay: bool,
 ) -> Option<(StatefulChainRequestMeta, Option<String>)> {
     let static_prefix_summary = derive_static_prefix_summary_from_upstream_body(body);
     let current_non_input_fingerprint = compute_non_input_fingerprint(body);
@@ -1319,6 +1346,28 @@ fn prepare_stateful_chain_request(
             logger,
             format!(
                 "[StatefulChain] #{} previous_response_id_skipped reason=request_kind_session_title",
+                request_id
+            ),
+        );
+        return Some((
+            StatefulChainRequestMeta {
+                chain_key: chain_key.to_string(),
+                endpoint_key: endpoint_key.to_string(),
+                full_input,
+                static_prefix_summary,
+                static_prefix_same_as_prior: None,
+                non_input_fingerprint: current_non_input_fingerprint,
+            },
+            None,
+        ));
+    }
+
+    if force_full_replay {
+        emit_stream_diag(
+            log_tx,
+            logger,
+            format!(
+                "[StatefulChain] #{} previous_response_id_skipped reason=rewritten_history_requires_full_replay",
                 request_id
             ),
         );
@@ -3296,10 +3345,11 @@ fn latest_user_authored_text(request: &AnthropicRequest) -> String {
         .find(|message| message.role.eq_ignore_ascii_case("user"))
         .and_then(|message| message.content.as_ref())
         .map(|content| match content {
-            MessageContent::Text(text) => strip_non_user_authored_markup(text),
+            MessageContent::Text(text) => strip_non_user_authored_markup(text).trim().to_string(),
             MessageContent::Blocks(blocks) => blocks
                 .iter()
-                .filter_map(|block| match block {
+                .rev()
+                .find_map(|block| match block {
                     ContentBlock::Text { text } => {
                         let sanitized = strip_non_user_authored_markup(text);
                         let trimmed = sanitized.trim();
@@ -3311,8 +3361,7 @@ fn latest_user_authored_text(request: &AnthropicRequest) -> String {
                     }
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join("\n"),
+                .unwrap_or_default(),
         })
         .unwrap_or_default()
 }
@@ -3321,6 +3370,53 @@ fn request_explicitly_asks_for_worktree(request: &AnthropicRequest) -> bool {
     latest_user_authored_text(request)
         .to_ascii_lowercase()
         .contains("worktree")
+}
+
+fn request_contains_rewrite_sensitive_history(request: &AnthropicRequest) -> bool {
+    const SKILL_MARKERS: [&str; 4] = [
+        "Launching skill:",
+        "Base directory for this skill:",
+        "<command-name>",
+        "Base Path:",
+    ];
+    const WORKTREE_ERROR_PREFIX: &str = "Cannot create agent worktree:";
+
+    let text_contains_sensitive_marker = |text: &str| {
+        let trimmed = text.trim();
+        trimmed.starts_with(WORKTREE_ERROR_PREFIX)
+            || SKILL_MARKERS.iter().any(|marker| trimmed.contains(marker))
+    };
+
+    request.messages.iter().any(|message| match message.content.as_ref() {
+        Some(MessageContent::Text(text)) => text_contains_sensitive_marker(text),
+        Some(MessageContent::Blocks(blocks)) => blocks.iter().any(|block| match block {
+            ContentBlock::Text { text } => text_contains_sensitive_marker(text),
+            ContentBlock::ToolUse { name, input, .. } => {
+                name.eq_ignore_ascii_case("Agent")
+                    && input
+                        .get("isolation")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .map(|value| value.eq_ignore_ascii_case("worktree"))
+                        .unwrap_or(false)
+            }
+            ContentBlock::ToolResult { content, .. } => content
+                .as_ref()
+                .and_then(|value| match value {
+                    Value::String(text) => Some(text_contains_sensitive_marker(text)),
+                    Value::Array(items) => Some(items.iter().any(|item| {
+                        item.get("text")
+                            .and_then(|value| value.as_str())
+                            .map(text_contains_sensitive_marker)
+                            .unwrap_or(false)
+                    })),
+                    _ => None,
+                })
+                .unwrap_or(false),
+            _ => false,
+        }),
+        None => false,
+    })
 }
 
 fn extract_plan_file_path_from_text(text: &str) -> Option<String> {
@@ -5501,6 +5597,8 @@ async fn handle_request(
         let mut stateful_chain_meta_for_attempt = if enable_stateful_responses_chain
             && route_selection.converter.eq_ignore_ascii_case("codex")
         {
+            let force_full_replay =
+                request_contains_rewrite_sensitive_history(&anthropic_body);
             let hint_tail = stateful_chain_hint
                 .as_deref()
                 .map(|value| tail_chars(value, 18))
@@ -5526,7 +5624,7 @@ async fn handle_request(
                 &route_selection.model_name,
                 &anthropic_body,
             );
-            prepare_stateful_chain_request(
+            prepare_stateful_chain_request_with_policy(
                 &mut upstream_body,
                 &stateful_chain_store,
                 &stateful_chain_unsupported_endpoints,
@@ -5536,6 +5634,7 @@ async fn handle_request(
                 &request_id,
                 &log_tx,
                 &logger,
+                force_full_replay,
             )
             .map(|(meta, _turn_state)| meta) // 解构元组，只保留 meta
         } else {
@@ -7860,7 +7959,8 @@ mod tests {
         is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
         mark_codex_fast_endpoint_unsupported, mark_parallel_tool_degrade,
         observe_upstream_chunk_events, prepare_stateful_chain_request, record_stateful_chain_entry,
-        remove_priority_service_tier_from_upstream_body, request_explicitly_asks_for_worktree,
+        remove_priority_service_tier_from_upstream_body, request_contains_rewrite_sensitive_history,
+        request_explicitly_asks_for_worktree,
         resolve_effective_stream, resolve_stateful_chain_hint_info, resolve_upstream_url,
         resolve_upstream_url_with_codex_path_preference, should_drop_post_message_stop_output,
         should_retry_codex_fast_without_service_tier, should_retry_codex_v1_path_with_legacy,
@@ -9905,6 +10005,30 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
     }
 
     #[test]
+    fn test_request_explicitly_asks_for_worktree_ignores_prior_injected_text_blocks() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You can optionally set `isolation: \"worktree\"` to run an agent in a temporary git worktree."
+                    },
+                    {
+                        "type": "text",
+                        "text": "帮我并行开 3 个 subagent 查天气"
+                    }
+                ]
+            }],
+            "stream": true
+        }))
+        .expect("request");
+
+        assert!(!request_explicitly_asks_for_worktree(&request));
+    }
+
+    #[test]
     fn test_request_explicitly_asks_for_worktree_uses_latest_user_turn_only() {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model": "claude-sonnet-4-6",
@@ -9934,6 +10058,49 @@ data: {"type":"response.completed","response":{"id":"resp_123","status":"complet
         .expect("request");
 
         assert!(request_explicitly_asks_for_worktree(&request));
+    }
+
+    #[test]
+    fn test_request_contains_rewrite_sensitive_history_detects_skill_and_worktree_markers() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "call_agent_1",
+                        "name": "Agent",
+                        "input": {
+                            "description": "查天气",
+                            "isolation": "worktree"
+                        }
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_agent_1",
+                        "content": "Cannot create agent worktree: not in a git repository"
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "Launching skill: superpowers:dispatching-parallel-agents"
+                    }, {
+                        "type": "text",
+                        "text": "Base directory for this skill: /tmp/skills/dispatching-parallel-agents"
+                    }]
+                }
+            ],
+            "stream": true
+        }))
+        .expect("request");
+
+        assert!(request_contains_rewrite_sensitive_history(&request));
     }
 
     #[test]

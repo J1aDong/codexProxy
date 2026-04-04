@@ -1129,7 +1129,7 @@ fn streamed_agent_tool_use_preserves_explicit_non_default_team_name_in_input_jso
 }
 
 #[test]
-fn streamed_agent_tool_use_preserves_worktree_isolation_when_explicitly_allowed() {
+fn streamed_agent_tool_use_strips_worktree_isolation_even_when_explicitly_allowed() {
     let mut transformer = TransformResponse::new("gpt-5.3-codex");
     <TransformResponse as crate::transform::ResponseTransformer>::configure_request_context(
         &mut transformer,
@@ -1176,7 +1176,57 @@ fn streamed_agent_tool_use_preserves_worktree_isolation_when_explicitly_allowed(
     let input_json = collect_tool_input_json(&events);
 
     assert!(joined.contains("\"type\":\"tool_use\""));
-    assert!(input_json.contains("\"isolation\":\"worktree\""));
+    assert!(!input_json.contains("\"isolation\":\"worktree\""));
+}
+
+#[test]
+fn streamed_agent_argument_deltas_do_not_leak_raw_worktree_isolation() {
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_delta_worktree",
+                "type": "function_call",
+                "call_id": "call_agent_delta_worktree",
+                "name": "Agent"
+            }
+        })
+    );
+    let tool_args = format!(
+        "data: {}",
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_agent_delta_worktree",
+            "call_id": "call_agent_delta_worktree",
+            "delta": r#"{"description":"查北京天气","isolation":"worktree","subagent_type":"general-purpose"}"#
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_agent_delta_worktree",
+                "type": "function_call",
+                "call_id": "call_agent_delta_worktree",
+                "name": "Agent"
+            }
+        })
+    );
+
+    let mut events = transformer.transform_sse_line(&tool_added);
+    events.extend(transformer.transform_sse_line(&tool_args));
+    events.extend(transformer.transform_sse_line(&tool_done));
+    let input_json = collect_tool_input_json(&events);
+
+    assert!(input_json.contains("\"description\":\"查北京天气\""));
+    assert!(!input_json.contains("\"isolation\":\"worktree\""));
 }
 
 #[test]

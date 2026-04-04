@@ -1,7 +1,10 @@
 use crate::logger::{is_debug_log_enabled, truncate_for_log, AppLogger};
 use crate::models::{ContentBlock, ImageSource, ImageUrlValue, Message, MessageContent};
 use serde_json::{json, Value};
+use std::collections::HashSet;
+#[cfg(test)]
 use std::collections::hash_map::DefaultHasher;
+#[cfg(test)]
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use tokio::sync::broadcast;
@@ -19,6 +22,7 @@ pub struct ExtractedSkillPayload {
 }
 
 impl ExtractedSkillPayload {
+    #[cfg(test)]
     pub fn as_str(&self) -> &str {
         &self.payload
     }
@@ -725,6 +729,7 @@ impl MessageProcessor {
                     ));
 
                     let mut current_msg_content = Vec::new();
+                    let mut skipped_text_block_indexes = HashSet::new();
                     let mut image_hint_added = false;
                     let mut ensure_image_hint = |current_msg_content: &mut Vec<Value>| {
                         if image_hint_added {
@@ -750,6 +755,9 @@ impl MessageProcessor {
                     for (block_idx, block) in blocks.iter().enumerate() {
                         match block {
                             ContentBlock::Text { text } => {
+                                if skipped_text_block_indexes.contains(&block_idx) {
+                                    continue;
+                                }
                                 let text = if msg.role == "user" {
                                     Self::rewrite_teammate_protocol_text(text)
                                         .unwrap_or_else(|| text.clone())
@@ -964,10 +972,47 @@ impl MessageProcessor {
                                 };
 
                                 let mut override_result_text = None;
+                                let mut skill_parse_content = tool_content.clone();
 
-                                if is_skill || Self::is_potential_skill_result(tool_content) {
+                                if is_skill {
+                                    let mut combined_parts = Vec::new();
+                                    if let Some(content) = tool_content.as_ref() {
+                                        if let Some(text) =
+                                            Self::extract_tool_result_plain_text(content)
+                                        {
+                                            combined_parts.push(text);
+                                        }
+                                    }
+
+                                    for (next_idx, next_block) in
+                                        blocks.iter().enumerate().skip(block_idx + 1)
+                                    {
+                                        let ContentBlock::Text { text } = next_block else {
+                                            break;
+                                        };
+                                        let trimmed = text.trim();
+                                        let looks_like_skill_attachment =
+                                            trimmed.contains("Base directory for this skill:")
+                                                || trimmed.contains("Base Path:")
+                                                || trimmed.contains("<command-name>");
+                                        if !looks_like_skill_attachment {
+                                            break;
+                                        }
+                                        skipped_text_block_indexes.insert(next_idx);
+                                        combined_parts.push(text.clone());
+                                    }
+
+                                    if !combined_parts.is_empty() {
+                                        skill_parse_content =
+                                            Some(Value::String(combined_parts.join("\n")));
+                                    }
+                                }
+
+                                if is_skill
+                                    || Self::is_potential_skill_result(&skill_parse_content)
+                                {
                                     if let Some((s_name, s_content)) =
-                                        Self::extract_skill_info(tool_content)
+                                        Self::extract_skill_info(&skill_parse_content)
                                     {
                                         let remaining_budget = MAX_TOTAL_SKILL_CHARS
                                             .saturating_sub(extracted_skill_chars);
@@ -1345,13 +1390,19 @@ impl MessageProcessor {
         let Some(content_val) = content else {
             return false;
         };
+        let has_skill_markers = |text: &str| {
+            text.contains("<command-name>")
+                || text.contains("Base Path:")
+                || text.contains("Base directory for this skill:")
+                || text.contains("Launching skill:")
+        };
         let text = match content_val {
             Value::String(s) => s.as_str(),
             Value::Array(arr) => {
                 for item in arr {
                     if let Value::Object(obj) = item {
                         if let Some(Value::String(t)) = obj.get("text") {
-                            if t.contains("<command-name>") || t.contains("Base Path:") {
+                            if has_skill_markers(t) {
                                 return true;
                             }
                         }
@@ -1361,7 +1412,7 @@ impl MessageProcessor {
             }
             _ => "",
         };
-        text.contains("<command-name>") || text.contains("Base Path:")
+        has_skill_markers(text)
     }
 
     pub fn extract_skill_info(content: &Option<Value>) -> Option<(String, String)> {
@@ -1386,7 +1437,12 @@ impl MessageProcessor {
             _ => content_val.to_string(),
         };
 
-        if !full_text.contains("<command-name>") && !full_text.contains("Base Path:") {
+        let has_skill_markers = full_text.contains("<command-name>")
+            || full_text.contains("Base Path:")
+            || full_text.contains("Base directory for this skill:")
+            || full_text.contains("Launching skill:");
+
+        if !has_skill_markers {
             return None;
         }
 
@@ -1394,17 +1450,29 @@ impl MessageProcessor {
             let sub = &full_text[start + 14..];
             let end = sub.find("</command-name>")?;
             sub[..end].trim().trim_start_matches('/').to_string()
+        } else if let Some(idx) = full_text.find("Launching skill:") {
+            full_text[idx + "Launching skill:".len()..]
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)?
         } else {
             return None;
         };
 
-        let skill_content = if let Some(path_idx) = full_text.find("Base Path:") {
+        let skill_content = if let Some(path_idx) = full_text.find("Base directory for this skill:")
+        {
+            let next_line = full_text[path_idx..].find('\n')?;
+            full_text[path_idx + next_line..].trim().to_string()
+        } else if let Some(path_idx) = full_text.find("Base Path:") {
             let next_line = full_text[path_idx..].find('\n')?;
             full_text[path_idx + next_line..].trim().to_string()
         } else {
             full_text
                 .replace(&format!("<command-name>{}</command-name>", skill_name), "")
                 .replace(&format!("<command-name>/{}</command-name>", skill_name), "")
+                .replace(&format!("Launching skill: {}", skill_name), "")
                 .trim()
                 .to_string()
         };
@@ -1595,6 +1663,7 @@ impl MessageProcessor {
         truncated
     }
 
+    #[cfg(test)]
     fn build_skill_key(name: &str, content: &str) -> String {
         let normalized_name = name.trim().to_ascii_lowercase();
         let normalized_content = content.trim();
@@ -1726,6 +1795,89 @@ mod tests {
         assert_eq!(skills[0].tool_use_id.as_deref(), Some("call_skill_1"));
         assert_eq!(skills[0].name, "yat_commit");
         assert!(skills[0].contains("仅在用户明确要求提交代码时使用"));
+    }
+
+    #[test]
+    fn test_extract_skill_info_supports_launching_skill_format() {
+        let content = Some(Value::Array(vec![
+            json!({
+                "type": "text",
+                "text": "Launching skill: superpowers:dispatching-parallel-agents"
+            }),
+            json!({
+                "type": "text",
+                "text": "Base directory for this skill: /tmp/skills/dispatching-parallel-agents\n\n# Dispatching Parallel Agents\n\n并行分派时必须一次性启动多个 subagent。"
+            }),
+        ]));
+
+        let (name, body) =
+            MessageProcessor::extract_skill_info(&content).expect("skill info should extract");
+
+        assert_eq!(name, "superpowers:dispatching-parallel-agents");
+        assert!(body.contains("# Dispatching Parallel Agents"));
+        assert!(body.contains("并行分派时必须一次性启动多个 subagent"));
+    }
+
+    #[test]
+    fn test_transform_messages_merges_split_skill_result_blocks() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_skill_1".to_string()),
+                    name: "Skill".to_string(),
+                    input: json!({"skill": "superpowers:dispatching-parallel-agents"}),
+                    signature: None,
+                }])),
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: Some("call_skill_1".to_string()),
+                        id: None,
+                        content: Some(Value::String(
+                            "Launching skill: superpowers:dispatching-parallel-agents"
+                                .to_string(),
+                        )),
+                    },
+                    ContentBlock::Text {
+                        text: "Base directory for this skill: /tmp/skills/dispatching-parallel-agents\n\n# Dispatching Parallel Agents\n\n并行分派时必须一次性启动多个 subagent。".to_string(),
+                    },
+                ])),
+            },
+        ];
+
+        let (input, skills) = MessageProcessor::transform_messages(&messages, None);
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills[0].tool_use_id.as_deref(),
+            Some("call_skill_1")
+        );
+        assert!(skills[0].contains("# Dispatching Parallel Agents"));
+
+        let leaked_user_skill_text = input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+                && item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items.iter().any(|entry| {
+                            entry
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(|text| text.starts_with("Base directory for this skill:"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(
+            !leaked_user_skill_text,
+            "split skill body text should not leak as a normal user message"
+        );
     }
 
     #[test]

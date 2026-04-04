@@ -2411,7 +2411,7 @@ impl TransformResponse {
 
     fn normalize_agent_tool_arguments(
         arguments: &str,
-        allow_worktree_isolation: bool,
+        _allow_worktree_isolation: bool,
     ) -> Option<String> {
         let mut parsed = serde_json::from_str::<Value>(arguments).ok()?;
         let obj = parsed.as_object_mut()?;
@@ -2429,13 +2429,16 @@ impl TransformResponse {
             obj.remove("teamName");
         }
 
-        let should_strip_worktree_isolation = !allow_worktree_isolation
-            && obj
-                .get("isolation")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .map(|value| value.eq_ignore_ascii_case("worktree"))
-                .unwrap_or(false);
+        // Codex compatibility lane: never forward worktree isolation for Agent calls.
+        // Claude/Codex desktop sessions often include tool-schema text mentioning
+        // worktree in the request context, which can cause false-positive routing and
+        // break ordinary subagent launches outside git repos.
+        let should_strip_worktree_isolation = obj
+            .get("isolation")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .map(|value| value.eq_ignore_ascii_case("worktree"))
+            .unwrap_or(false);
 
         if should_strip_worktree_isolation {
             obj.remove("isolation");
@@ -2851,7 +2854,7 @@ data: {}
     }
 
     fn tool_supports_live_argument_stream(name: &str) -> bool {
-        !name.eq_ignore_ascii_case("Skill")
+        !name.eq_ignore_ascii_case("Skill") && !name.eq_ignore_ascii_case("Agent")
     }
 
     fn contains_any_json_key(arguments: &str, keys: &[&str]) -> bool {

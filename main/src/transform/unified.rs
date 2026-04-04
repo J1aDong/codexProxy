@@ -133,6 +133,12 @@ pub struct UnifiedChatRequest {
     pub reasoning: Option<UnifiedReasoning>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentWorktreeSanitizationStats {
+    pub stripped_call_isolation: usize,
+    pub dropped_tool_errors: usize,
+}
+
 impl UnifiedChatRequest {
     pub fn from_anthropic(request: &AnthropicRequest) -> Self {
         let mut messages = Vec::new();
@@ -197,6 +203,66 @@ impl UnifiedChatRequest {
             });
         }
     }
+}
+
+pub fn sanitize_agent_worktree_history(
+    request: &mut UnifiedChatRequest,
+) -> AgentWorktreeSanitizationStats {
+    const WORKTREE_ERROR_PREFIX: &str = "Cannot create agent worktree:";
+
+    let mut stats = AgentWorktreeSanitizationStats::default();
+
+    for message in &mut request.messages {
+        if message.role != UnifiedMessageRole::Assistant {
+            continue;
+        }
+
+        for call in &mut message.tool_calls {
+            if !call.function.name.eq_ignore_ascii_case("Agent") {
+                continue;
+            }
+
+            let Ok(mut parsed) = serde_json::from_str::<Value>(&call.function.arguments) else {
+                continue;
+            };
+            let Some(obj) = parsed.as_object_mut() else {
+                continue;
+            };
+
+            let should_strip = obj
+                .get("isolation")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .map(|value| value.eq_ignore_ascii_case("worktree"))
+                .unwrap_or(false);
+
+            if !should_strip {
+                continue;
+            }
+
+            obj.remove("isolation");
+            if let Ok(serialized) = serde_json::to_string(&parsed) {
+                call.function.arguments = serialized;
+                stats.stripped_call_isolation += 1;
+            }
+        }
+    }
+
+    let before = request.messages.len();
+    request.messages.retain(|message| {
+        if message.role != UnifiedMessageRole::Tool {
+            return true;
+        }
+
+        let Some(text) = message.content_text() else {
+            return true;
+        };
+
+        !text.trim_start().starts_with(WORKTREE_ERROR_PREFIX)
+    });
+    stats.dropped_tool_errors = before.saturating_sub(request.messages.len());
+
+    stats
 }
 
 fn is_proxy_lifecycle_progress_text(text: &str) -> bool {

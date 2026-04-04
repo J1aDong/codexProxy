@@ -13,7 +13,9 @@ tauri = { version = "2.10", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-http = "2"
+# The app only uses plain HTTP fetches and does not rely on persisted cookies.
+# Disabling default features avoids cookie-jar initialization on app startup.
+tauri-plugin-http = { version = "2", default-features = false, features = ["rustls-tls", "http2", "charset", "macos-system-configuration"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

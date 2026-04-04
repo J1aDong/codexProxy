@@ -2,8 +2,7 @@ pub mod anthropic;
 pub mod codex;
 pub mod gemini;
 pub mod openai;
-#[cfg(test)]
-mod processor;
+pub(crate) mod processor;
 pub mod providers;
 pub mod unified;
 
@@ -1409,7 +1408,7 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         assert!(instructions.contains("You are Claude Code."));
-        assert!(instructions.contains("Codex Teammate Compatibility"));
+        assert!(instructions.contains("Teammate / Subagent 速查"));
     }
 
     #[test]
@@ -1456,7 +1455,7 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         assert!(instructions.contains("Generate a concise, sentence-case title"));
-        assert!(!instructions.contains("Codex Teammate Compatibility"));
+        assert!(!instructions.contains("Teammate / Subagent 速查"));
     }
 
     #[test]
@@ -1561,7 +1560,7 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
 
-        assert!(messages_instructions.contains("Codex Teammate Compatibility"));
+        assert!(messages_instructions.contains("Teammate / Subagent 速查"));
         assert_eq!(messages_instructions, count_tokens_instructions);
     }
 }

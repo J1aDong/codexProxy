@@ -9,7 +9,7 @@ use crate::transform::processor::{ExtractedSkillPayload, MessageProcessor};
 
 use super::{
     providers::OpenAIChatAdapter, ResponseTransformRequestContext, ResponseTransformer,
-    TransformBackend, TransformContext,
+    unified::sanitize_agent_worktree_history, TransformBackend, TransformContext,
 };
 
 pub struct OpenAIChatBackend;
@@ -704,7 +704,9 @@ impl TransformBackend for OpenAIChatBackend {
         effective_stream: bool,
         model_override: Option<String>,
     ) -> (Value, String) {
-        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(anthropic_body);
+        let mut unified =
+            crate::transform::unified::UnifiedChatRequest::from_anthropic(anthropic_body);
+        let _ = sanitize_agent_worktree_history(&mut unified);
         let requested = model_override
             .as_deref()
             .or(anthropic_body.model.as_deref())
@@ -3002,6 +3004,76 @@ mod tests {
         assert!(tool_output.contains("agentId: a6b95ea1c5bd2a390"));
         assert!(tool_output
             .contains("output_file: /private/tmp/claude-501/demo/tasks/a6b95ea1c5bd2a390.output"));
+    }
+
+    #[test]
+    fn transform_request_strips_agent_worktree_isolation_for_openai_provider() {
+        use crate::models::{
+            AnthropicModelMapping, AnthropicRequest, CodexModelMapping, ContentBlock,
+            GeminiReasoningEffortMapping, Message, MessageContent, OpenAIModelMapping,
+            ReasoningEffortMapping,
+        };
+        use crate::transform::TransformContext;
+
+        let backend = OpenAIChatBackend;
+        let request = AnthropicRequest {
+            model: Some("gpt-4o".to_string()),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: Some("call_agent_1".to_string()),
+                    name: "Agent".to_string(),
+                    input: json!({
+                        "description": "查北京天气",
+                        "isolation": "worktree",
+                        "subagent_type": "general-purpose"
+                    }),
+                    signature: None,
+                }])),
+            }],
+            system: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+        let ctx = TransformContext {
+            reasoning_mapping: ReasoningEffortMapping::default(),
+            codex_model_mapping: CodexModelMapping::default(),
+            anthropic_model_mapping: AnthropicModelMapping::default(),
+            openai_model_mapping: OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: Default::default(),
+            custom_injection_prompt: String::new(),
+            converter: "openai".to_string(),
+            codex_model: String::new(),
+            gemini_reasoning_effort: GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let (body, _) = backend.transform_request(&request, None, &ctx, true, None);
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages should be present");
+
+        let tool_calls = messages[0]
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .expect("assistant tool_calls should be present");
+        let args = tool_calls[0]
+            .get("function")
+            .and_then(|value| value.get("arguments"))
+            .and_then(Value::as_str)
+            .expect("tool arguments should be present");
+        assert!(!args.contains("\"isolation\":\"worktree\""));
     }
 
     #[test]
