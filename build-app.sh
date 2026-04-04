@@ -4,9 +4,11 @@ set -e
 # 获取脚本所在目录
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 FRONTED_DIR="$BASE_DIR/fronted-tauri"
+SRC_TAURI_DIR="$FRONTED_DIR/src-tauri"
+TARGET_DIR="$SRC_TAURI_DIR/target"
 PACKAGE_JSON="$FRONTED_DIR/package.json"
-TAURI_CONF="$FRONTED_DIR/src-tauri/tauri.conf.json"
-CARGO_TOML="$FRONTED_DIR/src-tauri/Cargo.toml"
+TAURI_CONF="$SRC_TAURI_DIR/tauri.conf.json"
+CARGO_TOML="$SRC_TAURI_DIR/Cargo.toml"
 OS_NAME="$(uname -s)"
 
 echo "=========================================="
@@ -34,6 +36,38 @@ prompt_read() {
 
     printf -v "$__var_name" '%s' "$__value"
     return 0
+}
+
+# 检测 target 中是否残留了来自旧工作区路径的 Cargo/Tauri 构建缓存。
+# 这类缓存会让 tauri-build 去读取已经不存在的 permissions 输出文件。
+has_stale_tauri_target_cache() {
+    [ -d "$TARGET_DIR" ] || return 1
+
+    while IFS= read -r root_output_file; do
+        [ -f "$root_output_file" ] || continue
+        local recorded_path
+        recorded_path="$(sed -n '1p' "$root_output_file" 2>/dev/null || true)"
+        [ -n "$recorded_path" ] || continue
+
+        case "$recorded_path" in
+            "$TARGET_DIR"/*) ;;
+            *)
+                return 0
+                ;;
+        esac
+    done < <(find "$TARGET_DIR" -type f \( -path '*/build/tauri-*/root-output' -o -path '*/build/codex-proxy-desktop-*/root-output' \) 2>/dev/null)
+
+    return 1
+}
+
+refresh_tauri_target_if_needed() {
+    if ! has_stale_tauri_target_cache; then
+        return 0
+    fi
+
+    echo "♻️  检测到 Tauri/Cargo 构建缓存仍指向旧工作区，正在清理本地 target..."
+    rm -rf "$TARGET_DIR"
+    echo "✅ 已清理 $SRC_TAURI_DIR/target"
 }
 
 # 1. 检查目录
@@ -179,6 +213,8 @@ echo ""
 echo "🔨 开始本地构建流程..."
 cd "$FRONTED_DIR"
 
+refresh_tauri_target_if_needed
+
 # 检查依赖
 if [ ! -d "node_modules" ]; then
     echo "⬇️  正在安装前端依赖..."
@@ -248,4 +284,4 @@ esac
 
 echo ""
 echo "✅ 本地构建完成!"
-echo "📁 产物目录: $FRONTED_DIR/src-tauri/target/release/bundle"
+echo "📁 产物目录: ./fronted-tauri/src-tauri/target/release/bundle"
