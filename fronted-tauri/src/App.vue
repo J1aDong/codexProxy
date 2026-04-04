@@ -789,6 +789,14 @@ const currentEndpoint = computed(() => {
   return matched ?? form.endpointOptions[0] ?? DEFAULT_ENDPOINT_OPTION
 })
 
+const promoteEndpointToFront = (id: string) => {
+  const index = form.endpointOptions.findIndex((item) => item.id === id)
+  if (index <= 0) return
+
+  const selected = form.endpointOptions[index]
+  form.endpointOptions = [selected, ...form.endpointOptions.filter((item) => item.id !== id)]
+}
+
 const syncEndpointFromSelection = () => {
   const endpoint = currentEndpoint.value
   form.targetUrl = endpoint.url
@@ -818,6 +826,7 @@ const syncEndpointFromSelection = () => {
 // Watch for endpoint selection changes to load corresponding config
 watch(() => form.selectedEndpointId, async () => {
   isSyncing.value = true
+  promoteEndpointToFront(form.selectedEndpointId)
   syncEndpointFromSelection()
   await nextTick()
   isSyncing.value = false
