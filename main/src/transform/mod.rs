@@ -1101,6 +1101,154 @@ mod tests {
             key_a.contains("session"),
             "session-aware codex requests should restore stable cache keys"
         );
+        assert!(
+            key_a.len() <= 64,
+            "prompt_cache_key must satisfy upstream 64-char limit, got {}: {}",
+            key_a.len(),
+            key_a
+        );
+    }
+
+    #[test]
+    fn codex_adapter_truncates_session_prompt_cache_key_to_upstream_limit() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-6".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<environment_context><cwd>/Volumes/zhitai/code/ai/MyProjects/codexProxy</cwd></environment_context>\nhello".to_string(),
+                )),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: Some(json!({
+                "user_id": "{\"device_id\":\"abc\",\"account_uuid\":\"\",\"session_id\":\"d8affea6-1a36-4c3b-b9a8-6db32fee9aee\"}"
+            })),
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let hints = crate::transform::request_envelope_hints_from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "codex".to_string(),
+            codex_model: "gpt-5.4".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let adapter = crate::transform::providers::CodexAdapter;
+        let prepared = adapter.prepare_messages_request_with_hints(
+            &unified,
+            &ctx,
+            "https://api.openai.com/v1/responses",
+            "test-key",
+            "2023-06-01",
+            "gpt-5.4",
+            true,
+            &hints,
+        );
+
+        let key = prepared
+            .body
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .expect("prompt_cache_key");
+
+        assert!(
+            key.len() <= 64,
+            "session-derived prompt_cache_key must satisfy upstream 64-char limit, got {}: {}",
+            key.len(),
+            key
+        );
+        assert!(
+            key.contains("session"),
+            "session-derived prompt_cache_key should preserve request kind semantics"
+        );
+    }
+
+    #[test]
+    fn codex_adapter_truncates_cwd_prompt_cache_key_to_upstream_limit() {
+        use crate::models::{Message, MessageContent};
+
+        let request = AnthropicRequest {
+            model: Some("claude-sonnet-4-6".to_string()),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(
+                    "<environment_context><cwd>/Volumes/zhitai/code/ai/MyProjects/codexProxy/fronted-tauri/src/components/very/deep/nested/path</cwd></environment_context>\nhello".to_string(),
+                )),
+            }],
+            system: Some(SystemContent::Text("You are Claude Code.".to_string())),
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+        };
+
+        let unified = crate::transform::unified::UnifiedChatRequest::from_anthropic(&request);
+        let hints = crate::transform::request_envelope_hints_from_anthropic(&request);
+        let ctx = crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: "codex".to_string(),
+            codex_model: "gpt-5.4".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: false,
+            enable_codex_fast_mode: false,
+            enable_skill_routing_hint: false,
+        };
+
+        let adapter = crate::transform::providers::CodexAdapter;
+        let prepared = adapter.prepare_messages_request_with_hints(
+            &unified,
+            &ctx,
+            "https://api.openai.com/v1/responses",
+            "test-key",
+            "2023-06-01",
+            "gpt-5.4",
+            true,
+            &hints,
+        );
+
+        let key = prepared
+            .body
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .expect("prompt_cache_key");
+
+        assert!(
+            key.len() <= 64,
+            "cwd-derived prompt_cache_key must satisfy upstream 64-char limit, got {}: {}",
+            key.len(),
+            key
+        );
     }
 
     #[test]

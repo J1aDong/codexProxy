@@ -1210,25 +1210,41 @@ fn codex_tools_fingerprint(unified: &UnifiedChatRequest) -> Option<String> {
     Some(fingerprint_json_value(&Value::Array(tools)))
 }
 
+fn prompt_cache_request_kind_segment(hints: &RequestEnvelopeHints) -> &'static str {
+    match hints.request_kind {
+        super::ClaudeCodeRequestKind::SessionTitle => "st",
+        super::ClaudeCodeRequestKind::ConversationTurn => "ct",
+        super::ClaudeCodeRequestKind::Unknown => "uk",
+    }
+}
+
+fn prompt_cache_hash_hex(input: &str) -> String {
+    format!(
+        "{:016x}",
+        fnv1a64(normalize_cache_material(input).as_bytes())
+    )
+}
+
 fn build_prompt_cache_key(
     route_model: &str,
     hints: &RequestEnvelopeHints,
     applied_static_instructions: Option<&str>,
     tools_fingerprint: Option<&str>,
 ) -> String {
+    let model_segment = sanitize_cache_key_segment(route_model, 20);
+    let kind_segment = prompt_cache_request_kind_segment(hints);
+
     if let Some(hint) = hints
         .session_hint
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let model_segment = sanitize_cache_key_segment(route_model, 48);
-        let hint_segment = sanitize_cache_key_segment(hint, 72);
         return format!(
-            "codex-proxy:{}:{}:session:{}",
+            "cp:{}:{}:session:{}",
             model_segment,
-            hints.request_kind.as_str(),
-            hint_segment
+            kind_segment,
+            prompt_cache_hash_hex(hint)
         );
     }
 
@@ -1242,18 +1258,14 @@ fn build_prompt_cache_key(
     }
 
     let key_hash = fnv1a64(&key_material);
-    let model_segment = sanitize_cache_key_segment(route_model, 48);
-    let cwd_segment = hints
+    let cwd_hash = hints
         .request_cwd
         .as_deref()
-        .map(|cwd| sanitize_cache_key_segment(cwd, 64))
-        .unwrap_or_else(|| "default".to_string());
+        .map(prompt_cache_hash_hex)
+        .unwrap_or_else(|| prompt_cache_hash_hex("default"));
 
     format!(
-        "codex-proxy:{}:{}:{}:{:016x}",
-        model_segment,
-        hints.request_kind.as_str(),
-        cwd_segment,
-        key_hash
+        "cp:{}:{}:cwd:{}:{:016x}",
+        model_segment, kind_segment, cwd_hash, key_hash
     )
 }

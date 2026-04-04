@@ -179,7 +179,13 @@
       "WebFetch(domain:www.weather.com.cn)",
       "WebFetch(domain:www.nmc.cn)",
       "WebFetch(domain:gd.cma.gov.cn)",
-      "WebFetch(domain:weather.cma.cn)"
+      "WebFetch(domain:weather.cma.cn)",
+      "Bash(printf '\\\\n---FULL-DIFF---\\\\n')",
+      "Bash(printf '\\\\n---DIFF---\\\\n')",
+      "Bash(printf '\\\\n---FILES---\\\\n')",
+      "Bash(printf \"\\\\n---FILES---\\\\n\")",
+      "Bash(printf '\\\\n---PATCH---\\\\n')",
+      "Skill(yat_commit)"
     ]
   },
   "enableAllProjectMcpServers": true,
