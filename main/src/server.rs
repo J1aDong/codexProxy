@@ -9,6 +9,7 @@ use crate::models::{
 };
 use crate::transform::anthropic::build_raw_passthrough_body;
 use crate::transform::codex::build_codex_unified_request;
+use crate::transform::providers::build_gemini_explicit_cache_plan;
 use crate::transform::request_envelope_hints_from_anthropic;
 use crate::transform::{
     AnthropicBackend, CodexAdapter, CodexBackend, CountTokensMode, GeminiAdapter, GeminiBackend,
@@ -485,6 +486,7 @@ impl StreamRuntimeOptions {
 
 const STATEFUL_CHAIN_MAX_ENTRIES: usize = 128;
 const SKILL_CATALOG_CACHE_MAX_ENTRIES: usize = 128;
+const GEMINI_EXPLICIT_CACHE_TTL_SECS: u64 = 3600;
 const STATEFUL_CHAIN_HINT_HEADERS: [&str; 6] = [
     "x-codex-proxy-session",
     "x-claude-session-id",
@@ -516,8 +518,17 @@ struct StatefulChainEntry {
     updated_at: Instant,
 }
 
+#[derive(Clone)]
+struct GeminiExplicitCacheEntry {
+    cache_name: String,
+    prefix_fingerprint: String,
+    expires_at: Instant,
+}
+
 type StatefulChainStore = Arc<Mutex<HashMap<String, StatefulChainEntry>>>;
 type StatefulChainUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
+type GeminiExplicitCacheStore = Arc<Mutex<HashMap<String, GeminiExplicitCacheEntry>>>;
+type GeminiExplicitCacheUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type CodexV1UnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type CodexFastUnsupportedEndpointStore = Arc<Mutex<HashSet<String>>>;
 type SkillCatalogReminderStore = Arc<Mutex<HashMap<String, SkillCatalogCacheEntry>>>;
@@ -711,6 +722,257 @@ fn build_stateful_endpoint_key(
 fn build_codex_v1_endpoint_key(converter: &str, target_url: &str, api_key: &str) -> String {
     let fingerprint = hash_to_u64(&[converter, target_url, api_key]);
     format!("{}:{:016x}", converter.to_ascii_lowercase(), fingerprint)
+}
+
+fn build_gemini_explicit_cache_key(
+    endpoint_key: &str,
+    request_hints: &RequestEnvelopeHints,
+    route_model: &str,
+    prefix_fingerprint: &str,
+) -> String {
+    let scope = request_hints
+        .session_hint
+        .as_deref()
+        .or(request_hints.request_cwd.as_deref())
+        .unwrap_or("default");
+    let fingerprint = hash_to_u64(&[endpoint_key, scope, route_model, prefix_fingerprint]);
+    format!("gemini:{:016x}", fingerprint)
+}
+
+fn is_gemini_explicit_cache_endpoint_unsupported(
+    unsupported_store: &GeminiExplicitCacheUnsupportedEndpointStore,
+    endpoint_key: &str,
+) -> bool {
+    match unsupported_store.lock() {
+        Ok(guard) => guard.contains(endpoint_key),
+        Err(poisoned) => poisoned.into_inner().contains(endpoint_key),
+    }
+}
+
+fn mark_gemini_explicit_cache_endpoint_unsupported(
+    unsupported_store: &GeminiExplicitCacheUnsupportedEndpointStore,
+    endpoint_key: &str,
+) {
+    match unsupported_store.lock() {
+        Ok(mut guard) => {
+            guard.insert(endpoint_key.to_string());
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(endpoint_key.to_string());
+        }
+    }
+}
+
+fn get_gemini_explicit_cache_entry(
+    cache_store: &GeminiExplicitCacheStore,
+    cache_key: &str,
+) -> Option<GeminiExplicitCacheEntry> {
+    let now = Instant::now();
+    match cache_store.lock() {
+        Ok(mut guard) => {
+            if let Some(entry) = guard.get(cache_key) {
+                if entry.expires_at > now {
+                    return Some(entry.clone());
+                }
+            }
+            guard.remove(cache_key);
+            None
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            if let Some(entry) = guard.get(cache_key) {
+                if entry.expires_at > now {
+                    return Some(entry.clone());
+                }
+            }
+            guard.remove(cache_key);
+            None
+        }
+    }
+}
+
+fn upsert_gemini_explicit_cache_entry(
+    cache_store: &GeminiExplicitCacheStore,
+    cache_key: &str,
+    cache_name: &str,
+    prefix_fingerprint: &str,
+) {
+    let entry = GeminiExplicitCacheEntry {
+        cache_name: cache_name.to_string(),
+        prefix_fingerprint: prefix_fingerprint.to_string(),
+        expires_at: Instant::now() + Duration::from_secs(GEMINI_EXPLICIT_CACHE_TTL_SECS),
+    };
+    match cache_store.lock() {
+        Ok(mut guard) => {
+            guard.insert(cache_key.to_string(), entry);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(cache_key.to_string(), entry);
+        }
+    }
+}
+
+fn should_mark_gemini_cached_contents_unsupported(status: u16, error_text: &str) -> bool {
+    let normalized = error_text.to_ascii_lowercase();
+    matches!(status, 404 | 405 | 501)
+        || normalized.contains("unimplemented")
+        || normalized.contains("not implemented")
+        || (normalized.contains("cachedcontents")
+            && (normalized.contains("unknown")
+                || normalized.contains("unsupported")
+                || normalized.contains("not found")))
+}
+
+fn extract_gemini_cached_content_name(value: &Value) -> Option<String> {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .or_else(|| {
+            value
+                .get("cachedContent")
+                .and_then(|cached| cached.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        })
+}
+
+async fn prepare_gemini_explicit_cache(
+    http_client: &reqwest::Client,
+    request_id: &str,
+    request_hints: &RequestEnvelopeHints,
+    resolved_target_url: &str,
+    api_key: &str,
+    route_model: &str,
+    upstream_body: &mut Value,
+    cache_store: &GeminiExplicitCacheStore,
+    unsupported_store: &GeminiExplicitCacheUnsupportedEndpointStore,
+    log_tx: &broadcast::Sender<String>,
+) {
+    if request_hints.request_kind != crate::transform::ClaudeCodeRequestKind::ConversationTurn {
+        return;
+    }
+
+    let Some(plan) = build_gemini_explicit_cache_plan(upstream_body) else {
+        return;
+    };
+    let endpoint_key =
+        build_stateful_endpoint_key("gemini", resolved_target_url, route_model, api_key);
+    if is_gemini_explicit_cache_endpoint_unsupported(unsupported_store, &endpoint_key) {
+        let _ = log_tx.send(format!(
+            "[GeminiCache] #{} mode=skip reason=endpoint_unsupported endpoint={}",
+            request_id,
+            tail_chars(&endpoint_key, 20)
+        ));
+        return;
+    }
+
+    let cache_key = build_gemini_explicit_cache_key(
+        &endpoint_key,
+        request_hints,
+        route_model,
+        &plan.prefix_fingerprint,
+    );
+    if let Some(entry) = get_gemini_explicit_cache_entry(cache_store, &cache_key) {
+        let mut request_body = plan.request_body;
+        request_body["cachedContent"] = json!(entry.cache_name.clone());
+        *upstream_body = request_body;
+        let _ = log_tx.send(format!(
+            "[GeminiCache] #{} mode=hit endpoint={} cache={} fingerprint_match={}",
+            request_id,
+            tail_chars(&endpoint_key, 20),
+            tail_chars(&entry.cache_name, 36),
+            entry.prefix_fingerprint == plan.prefix_fingerprint
+        ));
+        return;
+    }
+
+    let create_request = GeminiAdapter.prepare_cached_contents_request(
+        resolved_target_url,
+        api_key,
+        plan.create_body,
+    );
+    match send_prepared_json_request(http_client, &create_request, None).await {
+        Ok(response) if response.status().is_success() => match response.text().await {
+            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(value) => {
+                    if let Some(cache_name) = extract_gemini_cached_content_name(&value) {
+                        upsert_gemini_explicit_cache_entry(
+                            cache_store,
+                            &cache_key,
+                            &cache_name,
+                            &plan.prefix_fingerprint,
+                        );
+                        let mut request_body = plan.request_body;
+                        request_body["cachedContent"] = json!(cache_name.clone());
+                        *upstream_body = request_body;
+                        let _ = log_tx.send(format!(
+                            "[GeminiCache] #{} mode=create endpoint={} cache={} ttl={}s",
+                            request_id,
+                            tail_chars(&endpoint_key, 20),
+                            tail_chars(&cache_name, 36),
+                            GEMINI_EXPLICIT_CACHE_TTL_SECS
+                        ));
+                    } else {
+                        let _ = log_tx.send(format!(
+                            "[GeminiCache] #{} mode=skip reason=missing_cache_name endpoint={}",
+                            request_id,
+                            tail_chars(&endpoint_key, 20)
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let _ = log_tx.send(format!(
+                        "[GeminiCache] #{} mode=skip reason=parse_error endpoint={} error={}",
+                        request_id,
+                        tail_chars(&endpoint_key, 20),
+                        error
+                    ));
+                }
+            },
+            Err(error) => {
+                let _ = log_tx.send(format!(
+                    "[GeminiCache] #{} mode=skip reason=read_error endpoint={} error={}",
+                    request_id,
+                    tail_chars(&endpoint_key, 20),
+                    error
+                ));
+            }
+        },
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let error_text = response.text().await.unwrap_or_default();
+            if should_mark_gemini_cached_contents_unsupported(status, &error_text) {
+                mark_gemini_explicit_cache_endpoint_unsupported(unsupported_store, &endpoint_key);
+                let _ = log_tx.send(format!(
+                    "[GeminiCache] #{} mode=skip reason=endpoint_unsupported endpoint={} status={}",
+                    request_id,
+                    tail_chars(&endpoint_key, 20),
+                    status
+                ));
+            } else {
+                let _ = log_tx.send(format!(
+                    "[GeminiCache] #{} mode=skip reason=create_failed endpoint={} status={} error={}",
+                    request_id,
+                    tail_chars(&endpoint_key, 20),
+                    status,
+                    head_chars(&error_text, 120)
+                ));
+            }
+        }
+        Err(error) => {
+            let _ = log_tx.send(format!(
+                "[GeminiCache] #{} mode=skip reason=request_error endpoint={} error={}",
+                request_id,
+                tail_chars(&endpoint_key, 20),
+                error
+            ));
+        }
+    }
 }
 
 fn is_codex_v1_endpoint_unsupported(
@@ -2425,6 +2687,7 @@ fn apply_sse_chunk_to_non_stream_message(
     stop_reason_state: &mut Option<String>,
     usage_input_tokens: &mut u64,
     usage_output_tokens: &mut u64,
+    usage_cached_input_tokens: &mut u64,
 ) {
     let Some((event, payload)) = parse_sse_chunk(chunk) else {
         return;
@@ -2507,6 +2770,11 @@ fn apply_sse_chunk_to_non_stream_message(
                     .get("output_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(*usage_output_tokens);
+                *usage_cached_input_tokens = usage
+                    .get("input_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(*usage_cached_input_tokens);
             }
         }
         "message_stop" => {
@@ -3387,36 +3655,39 @@ fn request_contains_rewrite_sensitive_history(request: &AnthropicRequest) -> boo
             || SKILL_MARKERS.iter().any(|marker| trimmed.contains(marker))
     };
 
-    request.messages.iter().any(|message| match message.content.as_ref() {
-        Some(MessageContent::Text(text)) => text_contains_sensitive_marker(text),
-        Some(MessageContent::Blocks(blocks)) => blocks.iter().any(|block| match block {
-            ContentBlock::Text { text } => text_contains_sensitive_marker(text),
-            ContentBlock::ToolUse { name, input, .. } => {
-                name.eq_ignore_ascii_case("Agent")
-                    && input
-                        .get("isolation")
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .map(|value| value.eq_ignore_ascii_case("worktree"))
-                        .unwrap_or(false)
-            }
-            ContentBlock::ToolResult { content, .. } => content
-                .as_ref()
-                .and_then(|value| match value {
-                    Value::String(text) => Some(text_contains_sensitive_marker(text)),
-                    Value::Array(items) => Some(items.iter().any(|item| {
-                        item.get("text")
+    request
+        .messages
+        .iter()
+        .any(|message| match message.content.as_ref() {
+            Some(MessageContent::Text(text)) => text_contains_sensitive_marker(text),
+            Some(MessageContent::Blocks(blocks)) => blocks.iter().any(|block| match block {
+                ContentBlock::Text { text } => text_contains_sensitive_marker(text),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    name.eq_ignore_ascii_case("Agent")
+                        && input
+                            .get("isolation")
                             .and_then(|value| value.as_str())
-                            .map(text_contains_sensitive_marker)
+                            .map(str::trim)
+                            .map(|value| value.eq_ignore_ascii_case("worktree"))
                             .unwrap_or(false)
-                    })),
-                    _ => None,
-                })
-                .unwrap_or(false),
-            _ => false,
-        }),
-        None => false,
-    })
+                }
+                ContentBlock::ToolResult { content, .. } => content
+                    .as_ref()
+                    .and_then(|value| match value {
+                        Value::String(text) => Some(text_contains_sensitive_marker(text)),
+                        Value::Array(items) => Some(items.iter().any(|item| {
+                            item.get("text")
+                                .and_then(|value| value.as_str())
+                                .map(text_contains_sensitive_marker)
+                                .unwrap_or(false)
+                        })),
+                        _ => None,
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            }),
+            None => false,
+        })
 }
 
 fn extract_plan_file_path_from_text(text: &str) -> Option<String> {
@@ -4557,6 +4828,10 @@ impl ProxyServer {
         let stateful_chain_store: StatefulChainStore = Arc::new(Mutex::new(HashMap::new()));
         let stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
+        let gemini_explicit_cache_store: GeminiExplicitCacheStore =
+            Arc::new(Mutex::new(HashMap::new()));
+        let gemini_explicit_cache_unsupported_endpoints: GeminiExplicitCacheUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
         let codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore =
             Arc::new(Mutex::new(HashSet::new()));
         let codex_fast_unsupported_endpoints: CodexFastUnsupportedEndpointStore =
@@ -4624,6 +4899,10 @@ impl ProxyServer {
                                 let stateful_chain_store = Arc::clone(&stateful_chain_store);
                                 let stateful_chain_unsupported_endpoints =
                                     Arc::clone(&stateful_chain_unsupported_endpoints);
+                                let gemini_explicit_cache_store =
+                                    Arc::clone(&gemini_explicit_cache_store);
+                                let gemini_explicit_cache_unsupported_endpoints =
+                                    Arc::clone(&gemini_explicit_cache_unsupported_endpoints);
                                 let codex_v1_unsupported_endpoints =
                                     Arc::clone(&codex_v1_unsupported_endpoints);
                                 let codex_fast_unsupported_endpoints =
@@ -4652,6 +4931,8 @@ impl ProxyServer {
                                             Arc::clone(&parallel_tool_degrade_until),
                                             Arc::clone(&stateful_chain_store),
                                             Arc::clone(&stateful_chain_unsupported_endpoints),
+                                            Arc::clone(&gemini_explicit_cache_store),
+                                            Arc::clone(&gemini_explicit_cache_unsupported_endpoints),
                                             Arc::clone(&codex_v1_unsupported_endpoints),
                                             Arc::clone(&codex_fast_unsupported_endpoints),
                                             Arc::clone(&skill_catalog_reminders),
@@ -4718,6 +4999,8 @@ async fn handle_request(
     parallel_tool_degrade_until: Arc<Mutex<HashMap<String, Instant>>>,
     stateful_chain_store: StatefulChainStore,
     stateful_chain_unsupported_endpoints: StatefulChainUnsupportedEndpointStore,
+    gemini_explicit_cache_store: GeminiExplicitCacheStore,
+    gemini_explicit_cache_unsupported_endpoints: GeminiExplicitCacheUnsupportedEndpointStore,
     codex_v1_unsupported_endpoints: CodexV1UnsupportedEndpointStore,
     codex_fast_unsupported_endpoints: CodexFastUnsupportedEndpointStore,
     skill_catalog_reminders: SkillCatalogReminderStore,
@@ -5597,8 +5880,7 @@ async fn handle_request(
         let mut stateful_chain_meta_for_attempt = if enable_stateful_responses_chain
             && route_selection.converter.eq_ignore_ascii_case("codex")
         {
-            let force_full_replay =
-                request_contains_rewrite_sensitive_history(&anthropic_body);
+            let force_full_replay = request_contains_rewrite_sensitive_history(&anthropic_body);
             let hint_tail = stateful_chain_hint
                 .as_deref()
                 .map(|value| tail_chars(value, 18))
@@ -5707,6 +5989,22 @@ async fn handle_request(
                     ));
                 }
             }
+        }
+
+        if route_selection.converter.eq_ignore_ascii_case("gemini") {
+            prepare_gemini_explicit_cache(
+                &http_client,
+                &request_id,
+                &request_hints,
+                &resolved_target_url,
+                &route_selection.api_key,
+                &route_selection.model_name,
+                &mut upstream_body,
+                &gemini_explicit_cache_store,
+                &gemini_explicit_cache_unsupported_endpoints,
+                &log_tx,
+            )
+            .await;
         }
 
         if let Some(input_summary) = summarize_codex_payload(&upstream_body) {
@@ -6446,6 +6744,7 @@ async fn handle_request(
         let mut stop_reason_state: Option<String> = None;
         let mut usage_input_tokens: u64 = 0;
         let mut usage_output_tokens: u64 = 0;
+        let mut usage_cached_input_tokens: u64 = 0;
         let mut latest_upstream_response_id: Option<String> = None;
         let mut latest_codex_terminal_snapshot: Option<Value> = None;
 
@@ -6488,6 +6787,7 @@ async fn handle_request(
                                         &mut stop_reason_state,
                                         &mut usage_input_tokens,
                                         &mut usage_output_tokens,
+                                        &mut usage_cached_input_tokens,
                                     );
                                 }
                             }
@@ -6518,6 +6818,7 @@ async fn handle_request(
                                         &mut stop_reason_state,
                                         &mut usage_input_tokens,
                                         &mut usage_output_tokens,
+                                        &mut usage_cached_input_tokens,
                                     );
                                 }
                             }
@@ -6589,6 +6890,7 @@ async fn handle_request(
                         &mut stop_reason_state,
                         &mut usage_input_tokens,
                         &mut usage_output_tokens,
+                        &mut usage_cached_input_tokens,
                     );
                 }
             }
@@ -6617,6 +6919,7 @@ async fn handle_request(
                     &mut stop_reason_state,
                     &mut usage_input_tokens,
                     &mut usage_output_tokens,
+                    &mut usage_cached_input_tokens,
                 );
             }
         }
@@ -6648,7 +6951,20 @@ async fn handle_request(
                 "input_tokens": usage_input_tokens,
                 "output_tokens": usage_output_tokens,
             });
-            message_obj.insert("usage".to_string(), usage);
+            if usage_cached_input_tokens > 0 {
+                message_obj.insert(
+                    "usage".to_string(),
+                    json!({
+                        "input_tokens": usage_input_tokens,
+                        "output_tokens": usage_output_tokens,
+                        "input_tokens_details": {
+                            "cached_tokens": usage_cached_input_tokens
+                        }
+                    }),
+                );
+            } else {
+                message_obj.insert("usage".to_string(), usage);
+            }
         }
 
         let payload = json!({
@@ -7945,7 +8261,8 @@ mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
         backfill_non_stream_payload_from_codex_snapshot, body_uses_priority_service_tier,
-        build_anthropic_message_from_codex_json_response, build_parallel_tool_degrade_key,
+        build_anthropic_message_from_codex_json_response, build_gemini_explicit_cache_key,
+        build_parallel_tool_degrade_key, build_stateful_endpoint_key,
         chunk_contains_sibling_tool_call_error, classify_connection_error,
         collect_skill_catalog_reminder_blocks, compute_non_input_fingerprint,
         derive_skill_catalog_cache_key, derive_stateful_chain_key, derive_stream_close_cause,
@@ -7958,17 +8275,21 @@ mod tests {
         is_business_stream_output, is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
         is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
         mark_codex_fast_endpoint_unsupported, mark_parallel_tool_degrade,
-        observe_upstream_chunk_events, prepare_stateful_chain_request, record_stateful_chain_entry,
-        remove_priority_service_tier_from_upstream_body, request_contains_rewrite_sensitive_history,
-        request_explicitly_asks_for_worktree,
+        observe_upstream_chunk_events, prepare_gemini_explicit_cache,
+        prepare_stateful_chain_request, record_stateful_chain_entry,
+        remove_priority_service_tier_from_upstream_body,
+        request_contains_rewrite_sensitive_history, request_explicitly_asks_for_worktree,
         resolve_effective_stream, resolve_stateful_chain_hint_info, resolve_upstream_url,
         resolve_upstream_url_with_codex_path_preference, should_drop_post_message_stop_output,
+        should_mark_gemini_cached_contents_unsupported,
         should_retry_codex_fast_without_service_tier, should_retry_codex_v1_path_with_legacy,
         should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
-        trim_leading_stateful_replay_items, CodexFastUnsupportedEndpointStore, ConnErrorClass,
-        SkillCatalogReminderStore, SseFrameParser, StatefulChainEntry, StatefulChainRequestMeta,
-        StatefulChainStore, StatefulChainUnsupportedEndpointStore, StreamEventCounters,
-        StreamRuntimeOptions, UpstreamOperation,
+        trim_leading_stateful_replay_items, upsert_gemini_explicit_cache_entry,
+        CodexFastUnsupportedEndpointStore, ConnErrorClass, GeminiExplicitCacheStore,
+        GeminiExplicitCacheUnsupportedEndpointStore, SkillCatalogReminderStore, SseFrameParser,
+        StatefulChainEntry, StatefulChainRequestMeta, StatefulChainStore,
+        StatefulChainUnsupportedEndpointStore, StreamEventCounters, StreamRuntimeOptions,
+        UpstreamOperation,
     };
     use crate::models::AnthropicRequest;
     use crate::transform::{request_envelope_hints_from_anthropic, RequestEnvelopeHints};
@@ -8702,6 +9023,7 @@ data: {"type":"response.failed","response":{"error":{"message":"rate_limit_excee
         let mut stop_reason_state = None;
         let mut usage_input_tokens = 0_u64;
         let mut usage_output_tokens = 0_u64;
+        let mut usage_cached_input_tokens = 0_u64;
 
         super::apply_sse_chunk_to_non_stream_message(
             r#"event: content_block_start
@@ -8714,6 +9036,7 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use"
             &mut stop_reason_state,
             &mut usage_input_tokens,
             &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
         );
         super::apply_sse_chunk_to_non_stream_message(
             r#"event: content_block_delta
@@ -8726,6 +9049,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"
             &mut stop_reason_state,
             &mut usage_input_tokens,
             &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
         );
         super::apply_sse_chunk_to_non_stream_message(
             r#"event: content_block_start
@@ -8738,6 +9062,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"
             &mut stop_reason_state,
             &mut usage_input_tokens,
             &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
         );
         super::apply_sse_chunk_to_non_stream_message(
             r#"event: content_block_delta
@@ -8750,6 +9075,7 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
             &mut stop_reason_state,
             &mut usage_input_tokens,
             &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
         );
         super::apply_sse_chunk_to_non_stream_message(
             r#"event: content_block_delta
@@ -8762,6 +9088,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"
             &mut stop_reason_state,
             &mut usage_input_tokens,
             &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
         );
         super::apply_sse_chunk_to_non_stream_message(
             r#"event: content_block_stop
@@ -8774,6 +9101,7 @@ data: {"type":"content_block_stop","index":1}
             &mut stop_reason_state,
             &mut usage_input_tokens,
             &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
         );
         super::apply_sse_chunk_to_non_stream_message(
             r#"event: content_block_stop
@@ -8786,6 +9114,7 @@ data: {"type":"content_block_stop","index":0}
             &mut stop_reason_state,
             &mut usage_input_tokens,
             &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
         );
         super::apply_sse_chunk_to_non_stream_message(
             r#"event: message_delta
@@ -8798,6 +9127,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input
             &mut stop_reason_state,
             &mut usage_input_tokens,
             &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
         );
 
         let mut message = message_state.expect("message state should exist");
@@ -8839,6 +9169,155 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input
             message.get("stop_reason").and_then(Value::as_str),
             Some("tool_use")
         );
+    }
+
+    #[test]
+    fn test_non_stream_aggregation_preserves_cached_input_tokens() {
+        let mut message_state = Some(json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "gemini-3.1-pro",
+            "stop_reason": null,
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        }));
+        let mut blocks = std::collections::BTreeMap::new();
+        let mut tool_input_buffers = std::collections::HashMap::new();
+        let mut stop_reason_state = None;
+        let mut usage_input_tokens = 0_u64;
+        let mut usage_output_tokens = 0_u64;
+        let mut usage_cached_input_tokens = 0_u64;
+
+        super::apply_sse_chunk_to_non_stream_message(
+            r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":50,"output_tokens":7,"input_tokens_details":{"cached_tokens":42}}}
+
+"#,
+            &mut message_state,
+            &mut blocks,
+            &mut tool_input_buffers,
+            &mut stop_reason_state,
+            &mut usage_input_tokens,
+            &mut usage_output_tokens,
+            &mut usage_cached_input_tokens,
+        );
+
+        let mut message = message_state.expect("message state should exist");
+        if let Some(message_obj) = message.as_object_mut() {
+            message_obj.insert(
+                "usage".to_string(),
+                json!({
+                    "input_tokens": usage_input_tokens,
+                    "output_tokens": usage_output_tokens,
+                    "input_tokens_details": {
+                        "cached_tokens": usage_cached_input_tokens,
+                    }
+                }),
+            );
+        }
+
+        assert_eq!(
+            message.get("usage"),
+            Some(&json!({
+                "input_tokens": 50,
+                "output_tokens": 7,
+                "input_tokens_details": {
+                    "cached_tokens": 42
+                }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_gemini_explicit_cache_uses_cached_entry_without_network() {
+        let endpoint_key = build_stateful_endpoint_key(
+            "gemini",
+            "https://api.shenfengwl.fun/v1beta/models/gemini-3.1-pro:streamGenerateContent?alt=sse",
+            "gemini-3.1-pro",
+            "test-key",
+        );
+        let request_hints = RequestEnvelopeHints {
+            request_kind: crate::transform::ClaudeCodeRequestKind::ConversationTurn,
+            session_hint: Some("session-1".to_string()),
+            request_cwd: Some("/tmp/project".to_string()),
+        };
+        let upstream_template = json!({
+            "model": "gemini-3.1-pro",
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "text": "<system-reminder>cached 1</system-reminder>" },
+                    { "text": "real question" }
+                ]
+            }],
+            "system_instruction": {
+                "parts": [{ "text": "system prompt" }]
+            },
+            "tools": [{ "functionDeclarations": [] }]
+        });
+        let plan =
+            crate::transform::providers::build_gemini_explicit_cache_plan(&upstream_template)
+                .expect("cache plan");
+        let cache_key = build_gemini_explicit_cache_key(
+            &endpoint_key,
+            &request_hints,
+            "gemini-3.1-pro",
+            &plan.prefix_fingerprint,
+        );
+        let cache_store: GeminiExplicitCacheStore = Arc::new(Mutex::new(HashMap::new()));
+        let unsupported_store: GeminiExplicitCacheUnsupportedEndpointStore =
+            Arc::new(Mutex::new(HashSet::new()));
+        upsert_gemini_explicit_cache_entry(
+            &cache_store,
+            &cache_key,
+            "cachedContents/cache-1",
+            &plan.prefix_fingerprint,
+        );
+
+        let mut upstream_body = upstream_template;
+        let log_tx = broadcast::channel(8).0;
+
+        prepare_gemini_explicit_cache(
+            &reqwest::Client::new(),
+            "req_1",
+            &request_hints,
+            "https://api.shenfengwl.fun/v1beta/models/gemini-3.1-pro:streamGenerateContent?alt=sse",
+            "test-key",
+            "gemini-3.1-pro",
+            &mut upstream_body,
+            &cache_store,
+            &unsupported_store,
+            &log_tx,
+        )
+        .await;
+
+        assert_eq!(
+            upstream_body.get("cachedContent").and_then(Value::as_str),
+            Some("cachedContents/cache-1")
+        );
+        assert!(upstream_body.get("system_instruction").is_none());
+        assert!(upstream_body.get("tools").is_none());
+        assert_eq!(
+            upstream_body["contents"][0]["parts"][0]["text"].as_str(),
+            Some("real question")
+        );
+    }
+
+    #[test]
+    fn test_should_mark_gemini_cached_contents_unsupported_recognizes_capability_errors() {
+        assert!(should_mark_gemini_cached_contents_unsupported(
+            404,
+            "cachedContents route not found"
+        ));
+        assert!(should_mark_gemini_cached_contents_unsupported(
+            400,
+            "UNIMPLEMENTED cachedContents is unsupported on this gateway"
+        ));
+        assert!(!should_mark_gemini_cached_contents_unsupported(
+            400,
+            "prefix too short for caching"
+        ));
     }
 
     #[test]

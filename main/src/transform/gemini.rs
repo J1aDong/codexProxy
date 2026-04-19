@@ -131,6 +131,7 @@ pub struct GeminiResponseTransformer {
     sent_message_start: bool,
     sent_message_stop: bool,
     thought_signature: Option<String>,
+    latest_usage: Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +155,7 @@ impl GeminiResponseTransformer {
             sent_message_start: false,
             sent_message_stop: false,
             thought_signature: None,
+            latest_usage: json!({ "input_tokens": 0, "output_tokens": 0 }),
         }
     }
 
@@ -296,7 +298,7 @@ impl GeminiResponseTransformer {
             json!({
                 "type": "message_delta",
                 "delta": { "stop_reason": stop_reason },
-                "usage": { "input_tokens": 0, "output_tokens": 0 }
+                "usage": self.latest_usage
             })
         ));
         out.push(format!(
@@ -404,6 +406,45 @@ impl GeminiResponseTransformer {
             })
             .unwrap_or(false)
     }
+
+    fn extract_usage(data: &Value) -> Option<Value> {
+        let usage = data
+            .get("usageMetadata")
+            .or_else(|| data.get("usage"))
+            .and_then(Value::as_object)?;
+        let input_tokens = usage
+            .get("promptTokenCount")
+            .or_else(|| usage.get("prompt_token_count"))
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(Value::as_u64)?;
+        let output_tokens = usage
+            .get("candidatesTokenCount")
+            .or_else(|| usage.get("candidates_token_count"))
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cached_tokens = usage
+            .get("cachedContentTokenCount")
+            .or_else(|| usage.get("cached_content_token_count"))
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+            })
+            .and_then(Value::as_u64);
+
+        let mut normalized = json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        });
+        if let Some(cached_tokens) = cached_tokens {
+            normalized["input_tokens_details"] = json!({
+                "cached_tokens": cached_tokens,
+            });
+        }
+
+        Some(normalized)
+    }
 }
 
 impl ResponseTransformer for GeminiResponseTransformer {
@@ -431,6 +472,10 @@ impl ResponseTransformer for GeminiResponseTransformer {
             return output;
         };
         let data = parsed_data.get("response").cloned().unwrap_or(parsed_data);
+
+        if let Some(usage) = Self::extract_usage(&data) {
+            self.latest_usage = usage;
+        }
 
         // 1. Extract thought signature if present
         if let Some(sig) = Self::extract_thought_signature(&data) {
@@ -696,6 +741,46 @@ mod tests {
                 .and_then(|delta| delta.get("stop_reason"))
                 .and_then(|value| value.as_str()),
             Some("end_turn")
+        );
+    }
+
+    #[test]
+    fn usage_metadata_maps_cached_content_tokens_into_message_delta_usage() {
+        let mut transformer = GeminiResponseTransformer::new("gemini-test");
+        let events = transformer.transform_line(
+            r#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"pong"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":7,"totalTokenCount":57,"cachedContentTokenCount":42}}}"#,
+        );
+        let parsed_events: Vec<(String, Value)> =
+            events.iter().map(|event| parse_sse_event(event)).collect();
+        let message_delta = parsed_events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .expect("message_delta should be emitted");
+
+        assert_eq!(
+            message_delta
+                .1
+                .get("usage")
+                .and_then(|usage| usage.get("input_tokens"))
+                .and_then(Value::as_u64),
+            Some(50)
+        );
+        assert_eq!(
+            message_delta
+                .1
+                .get("usage")
+                .and_then(|usage| usage.get("output_tokens"))
+                .and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            message_delta
+                .1
+                .get("usage")
+                .and_then(|usage| usage.get("input_tokens_details"))
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64),
+            Some(42)
         );
     }
 }

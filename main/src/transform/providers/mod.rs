@@ -22,6 +22,13 @@ pub struct OpenAIChatAdapter;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GeminiAdapter;
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GeminiExplicitCachePlan {
+    pub create_body: Value,
+    pub request_body: Value,
+    pub prefix_fingerprint: String,
+}
+
 impl AnthropicAdapter {
     pub fn prepare_messages_request(
         &self,
@@ -209,6 +216,20 @@ impl GeminiAdapter {
             body: encode_gemini_body(unified, route_model),
             session_id: Uuid::new_v4().to_string(),
         })
+    }
+
+    pub fn prepare_cached_contents_request(
+        &self,
+        target_url: &str,
+        api_key: &str,
+        body: Value,
+    ) -> PreparedRequest {
+        PreparedRequest {
+            url: gemini_cached_contents_url(target_url, ""),
+            headers: gemini_headers(api_key, false),
+            body,
+            session_id: Uuid::new_v4().to_string(),
+        }
     }
 }
 
@@ -490,6 +511,64 @@ fn encode_gemini_body(unified: &UnifiedChatRequest, route_model: &str) -> Value 
     body
 }
 
+pub(crate) fn build_gemini_explicit_cache_plan(body: &Value) -> Option<GeminiExplicitCachePlan> {
+    let model = body.get("model").and_then(Value::as_str)?.trim();
+    if model.is_empty() {
+        return None;
+    }
+
+    let contents = body.get("contents").and_then(Value::as_array)?;
+    let (content_index, cached_parts, live_parts) = split_gemini_cacheable_prefix_parts(contents)?;
+    if live_parts.is_empty() {
+        return None;
+    }
+
+    let mut create_body = json!({
+        "model": format!("models/{}", model),
+        "contents": [{
+            "role": "user",
+            "parts": cached_parts,
+        }],
+        "ttl": "3600s",
+    });
+    if let Some(system_instruction) = body
+        .get("system_instruction")
+        .filter(|value| !value.is_null())
+    {
+        create_body["systemInstruction"] = system_instruction.clone();
+    }
+    if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
+        create_body["tools"] = tools.clone();
+    }
+
+    let mut request_body = body.clone();
+    let request_obj = request_body.as_object_mut()?;
+    let request_contents = request_obj.get_mut("contents")?.as_array_mut()?;
+    let target_message = request_contents.get_mut(content_index)?.as_object_mut()?;
+    target_message.insert("parts".to_string(), Value::Array(live_parts));
+    if target_message
+        .get("parts")
+        .and_then(Value::as_array)
+        .map(|parts| parts.is_empty())
+        .unwrap_or(true)
+    {
+        request_contents.remove(content_index);
+    }
+    if request_contents.is_empty() {
+        return None;
+    }
+
+    request_obj.remove("system_instruction");
+    request_obj.remove("tools");
+    request_obj.insert("cachedContent".to_string(), Value::Null);
+
+    Some(GeminiExplicitCachePlan {
+        prefix_fingerprint: fingerprint_json_value(&create_body),
+        create_body,
+        request_body,
+    })
+}
+
 fn encode_anthropic_tools(unified: &UnifiedChatRequest) -> Option<Vec<Value>> {
     unified.tools.as_ref().map(|tools| {
         tools
@@ -703,10 +782,7 @@ fn sanitize_codex_user_text(text: &str) -> Option<String> {
         sanitized_lines.push(line.to_string());
     }
 
-    let sanitized = sanitized_lines
-        .join("\n")
-        .trim()
-        .to_string();
+    let sanitized = sanitized_lines.join("\n").trim().to_string();
 
     if sanitized.is_empty() {
         None
@@ -939,6 +1015,10 @@ fn gemini_headers(api_key: &str, stream: bool) -> Vec<(String, String)> {
     ]
 }
 
+fn strip_query_suffix(target_url: &str) -> &str {
+    target_url.split('?').next().unwrap_or(target_url)
+}
+
 fn openai_messages_url(target_url: &str) -> String {
     target_url.to_string()
 }
@@ -972,6 +1052,46 @@ fn gemini_count_tokens_url(target_url: &str, _route_model: &str) -> String {
         .replace(":streamGenerateContent?alt=sse", ":countTokens")
         .replace(":streamGenerateContent", ":countTokens")
         .replace(":generateContent", ":countTokens")
+}
+
+pub(crate) fn gemini_cached_contents_url(target_url: &str, _route_model: &str) -> String {
+    let base = strip_query_suffix(target_url).trim_end_matches('/');
+    if let Some(idx) = base.find("/models/") {
+        return format!("{}/cachedContents", &base[..idx]);
+    }
+
+    format!("{}/v1beta/cachedContents", base)
+}
+
+fn split_gemini_cacheable_prefix_parts(
+    contents: &[Value],
+) -> Option<(usize, Vec<Value>, Vec<Value>)> {
+    let (content_index, first_user_message) = contents
+        .iter()
+        .enumerate()
+        .find(|(_, content)| content.get("role").and_then(Value::as_str) == Some("user"))?;
+    let parts = first_user_message.get("parts").and_then(Value::as_array)?;
+    let split_index = parts
+        .iter()
+        .position(|part| !is_gemini_cacheable_envelope_part(part))
+        .unwrap_or(parts.len());
+    if split_index == 0 {
+        return None;
+    }
+
+    Some((
+        content_index,
+        parts[..split_index].to_vec(),
+        parts[split_index..].to_vec(),
+    ))
+}
+
+fn is_gemini_cacheable_envelope_part(part: &Value) -> bool {
+    let Some(text) = part.get("text").and_then(Value::as_str) else {
+        return false;
+    };
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<system-reminder>") || trimmed.starts_with("<environment_context>")
 }
 
 fn data_tail(url: &str) -> String {
@@ -1268,4 +1388,99 @@ fn build_prompt_cache_key(
         "cp:{}:{}:cwd:{}:{:016x}",
         model_segment, kind_segment, cwd_hash, key_hash
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_cached_contents_url_maps_base_and_stream_endpoints() {
+        assert_eq!(
+            gemini_cached_contents_url(
+                "https://generativelanguage.googleapis.com",
+                "gemini-2.5-pro"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/cachedContents"
+        );
+        assert_eq!(
+            gemini_cached_contents_url(
+                "https://api.shenfengwl.fun/v1beta/models/gemini-3.1-pro:streamGenerateContent?alt=sse",
+                "gemini-3.1-pro",
+            ),
+            "https://api.shenfengwl.fun/v1beta/cachedContents"
+        );
+    }
+
+    #[test]
+    fn gemini_explicit_cache_plan_caches_only_leading_wrapper_parts() {
+        let body = json!({
+            "model": "gemini-3.1-pro",
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": "<system-reminder>cached 1</system-reminder>" },
+                        { "text": "<environment_context><cwd>/tmp/project</cwd></environment_context>" },
+                        { "text": "real question" }
+                    ]
+                },
+                {
+                    "role": "model",
+                    "parts": [{ "text": "previous answer" }]
+                }
+            ],
+            "system_instruction": {
+                "parts": [{ "text": "system prompt" }]
+            },
+            "tools": [{ "functionDeclarations": [] }],
+            "generationConfig": {
+                "temperature": 0.2
+            }
+        });
+
+        let plan = build_gemini_explicit_cache_plan(&body).expect("cache plan");
+
+        assert_eq!(
+            plan.create_body["contents"][0]["parts"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            plan.request_body["contents"][0]["parts"][0]["text"].as_str(),
+            Some("real question")
+        );
+        assert_eq!(
+            plan.request_body["contents"][1]["parts"][0]["text"].as_str(),
+            Some("previous answer")
+        );
+        assert_eq!(
+            plan.create_body["systemInstruction"]["parts"][0]["text"].as_str(),
+            Some("system prompt")
+        );
+        assert_eq!(plan.request_body["cachedContent"].is_null(), true);
+        assert!(
+            !plan.prefix_fingerprint.is_empty(),
+            "prefix fingerprint should be stable"
+        );
+    }
+
+    #[test]
+    fn gemini_explicit_cache_plan_skips_when_wrapper_consumes_all_live_input() {
+        let body = json!({
+            "model": "gemini-3.1-pro",
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "text": "<system-reminder>cached only</system-reminder>" }
+                ]
+            }]
+        });
+
+        assert!(
+            build_gemini_explicit_cache_plan(&body).is_none(),
+            "cache plan should be skipped when no live tail remains"
+        );
+    }
 }
