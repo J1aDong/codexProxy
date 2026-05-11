@@ -82,6 +82,22 @@ pub struct ProxyServer {
     enable_skill_routing_hint: bool,
     enable_stateful_responses_chain: bool,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
+    codex_route_config: Option<InitialRouteConfig>,
+}
+
+#[derive(Clone)]
+struct InitialRouteConfig {
+    target_url: String,
+    api_key: Option<String>,
+    converter: String,
+}
+
+#[derive(Clone)]
+pub struct RuntimeRouteUpdate {
+    pub target_url: String,
+    pub api_key: Option<String>,
+    pub ctx: TransformContext,
+    pub load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
 #[derive(Clone)]
@@ -89,6 +105,7 @@ pub struct RuntimeConfigUpdate {
     pub target_url: String,
     pub api_key: Option<String>,
     pub ctx: TransformContext,
+    pub codex_route: Option<RuntimeRouteUpdate>,
     pub ignore_probe_requests: bool,
     pub allow_count_tokens_fallback_estimate: bool,
     pub enable_codex_fast_mode: bool,
@@ -120,10 +137,43 @@ pub struct RuntimeConfigUpdate {
 }
 
 #[derive(Clone)]
-struct RuntimeConfigState {
+struct RuntimeRouteState {
     target_url: String,
     api_key: Option<String>,
     ctx: TransformContext,
+    load_balancer_runtime: Option<LoadBalancerRuntime>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientRouteKind {
+    Claude,
+    Codex,
+}
+
+impl RuntimeRouteState {
+    fn from_update(
+        value: RuntimeRouteUpdate,
+        enable_codex_tool_schema_compaction: bool,
+        enable_codex_fast_mode: bool,
+        enable_skill_routing_hint: bool,
+    ) -> Self {
+        let mut ctx = value.ctx;
+        ctx.enable_codex_tool_schema_compaction = enable_codex_tool_schema_compaction;
+        ctx.enable_codex_fast_mode = enable_codex_fast_mode;
+        ctx.enable_skill_routing_hint = enable_skill_routing_hint;
+        Self {
+            target_url: value.target_url,
+            api_key: value.api_key,
+            ctx,
+            load_balancer_runtime: value.load_balancer_runtime,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeConfigState {
+    claude_route: RuntimeRouteState,
+    codex_route: RuntimeRouteState,
     ignore_probe_requests: bool,
     allow_count_tokens_fallback_estimate: bool,
     enable_codex_fast_mode: bool,
@@ -146,19 +196,35 @@ struct RuntimeConfigState {
     enable_codex_tool_schema_compaction: bool,
     enable_skill_routing_hint: bool,
     enable_stateful_responses_chain: bool,
-    load_balancer_runtime: Option<LoadBalancerRuntime>,
 }
 
 impl From<RuntimeConfigUpdate> for RuntimeConfigState {
     fn from(value: RuntimeConfigUpdate) -> Self {
-        let mut ctx = value.ctx;
-        ctx.enable_codex_tool_schema_compaction = value.enable_codex_tool_schema_compaction;
-        ctx.enable_codex_fast_mode = value.enable_codex_fast_mode;
-        ctx.enable_skill_routing_hint = value.enable_skill_routing_hint;
+        let claude_route = RuntimeRouteState::from_update(
+            RuntimeRouteUpdate {
+                target_url: value.target_url,
+                api_key: value.api_key,
+                ctx: value.ctx,
+                load_balancer_runtime: value.load_balancer_runtime,
+            },
+            value.enable_codex_tool_schema_compaction,
+            value.enable_codex_fast_mode,
+            value.enable_skill_routing_hint,
+        );
+        let codex_route = value
+            .codex_route
+            .map(|route| {
+                RuntimeRouteState::from_update(
+                    route,
+                    value.enable_codex_tool_schema_compaction,
+                    value.enable_codex_fast_mode,
+                    value.enable_skill_routing_hint,
+                )
+            })
+            .unwrap_or_else(|| claude_route.clone());
         Self {
-            target_url: value.target_url,
-            api_key: value.api_key,
-            ctx,
+            claude_route,
+            codex_route,
             ignore_probe_requests: value.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: value.allow_count_tokens_fallback_estimate,
             enable_codex_fast_mode: value.enable_codex_fast_mode,
@@ -181,7 +247,15 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
             enable_codex_tool_schema_compaction: value.enable_codex_tool_schema_compaction,
             enable_skill_routing_hint: value.enable_skill_routing_hint,
             enable_stateful_responses_chain: value.enable_stateful_responses_chain,
-            load_balancer_runtime: value.load_balancer_runtime,
+        }
+    }
+}
+
+impl RuntimeConfigState {
+    fn route_for(&self, kind: ClientRouteKind) -> RuntimeRouteState {
+        match kind {
+            ClientRouteKind::Claude => self.claude_route.clone(),
+            ClientRouteKind::Codex => self.codex_route.clone(),
         }
     }
 }
@@ -248,6 +322,18 @@ fn backend_label_by_converter(converter: &str) -> &'static str {
     } else {
         "Codex API"
     }
+}
+
+fn normalize_client_route_path(normalized_path: &str) -> (ClientRouteKind, String) {
+    if normalized_path == "/codex" {
+        return (ClientRouteKind::Codex, "/".to_string());
+    }
+
+    if let Some(stripped) = normalized_path.strip_prefix("/codex/") {
+        return (ClientRouteKind::Codex, format!("/{}", stripped));
+    }
+
+    (ClientRouteKind::Claude, normalized_path.to_string())
 }
 
 fn resolve_model_for_converter(
@@ -4547,6 +4633,7 @@ impl ProxyServer {
             enable_skill_routing_hint: false,
             enable_stateful_responses_chain: true,
             load_balancer_runtime: None,
+            codex_route_config: None,
         }
     }
 
@@ -4745,24 +4832,51 @@ impl ProxyServer {
         self
     }
 
+    pub fn with_codex_route(
+        mut self,
+        target_url: String,
+        api_key: Option<String>,
+        converter: String,
+    ) -> Self {
+        self.codex_route_config = Some(InitialRouteConfig {
+            target_url,
+            api_key,
+            converter,
+        });
+        self
+    }
+
     fn runtime_update(&self) -> RuntimeConfigUpdate {
+        let base_ctx = TransformContext {
+            reasoning_mapping: self.reasoning_mapping.clone(),
+            codex_model_mapping: self.codex_model_mapping.clone(),
+            anthropic_model_mapping: self.anthropic_model_mapping.clone(),
+            openai_model_mapping: self.openai_model_mapping.clone(),
+            openai_max_tokens_mapping: self.openai_max_tokens_mapping.clone(),
+            custom_injection_prompt: self.custom_injection_prompt.clone(),
+            converter: self.converter.clone(),
+            codex_model: self.codex_model.clone(),
+            gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),
+            enable_codex_tool_schema_compaction: self.enable_codex_tool_schema_compaction,
+            enable_codex_fast_mode: self.enable_codex_fast_mode,
+            enable_skill_routing_hint: self.enable_skill_routing_hint,
+        };
+        let codex_route = self.codex_route_config.as_ref().map(|route| {
+            let mut ctx = base_ctx.clone();
+            ctx.converter = route.converter.clone();
+            RuntimeRouteUpdate {
+                target_url: route.target_url.clone(),
+                api_key: route.api_key.clone(),
+                ctx,
+                load_balancer_runtime: None,
+            }
+        });
+
         RuntimeConfigUpdate {
             target_url: self.target_url.clone(),
             api_key: self.api_key.clone(),
-            ctx: TransformContext {
-                reasoning_mapping: self.reasoning_mapping.clone(),
-                codex_model_mapping: self.codex_model_mapping.clone(),
-                anthropic_model_mapping: self.anthropic_model_mapping.clone(),
-                openai_model_mapping: self.openai_model_mapping.clone(),
-                openai_max_tokens_mapping: self.openai_max_tokens_mapping.clone(),
-                custom_injection_prompt: self.custom_injection_prompt.clone(),
-                converter: self.converter.clone(),
-                codex_model: self.codex_model.clone(),
-                gemini_reasoning_effort: self.gemini_reasoning_effort.clone(),
-                enable_codex_tool_schema_compaction: self.enable_codex_tool_schema_compaction,
-                enable_codex_fast_mode: self.enable_codex_fast_mode,
-                enable_skill_routing_hint: self.enable_skill_routing_hint,
-            },
+            ctx: base_ctx,
+            codex_route,
             ignore_probe_requests: self.ignore_probe_requests,
             allow_count_tokens_fallback_estimate: self.allow_count_tokens_fallback_estimate,
             enable_codex_fast_mode: self.enable_codex_fast_mode,
@@ -5057,15 +5171,17 @@ async fn handle_request(
         return handle_cors_preflight();
     }
 
-    let is_messages = normalized_path == "/messages" || normalized_path == "/v1/messages";
-    let is_count_tokens = normalized_path == "/messages/count_tokens"
-        || normalized_path == "/v1/messages/count_tokens";
+    let (client_route_kind, routed_path) = normalize_client_route_path(normalized_path);
+    let is_messages = routed_path == "/messages" || routed_path == "/v1/messages";
+    let is_count_tokens =
+        routed_path == "/messages/count_tokens" || routed_path == "/v1/messages/count_tokens";
 
     let runtime_state = runtime_handle.snapshot();
     let stream_opts = StreamRuntimeOptions::from_state(&runtime_state);
-    let target_url = runtime_state.target_url;
-    let api_key = runtime_state.api_key;
-    let mut ctx = runtime_state.ctx;
+    let route_state = runtime_state.route_for(client_route_kind);
+    let target_url = route_state.target_url;
+    let api_key = route_state.api_key;
+    let mut ctx = route_state.ctx;
     // Keep transformer compaction behavior aligned with runtime switches even if context was stale.
     ctx.enable_codex_tool_schema_compaction = runtime_state.enable_codex_tool_schema_compaction;
     ctx.enable_codex_fast_mode = runtime_state.enable_codex_fast_mode;
@@ -5074,7 +5190,7 @@ async fn handle_request(
     let allow_count_tokens_fallback_estimate = runtime_state.allow_count_tokens_fallback_estimate;
     let prefer_codex_v1_path = runtime_state.prefer_codex_v1_path;
     let enable_stateful_responses_chain = runtime_state.enable_stateful_responses_chain;
-    let load_balancer_runtime = runtime_state.load_balancer_runtime;
+    let load_balancer_runtime = route_state.load_balancer_runtime;
 
     // 只处理 POST /messages、/v1/messages、/messages/count_tokens、/v1/messages/count_tokens
     if method != Method::POST || (!is_messages && !is_count_tokens) {
@@ -5652,7 +5768,7 @@ async fn handle_request(
         .unwrap_or(1);
 
     if let Some(ref l) = logger {
-        l.log_anthropic_request(method.as_str(), normalized_path, &body_bytes);
+        l.log_anthropic_request(method.as_str(), &routed_path, &body_bytes);
     }
 
     let mut attempt_index = 0usize;
@@ -8275,7 +8391,7 @@ mod tests {
         is_business_stream_output, is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
         is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
         mark_codex_fast_endpoint_unsupported, mark_parallel_tool_degrade,
-        observe_upstream_chunk_events, prepare_gemini_explicit_cache,
+        normalize_client_route_path, observe_upstream_chunk_events, prepare_gemini_explicit_cache,
         prepare_stateful_chain_request, record_stateful_chain_entry,
         remove_priority_service_tier_from_upstream_body,
         request_contains_rewrite_sensitive_history, request_explicitly_asks_for_worktree,
@@ -8284,12 +8400,12 @@ mod tests {
         should_mark_gemini_cached_contents_unsupported,
         should_retry_codex_fast_without_service_tier, should_retry_codex_v1_path_with_legacy,
         should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
-        trim_leading_stateful_replay_items, upsert_gemini_explicit_cache_entry,
+        trim_leading_stateful_replay_items, upsert_gemini_explicit_cache_entry, ClientRouteKind,
         CodexFastUnsupportedEndpointStore, ConnErrorClass, GeminiExplicitCacheStore,
-        GeminiExplicitCacheUnsupportedEndpointStore, SkillCatalogReminderStore, SseFrameParser,
-        StatefulChainEntry, StatefulChainRequestMeta, StatefulChainStore,
-        StatefulChainUnsupportedEndpointStore, StreamEventCounters, StreamRuntimeOptions,
-        UpstreamOperation,
+        GeminiExplicitCacheUnsupportedEndpointStore, RuntimeConfigState, RuntimeConfigUpdate,
+        RuntimeRouteUpdate, SkillCatalogReminderStore, SseFrameParser, StatefulChainEntry,
+        StatefulChainRequestMeta, StatefulChainStore, StatefulChainUnsupportedEndpointStore,
+        StreamEventCounters, StreamRuntimeOptions, UpstreamOperation,
     };
     use crate::models::AnthropicRequest;
     use crate::transform::{request_envelope_hints_from_anthropic, RequestEnvelopeHints};
@@ -8317,6 +8433,103 @@ mod tests {
             incomplete_stream_retry_max_attempts: 1,
             enable_sibling_tool_error_retry: true,
         }
+    }
+
+    fn test_transform_context(converter: &str) -> crate::transform::TransformContext {
+        crate::transform::TransformContext {
+            reasoning_mapping: crate::models::ReasoningEffortMapping::default(),
+            codex_model_mapping: crate::models::CodexModelMapping::default(),
+            anthropic_model_mapping: crate::models::AnthropicModelMapping::default(),
+            openai_model_mapping: crate::models::OpenAIModelMapping::default(),
+            openai_max_tokens_mapping: crate::models::OpenAIMaxTokensMapping::default(),
+            custom_injection_prompt: String::new(),
+            converter: converter.to_string(),
+            codex_model: "gpt-5.3-codex".to_string(),
+            gemini_reasoning_effort: crate::models::GeminiReasoningEffortMapping::default(),
+            enable_codex_tool_schema_compaction: true,
+            enable_codex_fast_mode: true,
+            enable_skill_routing_hint: false,
+        }
+    }
+
+    #[test]
+    fn codex_route_prefix_is_stripped_before_message_matching() {
+        assert_eq!(
+            normalize_client_route_path("/codex/v1/messages"),
+            (ClientRouteKind::Codex, "/v1/messages".to_string())
+        );
+        assert_eq!(
+            normalize_client_route_path("/codex/messages"),
+            (ClientRouteKind::Codex, "/messages".to_string())
+        );
+        assert_eq!(
+            normalize_client_route_path("/codex/v1/messages/count_tokens"),
+            (
+                ClientRouteKind::Codex,
+                "/v1/messages/count_tokens".to_string()
+            )
+        );
+        assert_eq!(
+            normalize_client_route_path("/v1/messages"),
+            (ClientRouteKind::Claude, "/v1/messages".to_string())
+        );
+        assert_eq!(
+            normalize_client_route_path("/codexfoo/v1/messages"),
+            (ClientRouteKind::Claude, "/codexfoo/v1/messages".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_state_keeps_claude_and_codex_routes_isolated() {
+        let state = RuntimeConfigState::from(RuntimeConfigUpdate {
+            target_url: "https://claude.example/messages".to_string(),
+            api_key: Some("claude-key".to_string()),
+            ctx: test_transform_context("anthropic"),
+            codex_route: Some(RuntimeRouteUpdate {
+                target_url: "https://codex.example/responses".to_string(),
+                api_key: Some("codex-key".to_string()),
+                ctx: test_transform_context("codex"),
+                load_balancer_runtime: None,
+            }),
+            ignore_probe_requests: false,
+            allow_count_tokens_fallback_estimate: true,
+            enable_codex_fast_mode: true,
+            force_stream_for_codex: true,
+            enable_sse_frame_parser: true,
+            enable_stream_heartbeat: true,
+            stream_heartbeat_interval_ms: 3_000,
+            enable_stream_log_sampling: true,
+            stream_log_sample_every_n: 20,
+            stream_log_max_chars: 512,
+            enable_stream_metrics: true,
+            enable_stream_event_metrics: true,
+            stream_silence_warn_ms: 20_000,
+            stream_silence_error_ms: 90_000,
+            enable_stall_retry: false,
+            stall_timeout_ms: 300_000,
+            stall_retry_max_attempts: 0,
+            stall_retry_only_heartbeat_phase: false,
+            enable_empty_completion_retry: false,
+            empty_completion_retry_max_attempts: 0,
+            enable_incomplete_stream_retry: true,
+            incomplete_stream_retry_max_attempts: 2,
+            enable_sibling_tool_error_retry: true,
+            prefer_codex_v1_path: true,
+            enable_codex_tool_schema_compaction: true,
+            enable_skill_routing_hint: false,
+            enable_stateful_responses_chain: true,
+            load_balancer_runtime: None,
+        });
+
+        let claude_route = state.route_for(ClientRouteKind::Claude);
+        assert_eq!(claude_route.target_url, "https://claude.example/messages");
+        assert_eq!(claude_route.api_key.as_deref(), Some("claude-key"));
+        assert_eq!(claude_route.ctx.converter, "anthropic");
+
+        let codex_route = state.route_for(ClientRouteKind::Codex);
+        assert_eq!(codex_route.target_url, "https://codex.example/responses");
+        assert_eq!(codex_route.api_key.as_deref(), Some("codex-key"));
+        assert_eq!(codex_route.ctx.converter, "codex");
     }
 
     #[test]

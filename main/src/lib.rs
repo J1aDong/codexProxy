@@ -11,7 +11,7 @@ pub use models::{
     GeminiReasoningEffortMapping, OpenAIMaxTokensMapping, OpenAIModelMapping, ReasoningEffort,
     ReasoningEffortMapping,
 };
-pub use server::{ProxyRuntimeHandle, ProxyServer, RuntimeConfigUpdate};
+pub use server::{ProxyRuntimeHandle, ProxyServer, RuntimeConfigUpdate, RuntimeRouteUpdate};
 pub use transform::codex::TransformResponse;
 pub use transform::{
     AnthropicAdapter, AnthropicBackend, CodexAdapter, GeminiAdapter, OpenAIChatAdapter,

@@ -72,6 +72,7 @@ export default {
     // Guide
     guideTitle: 'Configuration Guide',
     guideDesc: 'Add the following to your Claude Code settings file:',
+    guideCodexDesc: 'Use this local proxy URL in Codex clients:',
     guideTokenHint: 'Replace with real key (or any string if configured in proxy page)',
     copy: 'Copy',
     copied: 'Copied',

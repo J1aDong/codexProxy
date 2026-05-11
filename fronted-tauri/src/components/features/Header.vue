@@ -13,6 +13,22 @@
       {{ t('title') }}
     </h1>
     <div class="flex items-center justify-end gap-2">
+      <div class="client-mode-switch" :class="isDarkMode ? 'client-mode-switch-dark' : ''">
+        <button
+          class="client-mode-button"
+          :class="{ active: clientMode === 'claude' }"
+          @click="setClientMode('claude')"
+        >
+          Claude
+        </button>
+        <button
+          class="client-mode-button"
+          :class="{ active: clientMode === 'codex' }"
+          @click="setClientMode('codex')"
+        >
+          Codex
+        </button>
+      </div>
       <!-- Menu Button -->
       <div class="header-menu-wrapper" ref="menuRef">
         <Button
@@ -108,9 +124,13 @@ defineProps({
     type: Boolean,
     required: true,
   },
+  clientMode: {
+    type: String as () => 'claude' | 'codex',
+    default: 'claude',
+  },
 })
 
-const emit = defineEmits(['toggleLang', 'toggleDarkMode', 'showAbout', 'showSettings', 'showAdvancedSettings', 'showImportExport', 'showLogs'])
+const emit = defineEmits(['toggleLang', 'toggleDarkMode', 'update:clientMode', 'showAbout', 'showSettings', 'showAdvancedSettings', 'showImportExport', 'showLogs'])
 
 const menuVisible = ref(false)
 const menuRef = ref<HTMLElement | null>(null)
@@ -151,6 +171,10 @@ const handleShowLogs = () => {
   emit('showLogs')
 }
 
+const setClientMode = (mode: 'claude' | 'codex') => {
+  emit('update:clientMode', mode)
+}
+
 const onClickOutside = (e: MouseEvent) => {
   if (menuRef.value && !menuRef.value.contains(e.target as Node)) {
     closeMenu()
@@ -176,6 +200,50 @@ onUnmounted(() => {
 
 .header-menu-wrapper {
   position: relative;
+}
+
+.client-mode-switch {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid #e5e5ea;
+  border-radius: 8px;
+  background: #f5f5f7;
+}
+
+.client-mode-switch-dark {
+  border-color: #2a2a35;
+  background: #14141a;
+}
+
+.client-mode-button {
+  min-width: 58px;
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 9px;
+  background: transparent;
+  color: #6e6e73;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.client-mode-switch-dark .client-mode-button {
+  color: #a1a1aa;
+}
+
+.client-mode-button.active {
+  background: #ffffff;
+  color: #007aff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.client-mode-switch-dark .client-mode-button.active {
+  background: #25252d;
+  color: #60a5fa;
 }
 
 .header-dropdown {

@@ -35,8 +35,8 @@
 
     <div class="mt-5">
       <transition name="proxy-mode-fade" mode="out-in">
-        <div :key="form.proxyMode">
-          <div v-if="form.proxyMode === 'single'">
+        <div :key="effectiveProxyMode">
+          <div v-if="effectiveProxyMode === 'single'">
             <div class="space-y-4">
               <div>
                 <div class="flex items-center justify-between h-8 mb-1">
@@ -107,7 +107,7 @@
               />
             </div>
 
-            <div v-if="form.converter === 'codex' || form.converter === 'gemini'" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+            <div v-if="!isCodexMode && (form.converter === 'codex' || form.converter === 'gemini')" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
               <h3
                 class="text-sm font-semibold mb-3"
                 :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
@@ -182,7 +182,7 @@
               </div>
             </div>
 
-            <div v-else-if="form.converter === 'anthropic'" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+            <div v-else-if="!isCodexMode && form.converter === 'anthropic'" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
               <h3
                 class="text-sm font-semibold mb-3"
                 :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
@@ -212,7 +212,7 @@
               </div>
             </div>
 
-            <div v-else class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
+            <div v-else-if="!isCodexMode" class="mt-5 pt-4 border-t" :class="isDarkMode ? 'border-dark-border' : 'border-gray-200'">
               <h3
                 class="text-sm font-semibold mb-3"
                 :class="isDarkMode ? 'text-dark-text-primary' : 'text-apple-text-primary'"
@@ -652,12 +652,22 @@ const props = defineProps({
     type: Object as () => Record<string, boolean>,
     default: () => ({}),
   },
+  clientMode: {
+    type: String as () => 'claude' | 'codex',
+    default: 'claude',
+  },
 })
 
 const emit = defineEmits(['update:form', 'reset', 'toggle', 'addEndpoint', 'editEndpoint'])
 
 const localPort = ref(props.form.port)
 const localApiKey = ref(props.form.apiKey)
+const isCodexMode = computed(() => props.clientMode === 'codex')
+const effectiveProxyMode = computed(() => isCodexMode.value ? 'single' : props.form.proxyMode)
+
+watch(() => props.form.port, (newVal) => {
+  localPort.value = newVal
+})
 
 watch(() => props.form.apiKey, (newVal) => {
   localApiKey.value = newVal
@@ -755,7 +765,7 @@ const converterOptions = computed(() => [
 
 const proxyModeOptions = computed(() => [
   { value: 'single', label: t('proxyModeSingle') },
-  { value: 'load_balancer', label: t('proxyModeLoadBalancer') },
+  ...(isCodexMode.value ? [] : [{ value: 'load_balancer', label: t('proxyModeLoadBalancer') }]),
 ])
 
 const lbConverterOptions = computed(() => [
@@ -856,6 +866,14 @@ const createDefaultProfile = (name: string): LoadBalancerProfile => {
 }
 
 const handleProxyModeChange = (mode: string) => {
+  if (isCodexMode.value) {
+    emit('update:form', {
+      ...props.form,
+      proxyMode: 'single',
+    })
+    return
+  }
+
   const nextMode = mode === 'load_balancer' ? 'load_balancer' : 'single'
   const hasProfiles = props.form.loadBalancer.lbProfiles.length > 0
   const nextProfiles = hasProfiles

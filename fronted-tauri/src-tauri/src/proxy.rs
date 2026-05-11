@@ -7,7 +7,7 @@ use codex_proxy_core::load_balancer::{
 use codex_proxy_core::{
     AnthropicModelMapping, CodexModelMapping, GeminiReasoningEffortMapping, OpenAIMaxTokensMapping,
     OpenAIModelMapping, ProxyRuntimeHandle, ProxyServer, ReasoningEffort, ReasoningEffortMapping,
-    RuntimeConfigUpdate, TransformContext,
+    RuntimeConfigUpdate, RuntimeRouteUpdate, TransformContext,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -232,6 +232,29 @@ fn default_selected_endpoint_id() -> String {
     "aicodemirror-default".to_string()
 }
 
+fn default_codex_endpoint_options() -> Vec<EndpointOption> {
+    vec![EndpointOption {
+        id: "codex-default".to_string(),
+        alias: "CodebuddyProxy".to_string(),
+        url: "https://api.aicodemirror.com/api/codex/backend-api/codex/responses".to_string(),
+        api_key: String::new(),
+        converter: Some(default_converter()),
+        codex_model: None,
+        codex_model_mapping: None,
+        codex_effort_capability_map: None,
+        gemini_model_preset: None,
+        anthropic_model_mapping: None,
+        openai_model_mapping: None,
+        openai_max_tokens_mapping: None,
+        reasoning_effort: None,
+        gemini_reasoning_effort: None,
+    }]
+}
+
+fn default_codex_selected_endpoint_id() -> String {
+    "codex-default".to_string()
+}
+
 fn default_proxy_mode() -> String {
     "single".to_string()
 }
@@ -256,6 +279,47 @@ fn default_openai_model_mapping() -> OpenAIModelMappingConfig {
     OpenAIModelMappingConfig::default()
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexClientConfig {
+    #[serde(rename = "targetUrl")]
+    pub target_url: String,
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+    #[serde(rename = "endpointOptions", default = "default_codex_endpoint_options")]
+    pub endpoint_options: Vec<EndpointOption>,
+    #[serde(
+        rename = "selectedEndpointId",
+        default = "default_codex_selected_endpoint_id"
+    )]
+    pub selected_endpoint_id: String,
+    #[serde(default = "default_converter")]
+    pub converter: String,
+    #[serde(rename = "proxyMode", default = "default_proxy_mode")]
+    pub proxy_mode: String,
+}
+
+impl Default for CodexClientConfig {
+    fn default() -> Self {
+        let endpoint_options = default_codex_endpoint_options();
+        Self {
+            target_url: endpoint_options
+                .first()
+                .map(|item| item.url.clone())
+                .unwrap_or_default(),
+            api_key: String::new(),
+            endpoint_options,
+            selected_endpoint_id: default_codex_selected_endpoint_id(),
+            converter: default_converter(),
+            proxy_mode: default_proxy_mode(),
+        }
+    }
+}
+
+fn default_codex_config() -> CodexClientConfig {
+    CodexClientConfig::default()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ProxyConfig {
     pub port: u16,
@@ -270,6 +334,8 @@ pub struct ProxyConfig {
         default = "default_selected_endpoint_id"
     )]
     pub selected_endpoint_id: String,
+    #[serde(rename = "codexConfig", default = "default_codex_config")]
+    pub codex_config: CodexClientConfig,
     #[serde(default = "default_converter")]
     pub converter: String,
     #[serde(rename = "codexModel", default = "default_codex_model")]
@@ -600,6 +666,7 @@ fn default_proxy_config() -> ProxyConfig {
         api_key: String::new(),
         endpoint_options: default_endpoint_options(),
         selected_endpoint_id: default_selected_endpoint_id(),
+        codex_config: default_codex_config(),
         converter: default_converter(),
         codex_model: default_codex_model(),
         codex_model_mapping: CodexModelMappingConfig::default(),
@@ -796,11 +863,24 @@ fn build_lb_runtime(
     ))
 }
 
-fn selected_endpoint<'a>(config: &'a ProxyConfig) -> Option<&'a EndpointOption> {
-    config
-        .endpoint_options
+fn selected_endpoint_from<'a>(
+    endpoint_options: &'a [EndpointOption],
+    selected_endpoint_id: &str,
+) -> Option<&'a EndpointOption> {
+    endpoint_options
         .iter()
-        .find(|item| item.id == config.selected_endpoint_id)
+        .find(|item| item.id == selected_endpoint_id)
+}
+
+fn selected_endpoint<'a>(config: &'a ProxyConfig) -> Option<&'a EndpointOption> {
+    selected_endpoint_from(&config.endpoint_options, &config.selected_endpoint_id)
+}
+
+fn selected_codex_endpoint<'a>(config: &'a ProxyConfig) -> Option<&'a EndpointOption> {
+    selected_endpoint_from(
+        &config.codex_config.endpoint_options,
+        &config.codex_config.selected_endpoint_id,
+    )
 }
 
 fn resolve_target_and_api_key(config: &ProxyConfig) -> (String, Option<String>) {
@@ -819,12 +899,68 @@ fn resolve_target_and_api_key(config: &ProxyConfig) -> (String, Option<String>) 
     (target_url, api_key)
 }
 
+fn resolve_codex_target_api_key_and_converter(
+    config: &ProxyConfig,
+) -> (String, Option<String>, String) {
+    let selected = selected_codex_endpoint(config);
+    let target_url = selected
+        .map(|item| item.url.clone())
+        .unwrap_or_else(|| config.codex_config.target_url.clone());
+    let resolved_api_key = selected
+        .map(|item| item.api_key.clone())
+        .unwrap_or_else(|| config.codex_config.api_key.clone());
+    let api_key = if resolved_api_key.is_empty() {
+        None
+    } else {
+        Some(resolved_api_key)
+    };
+    let converter = selected
+        .and_then(|item| item.converter.clone())
+        .unwrap_or_else(|| config.codex_config.converter.clone());
+    (target_url, api_key, converter)
+}
+
+fn build_transform_context(
+    config: &ProxyConfig,
+    converter: String,
+    openai_max_tokens_mapping: OpenAIMaxTokensMapping,
+) -> TransformContext {
+    let custom_injection_prompt = resolve_custom_injection_prompt(&config.custom_injection_prompt);
+    TransformContext {
+        reasoning_mapping: config.reasoning_effort.to_mapping(),
+        codex_model_mapping: CodexModelMapping {
+            opus: config.codex_model_mapping.opus.clone(),
+            sonnet: config.codex_model_mapping.sonnet.clone(),
+            haiku: config.codex_model_mapping.haiku.clone(),
+        },
+        anthropic_model_mapping: AnthropicModelMapping {
+            opus: config.anthropic_model_mapping.opus.clone(),
+            sonnet: config.anthropic_model_mapping.sonnet.clone(),
+            haiku: config.anthropic_model_mapping.haiku.clone(),
+        },
+        openai_model_mapping: OpenAIModelMapping {
+            opus: config.openai_model_mapping.opus.clone(),
+            sonnet: config.openai_model_mapping.sonnet.clone(),
+            haiku: config.openai_model_mapping.haiku.clone(),
+        },
+        openai_max_tokens_mapping,
+        custom_injection_prompt,
+        converter,
+        codex_model: config.codex_model.clone(),
+        gemini_reasoning_effort: config.gemini_reasoning_effort.to_gemini_mapping(),
+        enable_codex_tool_schema_compaction: config.enable_codex_tool_schema_compaction,
+        enable_codex_fast_mode: config.enable_codex_fast_mode,
+        enable_skill_routing_hint: config.enable_skill_routing_hint,
+    }
+}
+
 fn build_runtime_update(
     config: &ProxyConfig,
     log_tx: Option<broadcast::Sender<String>>,
 ) -> RuntimeConfigUpdate {
     let (target_url, api_key) = resolve_target_and_api_key(config);
-    let custom_injection_prompt = resolve_custom_injection_prompt(&config.custom_injection_prompt);
+    let (codex_target_url, codex_api_key, codex_converter) =
+        resolve_codex_target_api_key_and_converter(config);
     let load_balancer_runtime = if config.proxy_mode.eq_ignore_ascii_case("load_balancer") {
         build_lb_runtime(config, log_tx)
     } else {
@@ -837,36 +973,22 @@ fn build_runtime_update(
         .and_then(|ep| ep.openai_max_tokens_mapping.clone())
         .map(|m| m.into())
         .unwrap_or_default();
+    let codex_selected = selected_codex_endpoint(config);
+    let codex_openai_max_tokens_mapping = codex_selected
+        .and_then(|ep| ep.openai_max_tokens_mapping.clone())
+        .map(|m| m.into())
+        .unwrap_or_default();
 
     RuntimeConfigUpdate {
         target_url,
         api_key,
-        ctx: TransformContext {
-            reasoning_mapping: config.reasoning_effort.to_mapping(),
-            codex_model_mapping: CodexModelMapping {
-                opus: config.codex_model_mapping.opus.clone(),
-                sonnet: config.codex_model_mapping.sonnet.clone(),
-                haiku: config.codex_model_mapping.haiku.clone(),
-            },
-            anthropic_model_mapping: AnthropicModelMapping {
-                opus: config.anthropic_model_mapping.opus.clone(),
-                sonnet: config.anthropic_model_mapping.sonnet.clone(),
-                haiku: config.anthropic_model_mapping.haiku.clone(),
-            },
-            openai_model_mapping: OpenAIModelMapping {
-                opus: config.openai_model_mapping.opus.clone(),
-                sonnet: config.openai_model_mapping.sonnet.clone(),
-                haiku: config.openai_model_mapping.haiku.clone(),
-            },
-            openai_max_tokens_mapping,
-            custom_injection_prompt: custom_injection_prompt,
-            converter: config.converter.clone(),
-            codex_model: config.codex_model.clone(),
-            gemini_reasoning_effort: config.gemini_reasoning_effort.to_gemini_mapping(),
-            enable_codex_tool_schema_compaction: config.enable_codex_tool_schema_compaction,
-            enable_codex_fast_mode: config.enable_codex_fast_mode,
-            enable_skill_routing_hint: config.enable_skill_routing_hint,
-        },
+        ctx: build_transform_context(config, config.converter.clone(), openai_max_tokens_mapping),
+        codex_route: Some(RuntimeRouteUpdate {
+            target_url: codex_target_url,
+            api_key: codex_api_key,
+            ctx: build_transform_context(config, codex_converter, codex_openai_max_tokens_mapping),
+            load_balancer_runtime: None,
+        }),
         ignore_probe_requests: config.ignore_probe_requests,
         allow_count_tokens_fallback_estimate: config.allow_count_tokens_fallback_estimate,
         enable_codex_fast_mode: config.enable_codex_fast_mode,
@@ -1099,10 +1221,17 @@ async fn start_proxy_with_manager(
     )
     .map_err(|e| e.to_string())?;
     let (resolved_target_url, api_key) = resolve_target_and_api_key(&config);
+    let (resolved_codex_target_url, codex_api_key, codex_converter) =
+        resolve_codex_target_api_key_and_converter(&config);
 
     app.emit(
         "proxy-log",
         format!("[System] Target: {}", resolved_target_url),
+    )
+    .map_err(|e| e.to_string())?;
+    app.emit(
+        "proxy-log",
+        format!("[System] Codex Target: {}", resolved_codex_target_url),
     )
     .map_err(|e| e.to_string())?;
     let custom_injection_prompt = resolve_custom_injection_prompt(&config.custom_injection_prompt);
@@ -1159,6 +1288,7 @@ async fn start_proxy_with_manager(
         .with_enable_codex_tool_schema_compaction(config.enable_codex_tool_schema_compaction)
         .with_enable_skill_routing_hint(config.enable_skill_routing_hint)
         .with_enable_stateful_responses_chain(config.enable_stateful_responses_chain)
+        .with_codex_route(resolved_codex_target_url, codex_api_key, codex_converter)
         .with_allow_external_access(config.allow_external_access)
         .with_max_concurrency(config.max_concurrency);
 
@@ -1344,6 +1474,9 @@ pub fn import_config(config_json: String) -> Result<(), String> {
     if config.endpoint_options.is_empty() {
         return Err("配置无效: endpoint_options 不能为空".to_string());
     }
+    if config.codex_config.endpoint_options.is_empty() {
+        return Err("配置无效: codexConfig.endpointOptions 不能为空".to_string());
+    }
 
     let path = get_config_path()?;
     if let Some(parent) = path.parent() {
@@ -1380,6 +1513,30 @@ mod tests {
     }
 
     #[test]
+    fn old_config_deserializes_with_default_codex_config() {
+        let config: ProxyConfig = serde_json::from_value(json!({
+            "port": 8889,
+            "targetUrl": "https://claude.example/messages",
+            "apiKey": "claude-key",
+            "endpointOptions": [{
+                "id": "claude-1",
+                "alias": "Claude",
+                "url": "https://claude.example/messages",
+                "apiKey": "claude-key"
+            }],
+            "selectedEndpointId": "claude-1"
+        }))
+        .expect("old config should deserialize");
+
+        assert_eq!(config.target_url, "https://claude.example/messages");
+        assert_eq!(config.api_key, "claude-key");
+        assert_eq!(config.selected_endpoint_id, "claude-1");
+        assert_eq!(config.codex_config.selected_endpoint_id, "codex-default");
+        assert_eq!(config.codex_config.converter, "codex");
+        assert_eq!(config.codex_config.endpoint_options.len(), 1);
+    }
+
+    #[test]
     fn build_runtime_update_falls_back_for_blank_prompt_and_keeps_custom_prompt() {
         let mut blank = default_proxy_config();
         blank.target_url = "http://127.0.0.1:3000".to_string();
@@ -1407,5 +1564,60 @@ mod tests {
         let disabled_fast_update = build_runtime_update(&disabled_fast, None);
         assert!(!disabled_fast_update.enable_codex_fast_mode);
         assert!(!disabled_fast_update.ctx.enable_codex_fast_mode);
+    }
+
+    #[test]
+    fn build_runtime_update_keeps_codex_target_separate() {
+        let mut config = default_proxy_config();
+        config.target_url = "https://claude.example/messages".to_string();
+        config.api_key = "claude-key".to_string();
+        config.endpoint_options = vec![EndpointOption {
+            id: "claude-1".to_string(),
+            alias: "Claude".to_string(),
+            url: "https://claude.example/messages".to_string(),
+            api_key: "claude-key".to_string(),
+            converter: Some("anthropic".to_string()),
+            codex_model: None,
+            codex_model_mapping: None,
+            codex_effort_capability_map: None,
+            gemini_model_preset: None,
+            anthropic_model_mapping: None,
+            openai_model_mapping: None,
+            openai_max_tokens_mapping: None,
+            reasoning_effort: None,
+            gemini_reasoning_effort: None,
+        }];
+        config.selected_endpoint_id = "claude-1".to_string();
+        config.codex_config.target_url = "https://codex.example/responses".to_string();
+        config.codex_config.api_key = "codex-key".to_string();
+        config.codex_config.endpoint_options = vec![EndpointOption {
+            id: "codex-1".to_string(),
+            alias: "Codex".to_string(),
+            url: "https://codex-selected.example/responses".to_string(),
+            api_key: "codex-selected-key".to_string(),
+            converter: Some("codex".to_string()),
+            codex_model: None,
+            codex_model_mapping: None,
+            codex_effort_capability_map: None,
+            gemini_model_preset: None,
+            anthropic_model_mapping: None,
+            openai_model_mapping: None,
+            openai_max_tokens_mapping: None,
+            reasoning_effort: None,
+            gemini_reasoning_effort: None,
+        }];
+        config.codex_config.selected_endpoint_id = "codex-1".to_string();
+
+        let update = build_runtime_update(&config, None);
+        assert_eq!(update.target_url, "https://claude.example/messages");
+        assert_eq!(update.api_key.as_deref(), Some("claude-key"));
+
+        let codex_route = update.codex_route.expect("codex route");
+        assert_eq!(
+            codex_route.target_url,
+            "https://codex-selected.example/responses"
+        );
+        assert_eq!(codex_route.api_key.as_deref(), Some("codex-selected-key"));
+        assert_eq!(codex_route.ctx.converter, "codex");
     }
 }

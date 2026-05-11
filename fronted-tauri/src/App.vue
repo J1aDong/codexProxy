@@ -5,8 +5,10 @@
       <Header
         :isRunning="isRunning"
         :isDarkMode="isDarkMode"
+        :clientMode="activeClientMode"
         @toggleLang="toggleLang"
         @toggleDarkMode="toggleDarkMode"
+        @update:clientMode="setActiveClientMode"
         @showAbout="showAbout = true"
         @showSettings="showSettings = true"
         @showAdvancedSettings="openAdvancedSettings"
@@ -16,7 +18,8 @@
 
       <!-- Config Card -->
       <ConfigCard
-        :form="form"
+        :form="activeForm"
+        :clientMode="activeClientMode"
         :isRunning="isRunning"
         :lbAvailabilityMap="lbAvailabilityMap"
         :isDarkMode="isDarkMode"
@@ -30,6 +33,7 @@
       <!-- Guide Section -->
       <GuideSection
         :port="form.port"
+        :clientMode="activeClientMode"
         :isDarkMode="isDarkMode"
       />
     </div>
@@ -77,7 +81,7 @@
     <ImportExportDialog
       :visible="showImportExport"
       @close="showImportExport = false"
-      @configImported="handleConfigImported"
+      @imported="handleConfigImported"
     />
 
     <!-- Advanced Settings Dialog -->
@@ -234,7 +238,16 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
 import { applyProxyConfig, loadConfig, restartProxy, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
-import type { AnthropicModelMapping, CodexEffortCapabilityMap, ConverterType, EndpointOption, GeminiModelPreset, OpenAIModelMapping, ProxyConfigV2 } from './types/configTypes'
+import type {
+  AnthropicModelMapping,
+  CodexClientConfig,
+  CodexEffortCapabilityMap,
+  ConverterType,
+  EndpointOption,
+  GeminiModelPreset,
+  OpenAIModelMapping,
+  ProxyConfigV2,
+} from './types/configTypes'
 import { DEFAULT_PROXY_CONFIG_V2 } from './types/configTypes'
 
 import Header from './components/features/Header.vue'
@@ -283,6 +296,8 @@ const showSettings = ref(false)
 const showAdvancedSettings = ref(false)
 const showImportExport = ref(false)
 const showEndpointDialog = ref(false)
+type ClientMode = 'claude' | 'codex'
+const activeClientMode = ref<ClientMode>('claude')
 
 const localMaxConcurrency = ref<number | null>(null)
 const localLbModelCooldownSeconds = ref<number | null>(3600)
@@ -340,6 +355,23 @@ const DEFAULT_ENDPOINT_OPTION: EndpointOption = {
   alias: 'aicodemirror',
   url: 'https://api.aicodemirror.com/api/codex/backend-api/codex/responses',
   apiKey: '',
+}
+
+const DEFAULT_CODEX_ENDPOINT_OPTION: EndpointOption = {
+  id: 'codex-default',
+  alias: 'CodebuddyProxy',
+  url: DEFAULT_ENDPOINT_OPTION.url,
+  apiKey: '',
+  converter: 'codex',
+}
+
+const DEFAULT_CODEX_CLIENT_CONFIG: CodexClientConfig = {
+  targetUrl: DEFAULT_CODEX_ENDPOINT_OPTION.url,
+  apiKey: '',
+  endpointOptions: [DEFAULT_CODEX_ENDPOINT_OPTION],
+  selectedEndpointId: DEFAULT_CODEX_ENDPOINT_OPTION.id,
+  converter: 'codex',
+  proxyMode: 'single',
 }
 
 const DEFAULT_CONFIG = {
@@ -442,6 +474,58 @@ const form = reactive({
   },
 })
 
+const cloneEndpointOptions = (options: EndpointOption[]) =>
+  options.map((item) => ({
+    ...item,
+    codexModelMapping: item.codexModelMapping ? { ...item.codexModelMapping } : item.codexModelMapping,
+    anthropicModelMapping: item.anthropicModelMapping ? { ...item.anthropicModelMapping } : item.anthropicModelMapping,
+    openaiModelMapping: item.openaiModelMapping ? { ...item.openaiModelMapping } : item.openaiModelMapping,
+    openaiMaxTokensMapping: item.openaiMaxTokensMapping ? { ...item.openaiMaxTokensMapping } : item.openaiMaxTokensMapping,
+    codexEffortCapabilityMap: item.codexEffortCapabilityMap ? JSON.parse(JSON.stringify(item.codexEffortCapabilityMap)) : item.codexEffortCapabilityMap,
+    geminiModelPreset: item.geminiModelPreset ? [...item.geminiModelPreset] : item.geminiModelPreset,
+    reasoningEffort: item.reasoningEffort ? { ...item.reasoningEffort } : item.reasoningEffort,
+    geminiReasoningEffort: item.geminiReasoningEffort ? { ...item.geminiReasoningEffort } : item.geminiReasoningEffort,
+  }))
+
+const codexForm = reactive({
+  ...DEFAULT_CONFIG,
+  ...DEFAULT_PROXY_CONFIG_V2,
+  port: form.port,
+  targetUrl: DEFAULT_CODEX_CLIENT_CONFIG.targetUrl,
+  apiKey: DEFAULT_CODEX_CLIENT_CONFIG.apiKey,
+  endpointOptions: cloneEndpointOptions(DEFAULT_CODEX_CLIENT_CONFIG.endpointOptions),
+  selectedEndpointId: DEFAULT_CODEX_CLIENT_CONFIG.selectedEndpointId,
+  converter: DEFAULT_CODEX_CLIENT_CONFIG.converter,
+  proxyMode: 'single' as const,
+  loadBalancer: {
+    ...DEFAULT_PROXY_CONFIG_V2.loadBalancer,
+    lbProfiles: [...DEFAULT_PROXY_CONFIG_V2.loadBalancer.lbProfiles],
+    lbEndpointConfigs: { ...DEFAULT_PROXY_CONFIG_V2.loadBalancer.lbEndpointConfigs },
+  },
+  reasoningEffort: { ...DEFAULT_CONFIG.reasoningEffort },
+  codexModelMapping: { ...DEFAULT_CONFIG.codexModelMapping },
+  anthropicModelMapping: { ...DEFAULT_CONFIG.anthropicModelMapping },
+  openaiModelMapping: { ...DEFAULT_CONFIG.openaiModelMapping },
+  openaiMaxTokensMapping: { ...DEFAULT_CONFIG.openaiMaxTokensMapping },
+  codexEffortCapabilityMap: JSON.parse(JSON.stringify(DEFAULT_CONFIG.codexEffortCapabilityMap)),
+  geminiModelPreset: [...DEFAULT_CONFIG.geminiModelPreset],
+  geminiReasoningEffort: { ...DEFAULT_CONFIG.geminiReasoningEffort },
+})
+
+const activeForm = computed(() => activeClientMode.value === 'codex' ? codexForm : form)
+
+const setActiveClientMode = (mode: ClientMode) => {
+  activeClientMode.value = mode
+}
+
+watch(() => form.port, (port) => {
+  if (codexForm.port !== port) codexForm.port = port
+})
+
+watch(() => codexForm.port, (port) => {
+  if (form.port !== port) form.port = port
+})
+
 
 const migrateCodexModel = (model: string): string => {
   return model === 'codex-mini-latest' ? 'gpt-5.1-codex-mini' : model
@@ -527,6 +611,63 @@ const normalizeConverter = (value: unknown, fallback: ConverterType): ConverterT
     return value
   }
   return fallback
+}
+
+const normalizeEndpointOptions = (
+  options: unknown,
+  fallbackOptions: EndpointOption[],
+): EndpointOption[] => {
+  if (!Array.isArray(options) || options.length === 0) {
+    return cloneEndpointOptions(fallbackOptions)
+  }
+
+  return cloneEndpointOptions(options as EndpointOption[]).map((item) => ({
+    ...item,
+    converter: item.converter ? normalizeConverter(item.converter, DEFAULT_CONFIG.converter) : item.converter,
+    codexModel: item.codexModel ? migrateCodexModel(item.codexModel) : item.codexModel,
+    codexModelMapping: item.codexModelMapping
+      ? migrateCodexModelMapping(item.codexModelMapping)
+      : item.codexModelMapping,
+    anthropicModelMapping: item.anthropicModelMapping
+      ? normalizeAnthropicModelMapping(item.anthropicModelMapping)
+      : item.anthropicModelMapping,
+    openaiModelMapping: item.openaiModelMapping
+      ? normalizeOpenaiModelMapping(item.openaiModelMapping)
+      : item.openaiModelMapping,
+  }))
+}
+
+const normalizeCodexClientConfig = (input: ProxyConfigV2['codexConfig']): CodexClientConfig => {
+  const raw = input || DEFAULT_CODEX_CLIENT_CONFIG
+  const endpointOptions = normalizeEndpointOptions(
+    raw.endpointOptions,
+    DEFAULT_CODEX_CLIENT_CONFIG.endpointOptions,
+  )
+  const selectedEndpointId = raw.selectedEndpointId
+    && endpointOptions.some((item) => item.id === raw.selectedEndpointId)
+    ? raw.selectedEndpointId
+    : endpointOptions[0]?.id || DEFAULT_CODEX_CLIENT_CONFIG.selectedEndpointId
+  const selected = endpointOptions.find((item) => item.id === selectedEndpointId)
+
+  return {
+    targetUrl: selected?.url || raw.targetUrl || DEFAULT_CODEX_CLIENT_CONFIG.targetUrl,
+    apiKey: selected?.apiKey || raw.apiKey || '',
+    endpointOptions,
+    selectedEndpointId,
+    converter: normalizeConverter(selected?.converter || raw.converter, DEFAULT_CODEX_CLIENT_CONFIG.converter),
+    proxyMode: 'single',
+  }
+}
+
+const applyCodexClientConfig = (input: ProxyConfigV2['codexConfig']) => {
+  const next = normalizeCodexClientConfig(input)
+  codexForm.targetUrl = next.targetUrl
+  codexForm.apiKey = next.apiKey
+  codexForm.endpointOptions = cloneEndpointOptions(next.endpointOptions)
+  codexForm.selectedEndpointId = next.selectedEndpointId
+  codexForm.converter = next.converter
+  codexForm.proxyMode = 'single'
+  syncEndpointFromSelection(codexForm)
 }
 
 const resolveSavedDefaultConverter = (savedConfig: ProxyConfigV2): ConverterType => {
@@ -675,6 +816,7 @@ const handleConfigImported = async () => {
   const savedConfig = await loadConfig()
   if (savedConfig) {
     const savedDefaultConverter = resolveSavedDefaultConverter(savedConfig as ProxyConfigV2)
+    applyCodexClientConfig((savedConfig as ProxyConfigV2).codexConfig)
     // V2 defaults (non-breaking for old configs)
     form.proxyMode = (savedConfig as ProxyConfigV2).proxyMode || DEFAULT_PROXY_CONFIG_V2.proxyMode
     form.loadBalancer = normalizeLoadBalancerConfig(
@@ -716,7 +858,7 @@ const handleConfigImported = async () => {
       form.endpointOptions = [legacyOption]
       form.selectedEndpointId = legacyOption.id
     }
-    syncEndpointFromSelection()
+    syncEndpointFromSelection(form)
     if (typeof savedConfig.customInjectionPrompt === 'string' && savedConfig.customInjectionPrompt.trim()) {
       form.customInjectionPrompt = savedConfig.customInjectionPrompt
     } else {
@@ -784,72 +926,75 @@ const handleConfigImported = async () => {
 
 const isSyncing = ref(false)
 
-const currentEndpoint = computed(() => {
-  const matched = form.endpointOptions.find((item) => item.id === form.selectedEndpointId)
-  return matched ?? form.endpointOptions[0] ?? DEFAULT_ENDPOINT_OPTION
-})
-
-const promoteEndpointToFront = (id: string) => {
-  const index = form.endpointOptions.findIndex((item) => item.id === id)
-  if (index <= 0) return
-
-  const selected = form.endpointOptions[index]
-  form.endpointOptions = [selected, ...form.endpointOptions.filter((item) => item.id !== id)]
+const selectedEndpointFor = (targetForm: typeof form | typeof codexForm) => {
+  const matched = targetForm.endpointOptions.find((item) => item.id === targetForm.selectedEndpointId)
+  return matched ?? targetForm.endpointOptions[0] ?? DEFAULT_ENDPOINT_OPTION
 }
 
-const syncEndpointFromSelection = () => {
-  const endpoint = currentEndpoint.value
-  form.targetUrl = endpoint.url
-  form.apiKey = endpoint.apiKey
-  if (endpoint.converter) form.converter = endpoint.converter
-  if (endpoint.codexModel) form.codexModel = migrateCodexModel(endpoint.codexModel)
-  if (endpoint.codexModelMapping) form.codexModelMapping = migrateCodexModelMapping(endpoint.codexModelMapping)
-  form.anthropicModelMapping = endpoint.anthropicModelMapping
+const promoteEndpointToFront = (targetForm: typeof form | typeof codexForm, id: string) => {
+  const index = targetForm.endpointOptions.findIndex((item) => item.id === id)
+  if (index <= 0) return
+
+  const selected = targetForm.endpointOptions[index]
+  targetForm.endpointOptions = [selected, ...targetForm.endpointOptions.filter((item) => item.id !== id)]
+}
+
+const syncEndpointFromSelection = (targetForm: typeof form | typeof codexForm = activeForm.value) => {
+  const endpoint = selectedEndpointFor(targetForm)
+  targetForm.targetUrl = endpoint.url
+  targetForm.apiKey = endpoint.apiKey
+  if (endpoint.converter) targetForm.converter = endpoint.converter
+  if (endpoint.codexModel) targetForm.codexModel = migrateCodexModel(endpoint.codexModel)
+  if (endpoint.codexModelMapping) targetForm.codexModelMapping = migrateCodexModelMapping(endpoint.codexModelMapping)
+  targetForm.anthropicModelMapping = endpoint.anthropicModelMapping
     ? normalizeAnthropicModelMapping(endpoint.anthropicModelMapping)
     : { ...DEFAULT_CONFIG.anthropicModelMapping }
-  form.openaiModelMapping = endpoint.openaiModelMapping
+  targetForm.openaiModelMapping = endpoint.openaiModelMapping
     ? normalizeOpenaiModelMapping(endpoint.openaiModelMapping)
     : { ...DEFAULT_CONFIG.openaiModelMapping }
-  form.openaiMaxTokensMapping = endpoint.openaiMaxTokensMapping
+  targetForm.openaiMaxTokensMapping = endpoint.openaiMaxTokensMapping
     ? { opus: endpoint.openaiMaxTokensMapping.opus ?? null, sonnet: endpoint.openaiMaxTokensMapping.sonnet ?? null, haiku: endpoint.openaiMaxTokensMapping.haiku ?? null }
     : { opus: null as number | null, sonnet: null as number | null, haiku: null as number | null }
   if (endpoint.codexEffortCapabilityMap) {
-    form.codexEffortCapabilityMap = normalizeCapabilityMap(endpoint.codexEffortCapabilityMap)
+    targetForm.codexEffortCapabilityMap = normalizeCapabilityMap(endpoint.codexEffortCapabilityMap)
   }
   if (endpoint.geminiModelPreset) {
-    form.geminiModelPreset = normalizeGeminiModelPreset(endpoint.geminiModelPreset)
+    targetForm.geminiModelPreset = normalizeGeminiModelPreset(endpoint.geminiModelPreset)
   }
-  if (endpoint.reasoningEffort) form.reasoningEffort = { ...endpoint.reasoningEffort }
-  if (endpoint.geminiReasoningEffort) form.geminiReasoningEffort = { ...endpoint.geminiReasoningEffort }
+  if (endpoint.reasoningEffort) targetForm.reasoningEffort = { ...endpoint.reasoningEffort }
+  if (endpoint.geminiReasoningEffort) targetForm.geminiReasoningEffort = { ...endpoint.geminiReasoningEffort }
 }
 
-// Watch for endpoint selection changes to load corresponding config
-watch(() => form.selectedEndpointId, async () => {
+const handleSelectedEndpointChange = async (targetForm: typeof form | typeof codexForm) => {
   isSyncing.value = true
-  promoteEndpointToFront(form.selectedEndpointId)
-  syncEndpointFromSelection()
+  promoteEndpointToFront(targetForm, targetForm.selectedEndpointId)
+  syncEndpointFromSelection(targetForm)
   await nextTick()
   isSyncing.value = false
   persistConfig(buildProxyConfig())
-})
+}
 
-const updateSelectedEndpointConfig = () => {
-  form.endpointOptions = form.endpointOptions.map((item) => {
-    if (item.id !== form.selectedEndpointId) return item
+// Watch for endpoint selection changes to load corresponding config
+watch(() => form.selectedEndpointId, () => handleSelectedEndpointChange(form))
+watch(() => codexForm.selectedEndpointId, () => handleSelectedEndpointChange(codexForm))
+
+const updateSelectedEndpointConfig = (targetForm: typeof form | typeof codexForm = activeForm.value) => {
+  targetForm.endpointOptions = targetForm.endpointOptions.map((item) => {
+    if (item.id !== targetForm.selectedEndpointId) return item
     return {
       ...item,
-      url: form.targetUrl,
-      apiKey: form.apiKey,
-      converter: form.converter,
-      codexModel: form.codexModel,
-      codexModelMapping: { ...form.codexModelMapping },
-      anthropicModelMapping: { ...form.anthropicModelMapping },
-      openaiModelMapping: { ...form.openaiModelMapping },
-      openaiMaxTokensMapping: { ...form.openaiMaxTokensMapping },
-      codexEffortCapabilityMap: JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
-      geminiModelPreset: [...form.geminiModelPreset],
-      reasoningEffort: { ...form.reasoningEffort },
-      geminiReasoningEffort: { ...form.geminiReasoningEffort },
+      url: targetForm.targetUrl,
+      apiKey: targetForm.apiKey,
+      converter: targetForm.converter,
+      codexModel: targetForm.codexModel,
+      codexModelMapping: { ...targetForm.codexModelMapping },
+      anthropicModelMapping: { ...targetForm.anthropicModelMapping },
+      openaiModelMapping: { ...targetForm.openaiModelMapping },
+      openaiMaxTokensMapping: { ...targetForm.openaiMaxTokensMapping },
+      codexEffortCapabilityMap: JSON.parse(JSON.stringify(targetForm.codexEffortCapabilityMap)),
+      geminiModelPreset: [...targetForm.geminiModelPreset],
+      reasoningEffort: { ...targetForm.reasoningEffort },
+      geminiReasoningEffort: { ...targetForm.geminiReasoningEffort },
     }
   })
 }
@@ -872,21 +1017,35 @@ watch(
   ],
   () => {
     if (isSyncing.value) return
-    updateSelectedEndpointConfig()
+    updateSelectedEndpointConfig(form)
+    persistConfig(buildProxyConfig())
+  },
+  { deep: true }
+)
+
+watch(
+  [
+    () => codexForm.targetUrl,
+    () => codexForm.apiKey,
+    () => codexForm.converter,
+  ],
+  () => {
+    if (isSyncing.value) return
+    updateSelectedEndpointConfig(codexForm)
     persistConfig(buildProxyConfig())
   },
   { deep: true }
 )
 
 const updateForm = (newForm: any) => {
-  Object.assign(form, newForm)
+  Object.assign(activeForm.value, newForm)
 }
 
 const editingEndpointId = ref('')
 
 const currentEditingEndpoint = computed(() => {
   if (!editingEndpointId.value) return undefined
-  return form.endpointOptions.find(opt => opt.id === editingEndpointId.value)
+  return activeForm.value.endpointOptions.find(opt => opt.id === editingEndpointId.value)
 })
 
 const openAddEndpointDialog = () => {
@@ -905,16 +1064,17 @@ const closeEndpointDialog = () => {
 }
 
 const handleEndpointSubmit = (endpointData: any) => {
+  const targetForm = activeForm.value
   if (editingEndpointId.value) {
     // Edit mode
-    const index = form.endpointOptions.findIndex(opt => opt.id === editingEndpointId.value)
+    const index = targetForm.endpointOptions.findIndex(opt => opt.id === editingEndpointId.value)
     if (index !== -1) {
-      form.endpointOptions[index] = {
-        ...form.endpointOptions[index],
+      targetForm.endpointOptions[index] = {
+        ...targetForm.endpointOptions[index],
         ...endpointData
       }
-      if (form.selectedEndpointId === editingEndpointId.value) {
-        syncEndpointFromSelection()
+      if (targetForm.selectedEndpointId === editingEndpointId.value) {
+        syncEndpointFromSelection(targetForm)
       }
     }
   } else {
@@ -923,36 +1083,38 @@ const handleEndpointSubmit = (endpointData: any) => {
     const nextOption: EndpointOption = {
       id: nextId,
       ...endpointData,
-      converter: endpointData.converter || form.converter,
-      codexModel: endpointData.codexModel || form.codexModel,
-      codexModelMapping: endpointData.codexModelMapping || { ...form.codexModelMapping },
-      anthropicModelMapping: endpointData.anthropicModelMapping || { ...form.anthropicModelMapping },
-      openaiModelMapping: endpointData.openaiModelMapping || { ...form.openaiModelMapping },
-      codexEffortCapabilityMap: endpointData.codexEffortCapabilityMap || JSON.parse(JSON.stringify(form.codexEffortCapabilityMap)),
-      geminiModelPreset: endpointData.geminiModelPreset || [...form.geminiModelPreset],
-      reasoningEffort: endpointData.reasoningEffort || { ...form.reasoningEffort },
-      geminiReasoningEffort: endpointData.geminiReasoningEffort || { ...form.geminiReasoningEffort },
+      converter: endpointData.converter || targetForm.converter,
+      codexModel: endpointData.codexModel || targetForm.codexModel,
+      codexModelMapping: endpointData.codexModelMapping || { ...targetForm.codexModelMapping },
+      anthropicModelMapping: endpointData.anthropicModelMapping || { ...targetForm.anthropicModelMapping },
+      openaiModelMapping: endpointData.openaiModelMapping || { ...targetForm.openaiModelMapping },
+      codexEffortCapabilityMap: endpointData.codexEffortCapabilityMap || JSON.parse(JSON.stringify(targetForm.codexEffortCapabilityMap)),
+      geminiModelPreset: endpointData.geminiModelPreset || [...targetForm.geminiModelPreset],
+      reasoningEffort: endpointData.reasoningEffort || { ...targetForm.reasoningEffort },
+      geminiReasoningEffort: endpointData.geminiReasoningEffort || { ...targetForm.geminiReasoningEffort },
     }
 
-    form.endpointOptions = [...form.endpointOptions, nextOption]
-    form.selectedEndpointId = nextId
-    syncEndpointFromSelection()
+    targetForm.endpointOptions = [...targetForm.endpointOptions, nextOption]
+    targetForm.selectedEndpointId = nextId
+    syncEndpointFromSelection(targetForm)
   }
   closeEndpointDialog()
+  persistConfig(buildProxyConfig())
 }
 
 const handleDeleteEndpoint = (id: string) => {
-  if (form.endpointOptions.length <= 1) {
+  const targetForm = activeForm.value
+  if (targetForm.endpointOptions.length <= 1) {
     alert(t('deleteLastEndpointError'))
     return
   }
   
-  const index = form.endpointOptions.findIndex(opt => opt.id === id)
+  const index = targetForm.endpointOptions.findIndex(opt => opt.id === id)
   if (index !== -1) {
-    form.endpointOptions.splice(index, 1)
-    if (form.selectedEndpointId === id) {
-      form.selectedEndpointId = form.endpointOptions[0].id
-      syncEndpointFromSelection()
+    targetForm.endpointOptions.splice(index, 1)
+    if (targetForm.selectedEndpointId === id) {
+      targetForm.selectedEndpointId = targetForm.endpointOptions[0].id
+      syncEndpointFromSelection(targetForm)
     }
     persistConfig(buildProxyConfig())
   }
@@ -1021,10 +1183,22 @@ const tryUpdateLbAvailability = (message: string) => {
 }
 
 const resetDefaults = () => {
+  if (activeClientMode.value === 'codex') {
+    codexForm.endpointOptions = cloneEndpointOptions(DEFAULT_CODEX_CLIENT_CONFIG.endpointOptions)
+    codexForm.selectedEndpointId = DEFAULT_CODEX_CLIENT_CONFIG.selectedEndpointId
+    codexForm.targetUrl = DEFAULT_CODEX_CLIENT_CONFIG.targetUrl
+    codexForm.apiKey = DEFAULT_CODEX_CLIENT_CONFIG.apiKey
+    codexForm.converter = DEFAULT_CODEX_CLIENT_CONFIG.converter
+    codexForm.proxyMode = 'single'
+    syncEndpointFromSelection(codexForm)
+    persistConfig(buildProxyConfig())
+    return
+  }
+
   form.port = DEFAULT_CONFIG.port
   form.endpointOptions = [...DEFAULT_CONFIG.endpointOptions]
   form.selectedEndpointId = DEFAULT_CONFIG.selectedEndpointId
-  syncEndpointFromSelection()
+  syncEndpointFromSelection(form)
   form.converter = DEFAULT_CONFIG.converter
   form.codexModel = DEFAULT_CONFIG.codexModel
   form.codexModelMapping = { ...DEFAULT_CONFIG.codexModelMapping }
@@ -1049,6 +1223,15 @@ const resetDefaults = () => {
   }
   useDefaultPrompt()
 }
+
+const buildCodexConfig = (): CodexClientConfig => ({
+  targetUrl: codexForm.targetUrl,
+  apiKey: codexForm.apiKey,
+  endpointOptions: cloneEndpointOptions(codexForm.endpointOptions),
+  selectedEndpointId: codexForm.selectedEndpointId,
+  converter: codexForm.converter,
+  proxyMode: 'single',
+})
 
 const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   port: form.port,
@@ -1078,6 +1261,7 @@ const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   force,
   proxyMode: form.proxyMode,
   loadBalancer: form.loadBalancer,
+  codexConfig: buildCodexConfig(),
 })
 
 const configRuntimeHash = (config: ProxyConfigV2) => JSON.stringify(config)
@@ -1245,6 +1429,7 @@ onMounted(() => {
     .then((savedConfig) => {
       if (savedConfig) {
         const savedDefaultConverter = resolveSavedDefaultConverter(savedConfig as ProxyConfigV2)
+        applyCodexClientConfig((savedConfig as ProxyConfigV2).codexConfig)
         if (savedConfig.port) form.port = savedConfig.port
         if (savedConfig.codexModel) {
           form.codexModel = migrateCodexModel(savedConfig.codexModel)
@@ -1287,7 +1472,7 @@ onMounted(() => {
           form.endpointOptions = [legacyOption]
           form.selectedEndpointId = legacyOption.id
         }
-        syncEndpointFromSelection()
+        syncEndpointFromSelection(form)
         if (typeof savedConfig.customInjectionPrompt === 'string' && savedConfig.customInjectionPrompt.trim()) {
           form.customInjectionPrompt = savedConfig.customInjectionPrompt
         } else {
@@ -1344,7 +1529,8 @@ onMounted(() => {
         localEnableCodexFastMode.value = form.enableCodexFastMode
         localAllowExternalAccess.value = form.allowExternalAccess
       } else {
-        syncEndpointFromSelection()
+        syncEndpointFromSelection(form)
+        syncEndpointFromSelection(codexForm)
         useDefaultPrompt()
         persistConfig(buildProxyConfig())
       }
@@ -1402,6 +1588,7 @@ onUnmounted(() => {
 
 watch(
   [
+    () => form.port,
     () => form.maxConcurrency,
     () => form.lbModelCooldownSeconds,
     () => form.lbTransientBackoffSeconds,

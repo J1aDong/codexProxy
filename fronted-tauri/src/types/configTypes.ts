@@ -85,9 +85,19 @@ export interface ProxyConfig {
     force: boolean
 }
 
+export interface CodexClientConfig {
+    targetUrl: string
+    apiKey: string
+    endpointOptions: EndpointOption[]
+    selectedEndpointId: string
+    converter: ConverterType
+    proxyMode?: ProxyMode
+}
+
 export interface ProxyConfigV2 extends ProxyConfig {
     proxyMode?: ProxyMode
     loadBalancer?: LoadBalancerConfigV2
+    codexConfig?: CodexClientConfig
 }
 
 export const DEFAULT_PROXY_CONFIG_V2: Pick<Required<ProxyConfigV2>, 'proxyMode' | 'loadBalancer'> = {

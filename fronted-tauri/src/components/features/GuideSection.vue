@@ -6,9 +6,12 @@
     <h3 class="text-xs font-semibold uppercase tracking-wider text-apple-text-secondary dark:text-dark-text-secondary mb-4">
       {{ t('guideTitle') }}
     </h3>
-    <p class="text-sm text-apple-text-primary dark:text-dark-text-primary mb-4 leading-relaxed">
+    <p v-if="clientMode === 'claude'" class="text-sm text-apple-text-primary dark:text-dark-text-primary mb-4 leading-relaxed">
       {{ t('guideDesc') }}<br />
       <code class="bg-gray-200 dark:bg-gray-700 px-1.5 py-0.5 rounded text-xs font-mono">~/.claude/settings.json</code>
+    </p>
+    <p v-else class="text-sm text-apple-text-primary dark:text-dark-text-primary mb-4 leading-relaxed">
+      {{ t('guideCodexDesc') }}
     </p>
     <div class="relative bg-gray-900 dark:bg-gray-800 rounded-xl p-4 mb-4">
       <pre class="font-mono text-xs text-gray-300 dark:text-gray-200 whitespace-pre-wrap leading-relaxed">
@@ -42,11 +45,19 @@ const props = defineProps({
     type: Boolean,
     required: true,
   },
+  clientMode: {
+    type: String as () => 'claude' | 'codex',
+    default: 'claude',
+  },
 })
 
 const copied = ref(false)
 
 const configExample = computed(() => {
+  if (props.clientMode === 'codex') {
+    return `http://localhost:${props.port}/codex`
+  }
+
   const tokenPlaceholder = t('guideTokenHint')
 
   return `{

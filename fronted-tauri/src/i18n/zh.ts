@@ -72,6 +72,7 @@ export default {
     // Guide
     guideTitle: '配置指南',
     guideDesc: '请将以下内容添加到您的 Claude Code 配置文件：',
+    guideCodexDesc: 'Codex 客户端请使用以下本地代理地址：',
     guideTokenHint: '替换为真实的key或者假如在proxy页面中配置了则任意字符串',
     copy: '复制',
     copied: '已复制',
