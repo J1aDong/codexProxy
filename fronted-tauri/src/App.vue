@@ -637,12 +637,18 @@ const normalizeEndpointOptions = (
   }))
 }
 
+const forceCodexEndpointOptions = (options: EndpointOption[]): EndpointOption[] =>
+  cloneEndpointOptions(options).map((item) => ({
+    ...item,
+    converter: 'codex' as ConverterType,
+  }))
+
 const normalizeCodexClientConfig = (input: ProxyConfigV2['codexConfig']): CodexClientConfig => {
   const raw = input || DEFAULT_CODEX_CLIENT_CONFIG
-  const endpointOptions = normalizeEndpointOptions(
+  const endpointOptions = forceCodexEndpointOptions(normalizeEndpointOptions(
     raw.endpointOptions,
     DEFAULT_CODEX_CLIENT_CONFIG.endpointOptions,
-  )
+  ))
   const selectedEndpointId = raw.selectedEndpointId
     && endpointOptions.some((item) => item.id === raw.selectedEndpointId)
     ? raw.selectedEndpointId
@@ -654,7 +660,7 @@ const normalizeCodexClientConfig = (input: ProxyConfigV2['codexConfig']): CodexC
     apiKey: selected?.apiKey || raw.apiKey || '',
     endpointOptions,
     selectedEndpointId,
-    converter: normalizeConverter(selected?.converter || raw.converter, DEFAULT_CODEX_CLIENT_CONFIG.converter),
+    converter: 'codex',
     proxyMode: 'single',
   }
 }
@@ -931,6 +937,8 @@ const selectedEndpointFor = (targetForm: typeof form | typeof codexForm) => {
   return matched ?? targetForm.endpointOptions[0] ?? DEFAULT_ENDPOINT_OPTION
 }
 
+const isCodexTargetForm = (targetForm: typeof form | typeof codexForm) => targetForm === codexForm
+
 const promoteEndpointToFront = (targetForm: typeof form | typeof codexForm, id: string) => {
   const index = targetForm.endpointOptions.findIndex((item) => item.id === id)
   if (index <= 0) return
@@ -943,7 +951,11 @@ const syncEndpointFromSelection = (targetForm: typeof form | typeof codexForm = 
   const endpoint = selectedEndpointFor(targetForm)
   targetForm.targetUrl = endpoint.url
   targetForm.apiKey = endpoint.apiKey
-  if (endpoint.converter) targetForm.converter = endpoint.converter
+  if (isCodexTargetForm(targetForm)) {
+    targetForm.converter = 'codex'
+  } else if (endpoint.converter) {
+    targetForm.converter = endpoint.converter
+  }
   if (endpoint.codexModel) targetForm.codexModel = migrateCodexModel(endpoint.codexModel)
   if (endpoint.codexModelMapping) targetForm.codexModelMapping = migrateCodexModelMapping(endpoint.codexModelMapping)
   targetForm.anthropicModelMapping = endpoint.anthropicModelMapping
@@ -985,7 +997,7 @@ const updateSelectedEndpointConfig = (targetForm: typeof form | typeof codexForm
       ...item,
       url: targetForm.targetUrl,
       apiKey: targetForm.apiKey,
-      converter: targetForm.converter,
+      converter: isCodexTargetForm(targetForm) ? 'codex' : targetForm.converter,
       codexModel: targetForm.codexModel,
       codexModelMapping: { ...targetForm.codexModelMapping },
       anthropicModelMapping: { ...targetForm.anthropicModelMapping },
@@ -1027,7 +1039,6 @@ watch(
   [
     () => codexForm.targetUrl,
     () => codexForm.apiKey,
-    () => codexForm.converter,
   ],
   () => {
     if (isSyncing.value) return
@@ -1071,7 +1082,8 @@ const handleEndpointSubmit = (endpointData: any) => {
     if (index !== -1) {
       targetForm.endpointOptions[index] = {
         ...targetForm.endpointOptions[index],
-        ...endpointData
+        ...endpointData,
+        converter: isCodexTargetForm(targetForm) ? 'codex' : targetForm.endpointOptions[index].converter,
       }
       if (targetForm.selectedEndpointId === editingEndpointId.value) {
         syncEndpointFromSelection(targetForm)
@@ -1083,7 +1095,7 @@ const handleEndpointSubmit = (endpointData: any) => {
     const nextOption: EndpointOption = {
       id: nextId,
       ...endpointData,
-      converter: endpointData.converter || targetForm.converter,
+      converter: isCodexTargetForm(targetForm) ? 'codex' : endpointData.converter || targetForm.converter,
       codexModel: endpointData.codexModel || targetForm.codexModel,
       codexModelMapping: endpointData.codexModelMapping || { ...targetForm.codexModelMapping },
       anthropicModelMapping: endpointData.anthropicModelMapping || { ...targetForm.anthropicModelMapping },
@@ -1227,9 +1239,9 @@ const resetDefaults = () => {
 const buildCodexConfig = (): CodexClientConfig => ({
   targetUrl: codexForm.targetUrl,
   apiKey: codexForm.apiKey,
-  endpointOptions: cloneEndpointOptions(codexForm.endpointOptions),
+  endpointOptions: forceCodexEndpointOptions(codexForm.endpointOptions),
   selectedEndpointId: codexForm.selectedEndpointId,
-  converter: codexForm.converter,
+  converter: 'codex',
   proxyMode: 'single',
 })
 

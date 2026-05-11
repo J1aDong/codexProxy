@@ -8,9 +8,9 @@
 
 - 在桌面配置界面新增 Claude / Codex 档位切换。
 - Claude 档位维持当前行为和当前界面。
-- Codex 档位复用单模型代理界面布局，但只展示端口、代理模式、目标地址、Codex API 密钥和转换器相关配置。
+- Codex 档位复用单模型代理界面布局，但只展示端口、代理模式、目标地址和 Codex API 密钥；转换器固定为 Codex 透传，不提供选择。
 - Codex 档位的目标地址配置与 Claude 档位完全独立，互不生效。
-- Codex 通过 `http://localhost:<port>/codex` 作为区分入口，避免和现有 Claude 兼容入口混淆。
+- Codex 通过 `http://localhost:<port>/codex/v1` 作为 Codex/OpenAI 原生 Base URL，避免和现有 Claude 兼容入口混淆。
 - 启动代理 / 停止代理仍然是全局动作：同一个运行中的代理同时服务 Claude 与 Codex 入口。
 
 ## Capabilities

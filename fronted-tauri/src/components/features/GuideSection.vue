@@ -55,7 +55,7 @@ const copied = ref(false)
 
 const configExample = computed(() => {
   if (props.clientMode === 'codex') {
-    return `http://localhost:${props.port}/codex`
+    return `http://localhost:${props.port}/codex/v1`
   }
 
   const tokenPlaceholder = t('guideTokenHint')

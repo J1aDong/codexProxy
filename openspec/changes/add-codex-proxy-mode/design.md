@@ -10,7 +10,7 @@
 约束：
 
 - Claude 档位必须维持当前行为，包括现有 `/v1/messages` 兼容入口和现有配置字段的向后兼容。
-- `/codex` 是 Codex 档位的本地入口前缀，不应改变 Claude 现有入口。
+- `/codex` 是 Codex 档位的本地入口前缀，不应改变 Claude 现有入口；`/codex/v1/**` 同时作为 Codex/OpenAI 原生 HTTP 透传入口。
 - 启动代理 / 停止代理是进程级动作，不随 UI 当前档位变化。
 - `main/src/transform/unified.rs` 继续只承载协议无关抽象，Codex 档位隔离不应通过污染统一输入层实现。
 
@@ -20,7 +20,7 @@
 
 - 在 UI 顶部新增 Claude / Codex 档位切换。
 - Claude 档位继续展示并使用当前完整配置。
-- Codex 档位展示精简的单模型配置界面，只保留端口、代理模式、目标地址、Codex API 密钥和转换器相关字段。
+- Codex 档位展示精简的单模型配置界面，只保留端口、代理模式、目标地址和 Codex API 密钥；转换器固定为 Codex 透传，不在 Codex 档位暴露选择。
 - 将 Codex 档位的目标地址、API 密钥、端点列表和当前选择与 Claude 档位分开持久化。
 - 让同一个运行中的代理同时处理 Claude 入口和 Codex 入口。
 - 请求路径以 `/codex` 开头时选择 Codex 配置；其他现有 Claude 入口继续选择 Claude 配置。
@@ -55,9 +55,9 @@
 
 4. **`/codex` 作为路径前缀，不替代现有 Claude 路径**
 
-   Codex 客户端配置本地 base URL 为 `http://localhost:<port>/codex`。服务端识别 `/codex` 前缀后使用 Codex route，并对后续路径继续按现有请求处理规则匹配。
+   Codex 客户端配置本地 base URL 为 `http://localhost:<port>/codex/v1`。服务端识别 `/codex` 前缀后使用 Codex route，并对后续路径继续按现有请求处理规则匹配。
 
-   如果后续需要支持 Codex 客户端原生 Responses API 路径，应在 `/codex` 前缀下新增明确的 OpenAI/Codex 入站协议处理；本变更先把路径隔离和配置隔离作为必要前置能力。
+   `/codex/v1/messages` 仍保留 Anthropic-compatible 兼容入口；其他 `/codex/v1/**` 路径作为原生 HTTP 透传，保留 method、query、headers 和 body，并使用 Codex 档位的目标地址与 API 密钥转发。
 
 5. **导入导出和热更新必须包含 Codex 配置**
 
@@ -66,7 +66,7 @@
 ## Risks / Trade-offs
 
 - [Risk] 旧配置文件没有 Codex 字段，加载后可能出现空目标地址 → Mitigation：为 `codexConfig` 提供默认端点、默认选中 ID 和空密钥，并在迁移时补齐。
-- [Risk] `/codex` 前缀与现有路径匹配规则混在一起，可能误判 404 → Mitigation：在进入现有 `is_messages` / `is_count_tokens` 判断前统一剥离前缀，并为 `/codex/v1/messages`、`/codex/messages`、`/codex/v1/messages/count_tokens` 添加回归测试。
+- [Risk] `/codex` 前缀与现有路径匹配规则混在一起，可能误判 404 → Mitigation：在进入现有 `is_messages` / `is_count_tokens` 判断前统一剥离前缀，并为 `/codex/v1/messages`、`/codex/messages`、`/codex/v1/messages/count_tokens`、`/codex/v1/models` 和 `/codex/v1/responses` 添加回归测试。
 - [Risk] UI 档位切换时 accidentally 写回另一套 endpointOptions → Mitigation：封装当前档位的 endpoint getter/setter，避免直接复用单一 `form.endpointOptions` 写入两处。
 - [Risk] 运行时热更新只更新当前 UI 档位，导致另一档位保存但未生效 → Mitigation：`buildProxyConfig` 始终提交完整配置，Tauri 侧每次构建包含两套路由的 `RuntimeConfigUpdate`。
 - [Risk] 精简 Codex UI 与现有完整表单共享代码后出现隐藏字段残留 → Mitigation：模板层按 `activeClientMode` 控制展示，保存层只序列化 Codex 允许字段到 `codexConfig`。
@@ -80,4 +80,4 @@
 
 ## Open Questions
 
-- Codex 客户端在 `/codex` 下第一阶段是否只需要 Anthropic-compatible `/v1/messages` 入口，还是需要同时支持原生 OpenAI Responses API 入站路径。当前设计把 `/codex` 配置隔离作为前置能力，具体入站协议可在实现时按现有客户端调用路径补充测试。
+- 已确定 Codex 客户端需要原生 OpenAI/Codex HTTP 透传能力；`/codex/v1/**` 中除 Anthropic-compatible messages 兼容路径外均走原生透传。

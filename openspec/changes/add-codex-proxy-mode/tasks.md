@@ -17,9 +17,9 @@
 
 - [x] 3.1 在主界面标题区域新增 Claude / Codex 档位切换控件
 - [x] 3.2 将现有完整表单绑定到 Claude 档位，并保持当前 Claude UI 行为不变
-- [x] 3.3 为 Codex 档位实现精简单模型表单，只展示端口、代理模式、目标地址、Codex API 密钥和转换器相关字段
+- [x] 3.3 为 Codex 档位实现精简单模型表单，只展示端口、代理模式、目标地址和 Codex API 密钥，转换器固定为 Codex 透传
 - [x] 3.4 确保 Codex 档位编辑 endpointOptions 时只写入 Codex 配置，不修改 Claude endpointOptions
-- [x] 3.5 调整配置指南文案，使 Claude 档位继续显示 Claude Code 配置，Codex 档位显示 `http://localhost:<port>/codex`
+- [x] 3.5 调整配置指南文案，使 Claude 档位继续显示 Claude Code 配置，Codex 档位显示 `http://localhost:<port>/codex/v1`
 
 ## 4. 验证
 

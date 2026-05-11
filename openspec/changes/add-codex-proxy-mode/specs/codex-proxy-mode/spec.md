@@ -12,6 +12,7 @@
 - **WHEN** 用户选择 Codex 档位
 - **THEN** 系统 SHALL 展示 Codex 精简配置界面
 - **AND** 系统 SHALL 隐藏 Claude 专属的模型映射与配置指南字段
+- **AND** 系统 SHALL 隐藏转换器选择，并固定使用 Codex 透传
 
 ### Requirement: Codex 档位使用独立目标配置
 系统 SHALL 为 Codex 档位保存独立于 Claude 档位的目标地址、API 密钥、端点列表和当前选中端点。
@@ -47,7 +48,7 @@
 
 #### Scenario: Codex messages 请求选择 Codex 配置
 - **WHEN** 客户端向 `/codex/v1/messages` 或 `/codex/messages` 发送 POST 请求
-- **THEN** 系统 SHALL 使用 Codex 档位的目标地址、API 密钥和转换器配置处理请求
+- **THEN** 系统 SHALL 使用 Codex 档位的目标地址、API 密钥和固定 Codex 透传转换器处理请求
 - **AND** 系统 SHALL NOT 使用 Claude 档位的目标地址配置
 
 #### Scenario: Claude messages 请求继续选择 Claude 配置
@@ -58,6 +59,16 @@
 #### Scenario: Codex count_tokens 请求选择 Codex 配置
 - **WHEN** 客户端向 `/codex/v1/messages/count_tokens` 或 `/codex/messages/count_tokens` 发送 POST 请求
 - **THEN** 系统 SHALL 使用 Codex 档位配置处理 count_tokens 请求
+
+#### Scenario: Codex 原生 models 请求透传
+- **WHEN** 客户端向 `/codex/v1/models` 发送 GET 请求
+- **THEN** 系统 SHALL 将请求透传到 Codex 档位目标地址对应的 `/v1/models`
+- **AND** 系统 SHALL NOT 返回本地 404
+
+#### Scenario: Codex 原生任意 v1 路径透传
+- **WHEN** 客户端向 `/codex/v1/responses`、`/codex/v1/images/generations` 或 `/codex/v1/files` 等非 messages 兼容路径发送请求
+- **THEN** 系统 SHALL 保留 method、query、headers 和 body 并透传到 Codex 档位目标地址对应的 `/v1/**` 路径
+- **AND** 系统 SHALL 使用 Codex 档位 API 密钥作为上游认证
 
 ### Requirement: 配置热更新包含两套档位配置
 系统 SHALL 在运行中应用配置时同时提交 Claude 与 Codex 两套路由配置，端口不变时不得要求重启代理。

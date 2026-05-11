@@ -99,7 +99,7 @@
               </div>
             </div>
 
-            <div class="mt-5">
+            <div v-if="!isCodexMode" class="mt-5">
               <Select
                 v-model="form.converter"
                 :options="converterOptions"

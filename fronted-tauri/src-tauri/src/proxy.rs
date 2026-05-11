@@ -914,10 +914,7 @@ fn resolve_codex_target_api_key_and_converter(
     } else {
         Some(resolved_api_key)
     };
-    let converter = selected
-        .and_then(|item| item.converter.clone())
-        .unwrap_or_else(|| config.codex_config.converter.clone());
-    (target_url, api_key, converter)
+    (target_url, api_key, default_converter())
 }
 
 fn build_transform_context(
@@ -1567,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn build_runtime_update_keeps_codex_target_separate() {
+    fn build_runtime_update_keeps_codex_target_separate_and_forces_codex_converter() {
         let mut config = default_proxy_config();
         config.target_url = "https://claude.example/messages".to_string();
         config.api_key = "claude-key".to_string();
@@ -1590,12 +1587,13 @@ mod tests {
         config.selected_endpoint_id = "claude-1".to_string();
         config.codex_config.target_url = "https://codex.example/responses".to_string();
         config.codex_config.api_key = "codex-key".to_string();
+        config.codex_config.converter = "gemini".to_string();
         config.codex_config.endpoint_options = vec![EndpointOption {
             id: "codex-1".to_string(),
             alias: "Codex".to_string(),
             url: "https://codex-selected.example/responses".to_string(),
             api_key: "codex-selected-key".to_string(),
-            converter: Some("codex".to_string()),
+            converter: Some("anthropic".to_string()),
             codex_model: None,
             codex_model_mapping: None,
             codex_effort_capability_map: None,

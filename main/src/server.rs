@@ -336,6 +336,12 @@ fn normalize_client_route_path(normalized_path: &str) -> (ClientRouteKind, Strin
     (ClientRouteKind::Claude, normalized_path.to_string())
 }
 
+fn is_codex_native_passthrough_path(routed_path: &str) -> bool {
+    (routed_path == "/v1" || routed_path.starts_with("/v1/"))
+        && routed_path != "/v1/messages"
+        && routed_path != "/v1/messages/count_tokens"
+}
+
 fn resolve_model_for_converter(
     converter: &str,
     input_model: &str,
@@ -456,6 +462,39 @@ async fn send_prepared_json_request(
         builder = builder.header("anthropic-beta", beta);
     }
     builder.send().await
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+            | "content-length"
+    )
+}
+
+fn should_forward_native_request_header(name: &str) -> bool {
+    !is_hop_by_hop_header(name)
+        && !name.eq_ignore_ascii_case("authorization")
+        && !name.eq_ignore_ascii_case("x-api-key")
+}
+
+fn should_forward_native_response_header(name: &str) -> bool {
+    !is_hop_by_hop_header(name)
+}
+
+fn extract_bearer_token(value: &str) -> Option<String> {
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(|token| token.to_string())
 }
 
 fn normalize_log_text(text: &str) -> String {
@@ -3906,6 +3945,113 @@ fn build_probe_json_payload(model: &str) -> Value {
     })
 }
 
+async fn handle_codex_native_passthrough(
+    req: Request<hyper::body::Incoming>,
+    request_id: &str,
+    routed_path: &str,
+    target_url: &str,
+    configured_api_key: Option<String>,
+    http_client: Arc<reqwest::Client>,
+    log_tx: broadcast::Sender<String>,
+) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+    let method = req.method().clone();
+    let upstream_url =
+        build_codex_native_passthrough_url(target_url, routed_path, req.uri().query());
+    let incoming_auth = req
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let incoming_x_api_key = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let final_api_key = configured_api_key
+        .or(incoming_x_api_key)
+        .or_else(|| incoming_auth.as_deref().and_then(extract_bearer_token));
+
+    let Some(final_api_key) = final_api_key else {
+        return Ok(Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("Content-Type", "application/json")
+            .body(full_body(
+                json!({"error": {"type": "unauthorized", "message": "Missing API key"}})
+                    .to_string(),
+            ))
+            .unwrap());
+    };
+
+    let mut upstream_req = http_client.request(method.clone(), &upstream_url);
+    for (name, value) in req.headers() {
+        if should_forward_native_request_header(name.as_str()) {
+            upstream_req = upstream_req.header(name, value);
+        }
+    }
+    upstream_req = upstream_req
+        .header("Authorization", format!("Bearer {}", final_api_key))
+        .header("x-api-key", final_api_key);
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(full_body(
+                    json!({"error": {"message": format!("Failed to read body: {}", e)}})
+                        .to_string(),
+                ))
+                .unwrap());
+        }
+    };
+    if !body_bytes.is_empty() {
+        upstream_req = upstream_req.body(body_bytes);
+    }
+
+    let _ = log_tx.send(format!(
+        "[System] Processing #{} native_codex {} {} -> {}",
+        request_id, method, routed_path, upstream_url
+    ));
+
+    let upstream_response = match upstream_req.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "application/json")
+                .body(full_body(
+                    json!({"error": {"type": "upstream_error", "message": e.to_string()}})
+                        .to_string(),
+                ))
+                .unwrap());
+        }
+    };
+
+    let status = upstream_response.status();
+    let mut response_builder = Response::builder().status(status);
+    for (name, value) in upstream_response.headers() {
+        if should_forward_native_response_header(name.as_str()) {
+            response_builder = response_builder.header(name, value);
+        }
+    }
+
+    match upstream_response.bytes().await {
+        Ok(bytes) => Ok(response_builder
+            .body(BoxBody::new(
+                Full::new(bytes).map_err(|_: Infallible| unreachable!()),
+            ))
+            .unwrap()),
+        Err(e) => Ok(Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header("Content-Type", "application/json")
+            .body(full_body(
+                json!({"error": {"type": "upstream_error", "message": e.to_string()}}).to_string(),
+            ))
+            .unwrap()),
+    }
+}
+
 fn parse_seconds_str(s: &str) -> Option<u64> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -4253,6 +4399,46 @@ fn build_codex_endpoint_with_path_preference(
     } else {
         format!("{}/{}", base, desired_suffix.trim_start_matches('/'))
     }
+}
+
+fn build_codex_native_base_url(target_url: &str) -> String {
+    let clean = strip_query(target_url.to_string());
+    let known_suffixes = [
+        "/v1/responses/input_tokens",
+        "/responses/input_tokens",
+        "/v1/responses",
+        "/responses",
+        "/v1",
+    ];
+
+    for suffix in known_suffixes {
+        if let Some(idx) = clean.rfind(suffix) {
+            return clean[..idx].trim_end_matches('/').to_string();
+        }
+    }
+
+    clean.trim_end_matches('/').to_string()
+}
+
+fn build_codex_native_passthrough_url(
+    target_url: &str,
+    routed_path: &str,
+    query: Option<&str>,
+) -> String {
+    let base = build_codex_native_base_url(target_url);
+    let path = if routed_path.starts_with('/') {
+        routed_path.to_string()
+    } else {
+        format!("/{}", routed_path)
+    };
+    let mut url = format!("{}{}", base, path);
+    if let Some(query) = query {
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(query);
+        }
+    }
+    url
 }
 
 fn is_codex_v1_responses_path(url: &str) -> bool {
@@ -5191,6 +5377,22 @@ async fn handle_request(
     let prefer_codex_v1_path = runtime_state.prefer_codex_v1_path;
     let enable_stateful_responses_chain = runtime_state.enable_stateful_responses_chain;
     let load_balancer_runtime = route_state.load_balancer_runtime;
+
+    if client_route_kind == ClientRouteKind::Codex
+        && ctx.converter.eq_ignore_ascii_case("codex")
+        && is_codex_native_passthrough_path(&routed_path)
+    {
+        return handle_codex_native_passthrough(
+            req,
+            &request_id,
+            &routed_path,
+            &target_url,
+            api_key,
+            http_client,
+            log_tx,
+        )
+        .await;
+    }
 
     // 只处理 POST /messages、/v1/messages、/messages/count_tokens、/v1/messages/count_tokens
     if method != Method::POST || (!is_messages && !is_count_tokens) {
@@ -8377,22 +8579,23 @@ mod tests {
     use super::{
         allow_leaked_tool_text_retry, allow_sibling_tool_error_retry,
         backfill_non_stream_payload_from_codex_snapshot, body_uses_priority_service_tier,
-        build_anthropic_message_from_codex_json_response, build_gemini_explicit_cache_key,
-        build_parallel_tool_degrade_key, build_stateful_endpoint_key,
-        chunk_contains_sibling_tool_call_error, classify_connection_error,
-        collect_skill_catalog_reminder_blocks, compute_non_input_fingerprint,
-        derive_skill_catalog_cache_key, derive_stateful_chain_key, derive_stream_close_cause,
-        disable_parallel_tool_calls_in_upstream_body, ensure_skill_catalog_context_for_codex,
-        extract_cached_input_tokens_from_response_usage, extract_codex_plan_file_path_from_request,
-        extract_codex_terminal_response_snapshot, extract_stateful_chain_hint_from_request,
-        extract_stateful_chain_output_items, extract_tool_leak_retry_signal,
-        extract_upstream_response_id, get_cached_skill_catalog_reminder,
-        get_parallel_tool_degrade_remaining_seconds, inject_retry_no_tool_text_mix_guardrail,
-        is_business_stream_output, is_codex_fast_endpoint_unsupported, is_codex_v1_responses_path,
-        is_previous_response_id_unsupported_error, leaked_tool_text_retry_skip_reason,
-        mark_codex_fast_endpoint_unsupported, mark_parallel_tool_degrade,
-        normalize_client_route_path, observe_upstream_chunk_events, prepare_gemini_explicit_cache,
-        prepare_stateful_chain_request, record_stateful_chain_entry,
+        build_anthropic_message_from_codex_json_response, build_codex_native_passthrough_url,
+        build_gemini_explicit_cache_key, build_parallel_tool_degrade_key,
+        build_stateful_endpoint_key, chunk_contains_sibling_tool_call_error,
+        classify_connection_error, collect_skill_catalog_reminder_blocks,
+        compute_non_input_fingerprint, derive_skill_catalog_cache_key, derive_stateful_chain_key,
+        derive_stream_close_cause, disable_parallel_tool_calls_in_upstream_body,
+        ensure_skill_catalog_context_for_codex, extract_cached_input_tokens_from_response_usage,
+        extract_codex_plan_file_path_from_request, extract_codex_terminal_response_snapshot,
+        extract_stateful_chain_hint_from_request, extract_stateful_chain_output_items,
+        extract_tool_leak_retry_signal, extract_upstream_response_id,
+        get_cached_skill_catalog_reminder, get_parallel_tool_degrade_remaining_seconds,
+        inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
+        is_codex_fast_endpoint_unsupported, is_codex_native_passthrough_path,
+        is_codex_v1_responses_path, is_previous_response_id_unsupported_error,
+        leaked_tool_text_retry_skip_reason, mark_codex_fast_endpoint_unsupported,
+        mark_parallel_tool_degrade, normalize_client_route_path, observe_upstream_chunk_events,
+        prepare_gemini_explicit_cache, prepare_stateful_chain_request, record_stateful_chain_entry,
         remove_priority_service_tier_from_upstream_body,
         request_contains_rewrite_sensitive_history, request_explicitly_asks_for_worktree,
         resolve_effective_stream, resolve_stateful_chain_hint_info, resolve_upstream_url,
@@ -8476,6 +8679,47 @@ mod tests {
         assert_eq!(
             normalize_client_route_path("/codexfoo/v1/messages"),
             (ClientRouteKind::Claude, "/codexfoo/v1/messages".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_native_passthrough_path_excludes_anthropic_messages_compat() {
+        assert!(is_codex_native_passthrough_path("/v1/models"));
+        assert!(is_codex_native_passthrough_path("/v1/responses"));
+        assert!(is_codex_native_passthrough_path("/v1/images/generations"));
+        assert!(is_codex_native_passthrough_path("/v1/files"));
+        assert!(!is_codex_native_passthrough_path("/v1/messages"));
+        assert!(!is_codex_native_passthrough_path(
+            "/v1/messages/count_tokens"
+        ));
+        assert!(!is_codex_native_passthrough_path("/messages"));
+    }
+
+    #[test]
+    fn codex_native_passthrough_url_uses_target_base_and_preserves_query() {
+        assert_eq!(
+            build_codex_native_passthrough_url(
+                "https://api.example.com/v1/responses",
+                "/v1/models",
+                None,
+            ),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(
+            build_codex_native_passthrough_url(
+                "https://api.example.com/responses",
+                "/v1/responses",
+                Some("stream=true"),
+            ),
+            "https://api.example.com/v1/responses?stream=true"
+        );
+        assert_eq!(
+            build_codex_native_passthrough_url(
+                "https://api.example.com/v1",
+                "/v1/images/generations",
+                None,
+            ),
+            "https://api.example.com/v1/images/generations"
         );
     }
 
