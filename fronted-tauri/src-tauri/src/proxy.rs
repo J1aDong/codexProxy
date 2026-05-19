@@ -1038,6 +1038,11 @@ pub struct EndpointTestResult {
 const TEST_INPUT_MODEL: &str = "claude-sonnet-4-6";
 const TEST_PROMPT: &str = "Who are you?";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestUpstreamOperation {
+    Messages,
+}
+
 fn build_backend_by_converter(converter: &str) -> Arc<dyn TransformBackend> {
     if converter.eq_ignore_ascii_case("gemini") {
         Arc::new(GeminiBackend)
@@ -1048,6 +1053,207 @@ fn build_backend_by_converter(converter: &str) -> Arc<dyn TransformBackend> {
     } else {
         Arc::new(CodexBackend)
     }
+}
+
+fn strip_query(url: String) -> String {
+    url.split('?').next().unwrap_or(url.as_str()).to_string()
+}
+
+fn build_gemini_test_endpoint(target_url: &str, model: &str) -> String {
+    if target_url.contains(":streamGenerateContent") {
+        return target_url.to_string();
+    }
+
+    if target_url.contains("{model}") {
+        let endpoint = target_url.replace("{model}", model);
+        if endpoint.contains(":streamGenerateContent") {
+            return endpoint;
+        }
+        if endpoint.contains(":generateContent") {
+            return endpoint.replace(":generateContent", ":streamGenerateContent");
+        }
+    }
+
+    if target_url.contains(":generateContent") {
+        return target_url.replace(":generateContent", ":streamGenerateContent");
+    }
+
+    let base = target_url.trim_end_matches('/');
+    format!(
+        "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+        base, model
+    )
+}
+
+fn build_codex_test_input_tokens_endpoint(target_url: &str) -> String {
+    let clean = strip_query(target_url.to_string());
+    if let Some(idx) = clean.rfind("/responses") {
+        let mut endpoint = clean;
+        endpoint.replace_range(idx..idx + "/responses".len(), "/responses/input_tokens");
+        return endpoint;
+    }
+
+    let base = clean.trim_end_matches('/');
+    format!("{}/responses/input_tokens", base)
+}
+
+fn build_codex_test_messages_endpoint(target_url: &str) -> String {
+    let endpoint = build_codex_test_input_tokens_endpoint(target_url);
+    if let Some(idx) = endpoint.rfind("/responses/input_tokens") {
+        let mut normalized = endpoint;
+        normalized.replace_range(idx..idx + "/responses/input_tokens".len(), "/responses");
+        return normalized;
+    }
+    endpoint
+}
+
+fn build_codex_test_endpoint_with_path_preference(
+    target_url: &str,
+    operation: TestUpstreamOperation,
+    prefer_v1: bool,
+) -> String {
+    let legacy_endpoint = match operation {
+        TestUpstreamOperation::Messages => build_codex_test_messages_endpoint(target_url),
+    };
+    let desired_suffix = match operation {
+        TestUpstreamOperation::Messages => {
+            if prefer_v1 {
+                "/v1/responses"
+            } else {
+                "/responses"
+            }
+        }
+    };
+    let known_suffixes = [
+        "/v1/responses/input_tokens",
+        "/responses/input_tokens",
+        "/v1/responses",
+        "/responses",
+    ];
+
+    for suffix in known_suffixes {
+        if let Some(idx) = legacy_endpoint.rfind(suffix) {
+            let mut endpoint = legacy_endpoint.clone();
+            endpoint.replace_range(idx..idx + suffix.len(), desired_suffix);
+            return endpoint;
+        }
+    }
+
+    let base = legacy_endpoint.trim_end_matches('/');
+    if prefer_v1 {
+        if base.ends_with("/v1") {
+            format!("{}/{}", base, desired_suffix.trim_start_matches("/v1/"))
+        } else {
+            format!("{}/{}", base, desired_suffix.trim_start_matches('/'))
+        }
+    } else {
+        format!("{}/{}", base, desired_suffix.trim_start_matches('/'))
+    }
+}
+
+fn build_anthropic_test_endpoint(target_url: &str) -> String {
+    let clean = strip_query(target_url.to_string());
+
+    if clean.contains("/messages/count_tokens") {
+        if let Some(idx) = clean.rfind("/messages/count_tokens") {
+            let mut endpoint = clean;
+            endpoint.replace_range(idx..idx + "/messages/count_tokens".len(), "/messages");
+            return endpoint;
+        }
+    }
+
+    if clean.contains("/messages") {
+        return clean;
+    }
+
+    if let Some(idx) = clean.rfind("/responses/input_tokens") {
+        let mut endpoint = clean;
+        endpoint.replace_range(idx..idx + "/responses/input_tokens".len(), "/messages");
+        return endpoint;
+    }
+
+    if let Some(idx) = clean.rfind("/responses") {
+        let mut endpoint = clean;
+        endpoint.replace_range(idx..idx + "/responses".len(), "/messages");
+        return endpoint;
+    }
+
+    let base = clean.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{}/messages", base)
+    } else {
+        format!("{}/v1/messages", base)
+    }
+}
+
+fn build_openai_test_endpoint(target_url: &str) -> String {
+    if target_url.contains("/chat/completions") || target_url.contains("openai.azure.com") {
+        return target_url.to_string();
+    }
+
+    let clean = strip_query(target_url.to_string());
+    let base = clean.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{}/chat/completions", base)
+    } else {
+        format!("{}/v1/chat/completions", base)
+    }
+}
+
+fn resolve_test_upstream_url(
+    converter: &str,
+    target_url: &str,
+    model: &str,
+    prefer_codex_v1_path: bool,
+) -> String {
+    if converter.eq_ignore_ascii_case("anthropic") {
+        return build_anthropic_test_endpoint(target_url);
+    }
+    if converter.eq_ignore_ascii_case("gemini") {
+        return build_gemini_test_endpoint(target_url, model);
+    }
+    if converter.eq_ignore_ascii_case("openai") {
+        return build_openai_test_endpoint(target_url);
+    }
+    build_codex_test_endpoint_with_path_preference(
+        target_url,
+        TestUpstreamOperation::Messages,
+        prefer_codex_v1_path,
+    )
+}
+
+fn should_retry_codex_test_v1_path_with_legacy(status: u16, error_text: &str) -> bool {
+    if status == 404 {
+        let lower = error_text.to_ascii_lowercase();
+        return lower.contains("route ") && lower.contains(" not found")
+            || lower.contains("route_not_found")
+            || lower.contains("no route")
+            || lower.contains("unknown route");
+    }
+
+    if status == 400 || status == 422 || status == 405 {
+        let lower = error_text.to_ascii_lowercase();
+        return lower.contains("unsupported")
+            && (lower.contains("path")
+                || lower.contains("endpoint")
+                || lower.contains("url")
+                || lower.contains("/v1/responses"))
+            || (status == 405 && lower.contains("method not allowed"));
+    }
+
+    false
+}
+
+fn describe_test_path(url: &str) -> String {
+    let without_query = url.split('?').next().unwrap_or(url);
+    if let Some(protocol_idx) = without_query.find("://") {
+        let after_scheme = &without_query[protocol_idx + 3..];
+        if let Some(path_idx) = after_scheme.find('/') {
+            return after_scheme[path_idx..].to_string();
+        }
+        return "/".to_string();
+    }
+    without_query.to_string()
 }
 
 fn first_non_empty(values: &[&str], fallback: &str) -> String {
@@ -1378,6 +1584,26 @@ fn endpoint_test_failure(
     }
 }
 
+fn build_test_failure_message(
+    status_code: u16,
+    reason: &str,
+    body_text: &str,
+    test_url: &str,
+) -> String {
+    let body_summary = truncate_error_body(body_text);
+    let path = describe_test_path(test_url);
+    let prefix = if status_code == 405 {
+        format!("HTTP {status_code} {reason}: 目标地址存在，但不接受当前测试路径/方法（{path}）")
+    } else {
+        format!("HTTP {status_code} {reason}: 测试路径 {path}")
+    };
+    if body_summary.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}: {body_summary}")
+    }
+}
+
 async fn wait_for_first_response_chunk(response: reqwest::Response) -> Result<bool, String> {
     let mut stream = response.bytes_stream();
     for _ in 0..8 {
@@ -1393,6 +1619,94 @@ async fn wait_for_first_response_chunk(response: reqwest::Response) -> Result<bo
         }
     }
     Ok(false)
+}
+
+enum EndpointTestAttempt {
+    Success {
+        response_time_ms: u64,
+        http_status: u16,
+    },
+    HttpFailure {
+        message: String,
+        response_time_ms: u64,
+        http_status: u16,
+        body_text: String,
+    },
+    TransportFailure {
+        message: String,
+        response_time_ms: u64,
+    },
+    EmptyResponse {
+        message: String,
+        response_time_ms: u64,
+        http_status: u16,
+    },
+}
+
+async fn run_endpoint_test_attempt(
+    client: &reqwest::Client,
+    backend: &Arc<dyn TransformBackend>,
+    target_url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    session_id: &str,
+) -> EndpointTestAttempt {
+    let started_at = Instant::now();
+    let response = match backend
+        .build_upstream_request(client, target_url, api_key, body, session_id, "2023-06-01")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let elapsed = started_at.elapsed().as_millis() as u64;
+            let message = if error.is_timeout() {
+                "请求超时".to_string()
+            } else if error.is_connect() {
+                format!("网络连接失败: {error}")
+            } else {
+                format!("请求失败: {error}")
+            };
+            return EndpointTestAttempt::TransportFailure {
+                message,
+                response_time_ms: elapsed,
+            };
+        }
+    };
+
+    let status = response.status();
+    let status_code = status.as_u16();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let reason = status.canonical_reason().unwrap_or("Upstream error");
+        let message = build_test_failure_message(status_code, reason, &body_text, target_url);
+        return EndpointTestAttempt::HttpFailure {
+            message,
+            response_time_ms: started_at.elapsed().as_millis() as u64,
+            http_status: status_code,
+            body_text,
+        };
+    }
+
+    match wait_for_first_response_chunk(response).await {
+        Ok(true) => EndpointTestAttempt::Success {
+            response_time_ms: started_at.elapsed().as_millis() as u64,
+            http_status: status_code,
+        },
+        Ok(false) => EndpointTestAttempt::EmptyResponse {
+            message: format!(
+                "上游连接成功，但未收到响应数据（测试路径 {}）",
+                describe_test_path(target_url)
+            ),
+            response_time_ms: started_at.elapsed().as_millis() as u64,
+            http_status: status_code,
+        },
+        Err(message) => EndpointTestAttempt::EmptyResponse {
+            message: format!("{}（测试路径 {}）", message, describe_test_path(target_url)),
+            response_time_ms: started_at.elapsed().as_millis() as u64,
+            http_status: status_code,
+        },
+    }
 }
 
 #[tauri::command]
@@ -1439,12 +1753,21 @@ pub async fn test_endpoint_model(
     let test_request = build_endpoint_test_request();
     let (body, session_id) =
         backend.transform_request(&test_request, None, &ctx, true, Some(model_used.clone()));
+    let mut test_url = resolve_test_upstream_url(
+        &converter,
+        &endpoint.url,
+        &model_used,
+        config.prefer_codex_v1_path,
+    );
 
     let _ = app.emit(
         "proxy-log",
         format!(
-            "[Test] Testing endpoint={} converter={} model={}",
-            endpoint.alias, converter, model_used
+            "[Test] Testing endpoint={} converter={} model={} path={}",
+            endpoint.alias,
+            converter,
+            model_used,
+            describe_test_path(&test_url)
         ),
     );
 
@@ -1452,105 +1775,111 @@ pub async fn test_endpoint_model(
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|error| error.to_string())?;
-    let started_at = Instant::now();
-    let response = match backend
-        .build_upstream_request(
-            &client,
-            &endpoint.url,
-            api_key,
-            &body,
-            &session_id,
-            "2023-06-01",
-        )
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            let elapsed = started_at.elapsed().as_millis() as u64;
-            let message = if error.is_timeout() {
-                "请求超时".to_string()
-            } else if error.is_connect() {
-                format!("网络连接失败: {error}")
-            } else {
-                format!("请求失败: {error}")
-            };
+    let mut attempt =
+        run_endpoint_test_attempt(&client, &backend, &test_url, api_key, &body, &session_id).await;
+
+    if converter.eq_ignore_ascii_case("codex") {
+        if let EndpointTestAttempt::HttpFailure {
+            http_status,
+            body_text,
+            ..
+        } = &attempt
+        {
+            if config.prefer_codex_v1_path
+                && should_retry_codex_test_v1_path_with_legacy(*http_status, body_text)
+            {
+                let fallback_url =
+                    resolve_test_upstream_url(&converter, &endpoint.url, &model_used, false);
+                let _ = app.emit(
+                    "proxy-log",
+                    format!(
+                        "[Test] Codex v1 path unsupported, retrying path={}",
+                        describe_test_path(&fallback_url)
+                    ),
+                );
+                test_url = fallback_url;
+                attempt = run_endpoint_test_attempt(
+                    &client,
+                    &backend,
+                    &test_url,
+                    api_key,
+                    &body,
+                    &session_id,
+                )
+                .await;
+            }
+        }
+    }
+
+    match attempt {
+        EndpointTestAttempt::TransportFailure {
+            message,
+            response_time_ms,
+        } => {
             let category = detect_error_category(None, &message);
             let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
-            return Ok(endpoint_test_failure(
+            Ok(endpoint_test_failure(
                 message,
-                Some(elapsed),
+                Some(response_time_ms),
                 None,
                 model_used,
                 converter,
                 Some(category),
-            ));
+            ))
         }
-    };
-
-    let status = response.status();
-    let status_code = status.as_u16();
-    if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
-        let body_summary = truncate_error_body(&body_text);
-        let reason = status.canonical_reason().unwrap_or("Upstream error");
-        let message = if body_summary.is_empty() {
-            format!("HTTP {status_code} {reason}")
-        } else {
-            format!("HTTP {status_code} {reason}: {body_summary}")
-        };
-        let category = detect_error_category(Some(status_code), &message);
-        let elapsed = started_at.elapsed().as_millis() as u64;
-        let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
-        return Ok(endpoint_test_failure(
+        EndpointTestAttempt::HttpFailure {
             message,
-            Some(elapsed),
-            Some(status_code),
-            model_used,
-            converter,
-            Some(category),
-        ));
-    }
-
-    match wait_for_first_response_chunk(response).await {
-        Ok(true) => {
-            let elapsed = started_at.elapsed().as_millis() as u64;
+            response_time_ms,
+            http_status,
+            ..
+        } => {
+            let category = detect_error_category(Some(http_status), &message);
+            let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
+            Ok(endpoint_test_failure(
+                message,
+                Some(response_time_ms),
+                Some(http_status),
+                model_used,
+                converter,
+                Some(category),
+            ))
+        }
+        EndpointTestAttempt::Success {
+            response_time_ms,
+            http_status,
+        } => {
             let message = "测试通过，已收到上游响应".to_string();
-            let _ = app.emit("proxy-log", format!("[Test] {message} ({elapsed}ms)"));
+            let _ = app.emit(
+                "proxy-log",
+                format!(
+                    "[Test] {message} ({}ms path={})",
+                    response_time_ms,
+                    describe_test_path(&test_url)
+                ),
+            );
             Ok(EndpointTestResult {
                 success: true,
                 message,
-                response_time_ms: Some(elapsed),
-                http_status: Some(status_code),
+                response_time_ms: Some(response_time_ms),
+                http_status: Some(http_status),
                 model_used,
                 converter,
                 error_category: None,
             })
         }
-        Ok(false) => {
-            let elapsed = started_at.elapsed().as_millis() as u64;
-            let message = "上游连接成功，但未收到响应数据".to_string();
+        EndpointTestAttempt::EmptyResponse {
+            message,
+            response_time_ms,
+            http_status,
+        } => {
             let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
             Ok(endpoint_test_failure(
                 message,
-                Some(elapsed),
-                Some(status_code),
+                Some(response_time_ms),
+                Some(http_status),
                 model_used,
                 converter,
                 Some("emptyResponse".to_string()),
-            ))
-        }
-        Err(message) => {
-            let elapsed = started_at.elapsed().as_millis() as u64;
-            let category = detect_error_category(Some(status_code), &message);
-            let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
-            Ok(endpoint_test_failure(
-                message,
-                Some(elapsed),
-                Some(status_code),
-                model_used,
-                converter,
-                Some(category),
             ))
         }
     }
