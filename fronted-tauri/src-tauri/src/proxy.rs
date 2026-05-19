@@ -4,16 +4,22 @@ use codex_proxy_core::load_balancer::{
     LoadBalancerProfile as CoreLoadBalancerProfile, LoadBalancerRuntime,
     SlotEndpointRef as CoreSlotEndpointRef, SlotMapping as CoreSlotMapping,
 };
+use codex_proxy_core::models::{Message, MessageContent};
+use codex_proxy_core::transform::{CodexBackend, GeminiBackend, OpenAIChatBackend};
 use codex_proxy_core::{
-    AnthropicModelMapping, CodexModelMapping, GeminiReasoningEffortMapping, OpenAIMaxTokensMapping,
-    OpenAIModelMapping, ProxyRuntimeHandle, ProxyServer, ReasoningEffort, ReasoningEffortMapping,
-    RuntimeConfigUpdate, RuntimeRouteUpdate, TransformContext,
+    AnthropicBackend, AnthropicModelMapping, AnthropicRequest, CodexModelMapping,
+    GeminiReasoningEffortMapping, OpenAIMaxTokensMapping, OpenAIModelMapping, ProxyRuntimeHandle,
+    ProxyServer, ReasoningEffort, ReasoningEffortMapping, RuntimeConfigUpdate, RuntimeRouteUpdate,
+    TransformBackend, TransformContext,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 
@@ -1014,6 +1020,539 @@ fn build_runtime_update(
         enable_skill_routing_hint: config.enable_skill_routing_hint,
         enable_stateful_responses_chain: config.enable_stateful_responses_chain,
         load_balancer_runtime,
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointTestResult {
+    pub success: bool,
+    pub message: String,
+    pub response_time_ms: Option<u64>,
+    pub http_status: Option<u16>,
+    pub model_used: String,
+    pub converter: String,
+    pub error_category: Option<String>,
+}
+
+const TEST_INPUT_MODEL: &str = "claude-sonnet-4-6";
+const TEST_PROMPT: &str = "Who are you?";
+
+fn build_backend_by_converter(converter: &str) -> Arc<dyn TransformBackend> {
+    if converter.eq_ignore_ascii_case("gemini") {
+        Arc::new(GeminiBackend)
+    } else if converter.eq_ignore_ascii_case("anthropic") {
+        Arc::new(AnthropicBackend)
+    } else if converter.eq_ignore_ascii_case("openai") {
+        Arc::new(OpenAIChatBackend)
+    } else {
+        Arc::new(CodexBackend)
+    }
+}
+
+fn first_non_empty(values: &[&str], fallback: &str) -> String {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn non_empty_mapping_value(value: Option<&String>) -> &str {
+    value.map(|item| item.as_str()).unwrap_or("")
+}
+
+fn normalize_gemini_model_value(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("low")
+        || trimmed.eq_ignore_ascii_case("medium")
+        || trimmed.eq_ignore_ascii_case("high")
+        || trimmed.eq_ignore_ascii_case("xhigh")
+    {
+        ""
+    } else {
+        trimmed
+    }
+}
+
+fn build_endpoint_test_context(
+    config: &ProxyConfig,
+    endpoint: &EndpointOption,
+    converter: String,
+) -> TransformContext {
+    let default_codex_mapping = CodexModelMappingConfig::default();
+    let default_reasoning = ReasoningEffortConfig::default();
+    let default_gemini_models = default_gemini_model_preset();
+    let endpoint_codex_mapping = endpoint.codex_model_mapping.as_ref();
+    let endpoint_anthropic_mapping = endpoint.anthropic_model_mapping.as_ref();
+    let endpoint_openai_mapping = endpoint.openai_model_mapping.as_ref();
+    let endpoint_reasoning = endpoint.reasoning_effort.as_ref();
+    let endpoint_gemini_reasoning = endpoint.gemini_reasoning_effort.as_ref();
+    let endpoint_gemini_preset = endpoint
+        .gemini_model_preset
+        .as_ref()
+        .and_then(|items| items.iter().find(|item| !item.trim().is_empty()))
+        .map(|item| item.as_str())
+        .unwrap_or("");
+    let config_gemini_preset = config
+        .gemini_model_preset
+        .iter()
+        .find(|item| !item.trim().is_empty())
+        .map(|item| item.as_str())
+        .unwrap_or("");
+    let default_gemini_model = default_gemini_models
+        .first()
+        .map(|item| item.as_str())
+        .unwrap_or("gemini-3-pro-preview");
+    let openai_max_tokens_mapping = endpoint
+        .openai_max_tokens_mapping
+        .clone()
+        .map(|mapping| mapping.into())
+        .unwrap_or_default();
+
+    let mut ctx = build_transform_context(config, converter, openai_max_tokens_mapping);
+    ctx.codex_model = first_non_empty(
+        &[
+            non_empty_mapping_value(endpoint.codex_model.as_ref()),
+            config.codex_model.as_str(),
+            default_codex_mapping.sonnet.as_str(),
+        ],
+        default_codex_mapping.sonnet.as_str(),
+    );
+    ctx.codex_model_mapping = CodexModelMapping {
+        opus: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_codex_mapping.map(|mapping| &mapping.opus)),
+                config.codex_model_mapping.opus.as_str(),
+                default_codex_mapping.opus.as_str(),
+            ],
+            default_codex_mapping.opus.as_str(),
+        ),
+        sonnet: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_codex_mapping.map(|mapping| &mapping.sonnet)),
+                config.codex_model_mapping.sonnet.as_str(),
+                default_codex_mapping.sonnet.as_str(),
+            ],
+            default_codex_mapping.sonnet.as_str(),
+        ),
+        haiku: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_codex_mapping.map(|mapping| &mapping.haiku)),
+                config.codex_model_mapping.haiku.as_str(),
+                default_codex_mapping.haiku.as_str(),
+            ],
+            default_codex_mapping.haiku.as_str(),
+        ),
+    };
+    ctx.reasoning_mapping = ReasoningEffortConfig {
+        opus: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_reasoning.map(|mapping| &mapping.opus)),
+                config.reasoning_effort.opus.as_str(),
+                default_reasoning.opus.as_str(),
+            ],
+            default_reasoning.opus.as_str(),
+        ),
+        sonnet: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_reasoning.map(|mapping| &mapping.sonnet)),
+                config.reasoning_effort.sonnet.as_str(),
+                default_reasoning.sonnet.as_str(),
+            ],
+            default_reasoning.sonnet.as_str(),
+        ),
+        haiku: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_reasoning.map(|mapping| &mapping.haiku)),
+                config.reasoning_effort.haiku.as_str(),
+                default_reasoning.haiku.as_str(),
+            ],
+            default_reasoning.haiku.as_str(),
+        ),
+    }
+    .to_mapping();
+    ctx.anthropic_model_mapping = AnthropicModelMapping {
+        opus: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_anthropic_mapping.map(|mapping| &mapping.opus)),
+                config.anthropic_model_mapping.opus.as_str(),
+            ],
+            "",
+        ),
+        sonnet: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_anthropic_mapping.map(|mapping| &mapping.sonnet)),
+                config.anthropic_model_mapping.sonnet.as_str(),
+            ],
+            "",
+        ),
+        haiku: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_anthropic_mapping.map(|mapping| &mapping.haiku)),
+                config.anthropic_model_mapping.haiku.as_str(),
+            ],
+            "",
+        ),
+    };
+    ctx.openai_model_mapping = OpenAIModelMapping {
+        opus: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_openai_mapping.map(|mapping| &mapping.opus)),
+                config.openai_model_mapping.opus.as_str(),
+            ],
+            "",
+        ),
+        sonnet: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_openai_mapping.map(|mapping| &mapping.sonnet)),
+                config.openai_model_mapping.sonnet.as_str(),
+            ],
+            "",
+        ),
+        haiku: first_non_empty(
+            &[
+                non_empty_mapping_value(endpoint_openai_mapping.map(|mapping| &mapping.haiku)),
+                config.openai_model_mapping.haiku.as_str(),
+            ],
+            "",
+        ),
+    };
+    ctx.gemini_reasoning_effort = ReasoningEffortConfig {
+        opus: first_non_empty(
+            &[
+                normalize_gemini_model_value(non_empty_mapping_value(
+                    endpoint_gemini_reasoning.map(|mapping| &mapping.opus),
+                )),
+                normalize_gemini_model_value(config.gemini_reasoning_effort.opus.as_str()),
+                endpoint_gemini_preset,
+                config_gemini_preset,
+                default_gemini_model,
+            ],
+            default_gemini_model,
+        ),
+        sonnet: first_non_empty(
+            &[
+                normalize_gemini_model_value(non_empty_mapping_value(
+                    endpoint_gemini_reasoning.map(|mapping| &mapping.sonnet),
+                )),
+                normalize_gemini_model_value(config.gemini_reasoning_effort.sonnet.as_str()),
+                endpoint_gemini_preset,
+                config_gemini_preset,
+                default_gemini_model,
+            ],
+            default_gemini_model,
+        ),
+        haiku: first_non_empty(
+            &[
+                normalize_gemini_model_value(non_empty_mapping_value(
+                    endpoint_gemini_reasoning.map(|mapping| &mapping.haiku),
+                )),
+                normalize_gemini_model_value(config.gemini_reasoning_effort.haiku.as_str()),
+                endpoint_gemini_preset,
+                config_gemini_preset,
+                default_gemini_model,
+            ],
+            default_gemini_model,
+        ),
+    }
+    .to_gemini_mapping();
+    ctx
+}
+
+fn resolve_test_model_for_sonnet(converter: &str, ctx: &TransformContext) -> String {
+    if converter.eq_ignore_ascii_case("anthropic") {
+        let mapped = ctx.anthropic_model_mapping.sonnet.trim();
+        return if mapped.is_empty() {
+            TEST_INPUT_MODEL.to_string()
+        } else {
+            mapped.to_string()
+        };
+    }
+
+    if converter.eq_ignore_ascii_case("openai") {
+        let mapped = ctx.openai_model_mapping.sonnet.trim();
+        return if mapped.is_empty() {
+            TEST_INPUT_MODEL.to_string()
+        } else {
+            mapped.to_string()
+        };
+    }
+
+    if converter.eq_ignore_ascii_case("gemini") {
+        return ctx.gemini_reasoning_effort.sonnet.clone();
+    }
+
+    ctx.codex_model_mapping.sonnet.clone()
+}
+
+fn build_endpoint_test_request() -> AnthropicRequest {
+    AnthropicRequest {
+        model: Some(TEST_INPUT_MODEL.to_string()),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(TEST_PROMPT.to_string())),
+        }],
+        system: None,
+        tools: None,
+        metadata: None,
+        tool_choice: None,
+        thinking: None,
+        stream: true,
+        max_tokens: Some(16),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+    }
+}
+
+fn truncate_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() <= 500 {
+        trimmed.to_string()
+    } else {
+        format!("{}...", trimmed.chars().take(500).collect::<String>())
+    }
+}
+
+fn detect_error_category(http_status: Option<u16>, message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if matches!(http_status, Some(401) | Some(403))
+        || lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("invalid_api_key")
+        || lower.contains("forbidden")
+    {
+        return "auth".to_string();
+    }
+    if http_status == Some(429)
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+    {
+        return "rateLimited".to_string();
+    }
+    if lower.contains("quota") || lower.contains("insufficient") || lower.contains("exceeded") {
+        return "quotaExceeded".to_string();
+    }
+    if lower.contains("model")
+        && (lower.contains("not found")
+            || lower.contains("not_found")
+            || lower.contains("does not exist")
+            || lower.contains("unsupported"))
+    {
+        return "modelNotFound".to_string();
+    }
+    if http_status.map(|status| status >= 500).unwrap_or(false) {
+        return "server".to_string();
+    }
+    if lower.contains("connect")
+        || lower.contains("dns")
+        || lower.contains("network")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        return "network".to_string();
+    }
+    "http".to_string()
+}
+
+fn endpoint_test_failure(
+    message: String,
+    response_time_ms: Option<u64>,
+    http_status: Option<u16>,
+    model_used: String,
+    converter: String,
+    error_category: Option<String>,
+) -> EndpointTestResult {
+    EndpointTestResult {
+        success: false,
+        message,
+        response_time_ms,
+        http_status,
+        model_used,
+        converter,
+        error_category,
+    }
+}
+
+async fn wait_for_first_response_chunk(response: reqwest::Response) -> Result<bool, String> {
+    let mut stream = response.bytes_stream();
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(45), stream.next()).await {
+            Ok(Some(Ok(bytes))) => {
+                if !bytes.is_empty() {
+                    return Ok(true);
+                }
+            }
+            Ok(Some(Err(error))) => return Err(format!("读取响应失败: {error}")),
+            Ok(None) => return Ok(false),
+            Err(_) => return Err("等待模型响应超时".to_string()),
+        }
+    }
+    Ok(false)
+}
+
+#[tauri::command]
+pub async fn test_endpoint_model(
+    app: AppHandle,
+    config: ProxyConfig,
+    endpoint_id: String,
+    client_mode: Option<String>,
+) -> Result<EndpointTestResult, String> {
+    let is_codex_mode = client_mode
+        .as_deref()
+        .map(|mode| mode.eq_ignore_ascii_case("codex"))
+        .unwrap_or(false);
+    let endpoints = if is_codex_mode {
+        &config.codex_config.endpoint_options
+    } else {
+        &config.endpoint_options
+    };
+    let endpoint = endpoints
+        .iter()
+        .find(|item| item.id == endpoint_id)
+        .ok_or_else(|| "未找到目标地址配置".to_string())?;
+    let converter = if is_codex_mode {
+        default_converter()
+    } else {
+        endpoint
+            .converter
+            .clone()
+            .unwrap_or_else(|| config.converter.clone())
+    };
+    let fallback_api_key = if is_codex_mode {
+        config.codex_config.api_key.as_str()
+    } else {
+        config.api_key.as_str()
+    };
+    let api_key = if endpoint.api_key.trim().is_empty() {
+        fallback_api_key
+    } else {
+        endpoint.api_key.as_str()
+    };
+    let ctx = build_endpoint_test_context(&config, endpoint, converter.clone());
+    let model_used = resolve_test_model_for_sonnet(&converter, &ctx);
+    let backend = build_backend_by_converter(&converter);
+    let test_request = build_endpoint_test_request();
+    let (body, session_id) =
+        backend.transform_request(&test_request, None, &ctx, true, Some(model_used.clone()));
+
+    let _ = app.emit(
+        "proxy-log",
+        format!(
+            "[Test] Testing endpoint={} converter={} model={}",
+            endpoint.alias, converter, model_used
+        ),
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let started_at = Instant::now();
+    let response = match backend
+        .build_upstream_request(
+            &client,
+            &endpoint.url,
+            api_key,
+            &body,
+            &session_id,
+            "2023-06-01",
+        )
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let elapsed = started_at.elapsed().as_millis() as u64;
+            let message = if error.is_timeout() {
+                "请求超时".to_string()
+            } else if error.is_connect() {
+                format!("网络连接失败: {error}")
+            } else {
+                format!("请求失败: {error}")
+            };
+            let category = detect_error_category(None, &message);
+            let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
+            return Ok(endpoint_test_failure(
+                message,
+                Some(elapsed),
+                None,
+                model_used,
+                converter,
+                Some(category),
+            ));
+        }
+    };
+
+    let status = response.status();
+    let status_code = status.as_u16();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let body_summary = truncate_error_body(&body_text);
+        let reason = status.canonical_reason().unwrap_or("Upstream error");
+        let message = if body_summary.is_empty() {
+            format!("HTTP {status_code} {reason}")
+        } else {
+            format!("HTTP {status_code} {reason}: {body_summary}")
+        };
+        let category = detect_error_category(Some(status_code), &message);
+        let elapsed = started_at.elapsed().as_millis() as u64;
+        let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
+        return Ok(endpoint_test_failure(
+            message,
+            Some(elapsed),
+            Some(status_code),
+            model_used,
+            converter,
+            Some(category),
+        ));
+    }
+
+    match wait_for_first_response_chunk(response).await {
+        Ok(true) => {
+            let elapsed = started_at.elapsed().as_millis() as u64;
+            let message = "测试通过，已收到上游响应".to_string();
+            let _ = app.emit("proxy-log", format!("[Test] {message} ({elapsed}ms)"));
+            Ok(EndpointTestResult {
+                success: true,
+                message,
+                response_time_ms: Some(elapsed),
+                http_status: Some(status_code),
+                model_used,
+                converter,
+                error_category: None,
+            })
+        }
+        Ok(false) => {
+            let elapsed = started_at.elapsed().as_millis() as u64;
+            let message = "上游连接成功，但未收到响应数据".to_string();
+            let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
+            Ok(endpoint_test_failure(
+                message,
+                Some(elapsed),
+                Some(status_code),
+                model_used,
+                converter,
+                Some("emptyResponse".to_string()),
+            ))
+        }
+        Err(message) => {
+            let elapsed = started_at.elapsed().as_millis() as u64;
+            let category = detect_error_category(Some(status_code), &message);
+            let _ = app.emit("proxy-log", format!("[Test][Error] {message}"));
+            Ok(endpoint_test_failure(
+                message,
+                Some(elapsed),
+                Some(status_code),
+                model_used,
+                converter,
+                Some(category),
+            ))
+        }
     }
 }
 

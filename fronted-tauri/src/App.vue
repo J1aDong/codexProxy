@@ -23,11 +23,13 @@
         :isRunning="isRunning"
         :lbAvailabilityMap="lbAvailabilityMap"
         :isDarkMode="isDarkMode"
+        :testingEndpointId="testingEndpointId"
         @update:form="updateForm"
         @reset="resetDefaults"
         @toggle="toggleProxy"
         @addEndpoint="openAddEndpointDialog"
         @editEndpoint="handleEditEndpoint"
+        @testEndpoint="handleTestEndpoint"
       />
 
       <!-- Guide Section -->
@@ -237,7 +239,7 @@ import { useI18n } from 'vue-i18n'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-shell'
 import { fetch } from '@tauri-apps/plugin-http'
-import { applyProxyConfig, loadConfig, restartProxy, saveConfig, startProxy, stopProxy, saveLang } from './bridge/configBridge'
+import { applyProxyConfig, loadConfig, restartProxy, saveConfig, startProxy, stopProxy, saveLang, testEndpointModel } from './bridge/configBridge'
 import type {
   AnthropicModelMapping,
   CodexClientConfig,
@@ -298,6 +300,7 @@ const showImportExport = ref(false)
 const showEndpointDialog = ref(false)
 type ClientMode = 'claude' | 'codex'
 const activeClientMode = ref<ClientMode>('claude')
+const testingEndpointId = ref('')
 
 const localMaxConcurrency = ref<number | null>(null)
 const localLbModelCooldownSeconds = ref<number | null>(3600)
@@ -1067,6 +1070,52 @@ const openAddEndpointDialog = () => {
 const handleEditEndpoint = (id: string) => {
   editingEndpointId.value = id
   showEndpointDialog.value = true
+}
+
+const handleTestEndpoint = async (id: string) => {
+  if (testingEndpointId.value) return
+  const targetForm = activeForm.value
+  const endpoint = targetForm.endpointOptions.find(opt => opt.id === id)
+  if (!endpoint) return
+
+  testingEndpointId.value = id
+  try {
+    updateSelectedEndpointConfig(targetForm)
+    const result = await testEndpointModel(buildProxyConfig(false), id, activeClientMode.value)
+    const elapsed = result.responseTimeMs != null ? `${result.responseTimeMs}ms` : '-'
+    if (result.success) {
+      const message = t('modelTestSuccess', {
+        name: endpoint.alias,
+        model: result.modelUsed,
+        ms: elapsed,
+      })
+      pushLog(`[Test] ${message}`)
+      alert(message)
+      return
+    }
+
+    const reason = result.message || result.errorCategory || t('modelTestUnknownError')
+    const message = t('modelTestFailed', {
+      name: endpoint.alias,
+      reason,
+    })
+    pushLog(`[Test][Error] ${message}`)
+    alert(message)
+  } catch (error) {
+    const reason = typeof error === 'string'
+      ? error
+      : error instanceof Error
+        ? error.message
+        : JSON.stringify(error)
+    const message = t('modelTestFailed', {
+      name: endpoint.alias,
+      reason,
+    })
+    pushLog(`[Test][Error] ${message}`)
+    alert(message)
+  } finally {
+    testingEndpointId.value = ''
+  }
 }
 
 const closeEndpointDialog = () => {

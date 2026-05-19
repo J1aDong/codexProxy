@@ -32,6 +32,7 @@ fn main() {
             proxy::apply_proxy_config,
             proxy::restart_proxy,
             proxy::stop_proxy,
+            proxy::test_endpoint_model,
             proxy::load_config,
             proxy::save_config,
             proxy::save_lang,

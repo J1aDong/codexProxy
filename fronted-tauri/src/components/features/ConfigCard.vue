@@ -67,6 +67,25 @@
                           {{ getEndpointOptionConverterTag(option) }}
                         </span>
                         <button
+                          class="text-gray-400 hover:text-emerald-600 opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-emerald-50 focus:outline-none disabled:cursor-wait disabled:opacity-100 dark:text-dark-text-tertiary dark:hover:text-emerald-400 dark:hover:bg-emerald-500/20"
+                          :disabled="isTestingEndpoint(option.value)"
+                          @click.stop="handleTestEndpoint(option.value)"
+                          :title="t('testModel')"
+                        >
+                          <svg
+                            v-if="isTestingEndpoint(option.value)"
+                            class="w-3.5 h-3.5 animate-spin"
+                            fill="none"
+                            viewBox="0 0 24 24"
+                          >
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                          </svg>
+                          <svg v-else class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 3.75h4.5M10.5 3.75v5.4l-4.2 7.28a2.7 2.7 0 002.34 4.07h6.72a2.7 2.7 0 002.34-4.07l-4.2-7.28v-5.4" />
+                          </svg>
+                        </button>
+                        <button
                           class="text-gray-400 hover:text-apple-blue opacity-0 group-hover:opacity-100 transition-all duration-200 p-1 rounded-full hover:bg-blue-50 focus:outline-none dark:text-dark-text-tertiary dark:hover:text-blue-400 dark:hover:bg-blue-500/20"
                           @click.stop="handleEditEndpoint(option.value)"
                           :title="t('edit')"
@@ -656,9 +675,13 @@ const props = defineProps({
     type: String as () => 'claude' | 'codex',
     default: 'claude',
   },
+  testingEndpointId: {
+    type: String,
+    default: '',
+  },
 })
 
-const emit = defineEmits(['update:form', 'reset', 'toggle', 'addEndpoint', 'editEndpoint'])
+const emit = defineEmits(['update:form', 'reset', 'toggle', 'addEndpoint', 'editEndpoint', 'testEndpoint'])
 
 const localPort = ref(props.form.port)
 const localApiKey = ref(props.form.apiKey)
@@ -1465,6 +1488,8 @@ const getEndpointOptionConverterTag = (
   return toLbConverter(endpoint?.converter || props.form.converter)
 }
 
+const isTestingEndpoint = (id: string | number) => props.testingEndpointId === String(id)
+
 const handlePortChange = () => {
   const port = Number(localPort.value)
   if (!isNaN(port) && port > 0 && port <= 65535) {
@@ -1510,6 +1535,10 @@ const handleAddEndpoint = () => {
 
 const handleEditEndpoint = (id: string | number) => {
   emit('editEndpoint', String(id))
+}
+
+const handleTestEndpoint = (id: string | number) => {
+  emit('testEndpoint', String(id))
 }
 </script>
 

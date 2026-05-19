@@ -100,6 +100,16 @@ export interface ProxyConfigV2 extends ProxyConfig {
     codexConfig?: CodexClientConfig
 }
 
+export interface EndpointTestResult {
+    success: boolean
+    message: string
+    responseTimeMs?: number | null
+    httpStatus?: number | null
+    modelUsed: string
+    converter: ConverterType
+    errorCategory?: string | null
+}
+
 export const DEFAULT_PROXY_CONFIG_V2: Pick<Required<ProxyConfigV2>, 'proxyMode' | 'loadBalancer'> = {
     proxyMode: DEFAULT_PROXY_MODE,
     loadBalancer: DEFAULT_LOAD_BALANCER_CONFIG,

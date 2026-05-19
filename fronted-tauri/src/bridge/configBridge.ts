@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { ProxyConfigV2 } from '../types/configTypes'
+import type { EndpointTestResult, ProxyConfigV2 } from '../types/configTypes'
 
 export const loadConfig = (): Promise<ProxyConfigV2 | null> =>
     invoke<ProxyConfigV2 | null>('load_config')
@@ -21,6 +21,13 @@ export const stopProxy = (): Promise<void> =>
 
 export const saveLang = (lang: string): Promise<void> =>
     invoke('save_lang', { lang })
+
+export const testEndpointModel = (
+    config: ProxyConfigV2,
+    endpointId: string,
+    clientMode: 'claude' | 'codex',
+): Promise<EndpointTestResult> =>
+    invoke<EndpointTestResult>('test_endpoint_model', { config, endpointId, clientMode })
 
 export const exportConfig = (): Promise<string> =>
     invoke<string>('export_config')
