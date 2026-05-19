@@ -1036,6 +1036,7 @@ pub struct EndpointTestResult {
 }
 
 const TEST_INPUT_MODEL: &str = "claude-sonnet-4-6";
+const TEST_CODEX_MODEL: &str = "gpt-5.4";
 const TEST_PROMPT: &str = "Who are you?";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1490,7 +1491,7 @@ fn resolve_test_model_for_sonnet(converter: &str, ctx: &TransformContext) -> Str
         return ctx.gemini_reasoning_effort.sonnet.clone();
     }
 
-    ctx.codex_model_mapping.sonnet.clone()
+    TEST_CODEX_MODEL.to_string()
 }
 
 fn build_endpoint_test_request() -> AnthropicRequest {
