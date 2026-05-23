@@ -90,6 +90,9 @@ struct InitialRouteConfig {
     target_url: String,
     api_key: Option<String>,
     converter: String,
+    image_generation_url: String,
+    image_generation_api_key: Option<String>,
+    strip_image_generation_tool: bool,
 }
 
 #[derive(Clone)]
@@ -98,6 +101,9 @@ pub struct RuntimeRouteUpdate {
     pub api_key: Option<String>,
     pub ctx: TransformContext,
     pub load_balancer_runtime: Option<LoadBalancerRuntime>,
+    pub image_generation_url: String,
+    pub image_generation_api_key: Option<String>,
+    pub strip_image_generation_tool: bool,
 }
 
 #[derive(Clone)]
@@ -142,6 +148,9 @@ struct RuntimeRouteState {
     api_key: Option<String>,
     ctx: TransformContext,
     load_balancer_runtime: Option<LoadBalancerRuntime>,
+    image_generation_url: String,
+    image_generation_api_key: Option<String>,
+    strip_image_generation_tool: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +175,9 @@ impl RuntimeRouteState {
             api_key: value.api_key,
             ctx,
             load_balancer_runtime: value.load_balancer_runtime,
+            image_generation_url: value.image_generation_url,
+            image_generation_api_key: value.image_generation_api_key,
+            strip_image_generation_tool: value.strip_image_generation_tool,
         }
     }
 }
@@ -206,6 +218,9 @@ impl From<RuntimeConfigUpdate> for RuntimeConfigState {
                 api_key: value.api_key,
                 ctx: value.ctx,
                 load_balancer_runtime: value.load_balancer_runtime,
+                image_generation_url: String::new(),
+                image_generation_api_key: None,
+                strip_image_generation_tool: false,
             },
             value.enable_codex_tool_schema_compaction,
             value.enable_codex_fast_mode,
@@ -340,6 +355,182 @@ fn is_codex_native_passthrough_path(routed_path: &str) -> bool {
     (routed_path == "/v1" || routed_path.starts_with("/v1/"))
         && routed_path != "/v1/messages"
         && routed_path != "/v1/messages/count_tokens"
+}
+
+fn is_image_generation_request(routed_path: &str) -> bool {
+    routed_path.contains("/images/")
+}
+
+/// Check if a request body contains an image generation model.
+/// Codex CLI sends image generation requests via /v1/responses with models like "gpt-image-2",
+/// rather than the traditional /v1/images/generations endpoint.
+fn is_image_generation_model(body: &[u8]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    // Only check the "model" field in JSON, not the full body text.
+    // A full-body scan would false-positive on requests that merely *mention*
+    // image model names inside their instructions/tools payload.
+    let body_str = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body_str) {
+        if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
+            return model.contains("gpt-image") || model.contains("dall-e");
+        }
+    }
+    false
+}
+
+/// Strip all `{"type":"image_generation"}` tools from the request body.
+/// Used when the upstream does not support image_generation tool type at all.
+fn strip_image_generation_tool_from_body(body: &[u8]) -> Bytes {
+    let Ok(body_str) = std::str::from_utf8(body) else {
+        return Bytes::from(body.to_vec());
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return Bytes::from(body.to_vec());
+    };
+    if let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        tools.retain(|tool| {
+            tool.get("type").and_then(|t| t.as_str()) != Some("image_generation")
+        });
+    }
+    Bytes::from(v.to_string())
+}
+
+fn convert_responses_to_images_api(body: &[u8]) -> Bytes {
+    let body_str = String::from_utf8_lossy(body);
+    let Ok(parsed) = serde_json::from_str::<Value>(&body_str) else {
+        return Bytes::from(body.to_vec());
+    };
+
+    let model = parsed.get("model").and_then(|m| m.as_str()).unwrap_or("gpt-image-2");
+
+    let prompt = parsed
+        .get("input")
+        .and_then(|i| {
+            if i.is_string() {
+                i.as_str().map(|s| s.to_string())
+            } else if i.is_array() {
+                i.as_array().and_then(|arr| {
+                    arr.iter().find_map(|item| {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("message") {
+                            item.get("content").and_then(|c| {
+                                if c.is_string() { Some(c.as_str().unwrap_or("").to_string()) }
+                                else if c.is_array() {
+                                    c.as_array().and_then(|parts| {
+                                        parts.iter().find_map(|p| {
+                                            if p.get("type").and_then(|t| t.as_str()) == Some("input_text") {
+                                                p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                                            } else { None }
+                                        })
+                                    })
+                                } else { None }
+                            })
+                        } else { None }
+                    })
+                })
+            } else { None }
+        })
+        .or_else(|| parsed.get("prompt").and_then(|p| p.as_str().map(|s| s.to_string())))
+        .unwrap_or_else(|| "generate an image".to_string());
+
+    let size = parsed.get("size").and_then(|s| s.as_str()).unwrap_or("1024x1024");
+    let n = parsed.get("n").and_then(|n| n.as_u64()).unwrap_or(1);
+
+    let images_body = json!({
+        "model": model,
+        "prompt": prompt,
+        "size": size,
+        "n": n,
+    });
+
+    Bytes::from(images_body.to_string().into_bytes())
+}
+
+fn convert_images_api_to_responses_response(images_body: &[u8], model: &str) -> Bytes {
+    let body_str = String::from_utf8_lossy(images_body);
+    let parsed = serde_json::from_str::<Value>(&body_str).ok();
+
+    let (image_urls, b64_images): (Vec<Value>, Vec<Value>) = if let Some(ref data) = parsed {
+        let data_arr = data.get("data").and_then(|d| d.as_array());
+        if let Some(arr) = data_arr {
+            let urls: Vec<Value> = arr.iter().filter_map(|item| {
+                item.get("url").cloned()
+            }).collect();
+            let b64s: Vec<Value> = arr.iter().filter_map(|item| {
+                item.get("b64_json").cloned()
+            }).collect();
+            (urls, b64s)
+        } else {
+            (vec![], vec![])
+        }
+    } else {
+        (vec![], vec![])
+    };
+
+    let mut content_parts: Vec<Value> = vec![];
+
+    if !image_urls.is_empty() {
+        for url in &image_urls {
+            content_parts.push(json!({
+                "type": "output_text",
+                "text": url.as_str().unwrap_or("")
+            }));
+        }
+    }
+    if !b64_images.is_empty() {
+        for _b64 in &b64_images {
+            content_parts.push(json!({
+                "type": "output_text",
+                "text": "[image generated - base64 data omitted for size]"
+            }));
+        }
+    }
+
+    if content_parts.is_empty() {
+        content_parts.push(json!({
+            "type": "output_text",
+            "text": "Image generation completed but no output was returned."
+        }));
+    }
+
+    let response = json!({
+        "id": format!("resp_img_{}", &chrono::Utc::now().timestamp_millis() % 1_000_000),
+        "object": "response",
+        "model": model,
+        "output": [{
+            "type": "message",
+            "id": format!("msg_{}", &chrono::Utc::now().timestamp_millis() % 1_000_000),
+            "status": "completed",
+            "role": "assistant",
+            "content": content_parts,
+        }],
+        "status": "completed",
+        "created_at": chrono::Utc::now().timestamp(),
+    });
+
+    Bytes::from(response.to_string().into_bytes())
+}
+
+/// Wrap a Responses-format JSON payload as SSE events so Codex CLI's streaming
+/// reader sees `response.completed` instead of `stream closed before response.completed`.
+fn wrap_responses_as_sse(payload: &[u8]) -> Bytes {
+    let payload_str = String::from_utf8_lossy(payload);
+    let mut sse = String::with_capacity(payload_str.len() + 128);
+
+    // Codex Responses API SSE 格式需要 event 行
+    sse.push_str("event: response.completed\n");
+    sse.push_str("data: ");
+    sse.push_str(&payload_str);
+    sse.push_str("\n\n");
+
+    // 结束标记
+    sse.push_str("data: [DONE]\n\n");
+
+    Bytes::from(sse.into_bytes())
 }
 
 fn resolve_model_for_converter(
@@ -2184,6 +2375,7 @@ fn observe_upstream_chunk_events(
 ) {
     counters.mark_upstream_frame();
     if upstream_chunk_contains_event(chunk, "response.completed")
+        || upstream_chunk_contains_event(chunk, "message_stop")
         || upstream_chunk_indicates_done(chunk)
     {
         *saw_response_completed = true;
@@ -3953,10 +4145,13 @@ async fn handle_codex_native_passthrough(
     configured_api_key: Option<String>,
     http_client: Arc<reqwest::Client>,
     log_tx: broadcast::Sender<String>,
+    image_generation_url: &str,
+    image_generation_api_key: Option<String>,
+    strip_image_generation_tool: bool,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+    let _ = log_tx.send(format!("[NATIVE_PASSTHROUGH] #{} path={}", request_id, routed_path));
     let method = req.method().clone();
-    let upstream_url =
-        build_codex_native_passthrough_url(target_url, routed_path, req.uri().query());
+    let query = req.uri().query().map(|q| q.to_string());
     let incoming_auth = req
         .headers()
         .get("authorization")
@@ -3967,9 +4162,131 @@ async fn handle_codex_native_passthrough(
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
-    let final_api_key = configured_api_key
-        .or(incoming_x_api_key)
-        .or_else(|| incoming_auth.as_deref().and_then(extract_bearer_token));
+    let headers_to_forward: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .filter(|(name, _)| should_forward_native_request_header(name.as_str()))
+        .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_string())))
+        .collect();
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            let _ = log_tx.send(format!("[Debug] #{} body collected, len={}", request_id, bytes.len()));
+            bytes
+        }
+        Err(e) => {
+            let _ = log_tx.send(format!("[Error] #{} failed to collect body: {}", request_id, e));
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(full_body(
+                    json!({"error": {"message": format!("Failed to read body: {}", e)}})
+                        .to_string(),
+                ))
+                .unwrap());
+        }
+    };
+
+    let is_streaming = !body_bytes.is_empty()
+        && std::str::from_utf8(&body_bytes)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+            .unwrap_or(false);
+    let is_image_gen_by_path = is_image_generation_request(routed_path);
+    let is_image_gen_by_model = !body_bytes.is_empty() && is_image_generation_model(&body_bytes);
+    let is_image_gen = is_image_gen_by_path || is_image_gen_by_model;
+
+    let _ = log_tx.send(format!(
+        "[Debug] #{} is_streaming={} is_image_gen={} (by_path={} by_model={})",
+        request_id, is_streaming, is_image_gen, is_image_gen_by_path, is_image_gen_by_model
+    ));
+
+    // 调试日志：记录请求体前 200 字符
+    if !body_bytes.is_empty() {
+        let body_preview = String::from_utf8_lossy(&body_bytes);
+        let preview_len = body_preview.len().min(200);
+        let _ = log_tx.send(format!(
+            "[Debug] #{} body_preview: {} is_image_gen={} is_streaming={}",
+            request_id, &body_preview[..preview_len], is_image_gen, is_streaming
+        ));
+    }
+
+    // 图片生成能力探测：input/prompt 为空或极短（<= 5 字符），直接在本地响应
+    // 真正的图片生成请求（有实质性 prompt）才转发到 image_generation_url
+    if is_image_gen {
+        let prompt_len = if !body_bytes.is_empty() {
+            convert_responses_to_images_api(&body_bytes)
+                .get(..512)
+                .and_then(|chunk| serde_json::from_slice::<Value>(chunk).ok())
+                .and_then(|v| v.get("prompt").and_then(|p| p.as_str()).map(|s| s.len()))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let is_capability_probe = prompt_len <= 5;
+
+        if is_capability_probe || image_generation_url.is_empty() {
+            let _ = log_tx.send(format!(
+                "[Route] #{} mode=native_codex image_gen=local_capability method={} path={} prompt_len={}",
+                request_id, method, routed_path, prompt_len
+            ));
+            let fallback = json!({
+                "id": format!("resp_img_{}", request_id),
+                "object": "response",
+                "model": "gpt-image-2",
+                "output": [{
+                    "type": "message",
+                    "id": format!("msg_{}", request_id),
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Image generation capability available."}]
+                }],
+                "status": "completed",
+                "created_at": chrono::Utc::now().timestamp(),
+            });
+            let body = fallback.to_string();
+            let (content_type, response_body) = if is_streaming {
+                ("text/event-stream", String::from_utf8_lossy(&wrap_responses_as_sse(body.as_bytes())).to_string())
+            } else {
+                ("application/json", body)
+            };
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type)
+                .body(full_body(response_body))
+                .unwrap());
+        }
+    }
+
+    let effective_url = if !image_generation_url.is_empty() && is_image_gen {
+        image_generation_url
+    } else {
+        target_url
+    };
+    let effective_routed_path = if is_image_gen && !image_generation_url.is_empty() {
+        "/v1/images/generations"
+    } else {
+        routed_path
+    };
+    let upstream_url =
+        build_codex_native_passthrough_url(effective_url, effective_routed_path, query.as_deref());
+
+    let effective_body = if is_image_gen && !image_generation_url.is_empty() && !body_bytes.is_empty() {
+        convert_responses_to_images_api(&body_bytes)
+    } else if strip_image_generation_tool && !body_bytes.is_empty() {
+        strip_image_generation_tool_from_body(&body_bytes)
+    } else {
+        body_bytes.clone()
+    };
+    let final_api_key = if !image_generation_url.is_empty() && is_image_gen {
+        image_generation_api_key.or(configured_api_key)
+    } else {
+        configured_api_key
+    }
+    .or(incoming_x_api_key)
+    .or_else(|| incoming_auth.as_deref().and_then(extract_bearer_token));
 
     let Some(final_api_key) = final_api_key else {
         return Ok(Response::builder()
@@ -3983,40 +4300,57 @@ async fn handle_codex_native_passthrough(
     };
 
     let mut upstream_req = http_client.request(method.clone(), &upstream_url);
-    for (name, value) in req.headers() {
-        if should_forward_native_request_header(name.as_str()) {
-            upstream_req = upstream_req.header(name, value);
-        }
+    for (name, value) in &headers_to_forward {
+        upstream_req = upstream_req.header(name.as_str(), value.as_str());
     }
     upstream_req = upstream_req
         .header("Authorization", format!("Bearer {}", final_api_key))
         .header("x-api-key", final_api_key);
 
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("Content-Type", "application/json")
-                .body(full_body(
-                    json!({"error": {"message": format!("Failed to read body: {}", e)}})
-                        .to_string(),
-                ))
-                .unwrap());
-        }
-    };
-    if !body_bytes.is_empty() {
-        upstream_req = upstream_req.body(body_bytes);
+    if !effective_body.is_empty() {
+        upstream_req = upstream_req.body(effective_body);
     }
 
     let _ = log_tx.send(format!(
-        "[System] Processing #{} native_codex {} {} -> {}",
+        "[Route] #{} mode=native_codex method={} path={} -> {} image_gen={}",
+        request_id, method, routed_path, upstream_url, is_image_gen
+    ));
+    let _ = log_tx.send(format!(
+        "[Req] #{} mode=native_codex {} {} upstream={}",
         request_id, method, routed_path, upstream_url
     ));
 
-    let upstream_response = match upstream_req.send().await {
+let upstream_response = match upstream_req.send().await {
         Ok(response) => response,
         Err(e) => {
+            if is_image_gen && !image_generation_url.is_empty() {
+                let _ = log_tx.send(format!("[Error] #{} image_gen upstream_error: {}", request_id, e));
+                let fallback = json!({
+                    "id": format!("resp_img_err_{}", request_id),
+                    "object": "response",
+                    "model": "gpt-image-2",
+                    "output": [{
+                        "type": "message",
+                        "id": format!("msg_err_{}", request_id),
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": format!("Image generation failed: {}. Please try again later.", e)}]
+                    }],
+                    "status": "completed",
+                    "created_at": chrono::Utc::now().timestamp(),
+                });
+                let body = fallback.to_string();
+                let (content_type, response_body) = if is_streaming {
+                    ("text/event-stream", String::from_utf8_lossy(&wrap_responses_as_sse(body.as_bytes())).to_string())
+                } else {
+                    ("application/json", body)
+                };
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", content_type)
+                    .body(full_body(response_body))
+                    .unwrap());
+            }
             return Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("Content-Type", "application/json")
@@ -4029,27 +4363,174 @@ async fn handle_codex_native_passthrough(
     };
 
     let status = upstream_response.status();
-    let mut response_builder = Response::builder().status(status);
-    for (name, value) in upstream_response.headers() {
-        if should_forward_native_response_header(name.as_str()) {
-            response_builder = response_builder.header(name, value);
+    let _ = log_tx.send(format!(
+        "[Req] #{} mode=native_codex status={}",
+        request_id, status.as_u16()
+    ));
+    let _ = log_tx.send(format!("[Debug] #{} upstream status={} is_streaming={} is_image_gen={}",
+        request_id, status.as_u16(), is_streaming, is_image_gen));
+    let response_headers: Vec<(String, String)> = upstream_response.headers().iter()
+        .filter_map(|(name, value)| {
+            if should_forward_native_response_header(name.as_str()) {
+                Some((name.to_string(), value.to_str().ok()?.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // 对于流式请求且非图片生成，直接转发上游流式响应
+    if is_streaming && !is_image_gen {
+        let _ = log_tx.send(format!(
+            "[Req] #{} mode=native_codex streaming=true, forwarding upstream stream directly",
+            request_id
+        ));
+        let log_tx_clone = log_tx.clone();
+        let request_id_clone = request_id.to_string();
+        let mut response_builder = Response::builder().status(status);
+        for (name, value) in &response_headers {
+            response_builder = response_builder.header(name.as_str(), value.as_str());
+        }
+        let stream_body = StreamBody::new(upstream_response.bytes_stream().map(move |result| {
+            match result {
+                Ok(bytes) => Ok(Frame::data(bytes)),
+                Err(e) => {
+                    let _ = log_tx_clone.send(format!(
+                        "[Error] #{} upstream stream error: {}",
+                        request_id_clone, e
+                    ));
+                    // 返回空帧来优雅地结束流
+                    Ok(Frame::data(Bytes::new()))
+                }
+            }
+        }));
+        return Ok(response_builder
+            .body(BoxBody::new(stream_body))
+            .unwrap());
+    }
+
+    let response_bytes = match upstream_response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            if is_image_gen && !image_generation_url.is_empty() {
+                let fallback = json!({
+                    "id": format!("resp_img_err_{}", request_id),
+                    "object": "response",
+                    "model": "gpt-image-2",
+                    "output": [{
+                        "type": "message",
+                        "id": format!("msg_err_{}", request_id),
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": format!("Image generation response read error: {}", e)}]
+                    }],
+                    "status": "completed",
+                    "created_at": chrono::Utc::now().timestamp(),
+                });
+                let body = fallback.to_string();
+                let (content_type, response_body) = if is_streaming {
+                    ("text/event-stream", String::from_utf8_lossy(&wrap_responses_as_sse(body.as_bytes())).to_string())
+                } else {
+                    ("application/json", body)
+                };
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", content_type)
+                    .body(full_body(response_body))
+                    .unwrap());
+            }
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "application/json")
+                .body(full_body(
+                    json!({"error": {"type": "upstream_error", "message": e.to_string()}}).to_string(),
+                ))
+                .unwrap());
+        }
+    };
+
+    if is_image_gen && !image_generation_url.is_empty() {
+        if status.is_success() {
+            let model_name = if !body_bytes.is_empty() {
+                String::from_utf8_lossy(&body_bytes)
+                    .find("gpt-image")
+                    .map(|_| "gpt-image-2".to_string())
+                    .unwrap_or_else(|| "gpt-image-2".to_string())
+            } else {
+                "gpt-image-2".to_string()
+            };
+            let converted = convert_images_api_to_responses_response(&response_bytes, &model_name);
+            let _ = log_tx.send(format!(
+                "[Req] #{} mode=native_codex image_gen=success converted_len={}",
+                request_id, converted.len()
+            ));
+            let body_str = String::from_utf8_lossy(&converted).to_string();
+            let (content_type, response_body) = if is_streaming {
+                ("text/event-stream", String::from_utf8_lossy(&wrap_responses_as_sse(converted.as_ref())).to_string())
+            } else {
+                ("application/json", body_str)
+            };
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type)
+                .body(full_body(response_body))
+                .unwrap());
+        } else {
+            let error_text = String::from_utf8_lossy(&response_bytes).to_string();
+            let _ = log_tx.send(format!(
+                "[Error] #{} image_gen upstream_error status={} body={}",
+                request_id, status.as_u16(), &error_text[..error_text.len().min(200)]
+            ));
+            let error_msg = serde_json::from_str::<Value>(&error_text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.get("message").and_then(|m| m.as_str().map(|s| s.to_string()))))
+                .or_else(|| serde_json::from_str::<Value>(&error_text)
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(|e| e.as_str().map(|s| s.to_string()))))
+                .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+            let fallback = json!({
+                "id": format!("resp_img_err_{}", request_id),
+                "object": "response",
+                "model": "gpt-image-2",
+                "output": [{
+                    "type": "message",
+                    "id": format!("msg_err_{}", request_id),
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("Image generation could not be completed: {}", error_msg)}]
+                }],
+                "status": "completed",
+                "created_at": chrono::Utc::now().timestamp(),
+            });
+            let body = fallback.to_string();
+            let (content_type, response_body) = if is_streaming {
+                ("text/event-stream", String::from_utf8_lossy(&wrap_responses_as_sse(body.as_bytes())).to_string())
+            } else {
+                ("application/json", body)
+            };
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type)
+                .body(full_body(response_body))
+                .unwrap());
         }
     }
 
-    match upstream_response.bytes().await {
-        Ok(bytes) => Ok(response_builder
-            .body(BoxBody::new(
-                Full::new(bytes).map_err(|_: Infallible| unreachable!()),
-            ))
-            .unwrap()),
-        Err(e) => Ok(Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .header("Content-Type", "application/json")
-            .body(full_body(
-                json!({"error": {"type": "upstream_error", "message": e.to_string()}}).to_string(),
-            ))
-            .unwrap()),
+    let mut response_builder = Response::builder().status(status);
+    for (name, value) in &response_headers {
+        response_builder = response_builder.header(name.as_str(), value.as_str());
     }
+
+    let _ = log_tx.send(format!(
+        "[Req] #{} mode=native_codex response_len={}",
+        request_id, response_bytes.len()
+    ));
+
+    Ok(response_builder
+        .body(BoxBody::new(
+            Full::new(response_bytes).map_err(|_: Infallible| unreachable!()),
+        ))
+        .unwrap())
 }
 
 fn parse_seconds_str(s: &str) -> Option<u64> {
@@ -5023,11 +5504,17 @@ impl ProxyServer {
         target_url: String,
         api_key: Option<String>,
         converter: String,
+        image_generation_url: String,
+        image_generation_api_key: Option<String>,
+        strip_image_generation_tool: bool,
     ) -> Self {
         self.codex_route_config = Some(InitialRouteConfig {
             target_url,
             api_key,
             converter,
+            image_generation_url,
+            image_generation_api_key,
+            strip_image_generation_tool,
         });
         self
     }
@@ -5055,6 +5542,9 @@ impl ProxyServer {
                 api_key: route.api_key.clone(),
                 ctx,
                 load_balancer_runtime: None,
+                image_generation_url: route.image_generation_url.clone(),
+                image_generation_api_key: route.image_generation_api_key.clone(),
+                strip_image_generation_tool: route.strip_image_generation_tool,
             }
         });
 
@@ -5377,11 +5867,17 @@ async fn handle_request(
     let prefer_codex_v1_path = runtime_state.prefer_codex_v1_path;
     let enable_stateful_responses_chain = runtime_state.enable_stateful_responses_chain;
     let load_balancer_runtime = route_state.load_balancer_runtime;
+    let image_generation_url = route_state.image_generation_url;
+
+    let _ = log_tx.send(format!("[Debug] #{} client_route_kind={:?} converter={} routed_path={} is_native_passthrough={}",
+        request_id, client_route_kind, ctx.converter, routed_path,
+        is_codex_native_passthrough_path(&routed_path)));
 
     if client_route_kind == ClientRouteKind::Codex
         && ctx.converter.eq_ignore_ascii_case("codex")
         && is_codex_native_passthrough_path(&routed_path)
     {
+        let _ = log_tx.send(format!("[Debug] #{} Entering handle_codex_native_passthrough", request_id));
         return handle_codex_native_passthrough(
             req,
             &request_id,
@@ -5390,6 +5886,9 @@ async fn handle_request(
             api_key,
             http_client,
             log_tx,
+            &image_generation_url,
+            route_state.image_generation_api_key,
+            route_state.strip_image_generation_tool,
         )
         .await;
     }
@@ -8592,7 +9091,7 @@ mod tests {
         get_cached_skill_catalog_reminder, get_parallel_tool_degrade_remaining_seconds,
         inject_retry_no_tool_text_mix_guardrail, is_business_stream_output,
         is_codex_fast_endpoint_unsupported, is_codex_native_passthrough_path,
-        is_codex_v1_responses_path, is_previous_response_id_unsupported_error,
+        is_codex_v1_responses_path, is_image_generation_model, is_previous_response_id_unsupported_error,
         leaked_tool_text_retry_skip_reason, mark_codex_fast_endpoint_unsupported,
         mark_parallel_tool_degrade, normalize_client_route_path, observe_upstream_chunk_events,
         prepare_gemini_explicit_cache, prepare_stateful_chain_request, record_stateful_chain_entry,
@@ -8603,7 +9102,8 @@ mod tests {
         should_mark_gemini_cached_contents_unsupported,
         should_retry_codex_fast_without_service_tier, should_retry_codex_v1_path_with_legacy,
         should_suppress_premature_message_stop, sibling_tool_error_retry_skip_reason,
-        trim_leading_stateful_replay_items, upsert_gemini_explicit_cache_entry, ClientRouteKind,
+        trim_leading_stateful_replay_items, upsert_gemini_explicit_cache_entry,
+        wrap_responses_as_sse, ClientRouteKind,
         CodexFastUnsupportedEndpointStore, ConnErrorClass, GeminiExplicitCacheStore,
         GeminiExplicitCacheUnsupportedEndpointStore, RuntimeConfigState, RuntimeConfigUpdate,
         RuntimeRouteUpdate, SkillCatalogReminderStore, SseFrameParser, StatefulChainEntry,
@@ -8724,6 +9224,36 @@ mod tests {
     }
 
     #[test]
+    fn image_generation_model_detection() {
+        assert!(is_image_generation_model(br#"{"model":"gpt-image-2","prompt":"test"}"#));
+        assert!(is_image_generation_model(br#"{"model":"gpt-image-1","prompt":"test"}"#));
+        assert!(is_image_generation_model(br#"{"model":"dall-e-3","prompt":"test"}"#));
+        assert!(!is_image_generation_model(br#"{"model":"gpt-5.3-codex","prompt":"test"}"#));
+        assert!(!is_image_generation_model(br#"{"model":"claude-sonnet-4-20250514"}"#));
+        assert!(!is_image_generation_model(b""));
+        assert!(!is_image_generation_model(br#"{"model":"o3"}"#));
+    }
+
+    #[test]
+    fn sse_wrapping_includes_event_prefix_data_and_done() {
+        let payload = br#"{"id":"resp_1","object":"response","status":"completed"}"#;
+        let sse = wrap_responses_as_sse(payload);
+        let sse_str = String::from_utf8_lossy(&sse);
+        assert!(sse_str.starts_with("event: response.completed\ndata: "));
+        assert!(sse_str.contains("\ndata: [DONE]\n"));
+        assert!(sse_str.ends_with("\n\n"));
+        assert!(sse_str.len() > payload.len());
+    }
+
+    #[test]
+    fn sse_wrapping_only_one_done_line() {
+        let sse = wrap_responses_as_sse(b"{}");
+        let sse_str = String::from_utf8_lossy(&sse);
+        let done_count = sse_str.matches("[DONE]").count();
+        assert_eq!(done_count, 1);
+    }
+
+    #[test]
     fn runtime_state_keeps_claude_and_codex_routes_isolated() {
         let state = RuntimeConfigState::from(RuntimeConfigUpdate {
             target_url: "https://claude.example/messages".to_string(),
@@ -8734,6 +9264,9 @@ mod tests {
                 api_key: Some("codex-key".to_string()),
                 ctx: test_transform_context("codex"),
                 load_balancer_runtime: None,
+                image_generation_url: String::new(),
+                image_generation_api_key: None,
+                strip_image_generation_tool: false,
             }),
             ignore_probe_requests: false,
             allow_count_tokens_fallback_estimate: true,

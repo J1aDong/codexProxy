@@ -166,4 +166,11 @@ export default {
     confirmDeleteEndpoint: 'Are you sure you want to delete endpoint "{name}"?',
     confirmDeleteEndpointFinal: 'Warning: This action cannot be undone. Are you sure?',
     deleteLastEndpointError: 'At least one endpoint must be kept.',
+
+    // Image Generation
+    imageGenerationUrl: 'Image Generation Endpoint',
+    imageGenerationUrlPlaceholder: 'Optional - specify a separate upstream endpoint for image generation',
+    imageGenerationUrlTip: 'If image generation is not supported at the main Codex URL, you can configure a separate endpoint here. Image generation requests will be routed to this endpoint.',
+    stripImageGenerationTool: 'Strip Image Generation Tool',
+    stripImageGenerationToolTip: 'When enabled, removes the image_generation tool from requests. Use this if your upstream does not support it.',
 }

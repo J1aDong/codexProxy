@@ -57,6 +57,13 @@
               >
                 [{{ extractLogTag(log.content) }}]
               </span>
+              <span
+                v-if="extractConverterTag(log.content)"
+                class="text-[10px] px-1.5 py-0.5 rounded border shrink-0"
+                :class="getConverterTagClass(extractConverterTag(log.content)!)"
+              >
+                {{ extractConverterTag(log.content) }}
+              </span>
             </div>
             <div class="mt-1 ml-[72px] text-xs text-apple-text-primary dark:text-dark-text-primary break-all leading-5">
               {{ extractLogBody(log.content) }}
@@ -138,6 +145,19 @@ const parseLog = (content: string) => {
   }
 }
 
+const extractConverterTag = (content: string): string | null => {
+  if (content.includes('mode=native_codex') || content.includes('image_gen=true')) return 'Codex'
+  const converterMatch = content.match(/converter=(\w+)/)
+  if (converterMatch) {
+    const converter = converterMatch[1].toLowerCase()
+    if (converter === 'codex') return 'Codex'
+    if (converter === 'gemini') return 'Gemini'
+    if (converter === 'anthropic') return 'Claude'
+    if (converter === 'openai') return 'OpenAI'
+  }
+  return null
+}
+
 const extractLogTag = (content: string) => parseLog(content).tag
 
 const extractLogBody = (content: string) => parseLog(content).body
@@ -151,6 +171,16 @@ const getLogTagClass = (tag: string) => {
   if (normalized === 'route') return 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-700'
   if (normalized === 'tokens' || normalized === 'ratelimit') return 'bg-amber-50 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-700'
   return 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-gray-600'
+}
+
+const getConverterTagClass = (converter: string) => {
+  switch (converter) {
+    case 'Codex': return 'bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 border-purple-200 dark:border-purple-700'
+    case 'Claude': return 'bg-orange-50 dark:bg-orange-900/30 text-orange-700 dark:text-orange-400 border-orange-200 dark:border-orange-700'
+    case 'Gemini': return 'bg-cyan-50 dark:bg-cyan-900/30 text-cyan-700 dark:text-cyan-400 border-cyan-200 dark:border-cyan-700'
+    case 'OpenAI': return 'bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-400 border-green-200 dark:border-green-700'
+    default: return 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-gray-600'
+  }
 }
 </script>
 

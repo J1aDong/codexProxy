@@ -265,6 +265,14 @@ fn default_proxy_mode() -> String {
     "single".to_string()
 }
 
+fn default_image_gen_endpoint_options() -> Vec<EndpointOption> {
+    Vec::new()
+}
+
+fn default_selected_image_gen_endpoint_id() -> String {
+    String::new()
+}
+
 fn default_load_balancer() -> LoadBalancerConfig {
     LoadBalancerConfig::default()
 }
@@ -303,6 +311,18 @@ pub struct CodexClientConfig {
     pub converter: String,
     #[serde(rename = "proxyMode", default = "default_proxy_mode")]
     pub proxy_mode: String,
+    #[serde(
+        rename = "imageGenerationEndpointOptions",
+        default = "default_image_gen_endpoint_options"
+    )]
+    pub image_generation_endpoint_options: Vec<EndpointOption>,
+    #[serde(
+        rename = "selectedImageGenerationEndpointId",
+        default = "default_selected_image_gen_endpoint_id"
+    )]
+    pub selected_image_generation_endpoint_id: String,
+    #[serde(rename = "stripImageGenerationTool", default)]
+    pub strip_image_generation_tool: bool,
 }
 
 impl Default for CodexClientConfig {
@@ -318,6 +338,9 @@ impl Default for CodexClientConfig {
             selected_endpoint_id: default_codex_selected_endpoint_id(),
             converter: default_converter(),
             proxy_mode: default_proxy_mode(),
+            image_generation_endpoint_options: default_image_gen_endpoint_options(),
+            selected_image_generation_endpoint_id: default_selected_image_gen_endpoint_id(),
+            strip_image_generation_tool: false,
         }
     }
 }
@@ -889,6 +912,13 @@ fn selected_codex_endpoint<'a>(config: &'a ProxyConfig) -> Option<&'a EndpointOp
     )
 }
 
+fn selected_image_gen_endpoint<'a>(config: &'a ProxyConfig) -> Option<&'a EndpointOption> {
+    selected_endpoint_from(
+        &config.codex_config.image_generation_endpoint_options,
+        &config.codex_config.selected_image_generation_endpoint_id,
+    )
+}
+
 fn resolve_target_and_api_key(config: &ProxyConfig) -> (String, Option<String>) {
     let selected = selected_endpoint(config);
     let target_url = selected
@@ -907,7 +937,7 @@ fn resolve_target_and_api_key(config: &ProxyConfig) -> (String, Option<String>) 
 
 fn resolve_codex_target_api_key_and_converter(
     config: &ProxyConfig,
-) -> (String, Option<String>, String) {
+) -> (String, Option<String>, String, String, Option<String>) {
     let selected = selected_codex_endpoint(config);
     let target_url = selected
         .map(|item| item.url.clone())
@@ -920,7 +950,25 @@ fn resolve_codex_target_api_key_and_converter(
     } else {
         Some(resolved_api_key)
     };
-    (target_url, api_key, default_converter())
+
+    // Resolve image generation endpoint
+    let image_gen_selected = selected_image_gen_endpoint(config);
+    let image_generation_url = image_gen_selected
+        .map(|item| item.url.clone())
+        .unwrap_or_default();
+    let image_generation_api_key = image_gen_selected
+        .and_then(|item| {
+            let key = item.api_key.clone();
+            if key.is_empty() { None } else { Some(key) }
+        });
+
+    (
+        target_url,
+        api_key,
+        default_converter(),
+        image_generation_url,
+        image_generation_api_key,
+    )
 }
 
 fn build_transform_context(
@@ -962,7 +1010,7 @@ fn build_runtime_update(
     log_tx: Option<broadcast::Sender<String>>,
 ) -> RuntimeConfigUpdate {
     let (target_url, api_key) = resolve_target_and_api_key(config);
-    let (codex_target_url, codex_api_key, codex_converter) =
+    let (codex_target_url, codex_api_key, codex_converter, image_generation_url, image_generation_api_key) =
         resolve_codex_target_api_key_and_converter(config);
     let load_balancer_runtime = if config.proxy_mode.eq_ignore_ascii_case("load_balancer") {
         build_lb_runtime(config, log_tx)
@@ -991,6 +1039,9 @@ fn build_runtime_update(
             api_key: codex_api_key,
             ctx: build_transform_context(config, codex_converter, codex_openai_max_tokens_mapping),
             load_balancer_runtime: None,
+            image_generation_url,
+            image_generation_api_key,
+            strip_image_generation_tool: config.codex_config.strip_image_generation_tool,
         }),
         ignore_probe_requests: config.ignore_probe_requests,
         allow_count_tokens_fallback_estimate: config.allow_count_tokens_fallback_estimate,
@@ -2087,7 +2138,7 @@ async fn start_proxy_with_manager(
     )
     .map_err(|e| e.to_string())?;
     let (resolved_target_url, api_key) = resolve_target_and_api_key(&config);
-    let (resolved_codex_target_url, codex_api_key, codex_converter) =
+    let (resolved_codex_target_url, codex_api_key, codex_converter, image_generation_url, image_generation_api_key) =
         resolve_codex_target_api_key_and_converter(&config);
 
     app.emit(
@@ -2098,6 +2149,11 @@ async fn start_proxy_with_manager(
     app.emit(
         "proxy-log",
         format!("[System] Codex Target: {}", resolved_codex_target_url),
+    )
+    .map_err(|e| e.to_string())?;
+    app.emit(
+        "proxy-log",
+        format!("[System] Codex Image Generation URL: [{}] api_key={}", image_generation_url, image_generation_api_key.as_deref().unwrap_or("(none)")),
     )
     .map_err(|e| e.to_string())?;
     let custom_injection_prompt = resolve_custom_injection_prompt(&config.custom_injection_prompt);
@@ -2154,7 +2210,7 @@ async fn start_proxy_with_manager(
         .with_enable_codex_tool_schema_compaction(config.enable_codex_tool_schema_compaction)
         .with_enable_skill_routing_hint(config.enable_skill_routing_hint)
         .with_enable_stateful_responses_chain(config.enable_stateful_responses_chain)
-        .with_codex_route(resolved_codex_target_url, codex_api_key, codex_converter)
+        .with_codex_route(resolved_codex_target_url, codex_api_key, codex_converter, image_generation_url, image_generation_api_key, config.codex_config.strip_image_generation_tool)
         .with_allow_external_access(config.allow_external_access)
         .with_max_concurrency(config.max_concurrency);
 
@@ -2178,16 +2234,23 @@ async fn start_proxy_with_manager(
     // 启动日志转发（Lagged 时跳过丢失的消息继续接收，不退出）
     let app_clone = app.clone();
     tokio::spawn(async move {
+        // 获取日志记录器实例
+        let logger = codex_proxy_core::logger::AppLogger::get();
         loop {
             match log_rx.recv().await {
                 Ok(msg) => {
+                    // 同时写入日志文件和发送到前端
+                    if let Some(logger) = &logger {
+                        logger.log(&msg);
+                    }
                     let _ = app_clone.emit("proxy-log", msg);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    let _ = app_clone.emit(
-                        "proxy-log",
-                        format!("[Warning] Log receiver lagged, skipped {} messages", n),
-                    );
+                    let lag_msg = format!("[Warning] Log receiver lagged, skipped {} messages", n);
+                    if let Some(logger) = &logger {
+                        logger.log(&lag_msg);
+                    }
+                    let _ = app_clone.emit("proxy-log", lag_msg);
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }

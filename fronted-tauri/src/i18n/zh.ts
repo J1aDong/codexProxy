@@ -166,4 +166,11 @@ export default {
     confirmDeleteEndpoint: '确定要删除地址 "{name}" 吗？',
     confirmDeleteEndpointFinal: '警告：此操作不可撤销，确定删除吗？',
     deleteLastEndpointError: '必须保留至少一个地址。',
+
+    // Image Generation
+    imageGenerationUrl: '生图端点',
+    imageGenerationUrlPlaceholder: '选填 - 为生图请求指定独立的上游端点',
+    imageGenerationUrlTip: '如果在 Codex 主地址上不支持生图，可以在此配置单独的生图接口端点。配置后生图请求将路由到此端点。',
+    stripImageGenerationTool: '过滤生图工具',
+    stripImageGenerationToolTip: '开启后将从请求中移除 image_generation 工具，适用于不支持该工具的上游服务。',
 }

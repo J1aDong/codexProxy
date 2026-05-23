@@ -92,6 +92,9 @@ export interface CodexClientConfig {
     selectedEndpointId: string
     converter: ConverterType
     proxyMode?: ProxyMode
+    imageGenerationEndpointOptions?: EndpointOption[]
+    selectedImageGenerationEndpointId?: string
+    stripImageGenerationTool?: boolean
 }
 
 export interface ProxyConfigV2 extends ProxyConfig {

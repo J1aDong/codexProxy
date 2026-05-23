@@ -30,6 +30,8 @@
         @addEndpoint="openAddEndpointDialog"
         @editEndpoint="handleEditEndpoint"
         @testEndpoint="handleTestEndpoint"
+        @addImageGenEndpoint="openAddImageGenEndpointDialog"
+        @editImageGenEndpoint="handleEditImageGenEndpoint"
       />
 
       <!-- Guide Section -->
@@ -375,6 +377,8 @@ const DEFAULT_CODEX_CLIENT_CONFIG: CodexClientConfig = {
   selectedEndpointId: DEFAULT_CODEX_ENDPOINT_OPTION.id,
   converter: 'codex',
   proxyMode: 'single',
+  imageGenerationEndpointOptions: [],
+  selectedImageGenerationEndpointId: '',
 }
 
 const DEFAULT_CONFIG = {
@@ -500,6 +504,9 @@ const codexForm = reactive({
   selectedEndpointId: DEFAULT_CODEX_CLIENT_CONFIG.selectedEndpointId,
   converter: DEFAULT_CODEX_CLIENT_CONFIG.converter,
   proxyMode: 'single' as const,
+  imageGenerationEndpointOptions: cloneEndpointOptions(DEFAULT_CODEX_CLIENT_CONFIG.imageGenerationEndpointOptions || []),
+  selectedImageGenerationEndpointId: DEFAULT_CODEX_CLIENT_CONFIG.selectedImageGenerationEndpointId || '',
+  stripImageGenerationTool: DEFAULT_CODEX_CLIENT_CONFIG.stripImageGenerationTool || false,
   loadBalancer: {
     ...DEFAULT_PROXY_CONFIG_V2.loadBalancer,
     lbProfiles: [...DEFAULT_PROXY_CONFIG_V2.loadBalancer.lbProfiles],
@@ -658,6 +665,15 @@ const normalizeCodexClientConfig = (input: ProxyConfigV2['codexConfig']): CodexC
     : endpointOptions[0]?.id || DEFAULT_CODEX_CLIENT_CONFIG.selectedEndpointId
   const selected = endpointOptions.find((item) => item.id === selectedEndpointId)
 
+  const imageGenOptions = normalizeEndpointOptions(
+    raw.imageGenerationEndpointOptions,
+    DEFAULT_CODEX_CLIENT_CONFIG.imageGenerationEndpointOptions || [],
+  )
+  const selectedImageGenId = raw.selectedImageGenerationEndpointId
+    && imageGenOptions.some((item) => item.id === raw.selectedImageGenerationEndpointId)
+    ? raw.selectedImageGenerationEndpointId
+    : imageGenOptions[0]?.id || ''
+
   return {
     targetUrl: selected?.url || raw.targetUrl || DEFAULT_CODEX_CLIENT_CONFIG.targetUrl,
     apiKey: selected?.apiKey || raw.apiKey || '',
@@ -665,6 +681,9 @@ const normalizeCodexClientConfig = (input: ProxyConfigV2['codexConfig']): CodexC
     selectedEndpointId,
     converter: 'codex',
     proxyMode: 'single',
+    imageGenerationEndpointOptions: imageGenOptions,
+    selectedImageGenerationEndpointId: selectedImageGenId,
+    stripImageGenerationTool: !!raw.stripImageGenerationTool,
   }
 }
 
@@ -676,6 +695,9 @@ const applyCodexClientConfig = (input: ProxyConfigV2['codexConfig']) => {
   codexForm.selectedEndpointId = next.selectedEndpointId
   codexForm.converter = next.converter
   codexForm.proxyMode = 'single'
+  codexForm.imageGenerationEndpointOptions = cloneEndpointOptions(next.imageGenerationEndpointOptions || [])
+  codexForm.selectedImageGenerationEndpointId = next.selectedImageGenerationEndpointId || ''
+  codexForm.stripImageGenerationTool = !!next.stripImageGenerationTool
   syncEndpointFromSelection(codexForm)
 }
 
@@ -1042,6 +1064,9 @@ watch(
   [
     () => codexForm.targetUrl,
     () => codexForm.apiKey,
+    () => codexForm.imageGenerationEndpointOptions,
+    () => codexForm.selectedImageGenerationEndpointId,
+    () => codexForm.stripImageGenerationTool,
   ],
   () => {
     if (isSyncing.value) return
@@ -1056,19 +1081,43 @@ const updateForm = (newForm: any) => {
 }
 
 const editingEndpointId = ref('')
+const editingImageGenEndpointId = ref('')
+const isImageGenDialogMode = ref(false)
 
 const currentEditingEndpoint = computed(() => {
+  if (editingImageGenEndpointId.value) {
+    const options = (codexForm as any).imageGenerationEndpointOptions || []
+    return options.find((opt: any) => opt.id === editingImageGenEndpointId.value)
+  }
   if (!editingEndpointId.value) return undefined
   return activeForm.value.endpointOptions.find(opt => opt.id === editingEndpointId.value)
 })
 
 const openAddEndpointDialog = () => {
   editingEndpointId.value = ''
+  editingImageGenEndpointId.value = ''
+  isImageGenDialogMode.value = false
+  showEndpointDialog.value = true
+}
+
+const openAddImageGenEndpointDialog = () => {
+  editingEndpointId.value = ''
+  editingImageGenEndpointId.value = ''
+  isImageGenDialogMode.value = true
   showEndpointDialog.value = true
 }
 
 const handleEditEndpoint = (id: string) => {
   editingEndpointId.value = id
+  editingImageGenEndpointId.value = ''
+  isImageGenDialogMode.value = false
+  showEndpointDialog.value = true
+}
+
+const handleEditImageGenEndpoint = (id: string) => {
+  editingEndpointId.value = ''
+  editingImageGenEndpointId.value = id
+  isImageGenDialogMode.value = true
   showEndpointDialog.value = true
 }
 
@@ -1121,9 +1170,31 @@ const handleTestEndpoint = async (id: string) => {
 const closeEndpointDialog = () => {
   showEndpointDialog.value = false
   editingEndpointId.value = ''
+  editingImageGenEndpointId.value = ''
+  isImageGenDialogMode.value = false
 }
 
 const handleEndpointSubmit = (endpointData: any) => {
+  if (isImageGenDialogMode.value) {
+    const codexFormRef = codexForm as any
+    let options = codexFormRef.imageGenerationEndpointOptions || []
+    if (editingImageGenEndpointId.value) {
+      const index = options.findIndex((opt: any) => opt.id === editingImageGenEndpointId.value)
+      if (index !== -1) {
+        options[index] = { ...options[index], ...endpointData }
+        codexFormRef.imageGenerationEndpointOptions = [...options]
+      }
+    } else {
+      const nextId = `imgen-endpoint-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      options = [...options, { id: nextId, ...endpointData }]
+      codexFormRef.imageGenerationEndpointOptions = options
+      codexFormRef.selectedImageGenerationEndpointId = nextId
+    }
+    closeEndpointDialog()
+    persistConfig(buildProxyConfig())
+    return
+  }
+
   const targetForm = activeForm.value
   if (editingEndpointId.value) {
     // Edit mode
@@ -1164,12 +1235,28 @@ const handleEndpointSubmit = (endpointData: any) => {
 }
 
 const handleDeleteEndpoint = (id: string) => {
+  if (isImageGenDialogMode.value) {
+    const codexFormRef = codexForm as any
+    let options = codexFormRef.imageGenerationEndpointOptions || []
+    const index = options.findIndex((opt: any) => opt.id === id)
+    if (index !== -1) {
+      options.splice(index, 1)
+      codexFormRef.imageGenerationEndpointOptions = [...options]
+      if (codexFormRef.selectedImageGenerationEndpointId === id) {
+        codexFormRef.selectedImageGenerationEndpointId = options.length > 0 ? options[0].id : ''
+      }
+      persistConfig(buildProxyConfig())
+    }
+    closeEndpointDialog()
+    return
+  }
+
   const targetForm = activeForm.value
   if (targetForm.endpointOptions.length <= 1) {
     alert(t('deleteLastEndpointError'))
     return
   }
-  
+
   const index = targetForm.endpointOptions.findIndex(opt => opt.id === id)
   if (index !== -1) {
     targetForm.endpointOptions.splice(index, 1)
@@ -1251,6 +1338,9 @@ const resetDefaults = () => {
     codexForm.apiKey = DEFAULT_CODEX_CLIENT_CONFIG.apiKey
     codexForm.converter = DEFAULT_CODEX_CLIENT_CONFIG.converter
     codexForm.proxyMode = 'single'
+    codexForm.imageGenerationEndpointOptions = cloneEndpointOptions(DEFAULT_CODEX_CLIENT_CONFIG.imageGenerationEndpointOptions || [])
+    codexForm.selectedImageGenerationEndpointId = DEFAULT_CODEX_CLIENT_CONFIG.selectedImageGenerationEndpointId || ''
+    codexForm.stripImageGenerationTool = DEFAULT_CODEX_CLIENT_CONFIG.stripImageGenerationTool || false
     syncEndpointFromSelection(codexForm)
     persistConfig(buildProxyConfig())
     return
@@ -1292,6 +1382,9 @@ const buildCodexConfig = (): CodexClientConfig => ({
   selectedEndpointId: codexForm.selectedEndpointId,
   converter: 'codex',
   proxyMode: 'single',
+  imageGenerationEndpointOptions: cloneEndpointOptions(codexForm.imageGenerationEndpointOptions || []),
+  selectedImageGenerationEndpointId: codexForm.selectedImageGenerationEndpointId || '',
+  stripImageGenerationTool: codexForm.stripImageGenerationTool,
 })
 
 const buildProxyConfig = (force = false): ProxyConfigV2 => ({

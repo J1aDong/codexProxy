@@ -185,7 +185,10 @@
       "Bash(printf '\\\\n---FILES---\\\\n')",
       "Bash(printf \"\\\\n---FILES---\\\\n\")",
       "Bash(printf '\\\\n---PATCH---\\\\n')",
-      "Skill(yat_commit)"
+      "Skill(yat_commit)",
+      "Bash(tmux send-keys *)",
+      "Bash(npm root *)",
+      "Bash(RUST_LOG=debug codex --version)"
     ]
   },
   "enableAllProjectMcpServers": true,
