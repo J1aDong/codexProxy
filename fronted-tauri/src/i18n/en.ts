@@ -88,6 +88,8 @@ export default {
 
     // Menu
     menuPromptSettings: 'Prompt Settings',
+    menuLightMode: 'Light Mode',
+    menuDarkMode: 'Dark Mode',
     menuAdvancedSettings: 'Advanced Settings',
     menuAbout: 'About',
     menuLogs: 'Logs',

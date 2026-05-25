@@ -88,6 +88,8 @@ export default {
 
     // Menu
     menuPromptSettings: '提示词设置',
+    menuLightMode: '浅色模式',
+    menuDarkMode: '深色模式',
     menuAdvancedSettings: '高级设置',
     menuAbout: '关于',
     menuLogs: '日志',
