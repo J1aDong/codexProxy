@@ -10,6 +10,10 @@ use std::time::SystemTime;
 const LOG_DIR: &str = "logs";
 /// 最多保留的日志文件数量（按修改时间排序）
 const LOG_MAX_FILES: usize = 3;
+/// 单个日志文件最大大小，达到后保留尾部内容
+const LOG_MAX_SIZE_BYTES: u64 = 500 * 1024 * 1024;
+/// 日志文件按大小截断时保留的尾部大小
+const LOG_TRUNCATE_KEEP_BYTES: u64 = 200 * 1024 * 1024;
 /// 单个日志文件最大请求交互数
 const LOG_MAX_REQUESTS: usize = 200;
 /// 运行时每隔多少个请求触发一次裁剪
@@ -106,11 +110,42 @@ impl AppLogger {
 
         for (idx, (path, _)) in log_entries.into_iter().enumerate() {
             if idx < keep_limit {
+                let _ = Self::truncate_file_by_size_if_needed(&path);
                 let _ = Self::trim_file_requests(&path, LOG_MAX_REQUESTS);
             } else {
                 let _ = fs::remove_file(path);
             }
         }
+    }
+
+    fn truncate_file_by_size_if_needed(path: &Path) -> std::io::Result<()> {
+        Self::truncate_file_to_tail_if_needed(path, LOG_MAX_SIZE_BYTES, LOG_TRUNCATE_KEEP_BYTES)
+    }
+
+    fn truncate_file_to_tail_if_needed(
+        path: &Path,
+        max_size: u64,
+        keep_size: u64,
+    ) -> std::io::Result<()> {
+        let file_size = match fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+
+        if file_size < max_size {
+            return Ok(());
+        }
+
+        let content = fs::read(path)?;
+        let keep_from = file_size.saturating_sub(keep_size) as usize;
+        let start = content
+            .get(keep_from..)
+            .and_then(|tail| tail.iter().position(|&byte| byte == b'\n'))
+            .map(|position| keep_from + position + 1)
+            .unwrap_or(keep_from);
+
+        fs::write(path, &content[start..])
     }
 
     fn trim_file_requests(path: &Path, max_requests: usize) -> std::io::Result<()> {
@@ -165,6 +200,7 @@ impl AppLogger {
 
     fn append_content(&self, content: &str) {
         self.with_write_lock(|| {
+            let _ = Self::truncate_file_by_size_if_needed(&self.log_path);
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -172,11 +208,13 @@ impl AppLogger {
             {
                 let _ = file.write_all(content.as_bytes());
             }
+            let _ = Self::truncate_file_by_size_if_needed(&self.log_path);
         });
     }
 
     fn append_request_with_conditional_trim(&self, content: &str) {
         self.with_write_lock(|| {
+            let _ = Self::truncate_file_by_size_if_needed(&self.log_path);
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -184,6 +222,7 @@ impl AppLogger {
             {
                 let _ = file.write_all(content.as_bytes());
             }
+            let _ = Self::truncate_file_by_size_if_needed(&self.log_path);
 
             let current = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
             if current % LOG_TRIM_INTERVAL_REQUESTS == 0 {
@@ -427,13 +466,38 @@ mod tests {
     }
 
     #[test]
+    fn size_truncate_keeps_small_files_unchanged() {
+        let dir = unique_temp_log_dir("small");
+        let path = dir.join("proxy_small.log");
+        let content = "first\nsecond\n";
+        fs::write(&path, content).expect("write log file");
+
+        AppLogger::truncate_file_to_tail_if_needed(&path, 1024, 512).expect("truncate small file");
+
+        assert_eq!(fs::read_to_string(&path).expect("read log file"), content);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn size_truncate_keeps_tail_on_line_boundary() {
+        let dir = unique_temp_log_dir("tail");
+        let path = dir.join("proxy_tail.log");
+        fs::write(&path, "old-one\nold-two\nkeep-one\nkeep-two\n").expect("write log file");
+
+        AppLogger::truncate_file_to_tail_if_needed(&path, 1, 24).expect("truncate log file");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read truncated log file"),
+            "keep-one\nkeep-two\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cleanup_reserves_one_slot_for_new_log_on_startup() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("codex_proxy_logs_{}", unique));
-        fs::create_dir_all(&dir).expect("create temp log dir");
+        let dir = unique_temp_log_dir("cleanup");
 
         for idx in 0..3 {
             let path = dir.join(format!("proxy_test_{}.log", idx));
@@ -457,5 +521,15 @@ mod tests {
         assert_eq!(retained_logs, LOG_MAX_FILES - 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn unique_temp_log_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codex_proxy_logs_{}_{}", prefix, unique));
+        fs::create_dir_all(&dir).expect("create temp log dir");
+        dir
     }
 }

@@ -1,4 +1,17 @@
 {
   "version": 1,
-  "bugs": []
+  "bugs": [
+    {
+      "id": "bug-001",
+      "timestamp": "2026-06-03T08:55:38+08:00",
+      "error_message": "codexProxy logs under /Users/mr.j/.codexProxy/logs can grow without a size cap",
+      "file": "main/src/logger.rs",
+      "root_cause": "AppLogger only limited log file count and request blocks; active log files were not capped by byte size.",
+      "fix": "Added size-based tail truncation at 500MB, preserving the latest 200MB on line boundaries during writes and startup cleanup.",
+      "tags": ["logging", "rotation", "storage"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-06-03T08:55:38+08:00"
+    }
+  ]
 }

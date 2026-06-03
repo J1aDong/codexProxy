@@ -12,6 +12,7 @@
 
 - **Project:** codexProxy
 - **Description:** Codex Proxy 是一个本地网关：以 **Anthropic Messages** 作为统一入口，兼容 **Claude Code** 使用习惯，并将请求稳定路由到 **Codex / Gemini / Anthropic（透传）** 等上游。
+- 日志目录 `~/.codexProxy/logs` 由 `main/src/logger.rs::AppLogger` 管理；单个 `proxy_*.log` 采用 500MB 触发、保留尾部 200MB 的字节级截断，另保留原有最多 3 个日志文件和 200 个请求块裁剪。
 
 ## Do-Not-Repeat
 
@@ -21,3 +22,4 @@
 ## Decision Log
 
 <!-- Significant technical decisions with rationale. Why X was chosen over Y. -->
+- 2026-06-03: codexProxy 日志大小治理对齐 codebuddy2api 的详情日志策略：不改日志目录/文件名/API，只在 AppLogger 写入前后及启动清理时做 500MB -> 200MB 尾部截断，避免单个日志无限增长。
