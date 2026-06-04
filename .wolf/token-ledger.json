@@ -5,7 +5,7 @@
     "total_tokens_estimated": 0,
     "total_reads": 0,
     "total_writes": 0,
-    "total_sessions": 0,
+    "total_sessions": 1,
     "anatomy_hits": 0,
     "anatomy_misses": 0,
     "repeated_reads_blocked": 0,
