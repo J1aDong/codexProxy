@@ -12,6 +12,18 @@
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-06-03T08:55:38+08:00"
+    },
+    {
+      "id": "bug-002",
+      "timestamp": "2026-06-04T14:35:04+08:00",
+      "error_message": "当前并发请求很卡，后面的请求很久才能回复",
+      "file": "main/src/server.rs",
+      "root_cause": "Global max_concurrency permits are held across the full streaming response; debug logging also uses a synchronous global file mutex and some diagnostics are written directly and again through the Tauri log forwarding task. Load-balancer endpoint permits constrain upstream acquisition/first-response concurrency rather than the full SSE body.",
+      "fix": "Changed the server connection builder to hyper-util auto (HTTP/1 + HTTP/2), released the global request-admission permit before spawning long-lived SSE streaming, removed duplicate file writes from the Tauri log forwarding task, and made AppLogger file writes non-blocking on logger lock contention.",
+      "tags": ["performance", "concurrency", "streaming", "logging", "load-balancer"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-06-04T14:35:04+08:00"
     }
   ]
 }

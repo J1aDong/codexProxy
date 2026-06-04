@@ -2234,22 +2234,13 @@ async fn start_proxy_with_manager(
     // 启动日志转发（Lagged 时跳过丢失的消息继续接收，不退出）
     let app_clone = app.clone();
     tokio::spawn(async move {
-        // 获取日志记录器实例
-        let logger = codex_proxy_core::logger::AppLogger::get();
         loop {
             match log_rx.recv().await {
                 Ok(msg) => {
-                    // 同时写入日志文件和发送到前端
-                    if let Some(logger) = &logger {
-                        logger.log(&msg);
-                    }
                     let _ = app_clone.emit("proxy-log", msg);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     let lag_msg = format!("[Warning] Log receiver lagged, skipped {} messages", n);
-                    if let Some(logger) = &logger {
-                        logger.log(&lag_msg);
-                    }
                     let _ = app_clone.emit("proxy-log", lag_msg);
                 }
                 Err(broadcast::error::RecvError::Closed) => break,

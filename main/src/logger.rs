@@ -193,7 +193,7 @@ impl AppLogger {
     where
         F: FnOnce(),
     {
-        if let Ok(_guard) = self.write_lock.lock() {
+        if let Ok(_guard) = self.write_lock.try_lock() {
             f();
         }
     }

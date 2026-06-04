@@ -20,10 +20,10 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::Frame;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use serde_json::{json, Map, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2616,20 +2616,6 @@ impl ConnErrorClass {
     }
 }
 
-fn collect_error_source_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut current = err.source();
-    while let Some(source) = current {
-        parts.push(source.to_string());
-        current = source.source();
-    }
-    if parts.is_empty() {
-        "-".to_string()
-    } else {
-        parts.join(" <- ")
-    }
-}
-
 fn classify_connection_error(display: &str, debug: &str, source_chain: &str) -> ConnErrorClass {
     let haystack = format!(
         "{}\n{}\n{}",
@@ -2655,18 +2641,17 @@ fn classify_connection_error(display: &str, debug: &str, source_chain: &str) -> 
     }
 }
 
-fn emit_connection_error_diag(
+fn emit_connection_error_diag_parts(
     log_tx: &broadcast::Sender<String>,
     logger: &Arc<AppLogger>,
     conn_id: &str,
     peer_addr: &SocketAddr,
     local_port: u16,
-    err: &(dyn std::error::Error + 'static),
+    display: &str,
+    debug: &str,
+    source_chain: &str,
 ) {
-    let display = err.to_string();
-    let debug = format!("{err:?}");
-    let source_chain = collect_error_source_chain(err);
-    let class = classify_connection_error(&display, &debug, &source_chain);
+    let class = classify_connection_error(display, debug, source_chain);
     let payload = json!({
         "conn_id": conn_id,
         "peer_addr": peer_addr.to_string(),
@@ -5730,22 +5715,27 @@ impl ProxyServer {
                                         )
                                     });
 
-                                    if let Err(e) = http1::Builder::new()
+                                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
                                         .serve_connection(io, service)
                                         .await
                                     {
-                                        emit_connection_error_diag(
+                                        let display = e.to_string();
+                                        let debug = format!("{e:?}");
+                                        let source_chain = "-".to_string();
+                                        emit_connection_error_diag_parts(
                                             &log_tx,
                                             &logger_for_conn,
                                             &conn_id,
                                             &peer_addr,
                                             listen_port,
-                                            &e,
+                                            &display,
+                                            &debug,
+                                            &source_chain,
                                         );
                                         let class = classify_connection_error(
-                                            &e.to_string(),
-                                            &format!("{e:?}"),
-                                            &collect_error_source_chain(&e),
+                                            &display,
+                                            &debug,
+                                            &source_chain,
                                         );
                                         if matches!(class, ConnErrorClass::ProtocolOrNetwork) {
                                             eprintln!(
@@ -7902,7 +7892,7 @@ async fn handle_request(
     let logger_for_stream = logger.clone();
     let stream_opts_for_task = stream_opts;
     let request_started_at_for_stream = request_started_at;
-    let permit_for_stream = permit;
+    drop(permit);
     let request_backend_for_stream = request_backend.clone();
     let model_for_stream = model.clone();
     let upstream_url_for_stream = resolved_target_url_for_stream.clone();
@@ -7924,7 +7914,6 @@ async fn handle_request(
     let response_transform_request_ctx_for_stream = response_transform_request_ctx.clone();
     let downstream_path_for_stream = normalized_path.to_string();
     tokio::spawn(async move {
-        let _permit_guard = permit_for_stream;
         let mut stream = response.bytes_stream();
         let mut transformer = request_backend_for_stream
             .create_response_transformer(&model_for_stream, allow_visible_thinking_for_request);
