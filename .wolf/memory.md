@@ -12,3 +12,12 @@
 | 14:35 | diagnosed concurrent request latency bottlenecks | main/src/server.rs, main/src/logger.rs, main/src/load_balancer/mod.rs | found stream-held global semaphore and synchronous duplicate log writes; LB permits constrain upstream acquisition/first-response phase | ~18k |
 | 14:48 | optimized concurrent streaming and logging hot paths | main/src/server.rs, main/src/logger.rs, fronted-tauri/src-tauri/src/proxy.rs | tests passed; stream no longer holds global maxConcurrency permit and log forwarding no longer double-writes | ~8k |
 | 14:50 | ran frontend build regression | fronted-tauri | vue-tsc and vite build passed | ~1k |
+
+## Session: 2026-06-17 10:48
+
+| Time | Action | File(s) | Outcome | ~Tokens |
+|------|--------|---------|---------|--------|
+| 10:49 | Edited .github/workflows/release.yml | 3→3 lines | ~27 |
+| 10:49 | Session end: 1 writes across 1 files (release.yml) | 1 reads | ~1947 tok |
+| 10:50 | Session end: 1 writes across 1 files (release.yml) | 2 reads | ~2180 tok |
+| 10:52 | Session end: 1 writes across 1 files (release.yml) | 2 reads | ~2180 tok |

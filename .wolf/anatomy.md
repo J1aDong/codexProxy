@@ -1,6 +1,6 @@
 # anatomy.md
 
-> Auto-maintained by OpenWolf. Last scanned: 2026-06-02T11:21:58.416Z
+> Auto-maintained by OpenWolf. Last scanned: 2026-06-17T02:49:19.215Z
 > Files: 241 tracked | Anatomy hits: 0 | Misses: 0
 
 ## ./
@@ -166,7 +166,7 @@
 
 ## .github/workflows/
 
-- `release.yml` — CI: Build and Release (~1920 tok)
+- `release.yml` — CI: Build and Release (~1923 tok)
 
 ## .iflow/commands/
 
