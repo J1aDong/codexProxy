@@ -16,7 +16,7 @@ jobs:
       manual-notes: ${{ steps.manual-notes.outputs.notes }}
     steps:
       - name: Checkout repository with full history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -118,16 +118,24 @@ jobs:
 
     strategy:
       matrix:
-        os: [macos-latest, macos-13, windows-latest, ubuntu-22.04]
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+          - os: windows-latest
 
     steps:
       - name: Check out git repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
+          cache: npm
+          cache-dependency-path: fronted-tauri/package-lock.json
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -154,7 +162,7 @@ jobs:
 
       - name: Install Dependencies
         working-directory: fronted-tauri
-        run: npm install
+        run: npm ci
 
       - name: Build release body
         id: release-body
@@ -184,8 +192,8 @@ jobs:
           echo "$BODY" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Build and Release Tauri App (macOS/Windows)
-        if: matrix.os != 'ubuntu-22.04'
+      - name: Build and Release Tauri App (macOS)
+        if: runner.os == 'macOS'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -194,6 +202,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Codex Proxy ${{ github.ref_name }}"
           releaseBody: ${{ steps.release-body.outputs.body }}
+          args: --bundles dmg --target ${{ matrix.target }}
 
       - name: Build and Release Tauri App (Linux)
         if: matrix.os == 'ubuntu-22.04'
@@ -206,3 +215,14 @@ jobs:
           releaseName: "Codex Proxy ${{ github.ref_name }}"
           releaseBody: ${{ steps.release-body.outputs.body }}
           args: --bundles appimage,deb,rpm
+
+      - name: Build and Release Tauri App (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: fronted-tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "Codex Proxy ${{ github.ref_name }}"
+          releaseBody: ${{ steps.release-body.outputs.body }}
