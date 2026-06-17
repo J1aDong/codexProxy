@@ -2,14 +2,14 @@
   "version": 1,
   "created_at": "2026-06-02T11:21:58.320Z",
   "lifetime": {
-    "total_tokens_estimated": 6307,
-    "total_reads": 5,
-    "total_writes": 3,
+    "total_tokens_estimated": 17154,
+    "total_reads": 13,
+    "total_writes": 8,
     "total_sessions": 2,
-    "anatomy_hits": 5,
+    "anatomy_hits": 13,
     "anatomy_misses": 0,
-    "repeated_reads_blocked": 0,
-    "estimated_savings_vs_bare_cli": 1000
+    "repeated_reads_blocked": 4,
+    "estimated_savings_vs_bare_cli": 10292
   },
   "sessions": [
     {
@@ -105,6 +105,147 @@
         "reads_count": 2,
         "writes_count": 1,
         "repeated_reads_blocked": 0,
+        "anatomy_lookups": 2
+      }
+    },
+    {
+      "id": "session-2026-06-17-1048",
+      "started": "2026-06-17T02:48:21.449Z",
+      "ended": "2026-06-17T02:58:32.542Z",
+      "reads": [
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 1920,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/fronted-tauri/src-tauri/tauri.conf.json",
+          "tokens_estimated": 233,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 27,
+          "action": "edit"
+        }
+      ],
+      "totals": {
+        "input_tokens_estimated": 2153,
+        "output_tokens_estimated": 27,
+        "reads_count": 2,
+        "writes_count": 1,
+        "repeated_reads_blocked": 0,
+        "anatomy_lookups": 2
+      }
+    },
+    {
+      "id": "session-2026-06-17-1048",
+      "started": "2026-06-17T02:48:21.449Z",
+      "ended": "2026-06-17T03:06:23.646Z",
+      "reads": [
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 1920,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/fronted-tauri/src-tauri/tauri.conf.json",
+          "tokens_estimated": 233,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 27,
+          "action": "edit"
+        }
+      ],
+      "totals": {
+        "input_tokens_estimated": 2153,
+        "output_tokens_estimated": 27,
+        "reads_count": 2,
+        "writes_count": 1,
+        "repeated_reads_blocked": 0,
+        "anatomy_lookups": 2
+      }
+    },
+    {
+      "id": "session-2026-06-17-1048",
+      "started": "2026-06-17T02:48:21.449Z",
+      "ended": "2026-06-17T03:11:53.447Z",
+      "reads": [
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 1923,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/fronted-tauri/src-tauri/tauri.conf.json",
+          "tokens_estimated": 233,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 27,
+          "action": "edit"
+        }
+      ],
+      "totals": {
+        "input_tokens_estimated": 2156,
+        "output_tokens_estimated": 27,
+        "reads_count": 2,
+        "writes_count": 1,
+        "repeated_reads_blocked": 2,
+        "anatomy_lookups": 2
+      }
+    },
+    {
+      "id": "session-2026-06-17-1048",
+      "started": "2026-06-17T02:48:21.449Z",
+      "ended": "2026-06-17T03:32:40.596Z",
+      "reads": [
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 1923,
+          "was_repeated": true,
+          "anatomy_had_description": false
+        },
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/fronted-tauri/src-tauri/tauri.conf.json",
+          "tokens_estimated": 233,
+          "was_repeated": false,
+          "anatomy_had_description": false
+        }
+      ],
+      "writes": [
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 27,
+          "action": "edit"
+        },
+        {
+          "file": "/Volumes/zhitai/code/ai/MyProjects/codexProxy/.github/workflows/release.yml",
+          "tokens_estimated": 2121,
+          "action": "create"
+        }
+      ],
+      "totals": {
+        "input_tokens_estimated": 2156,
+        "output_tokens_estimated": 2148,
+        "reads_count": 2,
+        "writes_count": 2,
+        "repeated_reads_blocked": 2,
         "anatomy_lookups": 2
       }
     }

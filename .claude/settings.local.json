@@ -188,7 +188,8 @@
       "Skill(yat_commit)",
       "Bash(tmux send-keys *)",
       "Bash(npm root *)",
-      "Bash(RUST_LOG=debug codex --version)"
+      "Bash(RUST_LOG=debug codex --version)",
+      "Skill(open-websearch)"
     ]
   },
   "enableAllProjectMcpServers": true,
