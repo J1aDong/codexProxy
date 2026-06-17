@@ -40,6 +40,8 @@ fn main() {
             proxy::kill_port,
             proxy::export_config,
             proxy::import_config,
+            proxy::apply_claude_config,
+            proxy::apply_codex_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -8,7 +8,11 @@
       "file": "main/src/logger.rs",
       "root_cause": "AppLogger only limited log file count and request blocks; active log files were not capped by byte size.",
       "fix": "Added size-based tail truncation at 500MB, preserving the latest 200MB on line boundaries during writes and startup cleanup.",
-      "tags": ["logging", "rotation", "storage"],
+      "tags": [
+        "logging",
+        "rotation",
+        "storage"
+      ],
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-06-03T08:55:38+08:00"
@@ -20,10 +24,48 @@
       "file": "main/src/server.rs",
       "root_cause": "Global max_concurrency permits are held across the full streaming response; debug logging also uses a synchronous global file mutex and some diagnostics are written directly and again through the Tauri log forwarding task. Load-balancer endpoint permits constrain upstream acquisition/first-response concurrency rather than the full SSE body.",
       "fix": "Changed the server connection builder to hyper-util auto (HTTP/1 + HTTP/2), released the global request-admission permit before spawning long-lived SSE streaming, removed duplicate file writes from the Tauri log forwarding task, and made AppLogger file writes non-blocking on logger lock contention.",
-      "tags": ["performance", "concurrency", "streaming", "logging", "load-balancer"],
+      "tags": [
+        "performance",
+        "concurrency",
+        "streaming",
+        "logging",
+        "load-balancer"
+      ],
       "related_bugs": [],
       "occurrences": 1,
       "last_seen": "2026-06-04T14:35:04+08:00"
+    },
+    {
+      "id": "bug-003",
+      "timestamp": "2026-06-17T14:17:14.713Z",
+      "error_message": "CSS fix: dark",
+      "file": "fronted-tauri/src/components/features/GuideSection.vue",
+      "root_cause": "dark: text-dark-text-primary mb-4 leading-relaxed\"> → bg-gray-700 px-1.5 py-0.5 rounded text-xs font-mono\">~/.codex/config.toml</code>",
+      "fix": "Changed dark: text-dark-text-primary mb-4 leading-relaxed\"> → bg-gray-700 px-1.5 py-0.5 rounded text-xs font-mono\">~/.codex/config.toml</code>",
+      "tags": [
+        "auto-detected",
+        "style-fix",
+        "vue"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-06-17T14:17:14.713Z"
+    },
+    {
+      "id": "bug-004",
+      "timestamp": "2026-06-17T14:17:43.392Z",
+      "error_message": "Wrong return value",
+      "file": "fronted-tauri/src/components/features/GuideSection.vue",
+      "root_cause": "Was returning: `http://localhost:${props.port}/codex/v1`",
+      "fix": "Now returns: `model_provider = \"codex-proxy\"",
+      "tags": [
+        "auto-detected",
+        "return-value",
+        "vue"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-06-17T14:17:43.392Z"
     }
   ]
 }

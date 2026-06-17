@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "codex-proxy-desktop"
-version = "0.3.3"
+version = "0.3.7"
 dependencies = [
  "codex-proxy-core",
  "dirs 5.0.1",
@@ -393,6 +393,7 @@ dependencies = [
  "tauri-plugin-http",
  "tauri-plugin-shell",
  "tokio",
+ "toml 0.8.2",
 ]
 
 [[package]]

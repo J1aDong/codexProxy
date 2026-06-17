@@ -80,6 +80,10 @@ export default {
     guideTokenHint: '替换为真实的key或者假如在proxy页面中配置了则任意字符串',
     copy: '复制',
     copied: '已复制',
+    applyConfig: '一键写入配置',
+    applyingConfig: '写入中...',
+    applyConfigSuccess: '已写入 {path}',
+    applyConfigFailed: '写入失败: {error}',
 
     // Logs
     logsTitle: '系统日志',

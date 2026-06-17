@@ -1,7 +1,7 @@
 # anatomy.md
 
-> Auto-maintained by OpenWolf. Last scanned: 2026-06-17T03:15:35.350Z
-> Files: 241 tracked | Anatomy hits: 0 | Misses: 0
+> Auto-maintained by OpenWolf. Last scanned: 2026-06-17T14:17:43.377Z
+> Files: 242 tracked | Anatomy hits: 0 | Misses: 0
 
 ## ./
 
@@ -38,6 +38,10 @@
 - `archive.md` — Archive Complete (~1254 tok)
 - `explore.md` — The Stance (~1544 tok)
 - `propose.md` (~1104 tok)
+
+## .claude/plans/
+
+- `auto-write-config-plan.md` — 配置指南：从"复制粘贴"改为"一键写入文件" (~818 tok)
 
 ## .claude/rules/
 
@@ -228,7 +232,7 @@
 
 - `.DS_Store` (~1639 tok)
 - `build.rs` (~12 tok)
-- `Cargo.toml` — Rust package manifest (~300 tok)
+- `Cargo.toml` — Rust package manifest (~284 tok)
 - `task_plan.md` — Task Plan: Vue AI学习助手实施计划 (~171 tok)
 - `tauri.conf.json` (~233 tok)
 
@@ -262,8 +266,8 @@
 
 ## fronted-tauri/src-tauri/src/
 
-- `main.rs` — Struct: AppState (~353 tok)
-- `proxy.rs` — ReasoningEffortConfig: to_mapping, to_gemini_mapping (~24902 tok)
+- `main.rs` — Struct: AppState (~350 tok)
+- `proxy.rs` — ReasoningEffortConfig: to_mapping, to_gemini_mapping (~24266 tok)
 
 ## fronted-tauri/src/
 
@@ -274,7 +278,7 @@
 
 ## fronted-tauri/src/bridge/
 
-- `configBridge.ts` — Exports loadConfig, saveConfig, startProxy, applyProxyConfig + 6 more (~370 tok)
+- `configBridge.ts` — Exports loadConfig, saveConfig, startProxy, applyProxyConfig + 8 more (~447 tok)
 
 ## fronted-tauri/src/components/base/
 
@@ -289,7 +293,7 @@
 - `ConfigCard.vue` — Vue component (~15459 tok)
 - `DialogTestPage.vue` — Vue: TS (~850 tok)
 - `EndpointDialog.vue` — Vue: TS, emits (~1135 tok)
-- `GuideSection.vue` — Vue: TS (~624 tok)
+- `GuideSection.vue` — Vue component (~1081 tok)
 - `Header.vue` — Vue: TS, emits (~2774 tok)
 - `ImportExportDialog.vue` — Vue: JSON, TS, emits (~1758 tok)
 - `LogsPanel.vue` — Vue: TS, emits (~1963 tok)
@@ -298,9 +302,9 @@
 
 ## fronted-tauri/src/i18n/
 
-- `en.ts` (~2557 tok)
+- `en.ts` (~2603 tok)
 - `index.ts` — Declares i18n (~64 tok)
-- `zh.ts` (~1801 tok)
+- `zh.ts` (~1840 tok)
 
 ## fronted-tauri/src/types/
 

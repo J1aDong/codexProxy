@@ -80,6 +80,10 @@ export default {
     guideTokenHint: 'Replace with real key (or any string if configured in proxy page)',
     copy: 'Copy',
     copied: 'Copied',
+    applyConfig: 'Apply Config',
+    applyingConfig: 'Writing...',
+    applyConfigSuccess: 'Written to {path}',
+    applyConfigFailed: 'Write failed: {error}',
 
     // Logs
     logsTitle: 'System Logs',

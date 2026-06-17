@@ -2408,6 +2408,131 @@ pub fn import_config(config_json: String) -> Result<(), String> {
     fs::write(&path, content).map_err(|e| format!("写入配置文件失败: {}", e))
 }
 
+/// 获取 Claude Code 配置文件路径：~/.claude/settings.json
+fn get_claude_settings_path() -> Result<std::path::PathBuf, String> {
+    dirs::home_dir()
+        .map(|p| p.join(".claude").join("settings.json"))
+        .ok_or_else(|| "无法定位用户主目录".to_string())
+}
+
+/// 获取 Codex CLI 配置文件路径：~/.codex/config.toml
+fn get_codex_config_path() -> Result<std::path::PathBuf, String> {
+    dirs::home_dir()
+        .map(|p| p.join(".codex").join("config.toml"))
+        .ok_or_else(|| "无法定位用户主目录".to_string())
+}
+
+/// 一键写入 Claude Code 配置（merge，不覆盖用户已有的其他字段）
+#[tauri::command]
+pub fn apply_claude_config(port: u16, auth_token: String) -> Result<String, String> {
+    let path = get_claude_settings_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+    }
+
+    // 读取现有配置（不存在则空对象）
+    let mut root: serde_json::Value = if path.exists() {
+        let content = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {}", e))?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // 确保是对象
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let obj = root.as_object_mut().ok_or_else(|| "配置根不是对象".to_string())?;
+
+    // 合并 env 字段
+    let env_entry = obj
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !env_entry.is_object() {
+        *env_entry = serde_json::json!({});
+    }
+    let env_obj = env_entry
+        .as_object_mut()
+        .ok_or_else(|| "env 字段不是对象".to_string())?;
+    env_obj.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        serde_json::json!(format!("http://localhost:{}", port)),
+    );
+    env_obj.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        serde_json::json!(auth_token),
+    );
+
+    // forceLoginMethod
+    obj.insert(
+        "forceLoginMethod".to_string(),
+        serde_json::json!("claudeai"),
+    );
+
+    let content =
+        serde_json::to_string_pretty(&root).map_err(|e| format!("序列化配置失败: {}", e))?;
+    fs::write(&path, content).map_err(|e| format!("写入配置文件失败: {}", e))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 一键写入 Codex CLI 配置（merge，不覆盖用户已有的其他字段）
+#[tauri::command]
+pub fn apply_codex_config(port: u16) -> Result<String, String> {
+    let path = get_codex_config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+    }
+
+    // 读取现有 TOML（不存在则空表）
+    let mut doc: toml::Table = if path.exists() {
+        let content = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {}", e))?;
+        toml::from_str(&content).unwrap_or_default()
+    } else {
+        toml::Table::new()
+    };
+
+    // model_provider = "codex-proxy"
+    doc.insert(
+        "model_provider".to_string(),
+        toml::Value::String("codex-proxy".to_string()),
+    );
+
+    // [model_providers.codex-proxy]
+    let provider_name = "codex-proxy".to_string();
+    let mut provider_table = toml::Table::new();
+    provider_table.insert(
+        "name".to_string(),
+        toml::Value::String("Codex Proxy".to_string()),
+    );
+    provider_table.insert(
+        "base_url".to_string(),
+        toml::Value::String(format!("http://localhost:{}/codex/v1", port)),
+    );
+    provider_table.insert(
+        "env_key".to_string(),
+        toml::Value::String("OPENAI_API_KEY".to_string()),
+    );
+    provider_table.insert(
+        "wire_api".to_string(),
+        toml::Value::String("responses".to_string()),
+    );
+
+    // 合并到 model_providers 表（保留已有的其他 provider）
+    let model_providers_entry = doc
+        .entry("model_providers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !model_providers_entry.is_table() {
+        *model_providers_entry = toml::Value::Table(toml::Table::new());
+    }
+    if let Some(providers) = model_providers_entry.as_table_mut() {
+        providers.insert(provider_name, toml::Value::Table(provider_table));
+    }
+
+    let content = toml::to_string_pretty(&doc).map_err(|e| format!("序列化配置失败: {}", e))?;
+    fs::write(&path, content).map_err(|e| format!("写入配置文件失败: {}", e))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

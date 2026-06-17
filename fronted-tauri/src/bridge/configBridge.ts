@@ -34,3 +34,9 @@ export const exportConfig = (): Promise<string> =>
 
 export const importConfig = (configJson: string): Promise<void> =>
     invoke('import_config', { configJson })
+
+export const applyClaudeConfig = (port: number, authToken: string): Promise<string> =>
+    invoke<string>('apply_claude_config', { port, authToken })
+
+export const applyCodexConfig = (port: number): Promise<string> =>
+    invoke<string>('apply_codex_config', { port })
