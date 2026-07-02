@@ -670,7 +670,7 @@ fn default_enable_skill_routing_hint() -> bool {
 }
 
 fn default_enable_stateful_responses_chain() -> bool {
-    true
+    false
 }
 
 fn default_gemini_model_preset() -> Vec<String> {

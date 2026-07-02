@@ -5283,7 +5283,7 @@ impl ProxyServer {
             prefer_codex_v1_path: true,
             enable_codex_tool_schema_compaction: true,
             enable_skill_routing_hint: false,
-            enable_stateful_responses_chain: true,
+            enable_stateful_responses_chain: false,
             load_balancer_runtime: None,
             codex_route_config: None,
         }
@@ -9283,7 +9283,7 @@ mod tests {
             prefer_codex_v1_path: true,
             enable_codex_tool_schema_compaction: true,
             enable_skill_routing_hint: false,
-            enable_stateful_responses_chain: true,
+            enable_stateful_responses_chain: false,
             load_balancer_runtime: None,
         });
 
