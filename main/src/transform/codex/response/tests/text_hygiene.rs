@@ -396,3 +396,42 @@ fn test_unparsable_leaked_tool_prefix_is_suppressed_from_visible_text() {
         "suppressed unparsable leaked marker should stay hidden from client text"
     );
 }
+
+#[test]
+fn diagnostics_summary_exposes_channel_structure() {
+    // D5: 诊断摘要应暴露分通道结构（channels），同时保留旧 counters 兼容
+    let mut transformer = TransformResponse::new("gpt-5.3-codex");
+    let line = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "<proposed_plan>\nplan body\n</proposed_plan>"
+        })
+    );
+    transformer.transform_sse_line(&line);
+    let summary = <TransformResponse as crate::transform::ResponseTransformer>::take_diagnostics_summary(
+        &mut transformer,
+    )
+    .expect("diagnostics summary should exist");
+
+    // 旧 counters 路径仍可用（兼容）
+    assert_eq!(
+        summary
+            .pointer("/counters/detected_proposed_plan_blocks")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+    );
+    // 新 channels 分通道结构
+    assert_eq!(
+        summary
+            .pointer("/channels/plan_bridge/detected_proposed_plan_blocks")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "channels.plan_bridge should mirror plan_bridge counters"
+    );
+    // channels 应包含各治理通道
+    assert!(summary.pointer("/channels/leak").is_some());
+    assert!(summary.pointer("/channels/tool_binding").is_some());
+    assert!(summary.pointer("/channels/text").is_some());
+    assert!(summary.pointer("/channels/lifecycle").is_some());
+}

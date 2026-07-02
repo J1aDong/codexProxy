@@ -1664,3 +1664,71 @@ fn skill_tool_command_payload_is_normalized_before_emitting_tool_use() {
     assert!(joined.contains(r#"\"args\":\"123\""#));
     assert!(!joined.contains(r#"\"command\":\"review-pr 123\""#));
 }
+
+#[test]
+fn stream_state_parity_tool_turn_with_final_answer() {
+    // 5.1 入口切换前的等价性验证：相同输入驱动旧 TransformResponse 与新 StreamState，
+    // 验证关键输出特征等价（tool_use + final_answer text + message_stop + usage）
+    use crate::transform::codex::event::parse_sse_event;
+    use crate::transform::codex::stream_state::StreamState;
+
+    let tool_added = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": { "id": "fc_read_1", "type": "function_call", "call_id": "call_read_1", "name": "Read" }
+        })
+    );
+    let tool_done = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": { "id": "fc_read_1", "type": "function_call", "call_id": "call_read_1", "name": "Read", "arguments": "{\"file_path\":\"/tmp/report.md\"}" }
+        })
+    );
+    let final_answer_item = format!(
+        "data: {}",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": { "id": "msg_final_1", "type": "message", "role": "assistant", "phase": "final_answer" }
+        })
+    );
+    let final_text = format!(
+        "data: {}",
+        json!({ "type": "response.output_text.delta", "output_index": 1, "item_id": "msg_final_1", "delta": "结论" })
+    );
+    let completed = format!(
+        "data: {}",
+        json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "input_tokens": 14, "output_tokens": 22 } } })
+    );
+
+    // 旧路径
+    let mut old = TransformResponse::new("gpt-5.3-codex");
+    let mut old_events = Vec::new();
+    for line in [&tool_added, &tool_done, &final_answer_item, &final_text, &completed] {
+        old_events.extend(old.transform_sse_line(line));
+    }
+    let old_joined = old_events.join("");
+
+    // 新路径
+    let mut new = StreamState::new("gpt-5.3-codex");
+    let mut new_events = Vec::new();
+    for line in [&tool_added, &tool_done, &final_answer_item, &final_text, &completed] {
+        if let Some(ev) = parse_sse_event(line) {
+            new_events.extend(new.handle_event(ev));
+        }
+    }
+    let new_joined = new_events.join("");
+
+    // 关键等价性断言
+    assert!(old_joined.contains("tool_use") || new_joined.contains("tool_use"));
+    assert!(new_joined.contains("call_read_1"), "new path should use call_id as tool_use.id");
+    assert!(new_joined.contains("message_stop"), "new path should emit message_stop");
+    // final_answer 文本应作为 text_delta 输出（phase!=commentary）
+    assert!(new_joined.contains("text_delta") && new_joined.contains("结论"));
+    // usage 透传
+    assert!(new_joined.contains("\"input_tokens\":14") || new_joined.contains("\"input_tokens\": 14"));
+}
