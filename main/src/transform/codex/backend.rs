@@ -3,14 +3,15 @@ use std::collections::HashMap;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use super::response::TransformResponse;
+use super::stream_state_transformer::StreamStateBackedTransformer;
 use crate::logger::AppLogger;
 use crate::models::AnthropicRequest;
 use crate::transform::{
     providers::CodexAdapter, request_envelope_hints_from_anthropic, RequestEnvelopeHints,
     processor::{ExtractedSkillPayload, MessageProcessor},
     unified::{
-        sanitize_agent_worktree_history, UnifiedContent, UnifiedMessage, UnifiedMessageRole,
+        sanitize_agent_worktree_history, AgentWorktreeSanitizationStats, UnifiedContent,
+        UnifiedMessage, UnifiedMessageRole,
     },
     ResponseTransformer, TransformBackend, TransformContext, UnifiedChatRequest,
 };
@@ -23,18 +24,17 @@ pub(crate) fn build_codex_unified_request(
 ) -> (UnifiedChatRequest, RequestEnvelopeHints) {
     let mut unified = UnifiedChatRequest::from_anthropic(anthropic_body);
     let hints = request_envelope_hints_from_anthropic(anthropic_body);
-    let (_, extracted_skills) = MessageProcessor::transform_messages(&anthropic_body.messages, None);
-    let worktree_stats = sanitize_agent_worktree_history(&mut unified);
 
+    // 步骤 1：从历史消息中提取 skill 调用并清理 worktree 隔离痕迹
+    let (extracted_skills, worktree_stats) = apply_skill_and_worktree_sanitization(&mut unified, anthropic_body);
+
+    // 步骤 2：把提取出的 skill 输出回填到对应 tool_result，并剥离 skill 脚手架 user 消息
     let appended_skill_outputs = append_extracted_skill_outputs(&mut unified, &extracted_skills);
     let stripped_skill_scaffolding =
         strip_skill_scaffolding_user_messages(&mut unified, !extracted_skills.is_empty());
 
-    if hints.request_kind == crate::transform::ClaudeCodeRequestKind::ConversationTurn
-        && unified.has_system_text()
-    {
-        unified.append_system_texts(crate::prompts::codex_system_prompt_extensions());
-    }
+    // 步骤 3：会话轮次注入 Codex 专属 system prompt 扩展（仅当已有 system 文本时）
+    inject_codex_system_prompt_extensions(&mut unified, &hints);
 
     if let Some(logger) = AppLogger::get() {
         logger.log_raw(&format!(
@@ -48,6 +48,28 @@ pub(crate) fn build_codex_unified_request(
     }
 
     (unified, hints)
+}
+
+/// 步骤 1：提取 skill 调用 + 清理 agent worktree 隔离历史
+fn apply_skill_and_worktree_sanitization(
+    unified: &mut UnifiedChatRequest,
+    anthropic_body: &AnthropicRequest,
+) -> (Vec<ExtractedSkillPayload>, AgentWorktreeSanitizationStats) {
+    let (_, extracted_skills) = MessageProcessor::transform_messages(&anthropic_body.messages, None);
+    let worktree_stats = sanitize_agent_worktree_history(unified);
+    (extracted_skills, worktree_stats)
+}
+
+/// 步骤 3：会话轮次注入 Codex 专属 system prompt 扩展
+fn inject_codex_system_prompt_extensions(
+    unified: &mut UnifiedChatRequest,
+    hints: &RequestEnvelopeHints,
+) {
+    if hints.request_kind == crate::transform::ClaudeCodeRequestKind::ConversationTurn
+        && unified.has_system_text()
+    {
+        unified.append_system_texts(crate::prompts::codex_system_prompt_extensions());
+    }
 }
 
 fn append_extracted_skill_outputs(
@@ -418,9 +440,8 @@ impl TransformBackend for CodexBackend {
         model: &str,
         allow_visible_thinking: bool,
     ) -> Box<dyn ResponseTransformer> {
-        Box::new(TransformResponse::new_with_visible_thinking(
-            model,
-            allow_visible_thinking,
-        ))
+        // D6 入口切换：主路径改用 StreamStateBackedTransformer（基于新 StreamState）
+        // 旧 TransformResponse 保留为回退，可通过切回 TransformResponse::new_with_visible_thinking 恢复
+        Box::new(StreamStateBackedTransformer::new(model, allow_visible_thinking))
     }
 }

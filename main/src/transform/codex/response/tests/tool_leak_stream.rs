@@ -79,7 +79,7 @@ fn marker_prefixed_high_risk_tool_json_emits_confirmation_and_stays_blocked() {
 
 #[test]
 fn raw_tool_json_assessment_scores_readonly_highrisk_and_suppressed_shapes() {
-    let readonly = LeakDetector::assess_raw_tool_json(
+    let readonly = super::leak::assess_raw_tool_json(
         "{\"tool_uses\":[{\"recipient_name\":\"functions.Read\",\"parameters\":{\"file_path\":\"/tmp/a.txt\"}}]}",
     );
     assert_eq!(
@@ -92,7 +92,7 @@ fn raw_tool_json_assessment_scores_readonly_highrisk_and_suppressed_shapes() {
         "readonly recoverable payload should receive high confidence score"
     );
 
-    let high_risk = LeakDetector::assess_raw_tool_json(
+    let high_risk = super::leak::assess_raw_tool_json(
         "{\"file_path\":\"/tmp/a.ts\",\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":false}",
     );
     assert_eq!(
@@ -105,7 +105,7 @@ fn raw_tool_json_assessment_scores_readonly_highrisk_and_suppressed_shapes() {
         "high-risk payload should receive strong confidence score"
     );
 
-    let suppressed = LeakDetector::assess_raw_tool_json(
+    let suppressed = super::leak::assess_raw_tool_json(
         "{\"file_path\":\"/tmp/a.txt\",\"offset\":0,\"limit\":120}",
     );
     assert_eq!(

@@ -1,4 +1,7 @@
 use crate::logger::AppLogger;
+use crate::transform::codex::inspectors::leak::{
+    self, RawToolJsonAssessment, RawToolJsonRiskTier,
+};
 use crate::transform::{ResponseTransformRequestContext, ResponseTransformer};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -220,189 +223,6 @@ struct PendingToolArgumentUpdate {
     kind: PendingToolArgumentUpdateKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RawToolJsonRiskTier {
-    ReadonlyRecoverable,
-    HighRisk,
-    Suppressed,
-}
-
-impl RawToolJsonRiskTier {
-    fn as_str(self) -> &'static str {
-        match self {
-            RawToolJsonRiskTier::ReadonlyRecoverable => "readonly_recoverable",
-            RawToolJsonRiskTier::HighRisk => "high_risk",
-            RawToolJsonRiskTier::Suppressed => "suppressed",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RawToolJsonAssessment {
-    tier: RawToolJsonRiskTier,
-    score: u8,
-    reason: &'static str,
-}
-
-impl RawToolJsonAssessment {
-    const fn readonly_recoverable(score: u8, reason: &'static str) -> Self {
-        Self {
-            tier: RawToolJsonRiskTier::ReadonlyRecoverable,
-            score,
-            reason,
-        }
-    }
-
-    const fn high_risk(score: u8, reason: &'static str) -> Self {
-        Self {
-            tier: RawToolJsonRiskTier::HighRisk,
-            score,
-            reason,
-        }
-    }
-
-    const fn suppressed(score: u8, reason: &'static str) -> Self {
-        Self {
-            tier: RawToolJsonRiskTier::Suppressed,
-            score,
-            reason,
-        }
-    }
-
-    fn is_high_risk(self) -> bool {
-        matches!(self.tier, RawToolJsonRiskTier::HighRisk)
-    }
-}
-
-/// Facade for leak-detection helpers so leak handling can be hardened independently
-/// from the core stream state machine.
-struct LeakDetector;
-
-impl LeakDetector {
-    fn starts_with_leaked_tool_marker(line: &str) -> bool {
-        TransformResponse::starts_with_leaked_tool_marker(line)
-    }
-
-    fn find_markdown_bash_start(line: &str) -> Option<(usize, usize)> {
-        TransformResponse::find_markdown_bash_start(line)
-    }
-
-    fn find_potential_leaked_tool_marker_start(line: &str) -> Option<usize> {
-        TransformResponse::find_potential_leaked_tool_marker_start(line)
-    }
-
-    fn leaked_marker_suffix_len(line: &str) -> usize {
-        TransformResponse::leaked_marker_suffix_len(line)
-    }
-
-    fn strip_suspicious_trailing_noise(text: &str) -> String {
-        TransformResponse::strip_suspicious_trailing_noise(text)
-    }
-
-    fn strip_known_leak_suffix_noise(text: &str) -> String {
-        TransformResponse::strip_known_leak_suffix_noise(text)
-    }
-
-    fn sanitize_prefix_before_raw_tool_json(prefix: &str) -> String {
-        TransformResponse::sanitize_prefix_before_raw_tool_json(prefix)
-    }
-
-    fn collapse_adjacent_duplicate_markdown_bold(text: &str) -> String {
-        TransformResponse::collapse_adjacent_duplicate_markdown_bold(text)
-    }
-
-    fn find_potential_raw_tool_json_start(line: &str) -> Option<usize> {
-        TransformResponse::find_potential_raw_tool_json_start(line)
-    }
-
-    fn split_tool_json_prefix_suffix(fragment: &str) -> Option<(String, String, String)> {
-        TransformResponse::split_tool_json_prefix_suffix(fragment)
-    }
-
-    fn split_contextual_note_json_prefix_suffix(
-        fragment: &str,
-        context: &str,
-    ) -> Option<(String, String, String, bool)> {
-        TransformResponse::split_contextual_note_json_prefix_suffix(fragment, context)
-    }
-
-    fn assess_raw_tool_json(raw_json: &str) -> RawToolJsonAssessment {
-        let Ok(parsed) = serde_json::from_str::<Value>(raw_json) else {
-            return RawToolJsonAssessment::suppressed(20, "json_parse_failed");
-        };
-        let Some(obj) = parsed.as_object() else {
-            return RawToolJsonAssessment::suppressed(25, "json_not_object");
-        };
-
-        if let Some(tool_uses) = obj.get("tool_uses").and_then(|v| v.as_array()) {
-            if tool_uses.is_empty() {
-                return RawToolJsonAssessment::suppressed(55, "tool_uses_empty");
-            }
-
-            for tool in tool_uses {
-                let recipient = tool.get("recipient_name").and_then(|v| v.as_str());
-                let Some(recipient) = recipient else {
-                    return RawToolJsonAssessment::high_risk(98, "tool_uses_missing_recipient");
-                };
-                let Some(name) = TransformResponse::normalize_recipient_tool_name(recipient) else {
-                    return RawToolJsonAssessment::high_risk(98, "tool_uses_invalid_recipient");
-                };
-                if !tool
-                    .get("parameters")
-                    .map(|v| v.is_object())
-                    .unwrap_or(false)
-                {
-                    return RawToolJsonAssessment::high_risk(97, "tool_uses_invalid_parameters");
-                }
-                if !TransformResponse::is_readonly_tool_name(name) {
-                    return RawToolJsonAssessment::high_risk(95, "tool_uses_non_readonly");
-                }
-            }
-
-            return RawToolJsonAssessment::readonly_recoverable(93, "tool_uses_all_readonly");
-        }
-
-        let has_edit_shape = obj.contains_key("old_string")
-            && obj.contains_key("new_string")
-            && obj.contains_key("file_path");
-        if has_edit_shape {
-            return RawToolJsonAssessment::high_risk(90, "edit_payload_shape");
-        }
-
-        let has_write_shape = obj.contains_key("content") && obj.contains_key("file_path");
-        if has_write_shape {
-            return RawToolJsonAssessment::high_risk(88, "write_payload_shape");
-        }
-
-        let trimmed = raw_json.trim();
-        if TransformResponse::looks_like_exec_command_payload_fragment(trimmed) {
-            return RawToolJsonAssessment::high_risk(92, "exec_payload_shape");
-        }
-
-        if TransformResponse::looks_like_task_output_payload_fragment(trimmed) {
-            return RawToolJsonAssessment::suppressed(76, "task_output_control_shape");
-        }
-
-        if TransformResponse::looks_like_read_payload_fragment(trimmed) {
-            return RawToolJsonAssessment::suppressed(74, "read_window_shape");
-        }
-
-        let has_search_shape = obj.contains_key("pattern")
-            && (obj.contains_key("output_mode")
-                || obj.contains_key("path")
-                || obj.contains_key("glob"));
-        if has_search_shape {
-            return RawToolJsonAssessment::suppressed(73, "search_payload_shape");
-        }
-
-        let has_command_only = obj.contains_key("command") || obj.contains_key("cmd");
-        if has_command_only {
-            return RawToolJsonAssessment::suppressed(60, "command_without_exec_context");
-        }
-
-        RawToolJsonAssessment::suppressed(40, "generic_suspicious_json_shape")
-    }
-}
 
 /// 响应转换器 - Codex SSE -> Anthropic SSE
 pub struct TransformResponse {
@@ -475,7 +295,9 @@ pub struct TransformResponse {
     logger: std::sync::Arc<AppLogger>,
 }
 
+#[allow(dead_code)] // 已迁移到 inspectors::leak 的旧函数定义，任务组5删除旧代码时一并清理
 impl TransformResponse {
+    #![allow(dead_code)]
     const MAX_FUNCTION_ARGS_WHITESPACE_RUN: usize = 64;
     const LEAKED_TOOL_MARKERS: [&'static str; 3] =
         ["assistant to=", "to=functions", "to=multi_tool_use"];
@@ -726,7 +548,7 @@ impl TransformResponse {
             if ch != '{' {
                 continue;
             }
-            if Self::looks_like_potential_raw_tool_json_fragment(&line[idx..]) {
+            if leak::looks_like_potential_raw_tool_json_fragment(&line[idx..]) {
                 return Some(idx);
             }
         }
@@ -866,7 +688,7 @@ impl TransformResponse {
             break;
         }
 
-        Self::collapse_duplicate_bridge_overlap(&out)
+        leak::collapse_duplicate_bridge_overlap(&out)
     }
 
     fn collapse_duplicate_bridge_overlap(text: &str) -> String {
@@ -885,7 +707,7 @@ impl TransformResponse {
 
             let left = &current[..bridge_pos];
             let right = &current[bridge_pos + 4..];
-            let overlap = Self::longest_suffix_prefix_overlap(left, right);
+            let overlap = leak::longest_suffix_prefix_overlap(left, right);
             if overlap < 16 {
                 break;
             }
@@ -1060,15 +882,15 @@ impl TransformResponse {
     }
 
     fn sanitize_prefix_before_raw_tool_json(prefix: &str) -> String {
-        let cleaned = LeakDetector::strip_known_leak_suffix_noise(prefix);
-        let trimmed_meta = if let Some(cut_pos) = Self::find_internal_planning_leak_start(&cleaned)
+        let cleaned = leak::strip_known_leak_suffix_noise(prefix);
+        let trimmed_meta = if let Some(cut_pos) = leak::find_internal_planning_leak_start(&cleaned)
         {
             cleaned[..cut_pos].to_string()
         } else {
             cleaned
         };
 
-        Self::strip_trailing_json_hint_noise(&trimmed_meta)
+        leak::strip_trailing_json_hint_noise(&trimmed_meta)
     }
 
     fn strip_trailing_json_hint_noise(text: &str) -> String {
@@ -1222,8 +1044,8 @@ impl TransformResponse {
         let mut recovered_calls = Vec::with_capacity(tool_uses.len());
         for tool in tool_uses {
             let recipient = tool.get("recipient_name").and_then(|v| v.as_str())?;
-            let tool_name = Self::normalize_recipient_tool_name(recipient)?;
-            if !Self::is_readonly_tool_name(tool_name) {
+            let tool_name = leak::normalize_recipient_tool_name(recipient)?;
+            if !leak::is_readonly_tool_name(tool_name) {
                 return None;
             }
 
@@ -1305,23 +1127,23 @@ impl TransformResponse {
             return true;
         }
 
-        if Self::looks_like_task_output_payload_fragment(trimmed) {
+        if leak::looks_like_task_output_payload_fragment(trimmed) {
             return true;
         }
 
-        if Self::looks_like_read_payload_fragment(trimmed) {
+        if leak::looks_like_read_payload_fragment(trimmed) {
             return true;
         }
 
-        Self::looks_like_exec_command_payload_fragment(trimmed)
+        leak::looks_like_exec_command_payload_fragment(trimmed)
     }
 
     fn split_tool_json_prefix_suffix(fragment: &str) -> Option<(String, String, String)> {
-        let json_start = LeakDetector::find_potential_raw_tool_json_start(fragment)?;
+        let json_start = leak::find_potential_raw_tool_json_start(fragment)?;
         let prefix = fragment[..json_start].to_string();
         let candidate = &fragment[json_start..];
-        let json = Self::extract_first_json_object_fragment(candidate)?;
-        if !Self::looks_like_raw_tool_json_fragment(&json) {
+        let json = leak::extract_first_json_object_fragment(candidate)?;
+        if !leak::looks_like_raw_tool_json_fragment(&json) {
             return None;
         }
         let suffix_start = json_start + json.len();
@@ -1342,7 +1164,7 @@ impl TransformResponse {
             }
 
             // 检查是否有前缀模式
-            if Self::looks_like_contextual_running_prefix(&context[..json_start]) {
+            if leak::looks_like_contextual_running_prefix(&context[..json_start]) {
                 // 查找对应的结束标记 ```
                 if let Some(json_end) = context[json_content_start..].find("```") {
                     let json_end_pos = json_content_start + json_end;
@@ -1377,7 +1199,7 @@ impl TransformResponse {
                             };
 
                             let prefix_in_fragment =
-                                LeakDetector::collapse_adjacent_duplicate_markdown_bold(
+                                leak::collapse_adjacent_duplicate_markdown_bold(
                                     &prefix_in_fragment,
                                 );
 
@@ -1414,12 +1236,12 @@ impl TransformResponse {
         }
 
         // 回退到原来的逻辑处理裸 JSON
-        let json_start = LeakDetector::find_potential_raw_tool_json_start(fragment)?;
+        let json_start = leak::find_potential_raw_tool_json_start(fragment)?;
         let prefix = fragment[..json_start].to_string();
         let candidate = &fragment[json_start..];
-        let json = Self::extract_first_json_object_fragment(candidate)?;
+        let json = leak::extract_first_json_object_fragment(candidate)?;
 
-        if !Self::looks_like_contextual_leaked_note_json(&json, context) {
+        if !leak::looks_like_contextual_leaked_note_json(&json, context) {
             return None;
         }
 
@@ -1427,7 +1249,7 @@ impl TransformResponse {
         let mut suffix = fragment[suffix_start..].to_string();
 
         // 对上下文泄漏的情况，清理可疑的尾巴噪声
-        suffix = LeakDetector::strip_suspicious_trailing_noise(&suffix);
+        suffix = leak::strip_suspicious_trailing_noise(&suffix);
 
         Some((prefix, json, suffix, false))
     }
@@ -1442,12 +1264,12 @@ impl TransformResponse {
         let trimmed_start_len = pending_raw.len() - pending_raw.trim_start().len();
         let pending_for_tool_parse = &pending_raw[trimmed_start_len..];
 
-        if LeakDetector::starts_with_leaked_tool_marker(pending_for_tool_parse) {
+        if leak::starts_with_leaked_tool_marker(pending_for_tool_parse) {
             if let Some((_, raw_json, suffix)) =
-                LeakDetector::split_tool_json_prefix_suffix(pending_for_tool_parse)
+                leak::split_tool_json_prefix_suffix(pending_for_tool_parse)
             {
                 self.diagnostics.dropped_leaked_marker_fragments += 1;
-                let assessment = LeakDetector::assess_raw_tool_json(&raw_json);
+                let assessment = leak::assess_raw_tool_json(&raw_json);
                 self.record_raw_tool_json_assessment(assessment);
                 if let Some(recovered_calls) =
                     self.try_recover_readonly_tool_uses_from_raw_json(output, &raw_json)
@@ -1484,7 +1306,7 @@ impl TransformResponse {
                         .log_raw("[Warn] Dropping leaked tool marker fragment from visible text");
                     let suffix = &pending_for_tool_parse[newline_idx + 1..];
                     if !suffix.is_empty() {
-                        let cleaned_suffix = LeakDetector::strip_suspicious_trailing_noise(suffix);
+                        let cleaned_suffix = leak::strip_suspicious_trailing_noise(suffix);
                         if !cleaned_suffix.is_empty() {
                             // Keep post-marker suffix in pending mode instead of directly emitting.
                             // This avoids leaking chunk-split JSON argument fragments as visible text.
@@ -1504,7 +1326,7 @@ impl TransformResponse {
             if let Some(newline_idx) = pending_for_tool_parse.find('\n') {
                 let suffix = &pending_for_tool_parse[newline_idx + 1..];
                 if !suffix.is_empty() {
-                    let cleaned_suffix = LeakDetector::strip_suspicious_trailing_noise(suffix);
+                    let cleaned_suffix = leak::strip_suspicious_trailing_noise(suffix);
                     if !cleaned_suffix.is_empty() {
                         self.pending_tool_text = cleaned_suffix;
                         self.process_pending_tool_text(output, true);
@@ -1516,13 +1338,13 @@ impl TransformResponse {
 
         // 检查高置信工具参数泄漏
         if let Some((prefix, raw_json, suffix)) =
-            LeakDetector::split_tool_json_prefix_suffix(&pending_raw)
+            leak::split_tool_json_prefix_suffix(&pending_raw)
         {
             self.diagnostics.dropped_raw_tool_json_fragments += 1;
-            let assessment = LeakDetector::assess_raw_tool_json(&raw_json);
+            let assessment = leak::assess_raw_tool_json(&raw_json);
             self.record_raw_tool_json_assessment(assessment);
             if !prefix.is_empty() {
-                let cleaned_prefix = LeakDetector::sanitize_prefix_before_raw_tool_json(&prefix);
+                let cleaned_prefix = leak::sanitize_prefix_before_raw_tool_json(&prefix);
                 if !cleaned_prefix.is_empty() {
                     self.emit_plain_text_fragment(output, &cleaned_prefix);
                 }
@@ -1562,7 +1384,7 @@ impl TransformResponse {
         // 检查上下文 note-json 泄漏（新增）
         let context = format!("{}{}", self.text_carryover, &pending_raw);
         if let Some((prefix, _, _suffix, is_cross_chunk)) =
-            LeakDetector::split_contextual_note_json_prefix_suffix(&pending_raw, &context)
+            leak::split_contextual_note_json_prefix_suffix(&pending_raw, &context)
         {
             self.diagnostics.dropped_contextual_note_json_fragments += 1;
             self.logger
@@ -1576,10 +1398,10 @@ impl TransformResponse {
             return;
         }
 
-        if let Some(raw_json_start) = LeakDetector::find_potential_raw_tool_json_start(&pending_raw)
+        if let Some(raw_json_start) = leak::find_potential_raw_tool_json_start(&pending_raw)
         {
             let candidate = &pending_raw[raw_json_start..];
-            let json_complete = Self::extract_first_json_object_fragment(candidate).is_some();
+            let json_complete = leak::extract_first_json_object_fragment(candidate).is_some();
 
             if !json_complete {
                 if !force_flush {
@@ -3602,7 +3424,7 @@ data: {}
                 // 检查剩余内容是否是可疑的尾巴噪声
                 if !remaining.is_empty() {
                     let cleaned_remaining =
-                        LeakDetector::strip_suspicious_trailing_noise(remaining);
+                        leak::strip_suspicious_trailing_noise(remaining);
                     if !cleaned_remaining.is_empty() {
                         self.handle_text_fragment(output, &cleaned_remaining, emit_plain_text);
                     } else {
@@ -3653,7 +3475,7 @@ data: {}
             return;
         }
 
-        if let Some((marker_start, marker_len)) = LeakDetector::find_markdown_bash_start(&combined)
+        if let Some((marker_start, marker_len)) = leak::find_markdown_bash_start(&combined)
         {
             let prefix_text = &combined[..marker_start];
             let after_marker = &combined[marker_start + marker_len..];
@@ -3681,7 +3503,7 @@ data: {}
             return;
         }
 
-        if let Some(marker_start) = LeakDetector::find_potential_leaked_tool_marker_start(&combined)
+        if let Some(marker_start) = leak::find_potential_leaked_tool_marker_start(&combined)
         {
             let (prefix_text, leaked_fragment) = combined.split_at(marker_start);
             if emit_plain_text && !prefix_text.is_empty() {
@@ -3694,11 +3516,11 @@ data: {}
 
         // 某些泄漏不带 `assistant to=`/`to=` 前缀，而是直接混入工具参数 JSON。
         // 将裸 JSON 片段送入 pending，按高置信规则分段抑制，仅保留前后安全文本。
-        if let Some(raw_json_start) = LeakDetector::find_potential_raw_tool_json_start(&combined) {
+        if let Some(raw_json_start) = leak::find_potential_raw_tool_json_start(&combined) {
             let (prefix_text, leaked_fragment) = combined.split_at(raw_json_start);
             if emit_plain_text && !prefix_text.is_empty() {
                 let cleaned_prefix =
-                    LeakDetector::sanitize_prefix_before_raw_tool_json(prefix_text);
+                    leak::sanitize_prefix_before_raw_tool_json(prefix_text);
                 if !cleaned_prefix.is_empty() {
                     self.emit_or_defer_plain_text(output, &cleaned_prefix);
                 }
@@ -3711,7 +3533,7 @@ data: {}
         // 检查上下文 note-json 泄漏
         let context = format!("{}{}", self.text_carryover, &combined);
         if let Some((prefix, _, _suffix, is_cross_chunk)) =
-            LeakDetector::split_contextual_note_json_prefix_suffix(&combined, &context)
+            leak::split_contextual_note_json_prefix_suffix(&combined, &context)
         {
             // 对于上下文泄漏，只保留前缀中的安全部分，完全抑制 JSON 和可疑尾巴
             if is_cross_chunk {
@@ -3732,7 +3554,7 @@ data: {}
             return;
         }
 
-        let carry_len = LeakDetector::leaked_marker_suffix_len(&combined);
+        let carry_len = leak::leaked_marker_suffix_len(&combined);
         if carry_len == 0 {
             self.emit_plain_text_fragment(output, &combined);
             return;
@@ -3764,7 +3586,7 @@ data: {}
             return;
         }
 
-        let normalized_fragment = LeakDetector::collapse_adjacent_duplicate_markdown_bold(fragment);
+        let normalized_fragment = leak::collapse_adjacent_duplicate_markdown_bold(fragment);
         if normalized_fragment.is_empty() {
             return;
         }
@@ -3989,7 +3811,7 @@ data: {}
         let carryover = std::mem::take(&mut self.text_carryover);
         let carryover = Self::strip_proposed_plan_wrappers(&carryover);
 
-        if let Some((marker_start, marker_len)) = LeakDetector::find_markdown_bash_start(&carryover)
+        if let Some((marker_start, marker_len)) = leak::find_markdown_bash_start(&carryover)
         {
             let prefix_text = &carryover[..marker_start];
             let after_marker = &carryover[marker_start + marker_len..];
@@ -4004,7 +3826,7 @@ data: {}
         }
 
         if let Some(marker_start) =
-            LeakDetector::find_potential_leaked_tool_marker_start(&carryover)
+            leak::find_potential_leaked_tool_marker_start(&carryover)
         {
             let (prefix_text, leaked_fragment) = carryover.split_at(marker_start);
             if !self.has_open_tool_block() && !prefix_text.is_empty() {
@@ -4017,13 +3839,13 @@ data: {}
 
         // 检查高置信工具参数泄漏
         if let Some((prefix, raw_json, suffix)) =
-            LeakDetector::split_tool_json_prefix_suffix(&carryover)
+            leak::split_tool_json_prefix_suffix(&carryover)
         {
             self.diagnostics.dropped_raw_tool_json_fragments += 1;
-            let assessment = LeakDetector::assess_raw_tool_json(&raw_json);
+            let assessment = leak::assess_raw_tool_json(&raw_json);
             self.record_raw_tool_json_assessment(assessment);
             if !self.has_open_tool_block() && !prefix.is_empty() {
-                let cleaned_prefix = LeakDetector::sanitize_prefix_before_raw_tool_json(&prefix);
+                let cleaned_prefix = leak::sanitize_prefix_before_raw_tool_json(&prefix);
                 if !cleaned_prefix.is_empty() {
                     self.emit_plain_text_fragment(output, &cleaned_prefix);
                 }
@@ -4060,7 +3882,7 @@ data: {}
 
         // 检查上下文 note-json 泄漏（新增）
         if let Some((prefix, _, suffix, is_cross_chunk)) =
-            LeakDetector::split_contextual_note_json_prefix_suffix(&carryover, &carryover)
+            leak::split_contextual_note_json_prefix_suffix(&carryover, &carryover)
         {
             self.diagnostics.dropped_contextual_note_json_fragments += 1;
             self.logger
@@ -4077,10 +3899,10 @@ data: {}
             return;
         }
 
-        if let Some(raw_json_start) = LeakDetector::find_potential_raw_tool_json_start(&carryover) {
+        if let Some(raw_json_start) = leak::find_potential_raw_tool_json_start(&carryover) {
             let (prefix_text, leaked_fragment) = carryover.split_at(raw_json_start);
             if !self.has_open_tool_block() && !prefix_text.is_empty() {
-                let cleaned_prefix = LeakDetector::strip_known_leak_suffix_noise(prefix_text);
+                let cleaned_prefix = leak::strip_known_leak_suffix_noise(prefix_text);
                 if !cleaned_prefix.is_empty() {
                     self.emit_plain_text_fragment(output, &cleaned_prefix);
                 }
@@ -4109,9 +3931,55 @@ data: {}
     }
 
     fn build_diagnostics_summary(&self, terminal_event: &str) -> Value {
+        // 分通道视图（D5）：按 leak / plan_bridge / raw_tool_json / tool_binding / text 等
+        // 通道分组，取代 30+ 平铺字段。同时保留旧 `counters` 平铺结构以兼容现有测试断言。
+        let leak_channel = json!({
+            "dropped_leaked_marker_fragments": self.diagnostics.dropped_leaked_marker_fragments,
+            "dropped_raw_tool_json_fragments": self.diagnostics.dropped_raw_tool_json_fragments,
+            "assessed_raw_tool_json_fragments": self.diagnostics.assessed_raw_tool_json_fragments,
+            "assessed_raw_tool_json_readonly_recoverable": self.diagnostics.assessed_raw_tool_json_readonly_recoverable,
+            "assessed_raw_tool_json_high_risk": self.diagnostics.assessed_raw_tool_json_high_risk,
+            "assessed_raw_tool_json_suppressed": self.diagnostics.assessed_raw_tool_json_suppressed,
+            "dropped_high_risk_raw_tool_json_fragments": self.diagnostics.dropped_high_risk_raw_tool_json_fragments,
+            "emitted_high_risk_leak_questions": self.diagnostics.emitted_high_risk_leak_questions,
+            "recovered_readonly_leaked_tool_payloads": self.diagnostics.recovered_readonly_leaked_tool_payloads,
+            "recovered_readonly_leaked_tool_calls": self.diagnostics.recovered_readonly_leaked_tool_calls,
+            "dropped_contextual_note_json_fragments": self.diagnostics.dropped_contextual_note_json_fragments,
+            "dropped_incomplete_tool_json_fragments": self.diagnostics.dropped_incomplete_tool_json_fragments,
+        });
+        let plan_bridge_channel = json!({
+            "detected_proposed_plan_blocks": self.diagnostics.detected_proposed_plan_blocks,
+            "extracted_proposed_plan_body_chars": self.diagnostics.extracted_proposed_plan_body_chars,
+            "plan_bridge_write_successes": self.diagnostics.plan_bridge_write_successes,
+            "plan_bridge_write_failures": self.diagnostics.plan_bridge_write_failures,
+            "plan_bridge_exit_plan_mode_emitted": self.diagnostics.plan_bridge_exit_plan_mode_emitted,
+        });
+        let tool_binding_channel = json!({
+            "queued_orphan_tool_argument_updates": self.diagnostics.queued_orphan_tool_argument_updates,
+            "applied_orphan_tool_argument_updates": self.diagnostics.applied_orphan_tool_argument_updates,
+            "dropped_orphan_tool_argument_updates_no_hint": self.diagnostics.dropped_orphan_tool_argument_updates_no_hint,
+            "dropped_orphan_tool_argument_updates_closed_call": self.diagnostics.dropped_orphan_tool_argument_updates_closed_call,
+            "dropped_pending_tool_argument_updates_closed_call": self.diagnostics.dropped_pending_tool_argument_updates_closed_call,
+            "duplicate_active_call_items": self.diagnostics.duplicate_active_call_items,
+            "dropped_reused_closed_call_items": self.diagnostics.dropped_reused_closed_call_items,
+            "binding_conflicts_output_index": self.diagnostics.binding_conflicts_output_index,
+            "binding_conflicts_item_id": self.diagnostics.binding_conflicts_item_id,
+            "normalized_item_id_mismatches": self.diagnostics.normalized_item_id_mismatches,
+            "pending_tool_backlog_trimmed": self.diagnostics.pending_tool_backlog_trimmed,
+            "dropped_function_args_whitespace_overflow_fragments": self.diagnostics.dropped_function_args_whitespace_overflow_fragments,
+        });
+        let text_channel = json!({
+            "deferred_unscoped_text_chunks": self.diagnostics.deferred_unscoped_text_chunks,
+            "deferred_unscoped_text_flushes": self.diagnostics.deferred_unscoped_text_flushes,
+        });
+        let lifecycle_channel = json!({
+            "terminal_invariant_violations": self.diagnostics.terminal_invariant_violations,
+        });
+
         json!({
             "type": "codex_response_transform_summary",
             "terminal_event": terminal_event,
+            // 旧平铺结构（兼容现有测试的 /counters/ 路径断言）
             "counters": {
                 "deferred_unscoped_text_chunks": self.diagnostics.deferred_unscoped_text_chunks,
                 "deferred_unscoped_text_flushes": self.diagnostics.deferred_unscoped_text_flushes,
@@ -4146,6 +4014,14 @@ data: {}
                 "dropped_function_args_whitespace_overflow_fragments": self.diagnostics.dropped_function_args_whitespace_overflow_fragments,
                 "terminal_invariant_violations": self.diagnostics.terminal_invariant_violations,
                 "pending_orphan_updates": self.pending_tool_argument_updates.len()
+            },
+            // 新分通道结构（D5）：按治理通道分组，供新消费者使用
+            "channels": {
+                "leak": leak_channel,
+                "plan_bridge": plan_bridge_channel,
+                "tool_binding": tool_binding_channel,
+                "text": text_channel,
+                "lifecycle": lifecycle_channel,
             }
         })
     }
