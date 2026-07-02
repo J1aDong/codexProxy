@@ -190,7 +190,18 @@
       "Bash(npm root *)",
       "Bash(RUST_LOG=debug codex --version)",
       "Skill(open-websearch)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(ls packages/anthropic/src/)",
+      "Bash(ls packages/openai/src/)",
+      "Bash(ls packages/openai/src/responses/)",
+      "Bash(ls packages/open-responses/src/)",
+      "Bash(openspec status *)",
+      "Read(//Volumes/zhitai/code/ai/ai-sdk/packages/**)",
+      "Read(//Volumes/zhitai/code/ai/ai-sdk/**)",
+      "Bash(grep -nB2 -A20 \"trait ResponseTransformer\" main/src/transform/mod.rs)",
+      "Bash(grep -nB2 -A15 \"struct ResponseTransformRequestContext\" main/src/transform/mod.rs)",
+      "Bash(awk '{print $NF, $5}')",
+      "Bash(openspec instructions *)"
     ]
   },
   "enableAllProjectMcpServers": true,
