@@ -4376,22 +4376,12 @@ let upstream_response = match upstream_req.send().await {
         for (name, value) in &response_headers {
             response_builder = response_builder.header(name.as_str(), value.as_str());
         }
-        let stream_body = StreamBody::new(upstream_response.bytes_stream().map(move |result| {
-            match result {
-                Ok(bytes) => Ok(Frame::data(bytes)),
-                Err(e) => {
-                    let _ = log_tx_clone.send(format!(
-                        "[Error] #{} upstream stream error: {}",
-                        request_id_clone, e
-                    ));
-                    // 返回空帧来优雅地结束流
-                    Ok(Frame::data(Bytes::new()))
-                }
-            }
-        }));
-        return Ok(response_builder
-            .body(BoxBody::new(stream_body))
-            .unwrap());
+        let stream_body = StreamBody::new(map_native_passthrough_stream(
+            upstream_response.bytes_stream(),
+            log_tx_clone,
+            request_id_clone,
+        ));
+        return Ok(response_builder.body(BoxBody::new(stream_body)).unwrap());
     }
 
     let response_bytes = match upstream_response.bytes().await {
@@ -4516,6 +4506,29 @@ let upstream_response = match upstream_req.send().await {
             Full::new(response_bytes).map_err(|_: Infallible| unreachable!()),
         ))
         .unwrap())
+}
+
+fn map_native_passthrough_stream<S, E>(
+    stream: S,
+    log_tx: broadcast::Sender<String>,
+    request_id: String,
+) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    stream.scan((), move |_, result| {
+        std::future::ready(match result {
+            Ok(bytes) => Some(Ok(Frame::data(bytes))),
+            Err(error) => {
+                let _ = log_tx.send(format!(
+                    "[Error] #{} upstream stream error: {}",
+                    request_id, error
+                ));
+                None
+            }
+        })
+    })
 }
 
 fn parse_seconds_str(s: &str) -> Option<u64> {
@@ -9101,6 +9114,8 @@ mod tests {
     };
     use crate::models::AnthropicRequest;
     use crate::transform::{request_envelope_hints_from_anthropic, RequestEnvelopeHints};
+    use bytes::Bytes;
+    use futures_util::StreamExt;
     use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
@@ -11836,5 +11851,31 @@ data: {"type":"ping"}
             guard.insert(key.clone(), Instant::now() - Duration::from_secs(1));
         }
         assert!(get_parallel_tool_degrade_remaining_seconds(&degrade_map, &key).is_none());
+    }
+
+    #[tokio::test]
+    async fn native_passthrough_stream_stops_after_error() {
+        let (log_tx, _log_rx) = broadcast::channel(8);
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<_, &'static str>(Bytes::from_static(b"first")),
+            Err("stream failed"),
+            Ok(Bytes::from_static(b"must-not-pass")),
+        ]);
+
+        let frames: Vec<_> =
+            super::map_native_passthrough_stream(upstream, log_tx, "req-stream-error".to_string())
+                .collect()
+                .await;
+        let payloads: Vec<_> = frames
+            .into_iter()
+            .map(|frame| {
+                frame
+                    .expect("infallible frame")
+                    .into_data()
+                    .expect("data frame")
+            })
+            .collect();
+
+        assert_eq!(payloads, vec![Bytes::from_static(b"first")]);
     }
 }
