@@ -73,6 +73,7 @@ export interface ProxyConfig {
     geminiModelPreset: GeminiModelPreset
     maxConcurrency: number
     ignoreProbeRequests: boolean
+    testModelId: string
     allowCountTokensFallbackEstimate: boolean
     enableCodexFastMode: boolean
     allowExternalAccess: boolean

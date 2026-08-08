@@ -134,6 +134,17 @@
           <div class="text-apple-text-secondary dark:text-dark-text-secondary text-xs">{{ t('advancedLbTransientBackoffTip') }}</div>
         </div>
 
+        <div class="space-y-2">
+          <label class="text-sm font-medium text-apple-text-primary dark:text-dark-text-primary">{{ t('advancedTestModelIdLabel') }}</label>
+          <input
+            type="text"
+            v-model="localTestModelId"
+            class="w-full px-3 py-2.5 rounded-lg bg-gray-100 dark:bg-dark-tertiary dark:border-dark-border dark:text-dark-text-primary border border-transparent focus:bg-white dark:focus:bg-dark-tertiary focus:border-apple-blue dark:focus:border-accent-blue focus:ring-2 focus:ring-apple-blue focus:ring-opacity-20 transition-all duration-200 outline-none"
+            :placeholder="t('advancedTestModelIdPlaceholder')"
+          />
+          <div class="text-apple-text-secondary dark:text-dark-text-secondary text-xs">{{ t('advancedTestModelIdTip') }}</div>
+        </div>
+
         <label
           class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer dark:border-dark-border"
           :class="form.proxyMode === 'load_balancer' ? 'border-dark-border' : 'border-gray-200'"
@@ -305,6 +316,7 @@ const activeClientMode = ref<ClientMode>('claude')
 const testingEndpointId = ref('')
 
 const localMaxConcurrency = ref<number | null>(null)
+const localTestModelId = ref('gpt-5.6-terra')
 const localLbModelCooldownSeconds = ref<number | null>(3600)
 const localLbTransientBackoffSeconds = ref<number | null>(6)
 const localIgnoreProbeRequests = ref(false)
@@ -427,6 +439,7 @@ const DEFAULT_CONFIG = {
     'gemini-2.5-pro',
   ] as GeminiModelPreset,
   maxConcurrency: 0,
+  testModelId: 'gpt-5.6-terra',
   lbModelCooldownSeconds: 3600,
   lbTransientBackoffSeconds: 6,
   ignoreProbeRequests: false,
@@ -458,6 +471,7 @@ const form = reactive({
   endpointOptions: [...DEFAULT_CONFIG.endpointOptions],
   selectedEndpointId: DEFAULT_CONFIG.selectedEndpointId,
   maxConcurrency: DEFAULT_CONFIG.maxConcurrency,
+  testModelId: DEFAULT_CONFIG.testModelId,
   lbModelCooldownSeconds: DEFAULT_CONFIG.lbModelCooldownSeconds,
   lbTransientBackoffSeconds: DEFAULT_CONFIG.lbTransientBackoffSeconds,
   ignoreProbeRequests: DEFAULT_CONFIG.ignoreProbeRequests,
@@ -759,6 +773,7 @@ const updateCustomInjectionPrompt = (prompt: string) => {
 
 const openAdvancedSettings = () => {
   localMaxConcurrency.value = form.maxConcurrency
+  localTestModelId.value = form.testModelId
   localLbModelCooldownSeconds.value = form.lbModelCooldownSeconds
   localLbTransientBackoffSeconds.value = form.lbTransientBackoffSeconds
   localIgnoreProbeRequests.value = form.ignoreProbeRequests
@@ -792,6 +807,7 @@ const saveAdvancedSettings = async () => {
   }
 
   form.maxConcurrency = localMaxConcurrency.value ?? 0
+  form.testModelId = localTestModelId.value.trim() || DEFAULT_CONFIG.testModelId
   form.lbModelCooldownSeconds = Math.max(1, Math.floor(localLbModelCooldownSeconds.value ?? DEFAULT_CONFIG.lbModelCooldownSeconds))
   form.lbTransientBackoffSeconds = Math.max(1, Math.floor(localLbTransientBackoffSeconds.value ?? DEFAULT_CONFIG.lbTransientBackoffSeconds))
   form.ignoreProbeRequests = localIgnoreProbeRequests.value
@@ -901,6 +917,9 @@ const handleConfigImported = async () => {
     if (typeof savedConfig.maxConcurrency === 'number') {
       form.maxConcurrency = savedConfig.maxConcurrency
     }
+    form.testModelId = typeof savedConfig.testModelId === 'string' && savedConfig.testModelId.trim()
+      ? savedConfig.testModelId.trim()
+      : DEFAULT_CONFIG.testModelId
     if (typeof savedConfig.lbModelCooldownSeconds === 'number') {
       form.lbModelCooldownSeconds = Math.max(1, Math.floor(savedConfig.lbModelCooldownSeconds))
     }
@@ -1402,6 +1421,7 @@ const buildProxyConfig = (force = false): ProxyConfigV2 => ({
   codexEffortCapabilityMap: form.codexEffortCapabilityMap,
   geminiModelPreset: form.geminiModelPreset,
   maxConcurrency: form.maxConcurrency,
+  testModelId: form.testModelId,
   lbModelCooldownSeconds: form.lbModelCooldownSeconds,
   lbTransientBackoffSeconds: form.lbTransientBackoffSeconds,
   ignoreProbeRequests: form.ignoreProbeRequests,
@@ -1638,6 +1658,9 @@ onMounted(() => {
         if (typeof savedConfig.maxConcurrency === 'number') {
           form.maxConcurrency = savedConfig.maxConcurrency
         }
+        if (typeof savedConfig.testModelId === 'string' && savedConfig.testModelId.trim()) {
+          form.testModelId = savedConfig.testModelId.trim()
+        }
         if (typeof savedConfig.lbModelCooldownSeconds === 'number') {
           form.lbModelCooldownSeconds = Math.max(1, Math.floor(savedConfig.lbModelCooldownSeconds))
         }
@@ -1676,6 +1699,7 @@ onMounted(() => {
           form.allowExternalAccess = savedConfig.allowExternalAccess
         }
         localMaxConcurrency.value = form.maxConcurrency
+        localTestModelId.value = form.testModelId
         localLbModelCooldownSeconds.value = form.lbModelCooldownSeconds
         localLbTransientBackoffSeconds.value = form.lbTransientBackoffSeconds
         localIgnoreProbeRequests.value = form.ignoreProbeRequests
