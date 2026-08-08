@@ -393,6 +393,8 @@ pub struct ProxyConfig {
     pub max_concurrency: u32,
     #[serde(rename = "ignoreProbeRequests", default)]
     pub ignore_probe_requests: bool,
+    #[serde(rename = "testModelId", default = "default_test_model_id")]
+    pub test_model_id: String,
     #[serde(
         rename = "allowCountTokensFallbackEstimate",
         default = "default_allow_count_tokens_fallback_estimate"
@@ -569,6 +571,10 @@ fn default_codex_model() -> String {
     "gpt-5.3-codex".to_string()
 }
 
+fn default_test_model_id() -> String {
+    "gpt-5.6-terra".to_string()
+}
+
 fn default_allow_count_tokens_fallback_estimate() -> bool {
     true
 }
@@ -705,6 +711,7 @@ fn default_proxy_config() -> ProxyConfig {
         gemini_model_preset: default_gemini_model_preset(),
         max_concurrency: 0,
         ignore_probe_requests: false,
+        test_model_id: default_test_model_id(),
         allow_count_tokens_fallback_estimate: default_allow_count_tokens_fallback_estimate(),
         enable_codex_fast_mode: default_enable_codex_fast_mode(),
         force_stream_for_codex: default_force_stream_for_codex(),
@@ -1087,7 +1094,6 @@ pub struct EndpointTestResult {
 }
 
 const TEST_INPUT_MODEL: &str = "claude-sonnet-4-6";
-const TEST_CODEX_MODEL: &str = "gpt-5.4";
 const TEST_PROMPT: &str = "Who are you?";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1519,7 +1525,11 @@ fn build_endpoint_test_context(
     ctx
 }
 
-fn resolve_test_model_for_sonnet(converter: &str, ctx: &TransformContext) -> String {
+fn resolve_test_model_for_sonnet(
+    converter: &str,
+    ctx: &TransformContext,
+    test_model_id: &str,
+) -> String {
     if converter.eq_ignore_ascii_case("anthropic") {
         let mapped = ctx.anthropic_model_mapping.sonnet.trim();
         return if mapped.is_empty() {
@@ -1542,7 +1552,12 @@ fn resolve_test_model_for_sonnet(converter: &str, ctx: &TransformContext) -> Str
         return ctx.gemini_reasoning_effort.sonnet.clone();
     }
 
-    TEST_CODEX_MODEL.to_string()
+    let trimmed = test_model_id.trim();
+    if trimmed.is_empty() {
+        default_test_model_id()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn build_endpoint_test_request() -> AnthropicRequest {
@@ -1800,7 +1815,7 @@ pub async fn test_endpoint_model(
         endpoint.api_key.as_str()
     };
     let ctx = build_endpoint_test_context(&config, endpoint, converter.clone());
-    let model_used = resolve_test_model_for_sonnet(&converter, &ctx);
+    let model_used = resolve_test_model_for_sonnet(&converter, &ctx, &config.test_model_id);
     let backend = build_backend_by_converter(&converter);
     let test_request = build_endpoint_test_request();
     let (body, session_id) =
@@ -2555,6 +2570,68 @@ mod tests {
             config.enable_codex_fast_mode,
             "missing config field should default Codex fast mode to enabled"
         );
+        assert_eq!(config.test_model_id, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn codex_endpoint_test_uses_configured_model_and_falls_back_for_blank_value() {
+        let config = default_proxy_config();
+        let endpoint = selected_endpoint(&config).expect("default endpoint");
+        let ctx = build_endpoint_test_context(&config, endpoint, "codex".to_string());
+
+        assert_eq!(
+            resolve_test_model_for_sonnet("codex", &ctx, "custom-test-model"),
+            "custom-test-model"
+        );
+        assert_eq!(
+            resolve_test_model_for_sonnet("codex", &ctx, "  "),
+            "gpt-5.6-terra"
+        );
+    }
+
+    #[test]
+    fn custom_test_model_does_not_override_non_codex_provider_models() {
+        let mut config = default_proxy_config();
+        config.anthropic_model_mapping.sonnet = "claude-test-model".to_string();
+        config.openai_model_mapping.sonnet = "openai-test-model".to_string();
+        config.gemini_reasoning_effort.sonnet = "gemini-test-model".to_string();
+        let endpoint = selected_endpoint(&config).expect("default endpoint");
+
+        let anthropic_ctx =
+            build_endpoint_test_context(&config, endpoint, "anthropic".to_string());
+        assert_eq!(
+            resolve_test_model_for_sonnet(
+                "anthropic",
+                &anthropic_ctx,
+                "custom-codex-test-model"
+            ),
+            "claude-test-model"
+        );
+
+        let openai_ctx = build_endpoint_test_context(&config, endpoint, "openai".to_string());
+        assert_eq!(
+            resolve_test_model_for_sonnet("openai", &openai_ctx, "custom-codex-test-model"),
+            "openai-test-model"
+        );
+
+        let gemini_ctx = build_endpoint_test_context(&config, endpoint, "gemini".to_string());
+        assert_eq!(
+            resolve_test_model_for_sonnet("gemini", &gemini_ctx, "custom-codex-test-model"),
+            "gemini-test-model"
+        );
+    }
+
+    #[test]
+    fn custom_test_model_round_trips_through_config_json() {
+        let mut config = default_proxy_config();
+        config.test_model_id = "custom-test-model".to_string();
+
+        let serialized = serde_json::to_value(&config).expect("config should serialize");
+        assert_eq!(serialized["testModelId"], "custom-test-model");
+
+        let deserialized: ProxyConfig =
+            serde_json::from_value(serialized).expect("config should deserialize");
+        assert_eq!(deserialized.test_model_id, "custom-test-model");
     }
 
     #[test]
