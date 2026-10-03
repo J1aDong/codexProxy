@@ -1,3 +1,11 @@
+@font-face {
+  font-family: "DotGothic16";
+  src: url("./assets/fonts/DotGothic16-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
